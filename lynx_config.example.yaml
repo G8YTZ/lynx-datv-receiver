@@ -1,0 +1,141 @@
+audio:
+  default_volume: 100
+default_boot_preset:
+  freq: 437000
+  lnb_lo_khz: 0
+  plug: diversity
+  sr: 1000
+dial:
+  menu_timeout_ms: 6000
+  poll_interval_ms: 3000
+diversity:
+  combiner_out_port: 9943
+  enabled: false
+  hard_freeze_breaker_cooldown_secs: 300.0
+  hard_freeze_breaker_enabled: true
+  hard_freeze_breaker_min_retry_interval_secs: 5.0
+  hard_freeze_breaker_required_clean_secs: 2.0
+  hard_freeze_breaker_threshold: 5
+  hard_freeze_breaker_window_secs: 300.0
+  mer_switch_dwell_secs: 10.0
+  mer_switch_margin_db: 1.0
+  rcv1_plug: a
+  rcv2_plug: b
+notifications:
+  companion:
+    enabled: false
+    gpio_enabled: false
+    gpio_pin: 13
+    gpio_polarity: high
+    lock_settle_secs: 5.0
+    lock_url: ''
+    unlock_settle_secs: 5.0
+    unlock_url: ''
+  gpio_tx:
+    enabled: false
+    pin: 11
+    polarity: high
+    power_down_settle_secs: 900.0
+    power_up_settle_secs: 5.0
+    schedule_weekday_end: ''
+    schedule_weekday_start: ''
+    schedule_weekend_end: ''
+    schedule_weekend_start: ''
+  qrz:
+    api_key: ''
+    enabled: false
+    settle_secs: 15.0
+    suppress_mins: 60
+  slack:
+    enabled: false
+    message_template: '{site_callsign}''s 70cm input is active!
+
+      Call sign: ''{rx_callsign}''
+
+      MER: {mer}dB
+
+      Watch the web stream at: rtmp://rtmp.batc.org.uk/live/{site_callsign_lower}'
+    settle_secs: 15.0
+    webhook_url: ''
+picotuner:
+  cmd_port: 9921
+  cmd_port_b: 9922
+  default_plug: a
+  host: 192.168.0.126
+  status_port: 9997
+  ts_port: 9941
+  ts_port_b: 9942
+presets:
+- freq: 437000
+  name: GB3JV Input
+  note: GB3JV 70cm input
+  plug: a
+  sr: 333
+  type: rf
+- freq: 1255000
+  name: 23cm Test
+  note: 23cm test frequency
+  plug: a
+  sr: 333
+  type: rf
+- freq: 437000
+  lnb_lo_khz: 0
+  name: Diversity 437 MHz 333kS/s
+  note: User saved via web UI
+  plug: diversity
+  sr: 333
+  type: rf
+- freq: 437000
+  lnb_lo_khz: 0
+  name: 437 333k B
+  note: User saved via web UI
+  plug: b
+  sr: 333
+  type: rf
+- freq: 437000
+  lnb_lo_khz: 0
+  name: Diversity 437 MHz 1000 kS/s
+  note: User saved via web UI
+  plug: diversity
+  sr: 1000
+  type: rf
+- freq: 437000
+  lnb_lo_khz: 0
+  name: 437 1000 A
+  note: User saved via web UI
+  plug: a
+  sr: 1000
+  type: rf
+- name: DB0OZ Bremen
+  note: User saved via web UI
+  type: stream
+  url: rtmp://rtmp.batc.org.uk/live/db0oz
+- name: GB3OO
+  note: User saved via web UI
+  type: stream
+  url: rtmp://rtmp.batc.org.uk/live/gb3oo
+- name: GB3HV
+  note: User saved via web UI
+  type: stream
+  url: rtmp://rtmp.batc.org.uk/live/gb3hv
+- name: GB3TV
+  note: User saved via web UI
+  type: stream
+  url: rtmp://rtmp.batc.org.uk/live/gb3tv
+relay:
+  enabled: false
+  rtmp_url: ''
+ryde:
+  enabled: false
+  host: 192.168.40.115
+  port: 8765
+site:
+  callsign: My_Callsign
+  location: My_City
+  locator: My_Maidenhead_Locator
+  name: Lynx Home Receiver
+streams: []
+web:
+  host: 0.0.0.0
+  port: 8080
+  secret_key: ''

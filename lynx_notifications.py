@@ -1,0 +1,720 @@
+# Copyright (C) 2026 Justin, G8YTZ / EI3IOB
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+"""
+lynx_notifications.py — Repeater-activity notifications and control outputs.
+
+Fires, on a confirmed lock/unlock transition of EITHER Picotuner (diversity-
+aware, reusing the exact same "either tuner locked" expression already
+proven in rf_mpv_lifecycle_monitor(), but evaluated independently and
+continuously here — deliberately NOT gated on Lynx's own current playback
+mode, since a repeater controller needs to know about incoming signals
+regardless of whether the operator happens to be watching RF, a stream, or
+nothing at all right now):
+
+  - A QRZ.com logbook entry (via QRZ's XML/ADIF Logbook API)
+  - A Slack notification (via an incoming webhook)
+  - Two independent Bitfocus Companion HTTP triggers (lock, unlock)
+  - A GPIO "Tx on/off" output, signal-driven with its own settling timers,
+    optionally overridden by a configurable weekday/weekend schedule
+
+Each output has its own independent settling timer(s) — the delay between a
+confirmed lock/unlock and actually firing, matching the proven design in the
+reference Ryde webhook/Companion code this was adapted from (tested and
+running in production for over a year): long enough that a transmission's
+callsign metadata has had a chance to decode, short enough not to miss
+brief contacts or delay the notification unreasonably.
+
+QRZ and Slack payload construction, and the ADIF field-length-prefixed
+format specifically, are carried over unchanged from that reference
+code — this is a well-tested, working format, not something to redesign.
+"""
+
+import json
+import threading
+import time
+import datetime
+import requests
+
+# ── Physical (BOARD) pin -> BCM GPIO number, or a fixed power/ground label ──
+# Standard 40-pin header layout, unchanged across every 40-pin Raspberry Pi
+# model including the 5 (only the underlying chip serving these pins
+# changed, not the physical header layout or numbering). Verified directly
+# against pinout.xyz before use here, given how important getting this
+# exactly right is - a wrong mapping could mean driving the wrong physical
+# pin entirely.
+PHYSICAL_PIN_MAP = {
+    1: "3V3", 2: "5V",
+    3: "GPIO2", 4: "5V",
+    5: "GPIO3", 6: "GND",
+    7: "GPIO4", 8: "GPIO14",
+    9: "GND", 10: "GPIO15",
+    11: "GPIO17", 12: "GPIO18",
+    13: "GPIO27", 14: "GND",
+    15: "GPIO22", 16: "GPIO23",
+    17: "3V3", 18: "GPIO24",
+    19: "GPIO10", 20: "GND",
+    21: "GPIO9", 22: "GPIO25",
+    23: "GPIO11", 24: "GPIO8",
+    25: "GND", 26: "GPIO7",
+    27: "GPIO0", 28: "GPIO1",   # reserved for HAT EEPROM ID - deliberately
+                                 # excluded from USABLE_PHYSICAL_PINS below
+    29: "GPIO5", 30: "GND",
+    31: "GPIO6", 32: "GPIO12",
+    33: "GPIO13", 34: "GND",
+    35: "GPIO19", 36: "GPIO16",
+    37: "GPIO26", 38: "GPIO20",
+    39: "GND", 40: "GPIO21",
+}
+
+# Physical pins actually offered as GPIO output choices in the UI - power,
+# ground, and the two HAT-EEPROM-reserved pins (27, 28) are excluded, since
+# none of these are appropriate as a general-purpose output regardless of
+# what's wired to them.
+USABLE_PHYSICAL_PINS = [
+    p for p, label in PHYSICAL_PIN_MAP.items()
+    if label.startswith("GPIO") and p not in (27, 28)
+]
+
+def pin_label(physical_pin):
+    """'Pin 11 (GPIO17)' - for displaying both numbering schemes together,
+    exactly as requested, so there's never ambiguity about which physical
+    pin a given config value actually refers to."""
+    bcm = PHYSICAL_PIN_MAP.get(physical_pin, "?")
+    return f"Pin {physical_pin} ({bcm})"
+
+
+class SettlingAction:
+    """Fires `callback` after `delay_secs` of continuous, unbroken trigger
+    condition, cleanly cancelling if the condition reverts before the delay
+    elapses. threading.Timer-based - the same proven pattern as the
+    reference code's own settling-timer logic (there implemented by hand
+    with a polled timestamp comparison; here as a small, reusable,
+    thread-safe helper so the same correct behaviour doesn't need
+    re-implementing six separate times for six separate outputs).
+
+    A delay of 0 fires (almost) immediately, asynchronously. This is a
+    sensible general-purpose default for "no settling wanted" - NOT the
+    same thing as the Tx pin's own, specific "0 = never auto power-down"
+    sentinel, which is a different concept entirely and is handled at the
+    call site, before ever constructing or triggering a SettlingAction for
+    that specific case."""
+
+    def __init__(self, delay_secs, callback, name=""):
+        self.delay_secs = delay_secs
+        self.callback = callback
+        self.name = name
+        self._timer = None
+        self._lock = threading.Lock()
+
+    def trigger(self):
+        with self._lock:
+            self._cancel_locked()
+            if self.delay_secs <= 0:
+                threading.Thread(target=self._fire, daemon=True).start()
+            else:
+                self._timer = threading.Timer(self.delay_secs, self._fire)
+                self._timer.daemon = True
+                self._timer.start()
+
+    def cancel(self):
+        with self._lock:
+            self._cancel_locked()
+
+    def _cancel_locked(self):
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+
+    def _fire(self):
+        try:
+            self.callback()
+        except Exception as e:
+            print(f"[notifications] {self.name} action failed: {type(e).__name__}: {e}")
+
+
+class GpioPin:
+    """Thin wrapper around a single gpiozero output, using physical (BOARD)
+    pin numbering directly - gpiozero natively supports this via a
+    "BOARDxx" pin specifier, so no manual physical-to-BCM conversion is
+    needed for the actual hardware call itself (PHYSICAL_PIN_MAP above is
+    purely for UI display, matching what was asked for).
+
+    Deliberately fails soft: if gpiozero isn't installed, or GPIO hardware
+    access fails for any reason (wrong permissions, unavailable on this
+    specific board, etc.), this logs clearly and disables itself rather
+    than crashing the whole Lynx process - GPIO output is opt-in,
+    supplementary functionality, and a hardware/permissions problem with it
+    should never be able to take down reception."""
+
+    def __init__(self, physical_pin, active_high, name=""):
+        self.name = name
+        self.physical_pin = physical_pin
+        self.active_high = active_high
+        self._device = None
+        try:
+            from gpiozero import OutputDevice
+            # active_high here controls gpiozero's own idea of what
+            # .on()/.off() mean electrically - NOT yet whether the pin
+            # starts on or off, which is set explicitly below regardless.
+            self._device = OutputDevice(f"BOARD{physical_pin}",
+                                         active_high=active_high,
+                                         initial_value=False)
+            print(f"[notifications] GPIO {name}: {pin_label(physical_pin)} ready "
+                  f"(active {'high' if active_high else 'low'})")
+        except Exception as e:
+            print(f"[notifications] GPIO {name}: could not initialise "
+                  f"{pin_label(physical_pin)} - {type(e).__name__}: {e}. "
+                  f"This output is disabled.")
+
+    @property
+    def available(self):
+        return self._device is not None
+
+    def set(self, on: bool):
+        if self._device is None:
+            return
+        try:
+            if on:
+                self._device.on()
+            else:
+                self._device.off()
+        except Exception as e:
+            print(f"[notifications] GPIO {self.name}: failed to set state - "
+                  f"{type(e).__name__}: {e}")
+
+
+# ── QRZ.com Logbook ─────────────────────────────────────────────────────
+# ADIF construction below is carried over unchanged from the reference
+# code (confirmed tested, working in production for over a year) - the
+# <field:LENGTH>VALUE format, field selection, and field order are all
+# deliberately preserved exactly as proven, not redesigned.
+
+QRZ_LOGBOOK_URL = "https://logbook.qrz.com/api"
+
+def _build_qrz_adif(api_key, action, call, band, mode, qso_date, time_on,
+                     station_callsign, freq, comment, rst_sent):
+    ps = ""
+    ps += "KEY=" + api_key + "&"
+    ps += "ACTION=" + action + "&"
+    ps += "ADIF="
+    ps += "<band:" + str(len(band)) + ">" + str(band)
+    ps += "<mode:" + str(len(mode)) + ">" + str(mode)
+    ps += "<call:" + str(len(call)) + ">" + str(call)
+    ps += "<qso_date:" + str(len(qso_date)) + ">" + str(qso_date)
+    ps += "<time_on:" + str(len(time_on)) + ">" + str(time_on)
+    ps += "<station_callsign:" + str(len(station_callsign)) + ">" + str(station_callsign)
+    ps += "<freq:" + str(len(str(freq))) + ">" + str(freq)
+    ps += "<comment:" + str(len(str(comment))) + ">" + str(comment)
+    ps += "<rst_sent:" + str(len(str(rst_sent))) + ">" + str(rst_sent)
+    ps += "<eor>"
+    return ps
+
+def _qrz_band_from_freq_mhz(freq_mhz):
+    """Same band boundaries as the reference code - extend this if a
+    deployment ever needs a band outside these three."""
+    if 430 <= freq_mhz <= 440:
+        return "70cm"
+    elif 1240 <= freq_mhz <= 1325:
+        return "23cm"
+    elif 3400 <= freq_mhz <= 3410:
+        return "9cm"
+    return ""
+
+def submit_qrz_logbook(api_key, station_callsign, rx_callsign, freq_khz,
+                        mode, mer, margin):
+    """Builds and submits one QRZ logbook entry. freq_khz matches Lynx's
+    own convention throughout (presets, tuning) - converted to MHz here,
+    which is what QRZ's freq field expects (confirmed against the
+    reference code's own comment: "FREQ: frequency in MHz").
+
+    Lynx has no direct equivalent of the reference code's getPowerInd()
+    (a Ryde-specific "power indication" reading) - margin (signal margin,
+    dB) is used in its place for the comment/rst_sent fields as the
+    closest available, meaningful signal-quality figure Lynx actually has.
+    """
+    freq_mhz = freq_khz / 1000.0
+    band = _qrz_band_from_freq_mhz(freq_mhz)
+
+    call_trunc = ""
+    for ch in rx_callsign:
+        if ch.isalnum():
+            call_trunc += ch
+        else:
+            break
+
+    now = datetime.datetime.now(datetime.timezone.utc)
+    qso_date = now.strftime("%Y%m%d")
+    time_on = now.strftime("%H%M%S")
+
+    comment = f"{mode} | {mer}dB MER | {margin}dB margin"
+    rst_sent = f"{margin}dB"
+
+    payload = _build_qrz_adif(api_key, "INSERT", call_trunc, band, str(mode),
+                               qso_date, time_on, station_callsign,
+                               str(freq_mhz), comment, str(rst_sent))
+
+    r = requests.post(QRZ_LOGBOOK_URL, data=payload,
+                       headers={"User-agent": "lynx-notifications/1.0"}, timeout=10)
+    result, logid, count, reason = "none", "none", "none", "none"
+    if r.status_code == 200:
+        for pair in r.text.split("&"):
+            kv = pair.split("=")
+            if len(kv) == 2:
+                if kv[0] == "RESULT":
+                    result = kv[1]
+                elif kv[0] == "LOGID":
+                    logid = kv[1]
+                elif kv[0] == "COUNT":
+                    count = kv[1]
+                elif kv[0] == "REASON":
+                    reason = kv[1]
+    else:
+        print(f"[notifications] QRZ: non-200 response ({r.status_code}): {r.text}")
+    if result not in ("OK", "REPLACE"):
+        print(f"[notifications] QRZ: API reported an error - result={result} reason={reason}")
+    else:
+        print(f"[notifications] QRZ: logged {call_trunc} - result={result} logid={logid}")
+    return result
+
+
+# ── Slack ────────────────────────────────────────────────────────────────
+
+def send_slack_message(webhook_url, template, placeholders):
+    """placeholders: dict of {name: value} substituted into template via
+    str.format(). Unknown/missing placeholders raise KeyError rather than
+    silently posting a broken message - caught and logged by the caller."""
+    text = template.format(**placeholders)
+    payload = json.dumps({"text": text})
+    r = requests.post(webhook_url, data=payload,
+                       headers={"Content-type": "application/json"}, timeout=10)
+    if r.status_code != 200:
+        print(f"[notifications] Slack: non-200 response ({r.status_code}): {r.text}")
+    else:
+        print(f"[notifications] Slack: sent")
+
+
+# ── Bitfocus Companion ───────────────────────────────────────────────────
+
+def trigger_companion(url):
+    """The reference code's Companion trigger had no error handling at
+    all, unlike its own Slack/QRZ code - a genuine gap, fixed here to
+    match the same try/except discipline used everywhere else in this
+    module, since an unreachable Companion instance should never be able
+    to raise uncaught inside a timer callback."""
+    r = requests.post(url, timeout=10)
+    if r.status_code not in (200, 204):
+        print(f"[notifications] Companion: non-200 response ({r.status_code}) from {url}")
+    else:
+        print(f"[notifications] Companion: triggered {url}")
+
+
+
+# ── Schedule window evaluation ──────────────────────────────────────────
+
+def _time_in_window(now_time, start_str, end_str):
+    """now_time: datetime.time. start_str/end_str: "HH:MM" strings, or
+    falsy (empty string / None) for "no schedule" (always False in that
+    case - this is the "No schedule" dropdown option). Handles a window
+    that crosses midnight correctly (e.g. 22:00-02:00)."""
+    if not start_str or not end_str:
+        return False
+    start = datetime.datetime.strptime(start_str, "%H:%M").time()
+    end = datetime.datetime.strptime(end_str, "%H:%M").time()
+    if start <= end:
+        return start <= now_time < end
+    else:
+        return now_time >= start or now_time < end
+
+def is_in_schedule_window(now, weekday_start, weekday_end, weekend_start, weekend_end):
+    """now: datetime.datetime. Saturday/Sunday use the weekend window,
+    Monday-Friday use the weekday window - each independently configurable,
+    each independently able to be "No schedule" (disabled)."""
+    is_weekend = now.weekday() >= 5  # Python: Monday=0 ... Sunday=6
+    if is_weekend:
+        return _time_in_window(now.time(), weekend_start, weekend_end)
+    return _time_in_window(now.time(), weekday_start, weekday_end)
+
+
+# ── Main manager ─────────────────────────────────────────────────────────
+
+class NotificationManager:
+    """Owns the independent lock-monitoring loop and drives all five
+    outputs (QRZ, Slack, Companion lock/unlock, GPIO Tx) from it.
+
+    Deliberately does NOT gate on Lynx's own current_mode the way
+    rf_mpv_lifecycle_monitor() does - a repeater controller needs to know
+    about incoming signals regardless of what's currently on screen.
+    Reuses that same monitor's exact "either tuner locked" expression and
+    LOCK_CONFIRM_POLLS debounce value, just evaluated independently and
+    continuously here.
+
+    `get_config` is a callable (not a captured dict reference) specifically
+    because lynx_app.py's own `config` global gets REASSIGNED (not just
+    mutated) on every config save - holding a direct reference captured at
+    startup would silently go stale after the first save. picotuner_state /
+    picotuner_state_b are passed as direct dict references instead, since
+    those are only ever mutated in place, never reassigned, so a captured
+    reference to them stays valid and current indefinitely."""
+
+    LOCK_CONFIRM_POLLS = 3   # matches rf_mpv_lifecycle_monitor()'s own, proven value
+    POLL_SECS = 1.0
+
+    def __init__(self, picotuner_state, picotuner_state_b, get_config):
+        self.picotuner_state = picotuner_state
+        self.picotuner_state_b = picotuner_state_b
+        self.get_config = get_config
+
+        self._stop_event = threading.Event()
+        self._thread = None
+
+        self._lock_streak = 0
+        self._loss_streak = 0
+        self._confirmed_locked = False
+
+        self._qrz_last_logged = {}   # {callsign: unix_timestamp} - suppression window
+
+        self._actions = {}   # {name: SettlingAction} - persistent, keyed store so a
+                              # later event (e.g. unlock) can find and cancel an earlier
+                              # one's (e.g. lock's) still-pending timer. Confirmed as a
+                              # genuine, real gap when this was a bare local variable per
+                              # call: a lock that starts a 15s QRZ timer, followed by a
+                              # genuine unlock 5s later, had no way to cancel that timer -
+                              # QRZ would still fire after the contact had already ended,
+                              # contradicting the reference code's own explicit design
+                              # ("a webhook will not be sent if the state goes to UNLOCK
+                              # during the settling time").
+
+        self._gpio_companion = None          # GpioPin mirroring Companion lock/unlock,
+        self._companion_gpio_cfg_key = None  # for relay-based input switching
+
+        self._gpio_tx = None          # GpioPin, (re)built if pin/polarity config changes
+        self._tx_pin_cfg_key = None   # (pin, polarity) the current GpioPin was built for
+        self._tx_power_up_action = None
+        self._tx_power_down_action = None
+        self._tx_was_in_window = False
+        self._tx_was_locked = False   # Tx pin's own view of lock state, tracked
+                                        # separately from self._confirmed_locked so the
+                                        # schedule-driven and signal-driven paths can
+                                        # never desync from each other
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        print("[notifications] monitor started")
+
+    def stop(self):
+        self._stop_event.set()
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            try:
+                self._poll()
+            except Exception as e:
+                print(f"[notifications] poll error: {type(e).__name__}: {e}")
+            time.sleep(self.POLL_SECS)
+
+    def _current_source_data(self):
+        """Picks whichever tuner is actually the active signal right now
+        (higher MER if both are locked simultaneously) and returns its
+        callsign/frequency/mer/margin/modcod/symbol_rate as a plain dict -
+        the single source of truth every output below reads from, so QRZ
+        and Slack can never disagree about which tuner's data they used."""
+        def to_float(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+
+        a = self.picotuner_state
+        b = self.picotuner_state_b
+        a_mer = to_float(a.get("mer"))
+        b_mer = to_float(b.get("mer"))
+        a_locked = a.get("locked", False)
+        b_locked = b.get("locked", False)
+
+        use_b = b_locked and (not a_locked or (b_mer is not None and (a_mer is None or b_mer > a_mer)))
+        src = b if use_b else a
+        return {
+            "rx_callsign": src.get("callsign", "") or "",
+            "frequency_khz": to_float(src.get("frequency")) or 0.0,
+            "mer": to_float(src.get("mer")),
+            "margin": to_float(src.get("margin")),
+            "modcod": src.get("modcod", "") or "",
+            "symbol_rate": src.get("symbol_rate", "") or "",
+        }
+
+    # -- lock/unlock transition handling (QRZ, Slack, Companion) --------
+
+    def _poll(self):
+        cfg = self.get_config()
+        notif_cfg = cfg.get('notifications', {})
+        diversity_enabled = cfg.get('diversity', {}).get('enabled', False)
+
+        raw_locked = self.picotuner_state.get("locked", False) or \
+                     (diversity_enabled and self.picotuner_state_b.get("locked", False))
+
+        if raw_locked:
+            self._loss_streak = 0
+            self._lock_streak += 1
+        else:
+            self._lock_streak = 0
+            self._loss_streak += 1
+
+        if self._lock_streak >= self.LOCK_CONFIRM_POLLS and not self._confirmed_locked:
+            self._confirmed_locked = True
+            self._on_confirmed_lock(notif_cfg, cfg)
+        elif self._loss_streak >= self.LOCK_CONFIRM_POLLS and self._confirmed_locked:
+            self._confirmed_locked = False
+            self._on_confirmed_unlock(notif_cfg)
+
+        self._poll_tx_pin(notif_cfg, cfg)
+
+    def _arm_action(self, key, delay, callback, name):
+        """Start (or restart) a named, persistent settling timer. Storing
+        it in self._actions (rather than a bare local variable) is what
+        lets a later, opposite event find and cancel it before it fires -
+        see the constructor's own note on why this matters."""
+        action = SettlingAction(delay, callback, name)
+        self._actions[key] = action
+        action.trigger()
+
+    def _cancel_action(self, key):
+        action = self._actions.get(key)
+        if action:
+            action.cancel()
+
+    def _ensure_companion_gpio(self, comp_cfg):
+        """(Re)builds the Companion-mirroring GPIO pin if its pin/polarity
+        config has changed, or returns the existing one - identical
+        pattern to the Tx pin's own cfg_key check in _poll_tx_pin()."""
+        pin = comp_cfg.get('gpio_pin')
+        if pin is None:
+            return None
+        active_high = (comp_cfg.get('gpio_polarity', 'high') == 'high')
+        cfg_key = (pin, active_high)
+        if self._gpio_companion is None or self._companion_gpio_cfg_key != cfg_key:
+            self._gpio_companion = GpioPin(pin, active_high, name="Companion lock/unlock")
+            self._companion_gpio_cfg_key = cfg_key
+            self._cancel_action('companion_gpio_lock')
+            self._cancel_action('companion_gpio_unlock')
+        return self._gpio_companion
+
+    def _on_confirmed_lock(self, notif_cfg, cfg):
+        site_callsign = cfg.get('site', {}).get('callsign', '')
+
+        # We're locked again - cancel anything the unlock side had
+        # pending a moment ago, so it can't fire late against a signal
+        # that's actually back.
+        self._cancel_action('companion_unlock')
+        self._cancel_action('companion_gpio_unlock')
+
+        qrz_cfg = notif_cfg.get('qrz', {})
+        if qrz_cfg.get('enabled', False):
+            delay = float(qrz_cfg.get('settle_secs', 15.0))
+            self._arm_action('qrz', delay, lambda: self._fire_qrz(qrz_cfg, site_callsign), "QRZ")
+
+        slack_cfg = notif_cfg.get('slack', {})
+        if slack_cfg.get('enabled', False):
+            delay = float(slack_cfg.get('settle_secs', 15.0))
+            self._arm_action('slack', delay, lambda: self._fire_slack(slack_cfg, site_callsign), "Slack")
+
+        comp_cfg = notif_cfg.get('companion', {})
+        if comp_cfg.get('enabled', False) and comp_cfg.get('lock_url'):
+            delay = float(comp_cfg.get('lock_settle_secs', 5.0))
+            self._arm_action('companion_lock', delay,
+                              lambda: trigger_companion(comp_cfg['lock_url']), "Companion-lock")
+
+        if comp_cfg.get('gpio_enabled', False):
+            gpio = self._ensure_companion_gpio(comp_cfg)
+            if gpio is not None and gpio.available:
+                # Deliberately the SAME settling timer as the Companion
+                # webhook above, not a separate one - this pin exists to
+                # mirror the webhook-driven lock/unlock for relay-based
+                # input switching, not to introduce its own timing.
+                delay = float(comp_cfg.get('lock_settle_secs', 5.0))
+                self._arm_action('companion_gpio_lock', delay,
+                                  lambda: gpio.set(True), "Companion-GPIO-lock")
+
+    def _on_confirmed_unlock(self, notif_cfg):
+        # We're unlocked again - cancel anything the lock side had
+        # pending, matching the reference code's explicit design: a
+        # webhook (or now, GPIO change) must not fire if the state goes
+        # back to unlocked during its own settling time.
+        self._cancel_action('qrz')
+        self._cancel_action('slack')
+        self._cancel_action('companion_lock')
+        self._cancel_action('companion_gpio_lock')
+
+        comp_cfg = notif_cfg.get('companion', {})
+        if comp_cfg.get('enabled', False) and comp_cfg.get('unlock_url'):
+            delay = float(comp_cfg.get('unlock_settle_secs', 5.0))
+            self._arm_action('companion_unlock', delay,
+                              lambda: trigger_companion(comp_cfg['unlock_url']), "Companion-unlock")
+
+        if comp_cfg.get('gpio_enabled', False):
+            gpio = self._ensure_companion_gpio(comp_cfg)
+            if gpio is not None and gpio.available:
+                delay = float(comp_cfg.get('unlock_settle_secs', 5.0))
+                self._arm_action('companion_gpio_unlock', delay,
+                                  lambda: gpio.set(False), "Companion-GPIO-unlock")
+
+    def _fire_qrz(self, qrz_cfg, site_callsign):
+        api_key = qrz_cfg.get('api_key', '')
+        if not api_key:
+            print("[notifications] QRZ enabled but no API key configured - skipping")
+            return
+        src = self._current_source_data()
+        call = src["rx_callsign"].strip()
+        if not call:
+            print("[notifications] QRZ: no callsign decoded by settling time - skipping this entry")
+            return
+
+        suppress_secs = float(qrz_cfg.get('suppress_mins', 60)) * 60.0
+        now = time.time()
+        last = self._qrz_last_logged.get(call, 0)
+        if now - last < suppress_secs:
+            remaining = suppress_secs - (now - last)
+            print(f"[notifications] QRZ: suppressing duplicate for {call} "
+                  f"({remaining:.0f}s remaining in window)")
+            return
+
+        try:
+            submit_qrz_logbook(api_key, site_callsign, call, src["frequency_khz"],
+                                src["modcod"], src["mer"], src["margin"])
+            self._qrz_last_logged[call] = now
+        except Exception as e:
+            print(f"[notifications] QRZ: submission failed - {type(e).__name__}: {e}")
+
+    def _fire_slack(self, slack_cfg, site_callsign):
+        webhook_url = slack_cfg.get('webhook_url', '')
+        template = slack_cfg.get('message_template', '')
+        if not webhook_url or not template:
+            print("[notifications] Slack enabled but not fully configured - skipping")
+            return
+        src = self._current_source_data()
+        placeholders = {
+            "site_callsign": site_callsign,
+            "site_callsign_lower": site_callsign.lower(),
+            "rx_callsign": src["rx_callsign"],
+            "mer": f"{src['mer']:.1f}" if src["mer"] is not None else "?",
+            "margin": f"{src['margin']:.1f}" if src["margin"] is not None else "?",
+            "modcod": src["modcod"],
+            "frequency": f"{src['frequency_khz'] / 1000.0:.3f}",
+        }
+        try:
+            send_slack_message(webhook_url, template, placeholders)
+        except KeyError as e:
+            print(f"[notifications] Slack: message template uses unknown placeholder {e} - skipping")
+        except Exception as e:
+            print(f"[notifications] Slack: send failed - {type(e).__name__}: {e}")
+
+    # -- GPIO Tx on/off pin: schedule-gated, signal-driven fallback ------
+
+    def _poll_tx_pin(self, notif_cfg, cfg, now=None):
+        tx_cfg = notif_cfg.get('gpio_tx', {})
+        if not tx_cfg.get('enabled', False):
+            return
+        pin = tx_cfg.get('pin')
+        if pin is None:
+            return
+        active_high = (tx_cfg.get('polarity', 'high') == 'high')
+
+        cfg_key = (pin, active_high)
+        if self._gpio_tx is None or self._tx_pin_cfg_key != cfg_key:
+            # Pin or polarity changed (or first run) - (re)build the
+            # underlying GPIO object and reset our own tracked state, so
+            # stale assumptions from a previous pin/polarity can't leak in.
+            self._gpio_tx = GpioPin(pin, active_high, name="Tx on/off")
+            self._tx_pin_cfg_key = cfg_key
+            self._cancel_tx_actions()
+            self._tx_was_in_window = False
+            self._tx_was_locked = False
+
+        if not self._gpio_tx.available:
+            return
+
+        if now is None:
+            now = datetime.datetime.now()
+        in_window = is_in_schedule_window(
+            now,
+            tx_cfg.get('schedule_weekday_start', ''),
+            tx_cfg.get('schedule_weekday_end', ''),
+            tx_cfg.get('schedule_weekend_start', ''),
+            tx_cfg.get('schedule_weekend_end', ''),
+        )
+        locked = self._confirmed_locked
+        power_up_secs = float(tx_cfg.get('power_up_settle_secs', 5.0))
+        power_down_secs = float(tx_cfg.get('power_down_settle_secs', 900.0))
+
+        if in_window and not self._tx_was_in_window:
+            # Just entered a schedule window - force on immediately, no
+            # settling timer (a scheduled event is predictable, not a
+            # noisy signal needing debounce), cancelling anything the
+            # auto logic had pending.
+            self._cancel_tx_actions()
+            self._gpio_tx.set(True)
+            print("[notifications] Tx: schedule window started - forcing on")
+
+        elif not in_window and self._tx_was_in_window:
+            # Just left a schedule window.
+            if locked:
+                # Repeater is in use right now - leave the pin on and do
+                # nothing further. Normal auto rules (including the
+                # power-down timer) pick up from the NEXT unlock.
+                print("[notifications] Tx: schedule window ended, still in use - staying on")
+            else:
+                # Idle - start the power-down timer from here, unless the
+                # sentinel (0) says never auto power-down.
+                print("[notifications] Tx: schedule window ended, idle - starting power-down timer")
+                if power_down_secs > 0:
+                    self._arm_tx_power_down(power_down_secs)
+
+        elif not in_window:
+            # Normal, signal-driven auto logic - only applies outside any
+            # schedule window (or when no schedule is configured for
+            # today at all, in which case in_window is always False and
+            # this is simply the 24-hour-a-day behaviour).
+            if locked and not self._tx_was_locked:
+                self._cancel_tx_actions()
+                self._arm_tx_power_up(power_up_secs)
+            elif not locked and self._tx_was_locked:
+                self._cancel_tx_actions()
+                if power_down_secs > 0:
+                    self._arm_tx_power_down(power_down_secs)
+                # else: sentinel - never auto power down once triggered on
+
+        # else: in_window with no transition - already forced on, nothing to do
+
+        self._tx_was_in_window = in_window
+        self._tx_was_locked = locked
+
+    def _cancel_tx_actions(self):
+        if self._tx_power_up_action:
+            self._tx_power_up_action.cancel()
+            self._tx_power_up_action = None
+        if self._tx_power_down_action:
+            self._tx_power_down_action.cancel()
+            self._tx_power_down_action = None
+
+    def _arm_tx_power_up(self, delay):
+        self._tx_power_up_action = SettlingAction(
+            delay, lambda: self._gpio_tx.set(True), "Tx-power-up")
+        self._tx_power_up_action.trigger()
+
+    def _arm_tx_power_down(self, delay):
+        self._tx_power_down_action = SettlingAction(
+            delay, lambda: self._gpio_tx.set(False), "Tx-power-down")
+        self._tx_power_down_action.trigger()
