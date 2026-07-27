@@ -1,17 +1,17 @@
 # Lynx DATV Receiver
 
-A Raspberry Pi 5 based DATV receiver for the Picotuner (WinterHill firmware), with a transparent on-screen display, a full web control portal, and optional diversity reception (two Picotuners combined for improved resilience against interference).
+A Raspberry Pi 5 based DATV receiver for the Picotuner (WinterHill firmware), with a transparent on-screen display, a full web control portal, and optional diversity reception (the two picotuner receivers combined for improved resilience against fades).
 
-**Status: Alpha.** Actively developed and in trial use at several BATC repeater sites. Expect rough edges — feedback and bug reports welcome.
+**Status: Alpha.** Actively developed and in trial use. Expect rough edges — feedback and bug reports welcome.
 
 ## Features
 
 - Full-screen live DATV picture with an on-screen overlay (callsign, MER, frequency, modcod, split-eye signal display for diversity mode)
 - Web Control Portal for tuning, memory presets, live BATC stream browsing, and volume control
-- Optional two-receiver diversity combining, with automatic source switching based on signal quality
-- Repeater-activity notifications (QRZ Logbook, Slack, Bitfocus Companion, GPIO Tx control)
+- Optional two-tuner diversity combining, with automatic source switching based on signal quality
+- Repeater/receiver-activity notifications (QRZ Logbook, Slack, Bitfocus Companion, GPIO Tx control)
 - Resumes its previous state automatically after any restart, including a genuine power loss
-- Optional M5Dial ("Knobler") front-panel control
+- Optional M5Dial ("Knobler") front-panel or remote control
 
 ## Getting started
 
@@ -30,7 +30,8 @@ Copy [`lynx_config.example.yaml`](./lynx_config.example.yaml) to `config/lynx_co
 - Raspberry Pi 5 (4GB or more), running Raspberry Pi OS with Desktop
 - A Picotuner (WinterHill firmware) on the same network
 - See the install guide for the full system/Python dependency list
+- Recommended to disable Wi-Fi and Bluetooth and used just wired Ethernet
 
 ## Contributing
 
-This project is under active development — issues and pull requests are welcome, particularly bug reports from alpha trial sites.
+This project is under active developmentwith new features and fixes being added — issues and pull requests are welcome, particularly bug reports from alpha trial sites.
