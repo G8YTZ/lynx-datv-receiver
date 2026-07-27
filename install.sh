@@ -7,7 +7,7 @@
 # ============================================================
 set -e   # stop on any error, rather than leaving a half-installed system
 
-REPO_URL="https://github.com/G8YTZ/lynx-datv-receiver.git"   # <-- fill in
+REPO_URL="https://github.com/G8YTZ/lynx-datv-receiver.git"
 
 echo "=== Lynx DATV Receiver — Installer ==="
 echo ""
@@ -61,9 +61,10 @@ mkdir -p ~/lynx/config
 if [ ! -f ~/lynx/config/lynx_config.yaml ]; then
   cp ~/lynx/lynx_config.example.yaml ~/lynx/config/lynx_config.yaml
   echo ""
-  echo ">>> ACTION NEEDED: edit ~/lynx/config/lynx_config.yaml and set"
-  echo ">>> your Picotuner's IP address (picotuner: host:) and your"
-  echo ">>> own site details before first run."
+  echo ">>> ACTION NEEDED: start Lynx, then go to the Web Control Portal's"
+  echo ">>> Configuration page and set your Picotuner's IP address and"
+  echo ">>> your own site details there - no need to hand-edit this file"
+  echo ">>> for that. (Config -> Picotuner Network Settings)"
   echo ""
 else
   echo "Config already exists at ~/lynx/config/lynx_config.yaml - leaving it untouched."
@@ -94,15 +95,17 @@ fi
 echo ""
 echo "=== Install complete ==="
 echo ""
-echo "Two things still need doing by hand:"
+echo "One thing still needs doing by hand:"
 echo ""
-echo "  1. Edit ~/lynx/config/lynx_config.yaml - set your Picotuner's"
-echo "     IP address and your own site details."
-echo ""
-echo "  2. Enable auto-login to the desktop (one-time GUI setting):"
-echo "     Preferences -> Raspberry Pi Configuration -> System -> Auto login -> on"
-echo "     Then reboot to confirm Lynx starts automatically."
+echo "  Enable auto-login to the desktop (one-time GUI setting):"
+echo "    Preferences -> Raspberry Pi Configuration -> System -> Auto login -> on"
+echo "    Then reboot to confirm Lynx starts automatically."
 echo ""
 echo "To test right now without rebooting:"
 echo "  cd ~/lynx && ./lynx_start.sh"
+echo ""
+echo "Once it's running, set your Picotuner's IP address and site details"
+echo "from the Web Control Portal's Configuration page - no need to hand-edit"
+echo "lynx_config.yaml for that. (Setting the Picotuner IP needs a quick"
+echo "restart of Lynx to take effect - the page will remind you.)"
 echo ""
