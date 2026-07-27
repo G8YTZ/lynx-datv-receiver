@@ -15,23 +15,24 @@ A Raspberry Pi 5 based DATV receiver for the Picotuner (WinterHill firmware), wi
 
 ## Getting started
 
-See [`lynx_install_guide.docx`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/lynx_install_guide.docx) for the full, step-by-step setup guide, from a blank SD card to a working receiver — or use the one-line installer described in that guide's Section 4.1.
+See [`lynx_install_guide.docx`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/docs/lynx_install_guide.docx) for the full, step-by-step setup guide, from a blank SD card to a working receiver — or use the one-line installer described in that guide's Section 4.1.
 
 Copy [`lynx_config.example.yaml`](./lynx_config.example.yaml) to `config/lynx_config.yaml`, start Lynx, then set your Picotuner's IP address from the Web Control Portal's Configuration page (⚙️ Config → Picotuner Network Settings) — no need to hand-edit the config file for this.
 
 ## Documentation
 
-- [`lynx_install_guide.docx`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/lynx_install_guide.docx) — full setup guide, blank SD card to working receiver
-- [`lynx_webui_manual.docx`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/lynx_webui_manual.docx) — what every button and field on the Web Control Portal actually does
-- [`lynx_overlay_annotated.pdf`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/lynx_overlay_annotated.pdf) — annotated guide to the on-screen display overlay
+- [`lynx_install_guide.docx`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/docs/lynx_install_guide.docx) — full setup guide, blank SD card to working receiver
+- [`lynx_webui_manual.docx`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/docs/lynx_webui_manual.docx) — what every button and field on the Web Control Portal actually does
+- [`lynx_overlay_annotated.pdf`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/docs/lynx_overlay_annotated.pdf) — annotated guide to the on-screen display overlay
+- [`lynx_diversity_overview.docx`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/docs/lynx_diversity_overview.docx) — how diversity reception actually works, and what's next
 
 ## Requirements
 
 - Raspberry Pi 5 (4GB or more), running Raspberry Pi OS with Desktop
 - A Picotuner (WinterHill firmware) on the same network
 - See the install guide for the full system/Python dependency list
-- Recommended to disable Wi-Fi and Bluetooth and used just wired Ethernet
+- Recommended to disable Wi-Fi and Bluetooth and use just wired Ethernet
 
 ## Contributing
 
-This project is under active developmentwith new features and fixes being added — issues and pull requests are welcome, particularly bug reports from alpha trial sites.
+This project is under active development, with new features and fixes being added — issues and pull requests are welcome, particularly bug reports from alpha trial sites.
