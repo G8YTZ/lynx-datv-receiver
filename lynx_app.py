@@ -1906,6 +1906,7 @@ class QrzConfigUpdate(BaseModel):
     api_key: str
     settle_secs: float
     suppress_mins: float
+    portable_locator: str = ""
 
 class SlackConfigUpdate(BaseModel):
     enabled: bool
@@ -2089,6 +2090,7 @@ def get_status():
             "mpv_running_for_rf": mpv_running_for_rf,
             "mpv_restarts_total": diagnostics["mpv_restarts_total"],
             "mpv_drift": get_mpv_drift_status(),
+            "portable_locator": config.get('notifications', {}).get('qrz', {}).get('portable_locator', ''),
             "timestamp": utc_now_iso()
         },
         "picotuner": {
@@ -2175,6 +2177,34 @@ def get_diagnostics():
         "events": list(reversed(diagnostics["events"])),  # newest first
     }
 
+class QrzTestRequest(BaseModel):
+    mode: str = "DVB-S2"
+    test_callsign: str = "TESTQRZ"
+
+@app.post("/api/qrz/test", tags=["Status"],
+          summary="Send a test QRZ Logbook entry",
+          description="Sends a real, clearly-marked test entry to QRZ Logbook "
+                      "using the configured API key, and returns QRZ's own, full "
+                      "response - the exact result/reason it gave, not just "
+                      "success/failure. Useful for diagnosing why real logging "
+                      "might be failing (e.g. a rejected mode value) without "
+                      "waiting for a genuine RF lock or using a terminal. Uses a "
+                      "clearly-marked test callsign so it's easy to spot and "
+                      "delete from the real logbook afterwards.")
+def qrz_test(req: QrzTestRequest):
+    qrz_cfg = config.get('notifications', {}).get('qrz', {})
+    api_key = qrz_cfg.get('api_key', '')
+    if not api_key:
+        raise HTTPException(status_code=400,
+                             detail="No QRZ API key configured - set one on the Config page first")
+    site_callsign = config.get('site', {}).get('callsign', '')
+    result = lynx_notifications.submit_qrz_logbook(
+        api_key, site_callsign, req.test_callsign, 437024,
+        req.mode, "20", "5",  # freq_khz, mer, margin - realistic dummy test values
+        comment_override="Lynx diagnostic test entry - safe to delete"
+    )
+    return result
+
 @app.get("/diagnostics", response_class=HTMLResponse, include_in_schema=False)
 def diagnostics_page():
     return """<!DOCTYPE html>
@@ -2202,6 +2232,19 @@ def diagnostics_page():
         <div class="col">
             <h2 class="lynx-title">&#x25B6; LYNX DIAGNOSTICS</h2>
             <small class="text-muted">mpv start/stop events - auto-refreshes every 5s. <a href="/">&larr; Back to receiver</a></small>
+        </div>
+    </div>
+
+    <div class="card mb-3">
+        <div class="card-header">Test QRZ Logging</div>
+        <div class="card-body">
+            <p class="text-muted small">Sends one real, clearly-marked test entry to your QRZ Logbook
+                (callsign TESTQRZ, comment noting it's a diagnostic test - safe to delete afterwards),
+                and shows QRZ's own, full response. Useful for checking your QRZ setup is genuinely
+                working without waiting for a real RF lock. Uses whatever API key is currently
+                configured on the Config page.</p>
+            <button class="btn btn-outline-warning btn-sm" onclick="sendQrzTest()">Send Test Entry</button>
+            <pre id="qrz-test-result" class="mt-3 mb-0 small" style="white-space: pre-wrap;"></pre>
         </div>
     </div>
 
@@ -2255,11 +2298,44 @@ const REASON_LABELS = {
     "drift_hard_freeze_restart": "Hard freeze detected - immediate mpv restart",
     "drift_hard_freeze_suppressed": "Hard freeze detected - restart breaker active, suppressed",
     "drift_hard_freeze_breaker_tripped": "Hard freeze restarts not helping, backed off",
+    "notif_confirmed_lock": "Notifications: own lock confirmation (arms settle timers)",
+    "notif_confirmed_unlock": "Notifications: own unlock confirmation (cancels pending timers)",
+    "notif_action_cancelled": "Notifications: a pending action was cancelled before firing",
+    "qrz_skipped": "QRZ: entry skipped",
+    "qrz_logged": "QRZ: logged successfully",
+    "qrz_failed": "QRZ: submission failed",
 };
 
 function fmtTime(t) {
     const d = new Date(t * 1000);
     return d.toLocaleString();
+}
+
+async function sendQrzTest() {
+    const resultEl = document.getElementById('qrz-test-result');
+    resultEl.textContent = 'Sending...';
+    try {
+        const r = await fetch('/api/qrz/test', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({})
+        });
+        const data = await r.json();
+        if (!r.ok) {
+            resultEl.textContent = 'Error: ' + (data.detail || 'request failed');
+            return;
+        }
+        resultEl.textContent =
+            'result:       ' + data.result + '\\n' +
+            'reason:       ' + data.reason + '\\n' +
+            'logid:        ' + data.logid + '\\n' +
+            'http_status:  ' + data.http_status + '\\n' +
+            'mode_sent:    ' + data.mode_sent + '\\n' +
+            'band_sent:    ' + data.band_sent + '\\n' +
+            'raw_response: ' + data.raw_response;
+    } catch (e) {
+        resultEl.textContent = 'Request failed: ' + e;
+    }
 }
 
 async function refresh() {
@@ -2474,9 +2550,17 @@ def config_page():
                             <input type="number" step="1" min="0" class="form-control" id="qrz-suppress-input">
                         </div>
                     </div>
+                    <label for="qrz-portable-locator" class="mt-2">Portable locator override</label>
+                    <input type="text" class="form-control" id="qrz-portable-locator-input"
+                           placeholder="e.g. IO91VG - leave blank for normal operation">
                     <p class="text-muted small mt-2 mb-0">
                         Settle time: delay after lock before logging, so the callsign has time to
                         decode. Suppress: don't log the same callsign again within this many minutes.
+                        Portable locator override: when a contacted station is operating portable and
+                        hasn't updated their QRZ profile, QRZ's own distance/bearing calculation uses
+                        their stale, registered locator. Set this to override it with their actual,
+                        current one for every contact logged while it's set - clear it (empty + save)
+                        once the portable session ends.
                     </p>
                     <div class="mt-3 d-flex align-items-center gap-2">
                         <button class="btn btn-save" onclick="saveQrz()">Save QRZ settings</button>
@@ -2714,6 +2798,7 @@ async function loadCurrentConfig() {
         document.getElementById('qrz-api-key-input').value = qrz.api_key || '';
         document.getElementById('qrz-settle-input').value = qrz.settle_secs ?? 15;
         document.getElementById('qrz-suppress-input').value = qrz.suppress_mins ?? 60;
+        document.getElementById('qrz-portable-locator-input').value = qrz.portable_locator || '';
 
         const slack = cfg.notifications?.slack || {};
         document.getElementById('slack-enabled-input').checked = slack.enabled || false;
@@ -2922,6 +3007,7 @@ async function saveQrz() {
                 api_key: document.getElementById('qrz-api-key-input').value,
                 settle_secs: parseFloat(document.getElementById('qrz-settle-input').value),
                 suppress_mins: parseFloat(document.getElementById('qrz-suppress-input').value),
+                portable_locator: document.getElementById('qrz-portable-locator-input').value.trim(),
             }
         };
         const r = await fetch('/api/config', {
@@ -4515,7 +4601,9 @@ if __name__ == "__main__":
     # mutated) on every save - a captured reference would silently go
     # stale after the first config change.
     notification_manager = lynx_notifications.NotificationManager(
-        picotuner_state, picotuner_state_b, lambda: config)
+        picotuner_state, picotuner_state_b, lambda: config,
+        record_event=record_diagnostic_event,
+        get_lnb_state=lambda: (current_lnb_lo_khz, current_lnb_side))
     notification_manager.start()
     print("Picotuner monitor started.")
 

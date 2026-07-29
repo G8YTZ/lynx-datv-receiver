@@ -133,6 +133,12 @@ class SettlingAction:
         with self._lock:
             self._cancel_locked()
 
+    @property
+    def pending(self):
+        """True if a timer is currently armed and waiting to fire."""
+        with self._lock:
+            return self._timer is not None
+
     def _cancel_locked(self):
         if self._timer is not None:
             self._timer.cancel()
@@ -197,15 +203,19 @@ class GpioPin:
 
 
 # ── QRZ.com Logbook ─────────────────────────────────────────────────────
-# ADIF construction below is carried over unchanged from the reference
-# code (confirmed tested, working in production for over a year) - the
-# <field:LENGTH>VALUE format, field selection, and field order are all
-# deliberately preserved exactly as proven, not redesigned.
+# The core ADIF construction below - the <field:LENGTH>VALUE format and
+# the original field set (band/mode/call/qso_date/time_on/station_callsign/
+# freq/comment/rst_sent) - is carried over unchanged from the reference
+# code (confirmed tested, working in production for over a year), and
+# deliberately preserved exactly as proven, not redesigned. gridsquare is
+# a genuinely new, additive field (portable-locator override, see
+# submit_qrz_logbook) - it's optional and only appears in the payload
+# when actually set, so it can't affect the proven, original behaviour.
 
 QRZ_LOGBOOK_URL = "https://logbook.qrz.com/api"
 
 def _build_qrz_adif(api_key, action, call, band, mode, qso_date, time_on,
-                     station_callsign, freq, comment, rst_sent):
+                     station_callsign, freq, comment, rst_sent, gridsquare=""):
     ps = ""
     ps += "KEY=" + api_key + "&"
     ps += "ACTION=" + action + "&"
@@ -219,22 +229,33 @@ def _build_qrz_adif(api_key, action, call, band, mode, qso_date, time_on,
     ps += "<freq:" + str(len(str(freq))) + ">" + str(freq)
     ps += "<comment:" + str(len(str(comment))) + ">" + str(comment)
     ps += "<rst_sent:" + str(len(str(rst_sent))) + ">" + str(rst_sent)
+    if gridsquare:
+        # Portable locator override (see submit_qrz_logbook) - only added
+        # when actually set, so normal operation produces byte-identical
+        # ADIF to before this field existed.
+        ps += "<gridsquare:" + str(len(gridsquare)) + ">" + str(gridsquare)
     ps += "<eor>"
     return ps
 
 def _qrz_band_from_freq_mhz(freq_mhz):
-    """Same band boundaries as the reference code - extend this if a
-    deployment ever needs a band outside these three."""
+    """Reference code's original three bands, plus 3cm - added after
+    direct testing of the LNB downlink-frequency reversal (see
+    _current_source_data) showed a genuine QO-100 downlink (~10489MHz)
+    had nowhere to land. Range confirmed against ADIF's own Band
+    Enumeration (10000-10500MHz). Extend further if a deployment ever
+    needs a band beyond these four."""
     if 430 <= freq_mhz <= 440:
         return "70cm"
     elif 1240 <= freq_mhz <= 1325:
         return "23cm"
     elif 3400 <= freq_mhz <= 3410:
         return "9cm"
+    elif 10000 <= freq_mhz <= 10500:
+        return "3cm"
     return ""
 
 def submit_qrz_logbook(api_key, station_callsign, rx_callsign, freq_khz,
-                        mode, mer, margin):
+                        mode, mer, margin, portable_locator="", comment_override=None):
     """Builds and submits one QRZ logbook entry. freq_khz matches Lynx's
     own convention throughout (presets, tuning) - converted to MHz here,
     which is what QRZ's freq field expects (confirmed against the
@@ -244,6 +265,27 @@ def submit_qrz_logbook(api_key, station_callsign, rx_callsign, freq_khz,
     (a Ryde-specific "power indication" reading) - margin (signal margin,
     dB) is used in its place for the comment/rst_sent fields as the
     closest available, meaningful signal-quality figure Lynx actually has.
+
+    portable_locator: an operator-supplied override for the contacted
+    station's grid square, for the case where they're operating portable
+    and haven't updated their QRZ profile - without this, QRZ calculates
+    distance/bearing from the contacted callsign's stale, registered
+    locator rather than where they actually are. Empty by default, in
+    which case no gridsquare is sent at all and QRZ's own lookup behaves
+    exactly as it always has.
+
+    Deliberately just a plain string, sourced from wherever the caller
+    gets it - today that's a manually-entered config value (see
+    NotificationManager._fire_qrz), but nothing here assumes a human
+    typed it. A future, automated source - an onboard GPS module, or a
+    phone's GPS relayed over Bluetooth, with the lat/long converted to a
+    Maidenhead locator - could populate the same underlying config value
+    on its own, and this function would need no changes at all to use it.
+
+    comment_override: replaces the normal, auto-built comment entirely
+    when set - used by the /diagnostics test feature to mark its entries
+    clearly as test data directly in the logbook itself, not just via the
+    TESTQRZ callsign. None by default, so real logging is unaffected.
     """
     freq_mhz = freq_khz / 1000.0
     band = _qrz_band_from_freq_mhz(freq_mhz)
@@ -259,12 +301,13 @@ def submit_qrz_logbook(api_key, station_callsign, rx_callsign, freq_khz,
     qso_date = now.strftime("%Y%m%d")
     time_on = now.strftime("%H%M%S")
 
-    comment = f"{mode} | {mer}dB MER | {margin}dB margin"
+    comment = comment_override if comment_override is not None else f"{mode} | {mer}dB MER"
     rst_sent = f"{margin}dB"
 
     payload = _build_qrz_adif(api_key, "INSERT", call_trunc, band, str(mode),
                                qso_date, time_on, station_callsign,
-                               str(freq_mhz), comment, str(rst_sent))
+                               str(freq_mhz), comment, str(rst_sent),
+                               gridsquare=portable_locator.strip())
 
     r = requests.post(QRZ_LOGBOOK_URL, data=payload,
                        headers={"User-agent": "lynx-notifications/1.0"}, timeout=10)
@@ -287,7 +330,11 @@ def submit_qrz_logbook(api_key, station_callsign, rx_callsign, freq_khz,
         print(f"[notifications] QRZ: API reported an error - result={result} reason={reason}")
     else:
         print(f"[notifications] QRZ: logged {call_trunc} - result={result} logid={logid}")
-    return result
+    return {
+        "result": result, "logid": logid, "count": count, "reason": reason,
+        "http_status": r.status_code, "raw_response": r.text,
+        "mode_sent": str(mode), "band_sent": band,
+    }
 
 
 # ── Slack ────────────────────────────────────────────────────────────────
@@ -372,10 +419,22 @@ class NotificationManager:
     LOCK_CONFIRM_POLLS = 3   # matches rf_mpv_lifecycle_monitor()'s own, proven value
     POLL_SECS = 1.0
 
-    def __init__(self, picotuner_state, picotuner_state_b, get_config):
+    def __init__(self, picotuner_state, picotuner_state_b, get_config, record_event=None,
+                 get_lnb_state=None):
         self.picotuner_state = picotuner_state
         self.picotuner_state_b = picotuner_state_b
         self.get_config = get_config
+        # Lets this module log onto the same, persistent Diagnostics page
+        # timeline lynx_app.py already uses for mpv events, rather than
+        # only to the terminal - defaults to a harmless no-op so this
+        # class stays constructible/testable without lynx_app.py present.
+        self.record_event = record_event or (lambda category, detail="", count_as_mpv_restart=False: None)
+        # (lnb_lo_khz, lnb_side) for the current tune, or (0, "low") if no
+        # LNB is in use - a callback (like get_config) since these are
+        # runtime state that changes on every tune, not a one-time value.
+        # Defaults to "no LNB" so this class stays constructible/testable
+        # standalone.
+        self.get_lnb_state = get_lnb_state or (lambda: (0, "low"))
 
         self._stop_event = threading.Event()
         self._thread = None
@@ -447,9 +506,42 @@ class NotificationManager:
 
         use_b = b_locked and (not a_locked or (b_mer is not None and (a_mer is None or b_mer > a_mer)))
         src = b if use_b else a
+        # picotuner_state['frequency'] is parsed directly from the
+        # Picotuner's own status broadcast, which reports it in MHz (see
+        # lynx_app.py's own parsing comment: "437.024 G8YTZ") - genuinely
+        # converted to kHz here to match this field's name and the rest
+        # of Lynx's own kHz convention (presets, tuning). Confirmed bug:
+        # this used to just relabel the raw MHz value as "kHz" with no
+        # actual conversion, so submit_qrz_logbook()'s own /1000 (which
+        # correctly expects real kHz input) silently turned a genuine
+        # 437MHz signal into 0.437MHz - outside every defined ADIF band
+        # range, leaving QRZ's own <band> field empty and the whole
+        # submission rejected.
+        freq_mhz_raw = to_float(src.get("frequency")) or 0.0
+
+        # When an LNB is in use, the Picotuner reports the L-band/IF
+        # frequency it's actually locked on, not the real satellite
+        # downlink frequency - same underlying fact lynx_app.py's own
+        # _compute_downlink_frequency() exists to handle, reversed here
+        # against whichever source (A or B) was actually picked above,
+        # rather than assuming tuner A the way that function does - the
+        # two tuners are always tuned to the same frequency in diversity
+        # mode, but not necessarily in single-plug-B-only operation.
+        lnb_lo_khz, lnb_side = self.get_lnb_state()
+        if lnb_lo_khz:
+            lo_mhz = lnb_lo_khz / 1000
+            if lnb_side == "high":
+                # High-side injection (C-band): IF = LO - downlink
+                freq_mhz = lo_mhz - freq_mhz_raw
+            else:
+                # Low-side injection (Ku-band): IF = downlink - LO
+                freq_mhz = freq_mhz_raw + lo_mhz
+        else:
+            freq_mhz = freq_mhz_raw
+
         return {
             "rx_callsign": src.get("callsign", "") or "",
-            "frequency_khz": to_float(src.get("frequency")) or 0.0,
+            "frequency_khz": freq_mhz * 1000.0,
             "mer": to_float(src.get("mer")),
             "margin": to_float(src.get("margin")),
             "modcod": src.get("modcod", "") or "",
@@ -475,9 +567,17 @@ class NotificationManager:
 
         if self._lock_streak >= self.LOCK_CONFIRM_POLLS and not self._confirmed_locked:
             self._confirmed_locked = True
+            print(f"[notifications] confirmed LOCK (own {self.LOCK_CONFIRM_POLLS}-poll debounce) - arming QRZ/Slack/Companion settle timers")
+            self.record_event("notif_confirmed_lock",
+                               "Notifications manager's own lock confirmation - arming settle timers",
+                               count_as_mpv_restart=False)
             self._on_confirmed_lock(notif_cfg, cfg)
         elif self._loss_streak >= self.LOCK_CONFIRM_POLLS and self._confirmed_locked:
             self._confirmed_locked = False
+            print(f"[notifications] confirmed UNLOCK (own {self.LOCK_CONFIRM_POLLS}-poll debounce) - cancelling any pending settle timers")
+            self.record_event("notif_confirmed_unlock",
+                               "Notifications manager's own unlock confirmation - cancelling pending settle timers",
+                               count_as_mpv_restart=False)
             self._on_confirmed_unlock(notif_cfg)
 
         self._poll_tx_pin(notif_cfg, cfg)
@@ -493,6 +593,12 @@ class NotificationManager:
 
     def _cancel_action(self, key):
         action = self._actions.get(key)
+        if action and action.pending:
+            print(f"[notifications] cancelling pending '{key}' action before it fired")
+            self.record_event("notif_action_cancelled",
+                               f"Pending '{key}' action cancelled before its settle time elapsed "
+                               f"(state reverted before firing)",
+                               count_as_mpv_restart=False)
         if action:
             action.cancel()
 
@@ -575,11 +681,14 @@ class NotificationManager:
         api_key = qrz_cfg.get('api_key', '')
         if not api_key:
             print("[notifications] QRZ enabled but no API key configured - skipping")
+            self.record_event("qrz_skipped", "No API key configured", count_as_mpv_restart=False)
             return
         src = self._current_source_data()
         call = src["rx_callsign"].strip()
         if not call:
             print("[notifications] QRZ: no callsign decoded by settling time - skipping this entry")
+            self.record_event("qrz_skipped", "No callsign had been decoded by the time the settle timer fired",
+                               count_as_mpv_restart=False)
             return
 
         suppress_secs = float(qrz_cfg.get('suppress_mins', 60)) * 60.0
@@ -589,14 +698,49 @@ class NotificationManager:
             remaining = suppress_secs - (now - last)
             print(f"[notifications] QRZ: suppressing duplicate for {call} "
                   f"({remaining:.0f}s remaining in window)")
+            self.record_event("qrz_skipped",
+                               f"Suppressed duplicate for {call} ({remaining:.0f}s remaining in window)",
+                               count_as_mpv_restart=False)
             return
 
         try:
-            submit_qrz_logbook(api_key, site_callsign, call, src["frequency_khz"],
-                                src["modcod"], src["mer"], src["margin"])
+            portable_locator = qrz_cfg.get('portable_locator', '').strip()
+            if portable_locator:
+                print(f"[notifications] QRZ: logging {call} with portable "
+                      f"locator override ({portable_locator}) instead of "
+                      f"their registered QRZ locator")
+            # ADIF's MODE field wants the standard name alongside the
+            # modcod (confirmed against a genuine, correct QRZ Logbook
+            # entry: "DVB-S2 QPSK 2/3") - src["modcod"] alone is just the
+            # coding rate half of that. Scoped to this QRZ submission
+            # only, not the underlying modcod value itself, which the
+            # OSD/Web UI/Slack all still show on its own for brevity.
+            # Assumption worth flagging: DVB-S2 is hardcoded here since
+            # every modcod Lynx has ever reported includes an explicit
+            # modulation type (QPSK/8PSK) alongside the coding rate -
+            # DVB-S2's variable-modulation notation, not DVB-S1's simpler,
+            # fixed-QPSK one - so this should be safe unless the Picotuner
+            # is ever used somewhere that genuinely receives DVB-S1.
+            adif_mode = f"DVB-S2 {src['modcod']}" if src["modcod"] else "DVB-S2"
+            result = submit_qrz_logbook(api_key, site_callsign, call, src["frequency_khz"],
+                                         adif_mode, src["mer"], src["margin"],
+                                         portable_locator=portable_locator)
             self._qrz_last_logged[call] = now
+            if result["result"] in ("OK", "REPLACE"):
+                self.record_event("qrz_logged",
+                                   f"Logged {call} - logid={result['logid']}",
+                                   count_as_mpv_restart=False)
+            else:
+                self.record_event("qrz_failed",
+                                   f"QRZ rejected {call} - result={result['result']} "
+                                   f"reason={result['reason']} | sent: mode={result['mode_sent']!r} "
+                                   f"band={result['band_sent']!r} freq_khz={src['frequency_khz']!r} "
+                                   f"mer={src['mer']!r} margin={src['margin']!r}",
+                                   count_as_mpv_restart=False)
         except Exception as e:
             print(f"[notifications] QRZ: submission failed - {type(e).__name__}: {e}")
+            self.record_event("qrz_failed", f"Exception during submission - {type(e).__name__}: {e}",
+                               count_as_mpv_restart=False)
 
     def _fire_slack(self, slack_cfg, site_callsign):
         webhook_url = slack_cfg.get('webhook_url', '')

@@ -113,6 +113,7 @@ state = {
     "stream_audio_codec": "",
     "stream_protocol": "",
     "mpv_transitioning": False,
+    "portable_locator": "",
     # Diversity mode — which tuner is actually the one supplying the
     # locked/displayed state.
     "diversity_enabled": False,
@@ -227,6 +228,7 @@ def poll_status():
             state["stream_audio_codec"] = stream_info.get('audio_codec') or ""
             state["stream_protocol"] = lynx.get('stream_protocol') or ""
             state["mpv_transitioning"] = lynx.get('mpv_transitioning', False)
+            state["portable_locator"] = lynx.get('portable_locator', '')
         except Exception:
             raw_online = False  # request itself failed (timeout, connection refused, etc) — treated the same as a genuine "not online" reading, fed into the same debounced history below rather than forcing the displayed state immediately
 
@@ -361,6 +363,14 @@ class LynxOverlay(Gtk.Window):
             colour = (0.0, 1.0, 0.25)
         else:
             colour = (0.0, 1.0, 0.25) if state["locked"] else (0.9, 0.5, 0.1)
+
+            # Shown whenever set, regardless of lock state - a constant,
+            # deliberately visible reminder that QRZ logging is currently
+            # using an overridden locator rather than each contacted
+            # station's own registered one, so it isn't left on by
+            # accident after a portable session ends.
+            if state["portable_locator"]:
+                lines.append(f"PORTABLE: {state['portable_locator']}")
 
             if state["diversity_enabled"]:
                 # Compact per-tuner MER/margin - one row per tuner,

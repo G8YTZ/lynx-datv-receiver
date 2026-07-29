@@ -25,6 +25,7 @@ Copy [`lynx_config.example.yaml`](./lynx_config.example.yaml) to `config/lynx_co
 - [`lynx_webui_manual.docx`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/docs/lynx_webui_manual.docx) — what every button and field on the Web Control Portal actually does
 - [`lynx_overlay_annotated.pdf`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/docs/lynx_overlay_annotated.pdf) — annotated guide to the on-screen display overlay
 - [`lynx_diversity_overview.docx`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/docs/lynx_diversity_overview.docx) — how diversity reception actually works, and what's next
+- [`CHANGELOG.md`](./CHANGELOG.md) — what's changed recently, in one place
 
 ## Requirements
 
