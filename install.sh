@@ -92,6 +92,37 @@ else
   chmod +x ~/.config/labwc/autostart
 fi
 
+# --- Cursor-hide keybind (labwc rc.xml) ------------------------
+# Only created if rc.xml doesn't exist at all - same reasoning as
+# the auto-login decision above: rc.xml is a general-purpose labwc
+# config file, not Lynx-specific, so someone may already have their
+# own customisations in there. Blindly merging a <keybind> into an
+# existing file risks producing invalid XML or clobbering something
+# unrelated - safer to only act when there's genuinely nothing there
+# yet, and print clear manual instructions otherwise.
+echo "--- Setting up cursor-hide keybind ---"
+if [ -f ~/.config/labwc/rc.xml ]; then
+  echo "rc.xml already exists - leaving it untouched."
+  echo "(To hide the mouse cursor, add this inside its <keyboard> section:"
+  echo '  <keybind key="A-W-h">'
+  echo '    <action name="HideCursor" />'
+  echo '    <action name="WarpCursor" x="-1" y="-1" />'
+  echo '  </keybind>)'
+else
+  cat > ~/.config/labwc/rc.xml << 'RCXML'
+<?xml version="1.0"?>
+<openbox_config>
+  <keyboard>
+    <keybind key="A-W-h">
+      <action name="HideCursor" />
+      <action name="WarpCursor" x="-1" y="-1" />
+    </keybind>
+  </keyboard>
+</openbox_config>
+RCXML
+  echo "Created."
+fi
+
 echo ""
 echo "=== Install complete ==="
 echo ""
