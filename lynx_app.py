@@ -611,8 +611,6 @@ def picotuner_monitor():
             
             data, addr = sock.recvfrom(4096)
             text = data.decode(errors='replace')
-            picotuner_state["online"] = True
-            picotuner_state["last_seen"] = time.time()
 
             # Discovery: this is a genuine broadcast, so it arrives here
             # from EVERY Picotuner on the local network, not just the
@@ -621,7 +619,9 @@ def picotuner_monitor():
             # mechanism. Confirmed live (2026-07-29) against a real v3
             # board's actual broadcast - format is a labelled table,
             # "Label   Value" separated by 2+ spaces (labels themselves
-            # can contain a single space, e.g. "IP address").
+            # can contain a single space, e.g. "IP address"). Left
+            # ungated deliberately - discovery genuinely wants every
+            # unit, unlike the status parsing below.
             if "PicoTuner Broadcast" in text:
                 fields = {}
                 for line in text.splitlines():
@@ -639,6 +639,22 @@ def picotuner_monitor():
                         "mac": mac,
                         "last_seen": time.time(),
                     }
+
+            # Everything below drives the actual status/OSD display, so -
+            # unlike discovery above - it must only trust broadcasts from
+            # the specifically configured Picotuner. This is a genuine
+            # broadcast port: with two units on the same network (a real,
+            # likely scenario now that discovery makes them easy to spot),
+            # an unfiltered listener would let whichever one's packet
+            # happened to arrive most recently silently overwrite the
+            # other's status - including showing "online" from a
+            # completely unrelated unit while the actually-configured one
+            # was genuinely offline.
+            if addr[0] != cfg['host']:
+                continue
+
+            picotuner_state["online"] = True
+            picotuner_state["last_seen"] = time.time()
 
             # Parse RX1 line: "437.024 G8YTZ" or "437.000T search"
             for line in text.splitlines():
