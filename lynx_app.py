@@ -613,7 +613,33 @@ def picotuner_monitor():
             text = data.decode(errors='replace')
             picotuner_state["online"] = True
             picotuner_state["last_seen"] = time.time()
-            
+
+            # Discovery: this is a genuine broadcast, so it arrives here
+            # from EVERY Picotuner on the local network, not just the
+            # one currently configured - a side effect of how this
+            # listener already works, not a separate discovery
+            # mechanism. Confirmed live (2026-07-29) against a real v3
+            # board's actual broadcast - format is a labelled table,
+            # "Label   Value" separated by 2+ spaces (labels themselves
+            # can contain a single space, e.g. "IP address").
+            if "PicoTuner Broadcast" in text:
+                fields = {}
+                for line in text.splitlines():
+                    parts = re.split(r'\s{2,}', line.strip())
+                    if len(parts) == 2:
+                        fields[parts[0].strip()] = parts[1].strip()
+                mac = fields.get("MAC", "")
+                if mac:
+                    discovered_picotuners[mac] = {
+                        "ip": fields.get("IP address", addr[0]),
+                        "host_name": fields.get("Host name", ""),
+                        "serial": fields.get("Pico serial", ""),
+                        "software": fields.get("Software", ""),
+                        "nim_type": fields.get("NIM type", ""),
+                        "mac": mac,
+                        "last_seen": time.time(),
+                    }
+
             # Parse RX1 line: "437.024 G8YTZ" or "437.000T search"
             for line in text.splitlines():
                 line = line.strip()
@@ -1649,6 +1675,16 @@ picotuner_state_b = {
                       # from any source at all, unlike mer/margin/etc.
 }
 
+# Any Picotuner heard on the local network, not just the one currently
+# configured - this is a genuine UDP broadcast, so picotuner_quality_
+# monitor() below already receives it from every unit on the segment,
+# not just the configured one, purely as a side effect of how it's
+# already listening. Keyed by MAC (the most stable identifier - IP can
+# change on DHCP renewal, host name is operator-set and could collide).
+# Pruned of stale entries (>10s since last seen) whenever read via the
+# API, matching the same staleness window picotuner_state itself uses.
+discovered_picotuners = {}
+
 def picotuner_table_monitor_b():
     """Background thread: reads the rich table-format status from
     Picotuner port 9904 (a confirmed duplicate of 9902). Live-tested
@@ -2074,6 +2110,22 @@ def _compute_downlink_frequency():
     except (ValueError, TypeError):
         return None
 
+@app.get("/api/picotuner/discovered", tags=["Status"],
+         summary="List Picotuners currently heard on the local network",
+         description="Every Picotuner broadcasting on this network segment, "
+                     "not just the one currently configured - a genuine UDP "
+                     "broadcast, so this includes units never yet pointed at "
+                     "this Lynx instance. Entries not heard from in the last "
+                     "10 seconds are treated as offline and left out.")
+def get_discovered_picotuners():
+    now = time.time()
+    return {
+        "picotuners": [
+            info for info in discovered_picotuners.values()
+            if now - info["last_seen"] <= 10
+        ]
+    }
+
 @app.get("/api/status", tags=["Status"],
          summary="Get current receiver status",
          description="Returns lock state, MER, callsign, frequency and more. "
@@ -2488,6 +2540,19 @@ def config_page():
                     <div class="mt-3 d-flex align-items-center gap-2">
                         <button class="btn btn-save" onclick="savePicotuner()">Save Picotuner settings</button>
                         <span class="save-status" id="pt-save-status"></span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Discovered Picotuners -->
+            <div class="card mb-3">
+                <div class="card-header">&#x1F50D; Discovered on this network</div>
+                <div class="card-body">
+                    <p class="text-muted small">Any Picotuner currently broadcasting nearby, not just the
+                        one configured above - click "Use" to fill in its IP address directly, rather
+                        than finding it by hand.</p>
+                    <div id="discovered-picotuners-list">
+                        <p class="text-muted small">Checking...</p>
                     </div>
                 </div>
             </div>
@@ -3112,7 +3177,32 @@ async function saveGpioTx() {
     }
 }
 
+async function loadDiscoveredPicotuners() {
+    const listEl = document.getElementById('discovered-picotuners-list');
+    try {
+        const data = await fetch('/api/picotuner/discovered').then(r => r.json());
+        const units = data.picotuners || [];
+        if (units.length === 0) {
+            listEl.innerHTML = '<p class="text-muted small mb-0">None heard yet - give it a few seconds.</p>';
+            return;
+        }
+        listEl.innerHTML = units.map(u => `
+            <div class="d-flex justify-content-between align-items-center mb-2 pb-2" style="border-bottom: 1px solid #333;">
+                <div>
+                    <div>${u.host_name || u.ip}</div>
+                    <small class="text-muted">${u.ip} &middot; ${u.software || 'unknown firmware'}</small>
+                </div>
+                <button class="btn btn-outline-light btn-sm" onclick="document.getElementById('pt-host-input').value='${u.ip}'">Use</button>
+            </div>
+        `).join('');
+    } catch (e) {
+        listEl.innerHTML = '<p class="text-muted small mb-0">Could not check.</p>';
+    }
+}
+
 loadCurrentConfig();
+loadDiscoveredPicotuners();
+setInterval(loadDiscoveredPicotuners, 5000);
 </script>
 </body>
 </html>"""
