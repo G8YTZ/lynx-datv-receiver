@@ -12,6 +12,10 @@ This file starts from 2026-07-29. Earlier changes are recorded in each document'
 ### Changed
 - OSD layout rearranged to make room for the new PPM meter: tuning info (frequency, symbol rate, modcod/codec, diversity split) moved from bottom-left to top-left. Magic eye's centre reading now explicitly shows "dBm" (e.g. "-52 dBm"), matching the M5Dial's own display.
 - Config page cards rebalanced across its three columns based on actual measured size (not guessed), fixing large, uneven gaps that had built up as cards were added over the course of the evening - previously 6 column-groups wrapping into 2 rows (so an uneven row could leave the shorter columns' next row starting late), now a single row of 3, so there's no second row to start late in the first place.
+- Volume control now displays dB relative to full scale (e.g. "-18.1 dB") instead of a raw percentage - mpv's own volume scale is cubic (confirmed directly against mpv's own issue tracker, not assumed), so percent alone never corresponded evenly to level anyway. 100% is still unity gain (0dB).
+
+### Known limitation
+- The PPM meter's calibration only holds at 100% volume (0dB). Its audio tap sits downstream of mpv's own volume gain, so turning the volume down for local listening makes the PPM read quieter too, rather than reflecting genuine programme level. A compensation fix was built and verified working, but reverted deliberately - it would have amplified noise floor by the same factor at lower volumes (up to 1000x near the bottom of the range), a worse trade-off than the limitation itself. Documented directly on the Control card rather than silently left as a surprise.
 
 ## 2026-07-29
 

@@ -4259,12 +4259,22 @@ def web_ui():
                         <input type="range" class="form-range flex-grow-1" id="volume-slider"
                                min="0" max="100" value="100"
                                oninput="onVolumeInput(this.value)" onchange="setVolume(this.value)">
-                        <span class="status-value" id="volume-value" style="min-width:3.2em; text-align:right;">100%</span>
+                        <span class="status-value" id="volume-value" style="min-width:4.5em; text-align:right;">0.0 dB</span>
                     </div>
                     <div class="text-muted small mb-2">
                         100% = unity gain (0 dB) — correct reference for
                         24-bit sources already mastered to EBU R128
-                        (normal programme level ≈ -18 dBFS).
+                        (normal programme level ≈ -18 dBFS). Shown here
+                        as dB relative to 24-bit full scale rather than
+                        percent - mpv's own volume scale is cubic, not
+                        linear, so percent alone doesn't correspond
+                        evenly to level.
+                    </div>
+                    <div class="text-muted small mb-2" style="color:#d98a1e !important">
+                        &#x26A0;&#xFE0F; The OSD's PPM meter is only correctly
+                        calibrated at 0dB (100%) - it reads mpv's actual
+                        output after this gain is applied, and doesn't
+                        currently compensate for it.
                     </div>
                     <div class="input-group input-group-sm mb-2">
                         <span class="input-group-text bg-dark text-light border-secondary" style="font-size:0.8em">Default on boot</span>
@@ -4666,10 +4676,20 @@ async function restartLynx() {
 // ── Volume ────────────────────────────────────────────────────
 let volumeDebounce = null;
 
+function volumeToDbText(value) {
+    // mpv's own volume scale is cubic (confirmed directly against
+    // mpv's own issue tracker, not assumed), so dB = 20*log10(gain)
+    // where gain = (value/100)^3, i.e. dB = 60*log10(value/100).
+    const v = parseInt(value);
+    if (v <= 0) return '-\u221E dB';
+    const db = 60 * Math.log10(v / 100);
+    return (db >= 0 ? '+' : '') + db.toFixed(1) + ' dB';
+}
+
 function onVolumeInput(value) {
     // Update the live readout immediately as the slider moves, but
     // debounce the actual API call so dragging doesn't flood requests
-    document.getElementById('volume-value').textContent = value + '%';
+    document.getElementById('volume-value').textContent = volumeToDbText(value);
     clearTimeout(volumeDebounce);
     volumeDebounce = setTimeout(() => setVolume(value), 150);
 }
@@ -4688,7 +4708,7 @@ async function loadVolume() {
         const data = await api('GET', '/api/volume');
         if (data.level != null) {
             document.getElementById('volume-slider').value = data.level;
-            document.getElementById('volume-value').textContent = data.level + '%';
+            document.getElementById('volume-value').textContent = volumeToDbText(data.level);
         }
     } catch(e) {}
     try {
