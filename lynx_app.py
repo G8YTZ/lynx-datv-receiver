@@ -2616,17 +2616,6 @@ def config_page():
                     </div>
                 </div>
 
-                <div class="card mb-3">
-                    <div class="card-header">&#x1F50D; Discovered on this network</div>
-                    <div class="card-body">
-                        <p class="text-muted small">Any Picotuner currently broadcasting nearby, not just the
-                            one configured above - click "Use" to fill in its IP address directly, rather
-                            than finding it by hand.</p>
-                        <div id="discovered-picotuners-list">
-                            <p class="text-muted small">Checking...</p>
-                        </div>
-                    </div>
-                </div>
         </div>
 
         <div class="col-md-4">
@@ -2821,6 +2810,18 @@ def config_page():
                         <div class="mt-3 d-flex align-items-center gap-2">
                             <button class="btn btn-save" onclick="savePicotuner()">Save Picotuner settings</button>
                             <span class="save-status" id="pt-save-status"></span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F50D; Discovered on this network</div>
+                    <div class="card-body">
+                        <p class="text-muted small">Any Picotuner currently broadcasting nearby, not just the
+                            one configured above - click "Use" to fill in its IP address directly, rather
+                            than finding it by hand.</p>
+                        <div id="discovered-picotuners-list">
+                            <p class="text-muted small">Checking...</p>
                         </div>
                     </div>
                 </div>
