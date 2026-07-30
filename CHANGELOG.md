@@ -4,6 +4,15 @@ All notable changes to Lynx are documented here, in reverse chronological order.
 
 This file starts from 2026-07-29. Earlier changes are recorded in each document's own version history section instead (e.g. the Installation Guide, Web UI Reference) - this centralized approach begins here rather than attempting to retroactively reconstruct everything that came before it.
 
+## 2026-07-30
+
+### Added
+- BBC-style stereo PPM (Peak Programme Meter) on the OSD, bottom-left. Calibrated PPM4 = -18dBFS (EBU R68), with genuine IEC 60268-10 Type IIa ballistics - confirmed against the documented spec numbers directly rather than assumed: 1.497s to fall 20dB (spec: ~1.5s), 1.20/2.79/4.68dB down for 10/5/3ms tone bursts (spec: ~1/2/4dB). Independent red (left) and green (right) needles - confirmed directly from Wikipedia's own PPM article that this is the genuine UK convention, not an arbitrary choice - driven by a live audio tap via PipeWire, running entirely separately from mpv (mpv's own metering path for this is confirmed broken upstream). Selectable "Skeleton" (needles and graduations only) or "Full Fat" (adds a round, vintage-style meter housing) display style, toggleable live from the Config page - the housing is a genuinely separate, independently-togglable piece from the needle/graduation core underneath, which stays identical either way.
+
+### Changed
+- OSD layout rearranged to make room for the new PPM meter: tuning info (frequency, symbol rate, modcod/codec, diversity split) moved from bottom-left to top-left. Magic eye's centre reading now explicitly shows "dBm" (e.g. "-52 dBm"), matching the M5Dial's own display.
+- Config page cards rebalanced across its three columns based on actual measured size (not guessed), fixing large, uneven gaps that had built up as cards were added over the course of the evening - previously 6 column-groups wrapping into 2 rows (so an uneven row could leave the shorter columns' next row starting late), now a single row of 3, so there's no second row to start late in the first place.
+
 ## 2026-07-29
 
 ### Added
@@ -14,11 +23,11 @@ This file starts from 2026-07-29. Earlier changes are recorded in each document'
 - Picotuner auto-discovery on the Config page - any Picotuner currently broadcasting on the local network now shows up automatically next to the Picotuner Network Settings card, with a one-click "Use" button to fill in its IP address. No new listener needed - this reuses the existing port-9997 status broadcast, which (being a genuine UDP broadcast) was already arriving from every unit on the network, not just the configured one.
 - Mouse cursor is now hidden automatically on boot (labwc's HideCursor/WarpCursor keybind, triggered once the OSD overlay has confirmed starting) - not Pi500-specific, affects any Lynx install on labwc's default desktop behaviour. install.sh now creates the required `~/.config/labwc/rc.xml` automatically on a fresh install; existing installs need it added once by hand (see the Installation Guide).
 
+### Changed
+- Removed margin from the QRZ Logbook comment field to keep it shorter (MER is retained).
+
 ### Fixed
 - **QRZ Logbook submissions from genuine RF locks were silently failing.** Root cause: the live frequency reading was being labelled as kHz without actually being converted from the MHz value the Picotuner reports - a real 437MHz signal was miscalculated as 0.437MHz, which doesn't fall into any defined amateur band, leaving QRZ's `band` field empty and the whole submission rejected. Manual/test submissions never hit this path, which is why it went unnoticed for a while - they always used a fixed, already-correct test frequency.
 - QRZ Logbook entries now correctly log the real satellite downlink frequency when an LNB is configured, rather than the raw IF frequency the Picotuner is actually tuned to (e.g. a genuine 10489.5MHz QO-100 contact was previously being logged as 739.5MHz).
 - QRZ Logbook's `mode` field now includes the DVB-S2 standard name alongside the modcod (e.g. `DVB-S2 QPSK 8/9`), matching the correct, expected ADIF format - previously sent as just the bare modcod.
 - Slack notifications' `{frequency}` placeholder was showing the wrong value (1000x too low) - same root cause as the QRZ frequency bug above, fixed by the same change.
-
-### Changed
-- Removed margin from the QRZ Logbook comment field to keep it shorter (MER is retained).

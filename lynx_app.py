@@ -1987,6 +1987,9 @@ class GpioTxConfigUpdate(BaseModel):
     schedule_weekend_start: str
     schedule_weekend_end: str
 
+class DisplayConfigUpdate(BaseModel):
+    ppm_style: str = "skeleton"  # "skeleton" or "full_fat"
+
 class ConfigUpdateRequest(BaseModel):
     site: Optional[SiteConfigUpdate] = None
     picotuner: Optional[PicotunerConfigUpdate] = None
@@ -1995,6 +1998,7 @@ class ConfigUpdateRequest(BaseModel):
     notifications_slack: Optional[SlackConfigUpdate] = None
     notifications_companion: Optional[CompanionConfigUpdate] = None
     notifications_gpio_tx: Optional[GpioTxConfigUpdate] = None
+    display: Optional[DisplayConfigUpdate] = None
 
 # ── Helpers ───────────────────────────────────────────────────
 def stop_current():
@@ -2159,6 +2163,7 @@ def get_status():
             "mpv_restarts_total": diagnostics["mpv_restarts_total"],
             "mpv_drift": get_mpv_drift_status(),
             "portable_locator": config.get('notifications', {}).get('qrz', {}).get('portable_locator', ''),
+            "ppm_style": config.get('display', {}).get('ppm_style', 'skeleton'),
             "timestamp": utc_now_iso()
         },
         "picotuner": {
@@ -2484,369 +2489,372 @@ def config_page():
         </div>
     </div>
 
-    <div class="row g-3">
+    <div class="row g-3 align-items-start">
 
-        <!-- Site Information -->
         <div class="col-md-4">
-            <div class="card mb-3">
-                <div class="card-header">&#x1F3E0; Site Information</div>
-                <div class="card-body">
-                    <div class="row g-3">
-                        <div class="col-md-6">
-                            <label for="site-name">Receiver name</label>
-                            <input type="text" class="form-control" id="site-name-input">
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F50C; GPIO Tx On/Off</div>
+                    <div class="card-body">
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="gpio-enabled-input">
+                            <label class="form-check-label" for="gpio-enabled">Enabled</label>
                         </div>
-                        <div class="col-md-6">
-                            <label for="site-callsign">Callsign</label>
-                            <input type="text" class="form-control" id="site-callsign-input">
+                        <div class="row g-2 mb-2">
+                            <div class="col-8">
+                                <label for="gpio-pin">Physical pin</label>
+                                <select class="form-control" id="gpio-pin-input"></select>
+                            </div>
+                            <div class="col-4">
+                                <label for="gpio-polarity">Polarity</label>
+                                <select class="form-control" id="gpio-polarity-input">
+                                    <option value="high">Active high</option>
+                                    <option value="low">Active low</option>
+                                </select>
+                            </div>
                         </div>
-                        <div class="col-md-6">
-                            <label for="site-location">Location</label>
-                            <input type="text" class="form-control" id="site-location-input">
+                        <div class="row g-2 mb-2">
+                            <div class="col-6">
+                                <label for="gpio-power-up" class="small">Power-up settle (s)</label>
+                                <input type="number" step="1" min="0" class="form-control" id="gpio-power-up-input">
+                            </div>
+                            <div class="col-6">
+                                <label for="gpio-power-down" class="small">Power-down settle (s)</label>
+                                <input type="number" step="1" min="0" class="form-control" id="gpio-power-down-input">
+                            </div>
                         </div>
-                        <div class="col-md-6">
-                            <label for="site-locator">Locator</label>
-                            <input type="text" class="form-control" id="site-locator-input">
+                        <p class="text-muted small mb-2">
+                            Power-down settle of <strong>0</strong> means never auto power-down once
+                            triggered on.
+                        </p>
+                        <hr>
+                        <p class="text-muted small mb-2">
+                            Inside a configured schedule window, the pin is forced on immediately
+                            (no settling). Outside a window, or with no schedule set for that day
+                            type, normal power-up/power-down timing above applies 24 hours a day.
+                        </p>
+                        <label class="small">Weekday schedule</label>
+                        <div class="row g-2 mb-2">
+                            <div class="col-6">
+                                <input type="time" class="form-control" id="gpio-weekday-start-input">
+                            </div>
+                            <div class="col-6">
+                                <input type="time" class="form-control" id="gpio-weekday-end-input">
+                            </div>
                         </div>
-                    </div>
-                    <div class="mt-3 d-flex align-items-center gap-2">
-                        <button class="btn btn-save" onclick="saveSite()">Save site info</button>
-                        <span class="save-status" id="site-save-status"></span>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="checkbox" id="gpio-weekday-none-input">
+                            <label class="form-check-label small" for="gpio-weekday-none">No schedule (24hr auto)</label>
+                        </div>
+                        <label class="small">Weekend schedule</label>
+                        <div class="row g-2 mb-2">
+                            <div class="col-6">
+                                <input type="time" class="form-control" id="gpio-weekend-start-input">
+                            </div>
+                            <div class="col-6">
+                                <input type="time" class="form-control" id="gpio-weekend-end-input">
+                            </div>
+                        </div>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="checkbox" id="gpio-weekend-none-input">
+                            <label class="form-check-label small" for="gpio-weekend-none">No schedule (24hr auto)</label>
+                        </div>
+                        <div class="mt-3 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveGpioTx()">Save GPIO settings</button>
+                            <span class="save-status" id="gpio-save-status"></span>
+                        </div>
                     </div>
                 </div>
-            </div>
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F500; Diversity Source Switching</div>
+                    <div class="card-body">
+                        <div class="alert alert-warning py-2 small mb-3">
+                            Changing these requires restarting the diversity combiner to take effect -
+                            it reads these once at startup, not continuously.
+                        </div>
+                        <p class="text-muted small mb-3">
+                            When both tuners are clean, the combiner sticks with whichever source is
+                            currently preferred rather than re-deciding every segment. The preferred
+                            source only changes when the other tuner's MER has been consistently,
+                            meaningfully better for a sustained period - not on a single momentary
+                            blip. These two settings control how sustained and how meaningful that has
+                            to be.
+                        </p>
+                        <div class="row g-3">
+                            <div class="col-md-6">
+                                <label for="div-dwell">Dwell time (seconds)</label>
+                                <input type="number" step="0.5" min="0" class="form-control" id="div-dwell-input">
+                            </div>
+                            <div class="col-md-6">
+                                <label for="div-margin">MER margin (dB)</label>
+                                <input type="number" step="0.1" min="0" class="form-control" id="div-margin-input">
+                            </div>
+                        </div>
+                        <div class="mt-3 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveDiversity()">Save diversity settings</button>
+                            <span class="save-status" id="div-save-status"></span>
+                        </div>
+                    </div>
+                </div>
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F3AF; PPM Meter Style</div>
+                    <div class="card-body">
+                        <p class="text-muted small">Applies live within a few seconds - no restart needed.</p>
+                        <div class="form-check">
+                            <input class="form-check-input" type="radio" name="ppm-style" id="ppm-style-skeleton" value="skeleton">
+                            <label class="form-check-label" for="ppm-style-skeleton">
+                                Skeleton <span class="text-muted small">- needles and graduations only</span>
+                            </label>
+                        </div>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="radio" name="ppm-style" id="ppm-style-full-fat" value="full_fat">
+                            <label class="form-check-label" for="ppm-style-full-fat">
+                                Full Fat <span class="text-muted small">- with the round meter housing</span>
+                            </label>
+                        </div>
+                        <button class="btn btn-outline-light btn-sm" onclick="savePpmStyle()">Save</button>
+                        <span id="ppm-style-status" class="save-status ms-2"></span>
+                    </div>
+                </div>
+
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F50D; Discovered on this network</div>
+                    <div class="card-body">
+                        <p class="text-muted small">Any Picotuner currently broadcasting nearby, not just the
+                            one configured above - click "Use" to fill in its IP address directly, rather
+                            than finding it by hand.</p>
+                        <div id="discovered-picotuners-list">
+                            <p class="text-muted small">Checking...</p>
+                        </div>
+                    </div>
+                </div>
         </div>
 
-        <!-- Picotuner Network Settings -->
         <div class="col-md-4">
-            <div class="card mb-3">
-                <div class="card-header">&#x1F4E1; Picotuner Network Settings</div>
-                <div class="card-body">
-                    <div class="alert alert-warning py-2 small mb-3">
-                        Changing these requires a restart of Lynx to take effect safely - background
-                        monitoring threads read these once at startup.
-                    </div>
-                    <div class="row g-3">
-                        <div class="col-md-6">
-                            <label for="pt-host">Picotuner IP address</label>
-                            <input type="text" class="form-control" id="pt-host-input">
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F3AC; Bitfocus Companion</div>
+                    <div class="card-body">
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="companion-enabled-input">
+                            <label class="form-check-label" for="companion-enabled">Enabled</label>
                         </div>
-                        <div class="col-md-3">
-                            <label for="pt-status-port">Status port</label>
-                            <input type="number" class="form-control" id="pt-status-port-input">
+                        <label for="companion-lock-url">Lock URL</label>
+                        <input type="text" class="form-control mb-1" id="companion-lock-url-input"
+                               placeholder="http://companion-ip:8888/api/...">
+                        <label for="companion-lock-settle" class="small text-muted">Settle time (s)</label>
+                        <input type="number" step="1" min="0" class="form-control mb-2" id="companion-lock-settle-input">
+                        <label for="companion-unlock-url">Unlock URL</label>
+                        <input type="text" class="form-control mb-1" id="companion-unlock-url-input"
+                               placeholder="http://companion-ip:8888/api/...">
+                        <label for="companion-unlock-settle" class="small text-muted">Settle time (s)</label>
+                        <input type="number" step="1" min="0" class="form-control" id="companion-unlock-settle-input">
+                        <hr>
+                        <div class="form-check form-switch mb-2">
+                            <input class="form-check-input" type="checkbox" id="companion-gpio-enabled-input">
+                            <label class="form-check-label" for="companion-gpio-enabled">
+                                Also mirror on a GPIO pin (relay-based switching)
+                            </label>
                         </div>
-                        <div class="col-md-3"></div>
-                        <div class="col-md-3">
-                            <label for="pt-cmd-port">Cmd port (A)</label>
-                            <input type="number" class="form-control" id="pt-cmd-port-input">
+                        <p class="text-muted small mb-2">
+                            Follows lock/unlock using the same settle times above - no separate timing.
+                        </p>
+                        <div class="row g-2">
+                            <div class="col-8">
+                                <label for="companion-gpio-pin" class="small">Physical pin</label>
+                                <select class="form-control" id="companion-gpio-pin-input"></select>
+                            </div>
+                            <div class="col-4">
+                                <label for="companion-gpio-polarity" class="small">Polarity</label>
+                                <select class="form-control" id="companion-gpio-polarity-input">
+                                    <option value="high">Active high</option>
+                                    <option value="low">Active low</option>
+                                </select>
+                            </div>
                         </div>
-                        <div class="col-md-3">
-                            <label for="pt-ts-port">TS port (A)</label>
-                            <input type="number" class="form-control" id="pt-ts-port-input">
+                        <div class="mt-3 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveCompanion()">Save Companion settings</button>
+                            <span class="save-status" id="companion-save-status"></span>
                         </div>
-                        <div class="col-md-3">
-                            <label for="pt-cmd-port-b">Cmd port (B)</label>
-                            <input type="number" class="form-control" id="pt-cmd-port-b-input">
-                        </div>
-                        <div class="col-md-3">
-                            <label for="pt-ts-port-b">TS port (B)</label>
-                            <input type="number" class="form-control" id="pt-ts-port-b-input">
-                        </div>
-                    </div>
-                    <div class="mt-3 d-flex align-items-center gap-2">
-                        <button class="btn btn-save" onclick="savePicotuner()">Save Picotuner settings</button>
-                        <span class="save-status" id="pt-save-status"></span>
-                    </div>
-                </div>
-            </div>
-
-            <!-- Discovered Picotuners -->
-            <div class="card mb-3">
-                <div class="card-header">&#x1F50D; Discovered on this network</div>
-                <div class="card-body">
-                    <p class="text-muted small">Any Picotuner currently broadcasting nearby, not just the
-                        one configured above - click "Use" to fill in its IP address directly, rather
-                        than finding it by hand.</p>
-                    <div id="discovered-picotuners-list">
-                        <p class="text-muted small">Checking...</p>
                     </div>
                 </div>
-            </div>
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F4D6; QRZ.com Logbook</div>
+                    <div class="card-body">
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="qrz-enabled-input">
+                            <label class="form-check-label" for="qrz-enabled">Enabled</label>
+                        </div>
+                        <label for="qrz-api-key">API key</label>
+                        <input type="text" class="form-control mb-2" id="qrz-api-key-input"
+                               placeholder="Your QRZ Logbook API key">
+                        <div class="row g-2">
+                            <div class="col-6">
+                                <label for="qrz-settle">Settle time (s)</label>
+                                <input type="number" step="1" min="0" class="form-control" id="qrz-settle-input">
+                            </div>
+                            <div class="col-6">
+                                <label for="qrz-suppress">Suppress (min)</label>
+                                <input type="number" step="1" min="0" class="form-control" id="qrz-suppress-input">
+                            </div>
+                        </div>
+                        <label for="qrz-portable-locator" class="mt-2">Portable locator override</label>
+                        <input type="text" class="form-control" id="qrz-portable-locator-input"
+                               placeholder="e.g. IO91VG - leave blank for normal operation">
+                        <p class="text-muted small mt-2 mb-0">
+                            Settle time: delay after lock before logging, so the callsign has time to
+                            decode. Suppress: don't log the same callsign again within this many minutes.
+                            Portable locator override: when a contacted station is operating portable and
+                            hasn't updated their QRZ profile, QRZ's own distance/bearing calculation uses
+                            their stale, registered locator. Set this to override it with their actual,
+                            current one for every contact logged while it's set - clear it (empty + save)
+                            once the portable session ends.
+                        </p>
+                        <div class="mt-3 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveQrz()">Save QRZ settings</button>
+                            <span class="save-status" id="qrz-save-status"></span>
+                        </div>
+                    </div>
+                </div>
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F4AC; Slack</div>
+                    <div class="card-body">
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="slack-enabled-input">
+                            <label class="form-check-label" for="slack-enabled">Enabled</label>
+                        </div>
+                        <label for="slack-webhook-url">Webhook URL</label>
+                        <input type="text" class="form-control mb-2" id="slack-webhook-url-input"
+                               placeholder="https://hooks.slack.com/services/...">
+                        <label for="slack-settle">Settle time (seconds)</label>
+                        <input type="number" step="1" min="0" class="form-control mb-2" id="slack-settle-input">
+                        <label for="slack-template">Message template</label>
+                        <textarea class="form-control" id="slack-template-input" rows="5"></textarea>
+                        <p class="text-muted small mt-2 mb-0">
+                            Placeholders: <code>{site_callsign}</code> <code>{site_callsign_lower}</code>
+                            <code>{rx_callsign}</code> <code>{mer}</code> <code>{margin}</code>
+                            <code>{modcod}</code> <code>{frequency}</code>
+                        </p>
+                        <div class="mt-3 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveSlack()">Save Slack settings</button>
+                            <span class="save-status" id="slack-save-status"></span>
+                        </div>
+                    </div>
+                </div>
         </div>
 
-        <!-- Diversity Source Switching + Integrations -->
         <div class="col-md-4">
-            <div class="card mb-3">
-                <div class="card-header">&#x1F500; Diversity Source Switching</div>
-                <div class="card-body">
-                    <div class="alert alert-warning py-2 small mb-3">
-                        Changing these requires restarting the diversity combiner to take effect -
-                        it reads these once at startup, not continuously.
-                    </div>
-                    <p class="text-muted small mb-3">
-                        When both tuners are clean, the combiner sticks with whichever source is
-                        currently preferred rather than re-deciding every segment. The preferred
-                        source only changes when the other tuner's MER has been consistently,
-                        meaningfully better for a sustained period - not on a single momentary
-                        blip. These two settings control how sustained and how meaningful that has
-                        to be.
-                    </p>
-                    <div class="row g-3">
-                        <div class="col-md-6">
-                            <label for="div-dwell">Dwell time (seconds)</label>
-                            <input type="number" step="0.5" min="0" class="form-control" id="div-dwell-input">
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F6E1;&#xFE0F; Hard-Freeze Recovery</div>
+                    <div class="card-body">
+                        <p class="text-muted small mb-3">
+                            Applies immediately, no restart needed - these are read fresh on every check.
+                            After enough restarts in quick succession, further attempts pause for a
+                            cooldown - but resume early the moment the combiner's own output confirms
+                            it's genuinely been clean for long enough, rather than always waiting out
+                            the full cooldown regardless.
+                        </p>
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="breaker-enabled-input">
+                            <label class="form-check-label" for="breaker-enabled">Enabled</label>
                         </div>
-                        <div class="col-md-6">
-                            <label for="div-margin">MER margin (dB)</label>
-                            <input type="number" step="0.1" min="0" class="form-control" id="div-margin-input">
+                        <div class="row g-2">
+                            <div class="col-6">
+                                <label for="breaker-threshold" class="small">Trip after this many restarts</label>
+                                <input type="number" step="1" min="1" class="form-control" id="breaker-threshold-input">
+                            </div>
+                            <div class="col-6">
+                                <label for="breaker-window" class="small">...within this many seconds</label>
+                                <input type="number" step="10" min="1" class="form-control" id="breaker-window-input">
+                            </div>
+                            <div class="col-6">
+                                <label for="breaker-cooldown" class="small">Max cooldown (s)</label>
+                                <input type="number" step="10" min="0" class="form-control" id="breaker-cooldown-input">
+                            </div>
+                            <div class="col-6">
+                                <label for="breaker-clean" class="small">Required clean time (s)</label>
+                                <input type="number" step="0.5" min="0" class="form-control" id="breaker-clean-input">
+                            </div>
+                            <div class="col-12">
+                                <label for="breaker-retry-interval" class="small">Min. seconds between early retries</label>
+                                <input type="number" step="0.5" min="0" class="form-control" id="breaker-retry-interval-input">
+                            </div>
                         </div>
-                    </div>
-                    <div class="mt-3 d-flex align-items-center gap-2">
-                        <button class="btn btn-save" onclick="saveDiversity()">Save diversity settings</button>
-                        <span class="save-status" id="div-save-status"></span>
+                        <div class="mt-3 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveBreaker()">Save recovery settings</button>
+                            <span class="save-status" id="breaker-save-status"></span>
+                        </div>
                     </div>
                 </div>
-            </div>
-        </div>
-
-        <!-- QRZ Logbook + Bitfocus Companion -->
-        <div class="col-md-4">
-            <div class="card mb-3">
-                <div class="card-header">&#x1F4D6; QRZ.com Logbook</div>
-                <div class="card-body">
-                    <div class="form-check form-switch mb-3">
-                        <input class="form-check-input" type="checkbox" id="qrz-enabled-input">
-                        <label class="form-check-label" for="qrz-enabled">Enabled</label>
-                    </div>
-                    <label for="qrz-api-key">API key</label>
-                    <input type="text" class="form-control mb-2" id="qrz-api-key-input"
-                           placeholder="Your QRZ Logbook API key">
-                    <div class="row g-2">
-                        <div class="col-6">
-                            <label for="qrz-settle">Settle time (s)</label>
-                            <input type="number" step="1" min="0" class="form-control" id="qrz-settle-input">
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F4E1; Picotuner Network Settings</div>
+                    <div class="card-body">
+                        <div class="alert alert-warning py-2 small mb-3">
+                            Changing these requires a restart of Lynx to take effect safely - background
+                            monitoring threads read these once at startup.
                         </div>
-                        <div class="col-6">
-                            <label for="qrz-suppress">Suppress (min)</label>
-                            <input type="number" step="1" min="0" class="form-control" id="qrz-suppress-input">
+                        <div class="row g-3">
+                            <div class="col-md-6">
+                                <label for="pt-host">Picotuner IP address</label>
+                                <input type="text" class="form-control" id="pt-host-input">
+                            </div>
+                            <div class="col-md-3">
+                                <label for="pt-status-port">Status port</label>
+                                <input type="number" class="form-control" id="pt-status-port-input">
+                            </div>
+                            <div class="col-md-3"></div>
+                            <div class="col-md-3">
+                                <label for="pt-cmd-port">Cmd port (A)</label>
+                                <input type="number" class="form-control" id="pt-cmd-port-input">
+                            </div>
+                            <div class="col-md-3">
+                                <label for="pt-ts-port">TS port (A)</label>
+                                <input type="number" class="form-control" id="pt-ts-port-input">
+                            </div>
+                            <div class="col-md-3">
+                                <label for="pt-cmd-port-b">Cmd port (B)</label>
+                                <input type="number" class="form-control" id="pt-cmd-port-b-input">
+                            </div>
+                            <div class="col-md-3">
+                                <label for="pt-ts-port-b">TS port (B)</label>
+                                <input type="number" class="form-control" id="pt-ts-port-b-input">
+                            </div>
                         </div>
-                    </div>
-                    <label for="qrz-portable-locator" class="mt-2">Portable locator override</label>
-                    <input type="text" class="form-control" id="qrz-portable-locator-input"
-                           placeholder="e.g. IO91VG - leave blank for normal operation">
-                    <p class="text-muted small mt-2 mb-0">
-                        Settle time: delay after lock before logging, so the callsign has time to
-                        decode. Suppress: don't log the same callsign again within this many minutes.
-                        Portable locator override: when a contacted station is operating portable and
-                        hasn't updated their QRZ profile, QRZ's own distance/bearing calculation uses
-                        their stale, registered locator. Set this to override it with their actual,
-                        current one for every contact logged while it's set - clear it (empty + save)
-                        once the portable session ends.
-                    </p>
-                    <div class="mt-3 d-flex align-items-center gap-2">
-                        <button class="btn btn-save" onclick="saveQrz()">Save QRZ settings</button>
-                        <span class="save-status" id="qrz-save-status"></span>
+                        <div class="mt-3 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="savePicotuner()">Save Picotuner settings</button>
+                            <span class="save-status" id="pt-save-status"></span>
+                        </div>
                     </div>
                 </div>
-            </div>
-
-            <div class="card">
-                <div class="card-header">&#x1F3AC; Bitfocus Companion</div>
-                <div class="card-body">
-                    <div class="form-check form-switch mb-3">
-                        <input class="form-check-input" type="checkbox" id="companion-enabled-input">
-                        <label class="form-check-label" for="companion-enabled">Enabled</label>
-                    </div>
-                    <label for="companion-lock-url">Lock URL</label>
-                    <input type="text" class="form-control mb-1" id="companion-lock-url-input"
-                           placeholder="http://companion-ip:8888/api/...">
-                    <label for="companion-lock-settle" class="small text-muted">Settle time (s)</label>
-                    <input type="number" step="1" min="0" class="form-control mb-2" id="companion-lock-settle-input">
-                    <label for="companion-unlock-url">Unlock URL</label>
-                    <input type="text" class="form-control mb-1" id="companion-unlock-url-input"
-                           placeholder="http://companion-ip:8888/api/...">
-                    <label for="companion-unlock-settle" class="small text-muted">Settle time (s)</label>
-                    <input type="number" step="1" min="0" class="form-control" id="companion-unlock-settle-input">
-                    <hr>
-                    <div class="form-check form-switch mb-2">
-                        <input class="form-check-input" type="checkbox" id="companion-gpio-enabled-input">
-                        <label class="form-check-label" for="companion-gpio-enabled">
-                            Also mirror on a GPIO pin (relay-based switching)
-                        </label>
-                    </div>
-                    <p class="text-muted small mb-2">
-                        Follows lock/unlock using the same settle times above - no separate timing.
-                    </p>
-                    <div class="row g-2">
-                        <div class="col-8">
-                            <label for="companion-gpio-pin" class="small">Physical pin</label>
-                            <select class="form-control" id="companion-gpio-pin-input"></select>
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F3E0; Site Information</div>
+                    <div class="card-body">
+                        <div class="row g-3">
+                            <div class="col-md-6">
+                                <label for="site-name">Receiver name</label>
+                                <input type="text" class="form-control" id="site-name-input">
+                            </div>
+                            <div class="col-md-6">
+                                <label for="site-callsign">Callsign</label>
+                                <input type="text" class="form-control" id="site-callsign-input">
+                            </div>
+                            <div class="col-md-6">
+                                <label for="site-location">Location</label>
+                                <input type="text" class="form-control" id="site-location-input">
+                            </div>
+                            <div class="col-md-6">
+                                <label for="site-locator">Locator</label>
+                                <input type="text" class="form-control" id="site-locator-input">
+                            </div>
                         </div>
-                        <div class="col-4">
-                            <label for="companion-gpio-polarity" class="small">Polarity</label>
-                            <select class="form-control" id="companion-gpio-polarity-input">
-                                <option value="high">Active high</option>
-                                <option value="low">Active low</option>
-                            </select>
+                        <div class="mt-3 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveSite()">Save site info</button>
+                            <span class="save-status" id="site-save-status"></span>
                         </div>
-                    </div>
-                    <div class="mt-3 d-flex align-items-center gap-2">
-                        <button class="btn btn-save" onclick="saveCompanion()">Save Companion settings</button>
-                        <span class="save-status" id="companion-save-status"></span>
                     </div>
                 </div>
-            </div>
-        </div>
-
-        <!-- Slack -->
-        <div class="col-md-4">
-            <div class="card mb-3">
-                <div class="card-header">&#x1F4AC; Slack</div>
-                <div class="card-body">
-                    <div class="form-check form-switch mb-3">
-                        <input class="form-check-input" type="checkbox" id="slack-enabled-input">
-                        <label class="form-check-label" for="slack-enabled">Enabled</label>
-                    </div>
-                    <label for="slack-webhook-url">Webhook URL</label>
-                    <input type="text" class="form-control mb-2" id="slack-webhook-url-input"
-                           placeholder="https://hooks.slack.com/services/...">
-                    <label for="slack-settle">Settle time (seconds)</label>
-                    <input type="number" step="1" min="0" class="form-control mb-2" id="slack-settle-input">
-                    <label for="slack-template">Message template</label>
-                    <textarea class="form-control" id="slack-template-input" rows="5"></textarea>
-                    <p class="text-muted small mt-2 mb-0">
-                        Placeholders: <code>{site_callsign}</code> <code>{site_callsign_lower}</code>
-                        <code>{rx_callsign}</code> <code>{mer}</code> <code>{margin}</code>
-                        <code>{modcod}</code> <code>{frequency}</code>
-                    </p>
-                    <div class="mt-3 d-flex align-items-center gap-2">
-                        <button class="btn btn-save" onclick="saveSlack()">Save Slack settings</button>
-                        <span class="save-status" id="slack-save-status"></span>
-                    </div>
-                </div>
-            </div>
-
-            <div class="card">
-                <div class="card-header">&#x1F6E1;&#xFE0F; Hard-Freeze Recovery</div>
-                <div class="card-body">
-                    <p class="text-muted small mb-3">
-                        Applies immediately, no restart needed - these are read fresh on every check.
-                        After enough restarts in quick succession, further attempts pause for a
-                        cooldown - but resume early the moment the combiner's own output confirms
-                        it's genuinely been clean for long enough, rather than always waiting out
-                        the full cooldown regardless.
-                    </p>
-                    <div class="form-check form-switch mb-3">
-                        <input class="form-check-input" type="checkbox" id="breaker-enabled-input">
-                        <label class="form-check-label" for="breaker-enabled">Enabled</label>
-                    </div>
-                    <div class="row g-2">
-                        <div class="col-6">
-                            <label for="breaker-threshold" class="small">Trip after this many restarts</label>
-                            <input type="number" step="1" min="1" class="form-control" id="breaker-threshold-input">
-                        </div>
-                        <div class="col-6">
-                            <label for="breaker-window" class="small">...within this many seconds</label>
-                            <input type="number" step="10" min="1" class="form-control" id="breaker-window-input">
-                        </div>
-                        <div class="col-6">
-                            <label for="breaker-cooldown" class="small">Max cooldown (s)</label>
-                            <input type="number" step="10" min="0" class="form-control" id="breaker-cooldown-input">
-                        </div>
-                        <div class="col-6">
-                            <label for="breaker-clean" class="small">Required clean time (s)</label>
-                            <input type="number" step="0.5" min="0" class="form-control" id="breaker-clean-input">
-                        </div>
-                        <div class="col-12">
-                            <label for="breaker-retry-interval" class="small">Min. seconds between early retries</label>
-                            <input type="number" step="0.5" min="0" class="form-control" id="breaker-retry-interval-input">
-                        </div>
-                    </div>
-                    <div class="mt-3 d-flex align-items-center gap-2">
-                        <button class="btn btn-save" onclick="saveBreaker()">Save recovery settings</button>
-                        <span class="save-status" id="breaker-save-status"></span>
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <!-- GPIO Tx on/off -->
-        <div class="col-md-4">
-            <div class="card">
-                <div class="card-header">&#x1F50C; GPIO Tx On/Off</div>
-                <div class="card-body">
-                    <div class="form-check form-switch mb-3">
-                        <input class="form-check-input" type="checkbox" id="gpio-enabled-input">
-                        <label class="form-check-label" for="gpio-enabled">Enabled</label>
-                    </div>
-                    <div class="row g-2 mb-2">
-                        <div class="col-8">
-                            <label for="gpio-pin">Physical pin</label>
-                            <select class="form-control" id="gpio-pin-input"></select>
-                        </div>
-                        <div class="col-4">
-                            <label for="gpio-polarity">Polarity</label>
-                            <select class="form-control" id="gpio-polarity-input">
-                                <option value="high">Active high</option>
-                                <option value="low">Active low</option>
-                            </select>
-                        </div>
-                    </div>
-                    <div class="row g-2 mb-2">
-                        <div class="col-6">
-                            <label for="gpio-power-up" class="small">Power-up settle (s)</label>
-                            <input type="number" step="1" min="0" class="form-control" id="gpio-power-up-input">
-                        </div>
-                        <div class="col-6">
-                            <label for="gpio-power-down" class="small">Power-down settle (s)</label>
-                            <input type="number" step="1" min="0" class="form-control" id="gpio-power-down-input">
-                        </div>
-                    </div>
-                    <p class="text-muted small mb-2">
-                        Power-down settle of <strong>0</strong> means never auto power-down once
-                        triggered on.
-                    </p>
-                    <hr>
-                    <p class="text-muted small mb-2">
-                        Inside a configured schedule window, the pin is forced on immediately
-                        (no settling). Outside a window, or with no schedule set for that day
-                        type, normal power-up/power-down timing above applies 24 hours a day.
-                    </p>
-                    <label class="small">Weekday schedule</label>
-                    <div class="row g-2 mb-2">
-                        <div class="col-6">
-                            <input type="time" class="form-control" id="gpio-weekday-start-input">
-                        </div>
-                        <div class="col-6">
-                            <input type="time" class="form-control" id="gpio-weekday-end-input">
-                        </div>
-                    </div>
-                    <div class="form-check mb-2">
-                        <input class="form-check-input" type="checkbox" id="gpio-weekday-none-input">
-                        <label class="form-check-label small" for="gpio-weekday-none">No schedule (24hr auto)</label>
-                    </div>
-                    <label class="small">Weekend schedule</label>
-                    <div class="row g-2 mb-2">
-                        <div class="col-6">
-                            <input type="time" class="form-control" id="gpio-weekend-start-input">
-                        </div>
-                        <div class="col-6">
-                            <input type="time" class="form-control" id="gpio-weekend-end-input">
-                        </div>
-                    </div>
-                    <div class="form-check mb-2">
-                        <input class="form-check-input" type="checkbox" id="gpio-weekend-none-input">
-                        <label class="form-check-label small" for="gpio-weekend-none">No schedule (24hr auto)</label>
-                    </div>
-                    <div class="mt-3 d-flex align-items-center gap-2">
-                        <button class="btn btn-save" onclick="saveGpioTx()">Save GPIO settings</button>
-                        <span class="save-status" id="gpio-save-status"></span>
-                    </div>
-                </div>
-            </div>
         </div>
 
     </div>
+
 </div>
 
 <script>
@@ -2857,6 +2865,9 @@ async function loadCurrentConfig() {
         document.getElementById('site-callsign-input').value = cfg.site?.callsign || '';
         document.getElementById('site-location-input').value = cfg.site?.location || '';
         document.getElementById('site-locator-input').value = cfg.site?.locator || '';
+
+        const ppmStyle = cfg.display?.ppm_style || 'skeleton';
+        document.getElementById(ppmStyle === 'full_fat' ? 'ppm-style-full-fat' : 'ppm-style-skeleton').checked = true;
 
         document.getElementById('pt-host-input').value = cfg.picotuner?.host || '';
         document.getElementById('pt-status-port-input').value = cfg.picotuner?.status_port || '';
@@ -2977,6 +2988,26 @@ async function saveSite() {
         });
         if (!r.ok) throw new Error(await r.text());
         statusEl.textContent = 'Saved - applied immediately.';
+        statusEl.className = 'save-status text-success';
+    } catch (e) {
+        statusEl.textContent = 'Save failed - see console.';
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
+async function savePpmStyle() {
+    const statusEl = document.getElementById('ppm-style-status');
+    statusEl.textContent = 'Saving...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const style = document.querySelector('input[name="ppm-style"]:checked').value;
+        const body = { display: { ppm_style: style } };
+        const r = await fetch('/api/config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+        });
+        if (!r.ok) throw new Error(await r.text());
+        statusEl.textContent = 'Saved - applies within a few seconds.';
         statusEl.className = 'save-status text-success';
     } catch (e) {
         statusEl.textContent = 'Save failed - see console.';
@@ -4021,6 +4052,12 @@ def update_config(req: ConfigUpdateRequest):
     if req.notifications_gpio_tx is not None:
         on_disk.setdefault('notifications', {}).setdefault('gpio_tx', {}).update(
             req.notifications_gpio_tx.model_dump())
+
+    # Display: takes effect live, no restart - the overlay picks this
+    # up on its own next /api/status poll (a few seconds), same as
+    # portable_locator and the notification settings above.
+    if req.display is not None:
+        on_disk.setdefault('display', {}).update(req.display.model_dump())
 
     tmp_path = str(CONFIG_PATH) + ".tmp"
     with open(tmp_path, 'w') as f:
