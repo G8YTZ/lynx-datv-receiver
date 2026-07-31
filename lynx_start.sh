@@ -222,7 +222,8 @@ systemd-notify --ready 2>/dev/null || true
 while true; do
     sleep 10
 
-    if ! curl -sf http://localhost:8080/api/status > /dev/null 2>&1; then
+    status_json=$(curl -sf http://localhost:8080/api/status 2>/dev/null)
+    if [ -z "$status_json" ]; then
         echo -e "${RED}Web app not responding — exiting for restart.${NC}"
         break
     fi
@@ -249,7 +250,21 @@ while true; do
     # overlay's benefit, which spans the entire deliberate gap; second,
     # as defense-in-depth for any tune path that might not set it, a
     # short retry rather than concluding death from one single snapshot.
-    if [ -f /tmp/lynx_mpv_transitioning ]; then
+    #
+    # Confirmed a THIRD, genuinely distinct bug on a fresh install with
+    # no previous state and no default boot preset configured: Lynx
+    # correctly stays idle in that case, and rf_mpv_lifecycle_monitor()
+    # in lynx_app.py deliberately never starts mpv at all while idle
+    # (only once an RF signal lock is confirmed, or a stream is
+    # playing) - so mpv's absence here was never a crash, just the
+    # correct, intended state, and this check had no way to tell the
+    # difference. Fixed by reading the actual mode this same status
+    # response already carries, and skipping the mpv check entirely
+    # whenever it's "idle".
+    lynx_mode=$(echo "$status_json" | grep -o '"mode"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/')
+    if [ "$lynx_mode" = "idle" ]; then
+        : # genuinely, correctly idle - mpv isn't supposed to be running at all, nothing to check
+    elif [ -f /tmp/lynx_mpv_transitioning ]; then
         : # deliberate, in-progress tune transition — mpv's temporary absence is expected, skip this check entirely for this cycle
     elif ! pgrep -f "mpv.*input-ipc-server=${MPV_SOCKET}" > /dev/null 2>&1; then
         # Not found on the first check — could still be a normal
