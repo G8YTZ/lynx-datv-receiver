@@ -94,7 +94,83 @@ picotuner:
   ts_port: 9941
   ts_port_b: 9942
 
-presets: []                # populate via the Web Control Portal's Save buttons
+presets:                    # Starting set for a fresh install - BATC's own network
+                             # relays (reachable by anyone, not site-specific) plus
+                             # generic 70cm/23cm starting frequencies at standard
+                             # symbol rates. Add/remove any of these, or your own,
+                             # from the Web Control Portal's Save buttons - this is
+                             # just where they happen to live in the file.
+  - type: stream
+    name: GB3OO
+    url: rtmp://rtmp.batc.org.uk/live/gb3oo
+    note: BATC network relay
+  - type: stream
+    name: GB3HV
+    url: rtmp://rtmp.batc.org.uk/live/gb3hv
+    note: BATC network relay
+  - type: stream
+    name: GB3TV
+    url: rtmp://rtmp.batc.org.uk/live/gb3tv
+    note: BATC network relay
+  - type: stream
+    name: GB3SQ
+    url: rtmp://rtmp.batc.org.uk/live/gb3sq
+    note: BATC network relay
+  - type: stream
+    name: GB3GG
+    url: rtmp://rtmp.batc.org.uk/live/gb3gg
+    note: BATC network relay
+  - type: stream
+    name: GB3EN
+    url: rtmp://rtmp.batc.org.uk/live/gb3en
+    note: BATC network relay
+  - type: stream
+    name: GB3JV
+    url: rtmp://rtmp.batc.org.uk/live/gb3jv
+    note: BATC network relay
+  - type: stream
+    name: GB3JT
+    url: rtmp://rtmp.batc.org.uk/live/gb3jt
+    note: BATC network relay
+  - type: stream
+    name: BATC Oscar 100 net
+    url: rtmp://rtmp.batc.org.uk/live/oscar100net
+    note: BATC network relay
+  - type: rf
+    name: 437MHz 333k A
+    freq: 437000
+    sr: 333
+    plug: a
+    lnb_lo_khz: 0
+    note: 70cm starting point
+  - type: rf
+    name: 437MHz 333k Diversity
+    freq: 437000
+    sr: 333
+    plug: diversity
+    lnb_lo_khz: 0
+    note: 70cm starting point
+  - type: rf
+    name: 437MHz 1000k Diversity
+    freq: 437000
+    sr: 1000
+    plug: diversity
+    lnb_lo_khz: 0
+    note: 70cm starting point
+  - type: rf
+    name: 1249MHz 333k A
+    freq: 1249000
+    sr: 333
+    plug: a
+    lnb_lo_khz: 0
+    note: 23cm starting point
+  - type: rf
+    name: 1249MHz 1000k A
+    freq: 1249000
+    sr: 1000
+    plug: a
+    lnb_lo_khz: 0
+    note: 23cm starting point
 
 relay:
   enabled: false

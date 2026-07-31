@@ -3374,11 +3374,34 @@ def get_my_ip():
     return result.stdout.split()[0]
 
 def picotuner_cmd(cmd: str):
-    """Send a UDP command to the Picotuner."""
-    cfg = config['picotuner']
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.sendto(cmd.encode(), (cfg['host'], cfg['cmd_port']))
-    sock.close()
+    """Send a UDP command to the Picotuner. Deliberately never raises -
+    this is fire-and-forget UDP with no response or acknowledgement
+    expected, so a caller shouldn't be able to fail just because this
+    couldn't be sent. Confirmed directly (2026-07-31) that the config
+    template's own placeholder host value ("192.168.0.XXX", set before
+    the Config page is ever visited on a fresh install) isn't a valid
+    IP, so Python tries to resolve it as a hostname via DNS - which
+    fails with socket.gaierror. With no try/except around this call in
+    _start_stream_impl(), that crashed the ENTIRE stream-start request,
+    meaning network streams (RTMP/SRT/UDP/RTSP - architecturally
+    unrelated to the Picotuner at all) couldn't be played until the
+    Picotuner was configured, on a receiver some people run for
+    streaming only. Returns True/False rather than raising, so callers
+    that genuinely need to know (RF tuning) still can, via the
+    Picotuner's own separate, already-visible "offline" status rather
+    than a raw exception."""
+    try:
+        cfg = config['picotuner']
+        host = cfg.get('host', '')
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.sendto(cmd.encode(), (host, cfg['cmd_port']))
+        finally:
+            sock.close()
+        return True
+    except Exception as e:
+        print(f"[picotuner_cmd] could not send (Picotuner likely not configured/reachable): {e}")
+        return False
 
 def calc_tuner_freq(freq_khz: int, lnb_lo_khz: int) -> int:
     """Given a downlink frequency and an LNB LO (0 = no LNB), returns
