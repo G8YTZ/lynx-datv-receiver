@@ -148,6 +148,117 @@ current_volume: int = config.get('audio', {}).get('default_volume', 100)
 
 tune_lock = threading.Lock()  # serializes tune()/start_stream() calls end-to-
                                # end (including the async mpv restart, not
+
+# ── Versioning / update checking ────────────────────────────────
+# LYNX_DIR is the repo root (this file's own directory) - used to run
+# git commands against the right checkout regardless of exactly where
+# it's installed, rather than assuming ~/lynx specifically.
+LYNX_DIR = os.path.dirname(os.path.abspath(__file__))
+
+update_state = {
+    "current_version": None,   # populated lazily on first GET /api/update/status (see ensure_current_version)
+    "checked_at": None,        # ISO timestamp of the last check (auto or manual)
+    "check_error": None,       # set if the last check itself failed (e.g. no network) - distinct from "no update available"
+    "update_available": False,
+    "commits_behind": 0,
+    "new_commits": [],         # list of "abc1234 commit subject" strings, most recent first
+}
+
+def git_cmd(*args, timeout=15):
+    """Run a git command against the Lynx repo. Never raises - callers
+    just check the returned success flag, so a git failure (no
+    network, corrupted checkout, misconfigured remote, etc) degrades
+    to a clear error message rather than crashing anything that calls
+    this."""
+    try:
+        env = os.environ.copy()
+        # If a remote were ever configured to need credentials, this
+        # makes git fail fast and cleanly instead of trying to prompt
+        # interactively for them - there's no terminal attached here
+        # to prompt on, and this is a defensive measure against that
+        # ever behaving unpredictably rather than a confirmed fix for
+        # a specific observed problem.
+        env["GIT_TERMINAL_PROMPT"] = "0"
+        result = subprocess.run(
+            ["git", "-C", LYNX_DIR, *args],
+            capture_output=True, text=True, timeout=timeout, env=env,
+        )
+        if result.returncode != 0:
+            return False, result.stderr.strip() or f"git {' '.join(args)} failed"
+        return True, result.stdout.strip()
+    except Exception as e:
+        return False, str(e)
+
+def detect_current_version():
+    """git describe --tags --always - falls back to a short commit SHA
+    if no tags exist yet, which is genuinely true for every existing
+    install until the first vYYYY.MM.DD tag is actually created and
+    pushed. Called once at startup; the result doesn't change while
+    this process keeps running (only a restart after a real update
+    would pick up a new one)."""
+    ok, out = git_cmd("describe", "--tags", "--always")
+    return out if ok and out else "unknown"
+
+def get_default_branch():
+    """The actual default branch name (main/master/whatever) rather
+    than assuming - confirmed correct either way, since guessing wrong
+    here would silently compare against the wrong branch."""
+    ok, ref = git_cmd("symbolic-ref", "refs/remotes/origin/HEAD")
+    if ok and ref:
+        return ref.rsplit("/", 1)[-1]
+    return "main"  # reasonable fallback if the symbolic ref isn't set for some reason
+
+def check_for_updates():
+    """Safe and read-only: git fetch, then compare local HEAD to the
+    remote's HEAD - never touches working files or applies anything.
+    Called both by the background auto-check loop and the on-demand
+    /api/update/check endpoint, so they share one, single code path
+    rather than two that could quietly drift apart."""
+    global update_state
+    ok, err = git_cmd("fetch", "origin", "--quiet")
+    if not ok:
+        update_state["check_error"] = f"Could not reach GitHub: {err}"
+        update_state["checked_at"] = utc_now_iso()
+        return
+
+    branch = get_default_branch()
+    ok, behind_str = git_cmd("rev-list", "--count", f"HEAD..origin/{branch}")
+    if not ok:
+        update_state["check_error"] = f"Could not compare versions: {behind_str}"
+        update_state["checked_at"] = utc_now_iso()
+        return
+
+    behind = int(behind_str) if behind_str.isdigit() else 0
+    update_state["check_error"] = None
+    update_state["checked_at"] = utc_now_iso()
+    update_state["update_available"] = behind > 0
+    update_state["commits_behind"] = behind
+
+    if behind > 0:
+        ok, log_out = git_cmd("log", f"HEAD..origin/{branch}", "--oneline", "--max-count=20")
+        update_state["new_commits"] = log_out.split("\n") if ok and log_out else []
+    else:
+        update_state["new_commits"] = []
+
+def ensure_current_version():
+    """Detects the current version on first call only, caching the
+    result - not a background thread, not periodic, nothing runs
+    until this is actually called (from GET /api/update/status, which
+    happens once when the page loads). git describe is local-only, no
+    network needed, so this is safe regardless of connectivity - the
+    thing that must never run automatically is the actual update
+    CHECK (git fetch), which only ever happens from an explicit
+    button press now. Not all Lynx receivers are reliably online,
+    sometimes running RF-only with no internet at all - background
+    network activity has no place interfering with that."""
+    if update_state["current_version"] is None:
+        try:
+            update_state["current_version"] = detect_current_version()
+        except Exception as e:
+            update_state["current_version"] = "unknown"
+            print(f"[update-check] version detection failed unexpectedly: {e}")
+
+
                                # just the initial synchronous part) — both
                                # share the same underlying resources (mpv,
                                # the transition-cover marker, the combiner)
@@ -1988,7 +2099,7 @@ class GpioTxConfigUpdate(BaseModel):
     schedule_weekend_end: str
 
 class DisplayConfigUpdate(BaseModel):
-    ppm_style: str = "skeleton"  # "skeleton" or "full_fat"
+    ppm_style: str = "full_fat"  # "skeleton" or "full_fat"
 
 class ConfigUpdateRequest(BaseModel):
     site: Optional[SiteConfigUpdate] = None
@@ -2163,7 +2274,7 @@ def get_status():
             "mpv_restarts_total": diagnostics["mpv_restarts_total"],
             "mpv_drift": get_mpv_drift_status(),
             "portable_locator": config.get('notifications', {}).get('qrz', {}).get('portable_locator', ''),
-            "ppm_style": config.get('display', {}).get('ppm_style', 'skeleton'),
+            "ppm_style": config.get('display', {}).get('ppm_style', 'full_fat'),
             "timestamp": utc_now_iso()
         },
         "picotuner": {
@@ -2867,7 +2978,7 @@ async function loadCurrentConfig() {
         document.getElementById('site-location-input').value = cfg.site?.location || '';
         document.getElementById('site-locator-input').value = cfg.site?.locator || '';
 
-        const ppmStyle = cfg.display?.ppm_style || 'skeleton';
+        const ppmStyle = cfg.display?.ppm_style || 'full_fat';
         document.getElementById(ppmStyle === 'full_fat' ? 'ppm-style-full-fat' : 'ppm-style-skeleton').checked = true;
 
         document.getElementById('pt-host-input').value = cfg.picotuner?.host || '';
@@ -3955,6 +4066,71 @@ def set_default_volume(req: VolumeRequest):
     save_config(config)
     return {"success": True, "default_volume": level}
 
+@app.get("/api/update/status", tags=["Configuration"],
+         summary="Current version and update-check status",
+         description="Populates current_version on first call (local-"
+                     "only, no network needed) if not already known. "
+                     "Does NOT itself check for updates - that stays "
+                     "fully manual (see POST /api/update/check) and "
+                     "never runs automatically, since not every Lynx "
+                     "receiver is reliably online. current_version is "
+                     "'unknown' only if git itself isn't available or "
+                     "this isn't a git checkout at all.")
+def get_update_status():
+    ensure_current_version()
+    return update_state
+
+@app.post("/api/update/check", tags=["Configuration"],
+          summary="Check for updates now",
+          description="Safe and read-only - runs git fetch and compares "
+                      "against the remote. This is the ONLY way a check "
+                      "ever happens - deliberately no automatic/"
+                      "background checking, since not every Lynx "
+                      "receiver is reliably online and this must never "
+                      "touch the network on its own. Never applies "
+                      "anything.")
+def post_update_check():
+    check_for_updates()
+    return update_state
+
+@app.post("/api/update/apply", tags=["Configuration"],
+          summary="Pull the latest code and restart",
+          description="Fails safely: if git pull fails for any reason "
+                      "(no network, local changes conflicting, etc), "
+                      "this returns an error and the currently-running "
+                      "process is left completely untouched - restart "
+                      "is only ever triggered after a confirmed-clean "
+                      "pull. Restart is via systemd (Restart=always "
+                      "picks it back up) - this only works if the "
+                      "lynx.service unit is actually installed and "
+                      "active; see the install guide.")
+def post_update_apply():
+    branch = get_default_branch()
+    ok, pull_output = git_cmd("pull", "--ff-only", "origin", branch)
+    if not ok:
+        raise HTTPException(status_code=502,
+            detail=f"Update failed, nothing was changed: {pull_output}")
+
+    # Refresh state immediately so a client that doesn't reload fast
+    # enough after the restart at least sees the truth if it asks again.
+    update_state["update_available"] = False
+    update_state["commits_behind"] = 0
+    update_state["new_commits"] = []
+
+    # Exit cleanly after a short delay, giving this HTTP response time
+    # to actually reach the browser first. systemd's Restart=always
+    # (see lynx.service) brings it back up running the new code - this
+    # deliberately does NOT try to restart itself directly, since that
+    # would require re-implementing the supervision systemd already
+    # does properly.
+    def _delayed_exit():
+        time.sleep(2)
+        os._exit(0)
+    threading.Thread(target=_delayed_exit, daemon=True).start()
+
+    return {"result": "ok", "message": "Update pulled successfully - restarting now.",
+            "pull_output": pull_output}
+
 class DefaultBootRequest(BaseModel):
     freq: int
     sr: int
@@ -4144,6 +4320,9 @@ def web_ui():
             <span><span class="led led-grey" id="picotuner-led"></span><small id="picotuner-status" class="text-muted">Picotuner</small></span>
             <span class="badge bg-secondary" id="mode-badge">IDLE</span>
             <a href="/diagnostics" class="badge bg-secondary text-decoration-none" title="mpv restart/stop diagnostics" id="diagnostics-link">mpv: <span id="mpv-restart-count">0</span></a>
+            <span class="btn btn-sm" id="version-badge" style="background:#3a4a63; color:#fff; cursor:default;" title="Current version">v?</span>
+            <button class="btn btn-sm btn-outline-light" onclick="checkForUpdates()" id="update-check-btn" title="Check for updates now">&#x1F504; Check Updates</button>
+            <button class="btn btn-sm btn-success" onclick="applyUpdate()" id="update-apply-btn" style="display:none" title="Pull the latest code and restart">&#x2B06;&#xFE0F; Update</button>
             <a href="/diagnostics" class="btn btn-sm btn-outline-light">&#x1F4CA; Diagnostics</a>
             <a href="/config" class="btn btn-sm btn-outline-light">&#x2699;&#xFE0F; Config</a>
         </div>
@@ -4626,7 +4805,7 @@ async function tuneTo() {
     const lnb_lo_khz = getLnbLoKhz();
     const tunerFreq = freq - lnb_lo_khz;
     if (tunerFreq < 50000 || tunerFreq > 2500000) {
-        alert(`Calculated tuner frequency ${(tunerFreq/1000).toFixed(3)} MHz is out of range.\n` +
+        alert(`Calculated tuner frequency ${(tunerFreq/1000).toFixed(3)} MHz is out of range.\\n` +
               `Check the LNB LO selection matches the frequency entered — nothing was sent.`);
         return;
     }
@@ -4718,12 +4897,113 @@ async function loadVolume() {
     } catch(e) {}
 }
 
+function renderUpdateStatus(status) {
+    const badge = document.getElementById('version-badge');
+    const applyBtn = document.getElementById('update-apply-btn');
+    const version = status.current_version || '?';
+
+    if (status.check_error) {
+        badge.textContent = 'v' + version.replace(/^v/, '');
+        badge.title = 'Update check failed: ' + status.check_error;
+        badge.style.background = '#3a4a63';
+        applyBtn.style.display = 'none';
+    } else if (status.update_available) {
+        badge.textContent = 'v' + version.replace(/^v/, '') + ' — ' +
+            status.commits_behind + ' update' + (status.commits_behind === 1 ? '' : 's') + ' available';
+        badge.title = (status.new_commits || []).join('\\n') || 'Update available';
+        badge.style.background = '#e8a33d';
+        applyBtn.style.display = 'inline-block';
+    } else if (status.checked_at) {
+        badge.textContent = 'v' + version.replace(/^v/, '') + ' — up to date';
+        badge.title = 'Last checked: ' + status.checked_at;
+        badge.style.background = '#1a9850';
+        applyBtn.style.display = 'none';
+    } else {
+        // Never actually checked yet - checking is entirely manual,
+        // so this is the normal, expected state until "Check Updates"
+        // is clicked, not an error or something stale.
+        badge.textContent = 'v' + version.replace(/^v/, '');
+        badge.title = 'Not yet checked - click "Check Updates"';
+        badge.style.background = '#3a4a63';
+        applyBtn.style.display = 'none';
+    }
+}
+
+async function loadUpdateStatus() {
+    try {
+        const status = await api('GET', '/api/update/status');
+        renderUpdateStatus(status);
+    } catch (e) {}
+}
+
+async function checkForUpdates() {
+    const btn = document.getElementById('update-check-btn');
+    const original = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = '…';
+    try {
+        const status = await api('POST', '/api/update/check');
+        renderUpdateStatus(status);
+    } catch (e) {
+        document.getElementById('version-badge').title = 'Check failed: ' + e.message;
+    } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+    }
+}
+
+async function applyUpdate() {
+    const commits = (document.getElementById('version-badge').title || '').trim();
+    const preview = commits ? ('\\n\\nChanges:\\n' + commits) : '';
+    if (!confirm('Pull the latest code and restart Lynx now? The stream will briefly ' +
+                 'drop while it restarts.' + preview)) {
+        return;
+    }
+    const btn = document.getElementById('update-apply-btn');
+    btn.disabled = true;
+    btn.textContent = 'Updating…';
+
+    let result;
+    try {
+        result = await api('POST', '/api/update/apply');
+    } catch (e) {
+        result = { detail: e.message };
+    }
+    // api() returns the parsed body regardless of HTTP status - a
+    // failed pull comes back as {detail: "..."} (FastAPI's own error
+    // shape), not a thrown exception, so check for that explicitly
+    // rather than relying on a catch block that wouldn't actually fire.
+    if (!result || result.detail) {
+        alert('Update failed - nothing was changed: ' + (result?.detail || 'unknown error'));
+        btn.disabled = false;
+        btn.textContent = '⬆️ Update';
+        return;
+    }
+
+    btn.textContent = 'Restarting…';
+    // Poll for the server coming back rather than a fixed delay - more
+    // robust to however long the actual restart takes.
+    setTimeout(() => {
+        const tryReload = async () => {
+            try {
+                const r = await fetch('/api/status');
+                if (!r.ok) throw new Error('not ready');
+                location.reload();
+            } catch (e) {
+                setTimeout(tryReload, 2000);
+            }
+        };
+        tryReload();
+    }, 4000);
+}
+
 // ── Init ──────────────────────────────────────────────────────
 loadConfig();
 loadPresets();
 loadLiveStreams();
 loadVolume();
 loadBootDefault();
+loadUpdateStatus();
 updateStatus();
 setInterval(updateStatus, 3000);
 setInterval(loadLiveStreams, 3600000);
@@ -4734,6 +5014,12 @@ setInterval(loadLiveStreams, 3600000);
 # ── Run ───────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
+    # Version detection is lazy (see ensure_current_version) and
+    # update checking is entirely manual (POST /api/update/check) -
+    # deliberately nothing here at startup: not all Lynx receivers
+    # are reliably online, sometimes running RF-only with no internet
+    # at all, and this must never touch the network unless a user
+    # explicitly asks it to.
     # Start Picotuner monitor background threads
     monitor = threading.Thread(target=picotuner_monitor, daemon=True)
     monitor.start()
