@@ -4094,16 +4094,22 @@ def post_update_check():
     return update_state
 
 @app.post("/api/update/apply", tags=["Configuration"],
-          summary="Pull the latest code and restart",
+          summary="Pull the latest code and reboot",
           description="Fails safely: if git pull fails for any reason "
                       "(no network, local changes conflicting, etc), "
-                      "this returns an error and the currently-running "
-                      "process is left completely untouched - restart "
-                      "is only ever triggered after a confirmed-clean "
-                      "pull. Restart is via systemd (Restart=always "
-                      "picks it back up) - this only works if the "
-                      "lynx.service unit is actually installed and "
-                      "active; see the install guide.")
+                      "this returns an error and nothing is touched - "
+                      "no reboot is triggered unless the pull itself "
+                      "succeeded cleanly first. Reboots the whole Pi "
+                      "(same mechanism as the Reboot button) rather than "
+                      "just restarting the Lynx process - deliberately "
+                      "chosen (2026-07-31) over relying on systemd's "
+                      "Restart=always, since the lynx.service unit's "
+                      "auto-start currently has a known, unresolved issue "
+                      "on labwc (graphical-session.target never "
+                      "activating). A full reboot reliably brings Lynx "
+                      "back up regardless via the proven autostart line, "
+                      "at the cost of being slower than a simple process "
+                      "restart would be.")
 def post_update_apply():
     branch = get_default_branch()
     ok, pull_output = git_cmd("pull", "--ff-only", "origin", branch)
@@ -4112,23 +4118,33 @@ def post_update_apply():
             detail=f"Update failed, nothing was changed: {pull_output}")
 
     # Refresh state immediately so a client that doesn't reload fast
-    # enough after the restart at least sees the truth if it asks again.
+    # enough after the reboot at least sees the truth if it asks again.
     update_state["update_available"] = False
     update_state["commits_behind"] = 0
     update_state["new_commits"] = []
 
-    # Exit cleanly after a short delay, giving this HTTP response time
-    # to actually reach the browser first. systemd's Restart=always
-    # (see lynx.service) brings it back up running the new code - this
-    # deliberately does NOT try to restart itself directly, since that
-    # would require re-implementing the supervision systemd already
-    # does properly.
-    def _delayed_exit():
-        time.sleep(2)
-        os._exit(0)
-    threading.Thread(target=_delayed_exit, daemon=True).start()
+    # Same passwordless-sudo check as the Reboot button, and for the
+    # same reason: a fire-and-forget reboot can't report back if it
+    # silently fails to actually happen, so check first rather than
+    # claim success either way. The pull has already succeeded by this
+    # point though, so a failed check here still leaves the code
+    # genuinely updated - just not yet running - which the error
+    # message below says explicitly, rather than leaving that unclear.
+    check = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=5)
+    if check.returncode != 0:
+        raise HTTPException(status_code=500,
+            detail="Code pulled successfully, but couldn't reboot automatically - "
+                   "passwordless sudo isn't configured for this user. The update "
+                   "IS applied; reboot the Pi manually (or run 'sudo visudo' to "
+                   "add a NOPASSWD entry for reboot, matching what the Reboot "
+                   "button needs) to actually start running it.")
 
-    return {"result": "ok", "message": "Update pulled successfully - restarting now.",
+    def _do_reboot():
+        time.sleep(1.0)  # let this HTTP response actually reach the browser first
+        subprocess.Popen(["sudo", "reboot"])
+    threading.Thread(target=_do_reboot, daemon=True).start()
+
+    return {"result": "ok", "message": "Update pulled successfully - rebooting the Pi now.",
             "pull_output": pull_output}
 
 class DefaultBootRequest(BaseModel):
@@ -4955,8 +4971,9 @@ async function checkForUpdates() {
 async function applyUpdate() {
     const commits = (document.getElementById('version-badge').title || '').trim();
     const preview = commits ? ('\\n\\nChanges:\\n' + commits) : '';
-    if (!confirm('Pull the latest code and restart Lynx now? The stream will briefly ' +
-                 'drop while it restarts.' + preview)) {
+    if (!confirm('Pull the latest code and reboot the Pi now? This reboots the whole ' +
+                 'system (not just Lynx), so it takes longer than a simple restart - ' +
+                 'roughly 30-60 seconds.' + preview)) {
         return;
     }
     const btn = document.getElementById('update-apply-btn');
@@ -4970,19 +4987,27 @@ async function applyUpdate() {
         result = { detail: e.message };
     }
     // api() returns the parsed body regardless of HTTP status - a
-    // failed pull comes back as {detail: "..."} (FastAPI's own error
+    // failure comes back as {detail: "..."} (FastAPI's own error
     // shape), not a thrown exception, so check for that explicitly
     // rather than relying on a catch block that wouldn't actually fire.
+    // Shows the backend's own message directly rather than prefixing
+    // "nothing was changed" - that's only true for a failed pull, not
+    // for the separate case where the pull succeeded but the automatic
+    // reboot itself couldn't run (passwordless sudo not configured) -
+    // the backend's own wording already covers both cases correctly.
     if (!result || result.detail) {
-        alert('Update failed - nothing was changed: ' + (result?.detail || 'unknown error'));
+        alert(result?.detail || 'Update failed: unknown error');
         btn.disabled = false;
         btn.textContent = '⬆️ Update';
         return;
     }
 
-    btn.textContent = 'Restarting…';
-    // Poll for the server coming back rather than a fixed delay - more
-    // robust to however long the actual restart takes.
+    btn.textContent = 'Rebooting…';
+    // Poll for the server coming back rather than a fixed delay - the
+    // retry loop below handles however long the actual reboot takes
+    // regardless, but starting the first attempt after a reasonable
+    // pause avoids wasting several retries on a Pi that's still mid-
+    // shutdown.
     setTimeout(() => {
         const tryReload = async () => {
             try {
@@ -4994,7 +5019,7 @@ async function applyUpdate() {
             }
         };
         tryReload();
-    }, 4000);
+    }, 10000);
 }
 
 // ── Init ──────────────────────────────────────────────────────
