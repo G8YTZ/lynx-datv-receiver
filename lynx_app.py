@@ -4044,9 +4044,13 @@ def restart_lynx():
     if check.returncode != 0:
         raise HTTPException(status_code=500,
             detail="'sudo reboot' requires passwordless sudo for this user, which "
-                   "isn't currently configured - the Pi was NOT rebooted. Run "
-                   "'sudo visudo' and add a NOPASSWD entry for reboot, or reboot "
-                   "manually over SSH instead.")
+                   "isn't currently configured - the Pi was NOT rebooted. Fix (run "
+                   "on the Pi over SSH):\n\n"
+                   'echo "$USER ALL=(ALL) NOPASSWD: /sbin/reboot, /usr/sbin/reboot" '
+                   "| sudo tee /etc/sudoers.d/lynx-reboot\n"
+                   "sudo chmod 0440 /etc/sudoers.d/lynx-reboot\n"
+                   "sudo visudo -c\n\n"
+                   "Or reboot manually over SSH instead.")
 
     def _do_reboot():
         time.sleep(1.0)  # let this HTTP response actually reach the browser first
@@ -4165,9 +4169,12 @@ def post_update_apply():
         raise HTTPException(status_code=500,
             detail="Code pulled successfully, but couldn't reboot automatically - "
                    "passwordless sudo isn't configured for this user. The update "
-                   "IS applied; reboot the Pi manually (or run 'sudo visudo' to "
-                   "add a NOPASSWD entry for reboot, matching what the Reboot "
-                   "button needs) to actually start running it.")
+                   "IS applied; reboot the Pi manually now, or fix this permanently "
+                   "(run on the Pi over SSH):\n\n"
+                   'echo "$USER ALL=(ALL) NOPASSWD: /sbin/reboot, /usr/sbin/reboot" '
+                   "| sudo tee /etc/sudoers.d/lynx-reboot\n"
+                   "sudo chmod 0440 /etc/sudoers.d/lynx-reboot\n"
+                   "sudo visudo -c")
 
     def _do_reboot():
         time.sleep(1.0)  # let this HTTP response actually reach the browser first
