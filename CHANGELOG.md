@@ -17,6 +17,7 @@ This file starts from 2026-07-29. Earlier changes are recorded in each document'
 
 ### Changed
 - PPM meter default display style changed from "skeleton" to "full_fat" (config template and code fallback) - existing installs with an explicit `display.ppm_style` setting already in their config are unaffected, since this only changes the default for a config with no explicit value set (e.g. a fresh install).
+- First version tag created: `v2026.07.31` - the version badge on the main page now shows this directly rather than a raw commit SHA.
 
 ## 2026-07-30
 
