@@ -7,11 +7,19 @@ After=graphical-session.target
 Wants=graphical-session.target
 
 [Service]
-Type=notify
-# lynx_start.sh itself calls systemd-notify (READY on successful
-# startup, WATCHDOG=1 from its own health-check loop) - already built
-# in, confirmed directly in the script, just never previously wired
-# up to a real systemd unit that would act on it.
+# Switched from Type=notify to Type=simple (2026-07-31) after a
+# confirmed, reproducible startup timeout: the script runs completely
+# correctly when launched directly (confirmed via full, successful
+# manual runs), but systemd's Type=notify specifically waits for a
+# systemd-notify --ready call before considering the service started
+# - and that wait was timing out when launched by systemd itself, for
+# reasons not fully pinned down. Type=simple removes that dependency
+# entirely: systemd just considers the service started as soon as the
+# process launches, without waiting on a signal that wasn't arriving
+# reliably. Restart=always is unaffected by this change - it doesn't
+# depend on Type at all, so auto-restart-on-crash/exit still works
+# exactly the same.
+Type=simple
 ExecStart=%h/lynx/lynx_start.sh
 Restart=always
 RestartSec=5
@@ -22,6 +30,13 @@ RestartSec=5
 # 45s gives a safe ~3x margin above that, so ordinary timing jitter
 # never triggers a false-positive restart, while a genuine hang is
 # still caught reasonably promptly.
+# NOTE: WatchdogSec's underlying notification socket is set up by
+# systemd whenever WatchdogSec is configured, independent of Type= -
+# so this should keep working the same as before. Not independently
+# re-verified after the Type change though, given no reliable way to
+# test this specific piece remotely - worth confirming directly
+# (systemctl --user status lynx.service after it's been running a
+# while) rather than assumed.
 WatchdogSec=45
 
 # Give the script's own cleanup() trap (SIGTERM handler - sends the
