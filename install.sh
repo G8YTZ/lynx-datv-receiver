@@ -76,20 +76,62 @@ fi
 # so this script is safe to re-run.
 chmod +x ~/lynx/lynx_start.sh
 
-# --- Autostart file (labwc) -----------------------------------
-# This is the one part of Section 8 that's safe to script -
-# creating the file itself is unambiguous. Enabling auto-login
-# to the desktop is NOT scripted here deliberately: it's a
-# one-time GUI toggle, and getting it wrong via an unverified
-# raspi-config flag risks leaving the Pi in a broken boot state,
-# a worse outcome than just asking for one manual step.
-echo "--- Setting up labwc autostart ---"
-mkdir -p ~/.config/labwc
+# --- systemd user service (replaces labwc autostart) -----------
+# Previously just a bare "lxterminal -e lynx_start.sh &" line in
+# labwc's own autostart file - that only ever launches Lynx once, at
+# boot, with nothing bringing it back if it ever exits or hangs.
+# lynx_start.sh's own health-check loop already calls systemd-notify
+# (READY, and WATCHDOG=1 every ~10s) for exactly this purpose - it's
+# just never had a real systemd unit wired up to act on it until now.
+# A user-level (not system-level) service, since mpv and the OSD
+# overlay need the logged-in user's own Wayland session (labwc) and
+# PipeWire audio - resources scoped to that user's session, not
+# available to a system-wide service.
+echo "--- Setting up systemd user service ---"
+mkdir -p ~/.config/systemd/user
+cp ~/lynx/lynx.service ~/.config/systemd/user/lynx.service
+systemctl --user daemon-reload
+systemctl --user enable lynx.service
+loginctl enable-linger "$USER" 2>/dev/null || true
+
+# Remove the old autostart line if present, so Lynx isn't launched
+# twice (once by labwc autostart, once by the new service) - leaves
+# the rest of the autostart file untouched, since it's a
+# general-purpose labwc file, not Lynx-specific.
 if [ -f ~/.config/labwc/autostart ] && grep -q "lynx_start.sh" ~/.config/labwc/autostart; then
-  echo "Autostart already configured - leaving it untouched."
+  sed -i '/lynx_start\.sh/d' ~/.config/labwc/autostart
+  echo "Removed the old autostart line - the systemd service replaces it."
+fi
+
+# --- Cursor-hide keybind (labwc rc.xml) ------------------------
+# Only created if rc.xml doesn't exist at all - same reasoning as
+# the auto-login decision above: rc.xml is a general-purpose labwc
+# config file, not Lynx-specific, so someone may already have their
+# own customisations in there. Blindly merging a <keybind> into an
+# existing file risks producing invalid XML or clobbering something
+# unrelated - safer to only act when there's genuinely nothing there
+# yet, and print clear manual instructions otherwise.
+echo "--- Setting up cursor-hide keybind ---"
+if [ -f ~/.config/labwc/rc.xml ]; then
+  echo "rc.xml already exists - leaving it untouched."
+  echo "(To hide the mouse cursor, add this inside its <keyboard> section:"
+  echo '  <keybind key="A-W-h">'
+  echo '    <action name="HideCursor" />'
+  echo '    <action name="WarpCursor" x="-1" y="-1" />'
+  echo '  </keybind>)'
 else
-  echo "lxterminal -e /home/pi/lynx/lynx_start.sh &" >> ~/.config/labwc/autostart
-  chmod +x ~/.config/labwc/autostart
+  cat > ~/.config/labwc/rc.xml << 'RCXML'
+<?xml version="1.0"?>
+<openbox_config>
+  <keyboard>
+    <keybind key="A-W-h">
+      <action name="HideCursor" />
+      <action name="WarpCursor" x="-1" y="-1" />
+    </keybind>
+  </keyboard>
+</openbox_config>
+RCXML
+  echo "Created."
 fi
 
 # --- Cursor-hide keybind (labwc rc.xml) ------------------------
@@ -134,6 +176,8 @@ echo "    Then reboot to confirm Lynx starts automatically."
 echo ""
 echo "To test right now without rebooting:"
 echo "  cd ~/lynx && ./lynx_start.sh"
+echo "  (or: systemctl --user start lynx.service - runs the same script, but"
+echo "   under systemd's own supervision, matching how it'll actually run on boot)"
 echo ""
 echo "Once it's running, set your Picotuner's IP address and site details"
 echo "from the Web Control Portal's Configuration page - no need to hand-edit"

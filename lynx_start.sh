@@ -184,6 +184,16 @@ else
     echo -e "${GREEN}OK${NC}"
 fi
 
+# ── Hide the mouse cursor ───────────────────────────────────────
+# Triggers labwc's own HideCursor+WarpCursor keybind (see rc.xml) -
+# placed here, after the overlay has already confirmed starting,
+# rather than in ~/.config/labwc/autostart with a fixed sleep, since
+# by this point labwc is guaranteed to have been running long enough
+# to have its keybinds registered - a fixed sleep elsewhere risked
+# racing against this script's own, much longer startup sequence
+# (network wait, NTP wait, etc).
+wtype -M alt -M logo -P h 2>/dev/null || true
+
 # ── Tuning is now handled inside lynx_app.py itself ────────────
 # On startup it automatically resumes whatever Lynx was last doing
 # (crash recovery, watchdog restart, scheduled reboot, or a genuine
