@@ -88,7 +88,7 @@ mkdir -p ~/.config/labwc
 if [ -f ~/.config/labwc/autostart ] && grep -q "lynx_start.sh" ~/.config/labwc/autostart; then
   echo "Autostart already configured - leaving it untouched."
 else
-  echo "lxterminal -e /home/pi/lynx/lynx_start.sh &" >> ~/.config/labwc/autostart
+  echo "lxterminal -e $HOME/lynx/lynx_start.sh &" >> ~/.config/labwc/autostart
   chmod +x ~/.config/labwc/autostart
 fi
 

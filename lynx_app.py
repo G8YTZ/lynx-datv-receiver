@@ -455,14 +455,21 @@ def restart_mpv(target_url: str, is_rf: bool = True):
     )
     env = os.environ.copy()
     env["DISPLAY"] = ":0"
-    env["XAUTHORITY"] = "/home/pi/.Xauthority"
-    # Explicitly hardcoded rather than relying on inheritance from
+    env["XAUTHORITY"] = os.path.expanduser("~/.Xauthority")
+    # Explicitly set rather than relying on inheritance from
     # lynx_app.py's own environment — that varied depending on how the
     # whole process chain was originally started (local desktop
     # terminal vs SSH session), causing intermittent video freezes
     # where mpv's playback stayed internally healthy (time-pos still
     # advancing, no eof) but nothing reached the actual display.
-    env["XDG_RUNTIME_DIR"] = "/run/user/1000"
+    # Was hardcoded to "/home/pi/..." until 2026-07-31 - broke for a
+    # user who'd chosen a different username during setup (increasingly
+    # common, since Raspberry Pi Imager now commonly prompts for a
+    # custom username rather than defaulting to "pi"). Confirmed via a
+    # real report: install completed and Lynx worked fine when started
+    # manually, but not via the autostart line - installed by install.sh
+    # with the same hardcoded assumption, fixed there too.
+    env["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
     # Force Xwayland rather than native Wayland — confirmed fix for a
     # freeze that only occurred when launched from within the actual
     # desktop/labwc session (local terminal or autostart), never via
