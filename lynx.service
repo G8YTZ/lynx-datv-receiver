@@ -1,0 +1,33 @@
+[Unit]
+Description=Lynx DATV Receiver
+# mpv and the OSD overlay (gtk4-layer-shell) both need a running
+# Wayland compositor (labwc) to draw into, so this can't start any
+# earlier than the graphical session itself being ready.
+After=graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=notify
+# lynx_start.sh itself calls systemd-notify (READY on successful
+# startup, WATCHDOG=1 from its own health-check loop) - already built
+# in, confirmed directly in the script, just never previously wired
+# up to a real systemd unit that would act on it.
+ExecStart=%h/lynx/lynx_start.sh
+Restart=always
+RestartSec=5
+
+# The script's own watchdog loop pings roughly every 10s, with a
+# possible extra ~3s retry during a genuine tune transition - worst
+# case observed directly in the script is ~13-15s between pings.
+# 45s gives a safe ~3x margin above that, so ordinary timing jitter
+# never triggers a false-positive restart, while a genuine hang is
+# still caught reasonably promptly.
+WatchdogSec=45
+
+# Give the script's own cleanup() trap (SIGTERM handler - sends the
+# Picotuner a "stream off" command and stops mpv cleanly) time to run
+# before a hard kill.
+TimeoutStopSec=15
+
+[Install]
+WantedBy=graphical-session.target
