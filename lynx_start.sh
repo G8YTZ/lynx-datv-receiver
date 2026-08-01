@@ -192,6 +192,20 @@ fi
 # to have its keybinds registered - a fixed sleep elsewhere risked
 # racing against this script's own, much longer startup sequence
 # (network wait, NTP wait, etc).
+# Checked explicitly, once, rather than just letting the command fail
+# silently - confirmed directly (2026-08-01) that an install predating
+# wtype being added to install.sh's dependency list left the cursor
+# permanently visible with absolutely nothing in the logs to explain
+# why, since the failure was fully swallowed by `2>/dev/null || true`
+# below. git pull / Update Now only ever pull code, never install
+# system packages, so any install that predates this fix needs `sudo
+# apt install -y wtype` run by hand regardless of how up to date its
+# code is - this warning at least makes that obvious in the startup
+# log instead of a silent, invisible failure.
+if ! command -v wtype > /dev/null 2>&1; then
+    echo -e "${AMBER}wtype not installed - mouse cursor will stay visible.${NC}"
+    echo -e "${AMBER}Fix: sudo apt install -y wtype${NC}"
+fi
 wtype -M alt -M logo -P h 2>/dev/null || true
 
 # ── Tuning is now handled inside lynx_app.py itself ────────────
@@ -237,8 +251,13 @@ while true; do
         # doing at the exact moment this was detected, before it gets
         # killed and restarted - the one chance to catch a genuinely
         # hung lock or background thread directly, rather than losing
-        # that evidence the moment the process is replaced.
-        echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) - web app unresponsive, dumping stacks ===" >> /tmp/lynx_stacktrace.log
+        # that evidence the moment the process is replaced. Same
+        # /var/log/lynx-preferred, /tmp-fallback logic as
+        # lynx_app.py's own faulthandler setup, so this marker and the
+        # actual dump always land in the same file.
+        STACKTRACE_LOG="/tmp/lynx_stacktrace.log"
+        [ -w /var/log/lynx ] 2>/dev/null && STACKTRACE_LOG="/var/log/lynx/stacktrace.log"
+        echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) - web app unresponsive, dumping stacks ===" >> "$STACKTRACE_LOG"
         kill -USR1 "$APP_PID" 2>/dev/null || true
         sleep 1  # give it a moment to actually write before the kill below
         break
