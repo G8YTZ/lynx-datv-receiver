@@ -222,9 +222,25 @@ systemd-notify --ready 2>/dev/null || true
 while true; do
     sleep 10
 
+    # Re-hide the mouse cursor - the one at startup only ever fires
+    # once, so if a mouse gets plugged in later (e.g. during
+    # troubleshooting a frozen screen), the cursor stays visible
+    # indefinitely with nothing to re-hide it short of a full restart.
+    # Cheap enough to just re-trigger every cycle rather than track
+    # whether it's actually needed.
+    wtype -M alt -M logo -P h 2>/dev/null || true
+
     status_json=$(curl -sf http://localhost:8080/api/status 2>/dev/null)
     if [ -z "$status_json" ]; then
         echo -e "${RED}Web app not responding — exiting for restart.${NC}"
+        # Capture what every thread inside lynx_app.py was actually
+        # doing at the exact moment this was detected, before it gets
+        # killed and restarted - the one chance to catch a genuinely
+        # hung lock or background thread directly, rather than losing
+        # that evidence the moment the process is replaced.
+        echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) - web app unresponsive, dumping stacks ===" >> /tmp/lynx_stacktrace.log
+        kill -USR1 "$APP_PID" 2>/dev/null || true
+        sleep 1  # give it a moment to actually write before the kill below
         break
     fi
     # Check for ANY currently-running mpv process matching our socket —

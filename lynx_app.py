@@ -30,6 +30,7 @@
 # ============================================================
 
 import asyncio
+import faulthandler
 import json
 import threading
 import os
@@ -52,6 +53,22 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import lynx_notifications
+
+# Diagnostic: dump every thread's current stack trace to a log file on
+# demand (kill -USR1 <pid of lynx_app.py>) - added 2026-08-01 after a
+# real, confirmed incident where the Web UI became completely
+# unresponsive while mpv (a genuinely separate process) kept running
+# fine - strongly suggesting something stuck INSIDE this process (a
+# held lock, a hung background thread) rather than anything display/
+# GPU-related. lynx_start.sh's own health-check loop also triggers
+# this automatically right before concluding the web app isn't
+# responding, so a dump gets captured at the actual moment of failure
+# without needing anyone to catch it manually in the act. Purely
+# diagnostic and read-only - registering this cannot itself cause the
+# hang it's meant to help catch, and does nothing at all unless the
+# signal is actually sent.
+_faulthandler_log = open('/tmp/lynx_stacktrace.log', 'a')
+faulthandler.register(signal.SIGUSR1, file=_faulthandler_log, all_threads=True)
 
 def utc_now_iso() -> str:
     """Same output format as the deprecated datetime.utcnow().isoformat()
