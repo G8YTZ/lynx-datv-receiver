@@ -4,6 +4,18 @@ All notable changes to Lynx are documented here, in reverse chronological order.
 
 This file starts from 2026-07-29. Earlier changes are recorded in each document's own version history section instead (e.g. the Installation Guide, Web UI Reference) - this centralized approach begins here rather than attempting to retroactively reconstruct everything that came before it.
 
+## 2026-08-01
+
+### Added
+- A diagnostic capability for tracking down an intermittent, hard-to-reproduce hang: a confirmed real incident where the Web UI became completely unresponsive while `mpv` (a genuinely separate process) kept running normally - strongly suggesting something stuck inside `lynx_app.py` itself (a held lock, a hung background thread) rather than anything display/GPU-related, but with no direct evidence yet of exactly what. `lynx_app.py` now registers Python's own `faulthandler` on `SIGUSR1`, dumping every thread's current stack trace to `/tmp/lynx_stacktrace.log` on demand - tested directly against a genuinely hung thread before deploying, confirmed to correctly show its exact blocked location. `lynx_start.sh`'s own health-check loop now triggers this automatically right at the moment it detects the web app not responding, capturing the evidence before the process gets killed and replaced, rather than losing it. Known limitation of the automatic trigger: it only fires if `/api/status` itself stops responding - a hang isolated to a different endpoint (e.g. one waiting on `tune_lock` specifically) might not trip it, though the same capability remains available manually (`kill -USR1 $(pgrep -f lynx_app.py)`) regardless.
+
+### Fixed
+- The mouse cursor-hide only ever fired once, right at Lynx's own startup - if a mouse was ever plugged in later (confirmed directly: during troubleshooting a separate, unrelated screen freeze), the cursor stayed visible indefinitely, with nothing short of a full restart to hide it again. Now re-triggered periodically from the existing health-check loop, so it recovers automatically instead.
+- `wtype` (what actually triggers the cursor-hide) was never in `install.sh`'s own dependency list at all - confirmed directly via `wtype: command not found` on a fresh install, meaning cursor-hide had been silently failing on every single install since it was introduced, with the failure swallowed by its own `2>/dev/null || true` safety net. Added to the dependency list - but since `git pull`/`Update Now` only ever pull code and never install system packages, any install that predates this fix won't get `wtype` itself just by updating (`sudo apt install -y wtype` needs running by hand once). `lynx_start.sh` now checks for this explicitly at startup and prints a clear, visible warning with the exact fix if it's missing, rather than failing silently the way it did here.
+
+### Known limitation
+- A real, confirmed, intermittent freeze/hang on a Pi 500 - screen frozen (mouse cursor still moves), Web UI unresponsive, `mpv` and the rest of the OS otherwise healthy (no memory pressure, no thermal/undervoltage throttling per `vcgencmd get_throttled`, no gaps in a continuous background watchdog log). Not yet root-caused. Ruled out so far: memory exhaustion, thermal/power throttling, screen blanking (already disabled). The diagnostic capability added above (see "Added") is specifically aimed at catching this properly the next time it happens, rather than continuing to infer from indirect, after-the-fact evidence.
+
 ## 2026-07-31
 
 ### Fixed
