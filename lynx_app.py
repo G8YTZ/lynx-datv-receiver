@@ -4402,8 +4402,8 @@ def web_ui():
         </div>
         <div class="col-auto d-flex align-items-start gap-2 pt-1">
             <span><span class="led led-grey" id="picotuner-led"></span><small id="picotuner-status" class="text-muted">Picotuner</small></span>
-            <span class="badge bg-secondary" id="mode-badge">IDLE</span>
-            <a href="/diagnostics" class="badge bg-secondary text-decoration-none" title="mpv restart/stop diagnostics" id="diagnostics-link">mpv: <span id="mpv-restart-count">0</span></a>
+            <span class="btn btn-sm" id="mode-badge" style="background:#3a4a63; color:#fff; cursor:default;">IDLE</span>
+            <a href="/diagnostics" class="btn btn-sm btn-outline-light" title="mpv restart/stop diagnostics" id="diagnostics-link">mpv: <span id="mpv-restart-count">0</span></a>
             <span class="btn btn-sm" id="version-badge" style="background:#3a4a63; color:#fff; cursor:default;" title="Current version">v?</span>
             <button class="btn btn-sm btn-outline-light" onclick="checkForUpdates()" id="update-check-btn" title="Check for updates now">&#x1F504; Check Updates</button>
             <button class="btn btn-sm btn-success" onclick="applyUpdate()" id="update-apply-btn" style="display:none" title="Pull the latest code and restart">&#x2B06;&#xFE0F; Update</button>
@@ -4591,7 +4591,7 @@ async function updateStatus() {
         const mode = s.lynx?.mode || 'idle';
         const badge = document.getElementById('mode-badge');
         badge.textContent = mode.toUpperCase();
-        badge.className = 'badge ' + (mode === 'idle' ? 'bg-secondary' : mode === 'rf' ? 'bg-success' : 'bg-info');
+        badge.style.background = mode === 'idle' ? '#3a4a63' : mode === 'rf' ? '#1a9850' : '#3b82c4';
 
         // mpv restart counter - links through to /diagnostics for detail
         const restartCount = s.lynx?.mpv_restarts_total ?? 0;
