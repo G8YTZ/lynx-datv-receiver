@@ -77,6 +77,19 @@ fi
 # so this script is safe to re-run.
 chmod +x ~/lynx/lynx_start.sh
 
+# --- Persistent log directory ----------------------------------
+# /tmp is typically RAM-backed on Raspberry Pi OS, losing its
+# contents on every reboot - genuinely confirmed as a real problem
+# (2026-08-01) when a stack-trace dump meant to help diagnose an
+# intermittent freeze was lost to exactly this, right when it would
+# have mattered most. lynx_app.py's own diagnostic logging prefers
+# this location when it's writable, falling back to /tmp otherwise -
+# this just makes sure it's actually there and owned correctly from
+# the start.
+echo "--- Setting up persistent log directory ---"
+sudo mkdir -p /var/log/lynx
+sudo chown "$USER":"$USER" /var/log/lynx
+
 # --- Autostart file (labwc) -----------------------------------
 # This is the one part of Section 8 that's safe to script -
 # creating the file itself is unambiguous. Enabling auto-login

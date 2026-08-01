@@ -251,8 +251,13 @@ while true; do
         # doing at the exact moment this was detected, before it gets
         # killed and restarted - the one chance to catch a genuinely
         # hung lock or background thread directly, rather than losing
-        # that evidence the moment the process is replaced.
-        echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) - web app unresponsive, dumping stacks ===" >> /tmp/lynx_stacktrace.log
+        # that evidence the moment the process is replaced. Same
+        # /var/log/lynx-preferred, /tmp-fallback logic as
+        # lynx_app.py's own faulthandler setup, so this marker and the
+        # actual dump always land in the same file.
+        STACKTRACE_LOG="/tmp/lynx_stacktrace.log"
+        [ -w /var/log/lynx ] 2>/dev/null && STACKTRACE_LOG="/var/log/lynx/stacktrace.log"
+        echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) - web app unresponsive, dumping stacks ===" >> "$STACKTRACE_LOG"
         kill -USR1 "$APP_PID" 2>/dev/null || true
         sleep 1  # give it a moment to actually write before the kill below
         break
