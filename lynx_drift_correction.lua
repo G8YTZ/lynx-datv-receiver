@@ -122,9 +122,31 @@ local HARD_FREEZE_ADVANCE_THRESHOLD = 0.2     -- playback must advance at least 
 local HARD_FREEZE_CONSECUTIVE_CHECKS = 2       -- this many consecutive near-zero-advance checks
                                                  -- (~2s of genuinely zero progress) confirms a
                                                  -- hard freeze, distinct from gradual drift
+local HARD_FREEZE_STARTUP_GRACE_SECS = 12.0    -- no hard-freeze evaluation at all for this long
+                                                 -- after a fresh start-file - covers mpv's own
+                                                 -- normal initial buffering/seek-to-live-edge,
+                                                 -- during which playback-time can legitimately
+                                                 -- sit still or advance very slowly for a few
+                                                 -- seconds without anything actually being wrong.
+                                                 -- Matches the same, already-proven precedent as
+                                                 -- lynx_app.py's own mpv_decoder_health_monitor()
+                                                 -- STARTUP_GRACE_SECS - confirmed live as a real,
+                                                 -- missing gap here specifically: with only 2
+                                                 -- consecutive 1s checks needed to trigger, and no
+                                                 -- grace period at all, a fresh restart could be
+                                                 -- falsely flagged as "frozen" within 2 seconds of
+                                                 -- starting, during completely normal initial
+                                                 -- buffering - rare when mpv restarted
+                                                 -- infrequently, but tri_watch switching sources
+                                                 -- far more often than this was ever exercised
+                                                 -- against turned this into a frequent, repeating
+                                                 -- false positive.
 local hard_freeze_streak = 0
 local hard_freeze_detected_at = 0.0  -- 0 means "not currently frozen"; timestamp of first
                                        -- confirmation once one has been detected
+local playback_start_time = 0.0  -- set by reset_state() on every fresh start-file - lets
+                                   -- check_drift() know how long the current playback has
+                                   -- actually been running, for the startup grace period above
 
 local function write_status()
     local f = io.open(STATUS_PATH, "w")
@@ -151,6 +173,7 @@ local function reset_state()
     last_action_at = mp.get_time()
     hard_freeze_streak = 0
     hard_freeze_detected_at = 0.0
+    playback_start_time = mp.get_time()
 end
 
 local function check_drift()
@@ -176,20 +199,25 @@ local function check_drift()
         -- gets a fundamentally different response: skip straight to
         -- signalling for a full restart rather than trying a nudge or
         -- drop-buffers, neither of which can help when playback isn't
-        -- advancing at all.
-        if playback_delta < HARD_FREEZE_ADVANCE_THRESHOLD then
-            hard_freeze_streak = hard_freeze_streak + 1
-        else
-            hard_freeze_streak = 0
-            hard_freeze_detected_at = 0.0
-        end
-        if hard_freeze_streak >= HARD_FREEZE_CONSECUTIVE_CHECKS and hard_freeze_detected_at == 0.0 then
-            mp.msg.warn(string.format(
-                "lynx_drift_correction: hard freeze detected - playback advanced < %.1fs " ..
-                "over %d consecutive checks despite real time passing - signalling for an " ..
-                "immediate full restart rather than nudging/drop-buffers",
-                HARD_FREEZE_ADVANCE_THRESHOLD, HARD_FREEZE_CONSECUTIVE_CHECKS))
-            hard_freeze_detected_at = now
+        -- advancing at all. Skipped entirely during the startup grace
+        -- period (see HARD_FREEZE_STARTUP_GRACE_SECS above) - normal
+        -- initial buffering can legitimately look identical to a
+        -- freeze for the first few seconds.
+        if now - playback_start_time >= HARD_FREEZE_STARTUP_GRACE_SECS then
+            if playback_delta < HARD_FREEZE_ADVANCE_THRESHOLD then
+                hard_freeze_streak = hard_freeze_streak + 1
+            else
+                hard_freeze_streak = 0
+                hard_freeze_detected_at = 0.0
+            end
+            if hard_freeze_streak >= HARD_FREEZE_CONSECUTIVE_CHECKS and hard_freeze_detected_at == 0.0 then
+                mp.msg.warn(string.format(
+                    "lynx_drift_correction: hard freeze detected - playback advanced < %.1fs " ..
+                    "over %d consecutive checks despite real time passing - signalling for an " ..
+                    "immediate full restart rather than nudging/drop-buffers",
+                    HARD_FREEZE_ADVANCE_THRESHOLD, HARD_FREEZE_CONSECUTIVE_CHECKS))
+                hard_freeze_detected_at = now
+            end
         end
 
         -- Playback advancing by less than real time actually passed

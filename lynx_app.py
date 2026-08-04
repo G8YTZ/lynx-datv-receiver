@@ -53,6 +53,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import lynx_notifications
+import lynx_rtmp_probe
 
 # Diagnostic: dump every thread's current stack trace to a log file on
 # demand (kill -USR1 <pid of lynx_app.py>) - added 2026-08-01 after a
@@ -150,6 +151,69 @@ mpv_running_for_rf: bool = False  # tracks whether mpv has actually been started
                                    # for-lock) - see rf_mpv_lifecycle_monitor()
 mpv_last_started_at: float = 0.0  # timestamp of the most recent mpv start - lets
                                    # mpv_decoder_health_monitor grant a startup grace period
+# Tri-watch (up to 3 sources - any mix of RF-A, RF-B, and a stream
+# input - watched simultaneously) - Stage 1: infrastructure only.
+# Generalized from an earlier, more limited "dual-watch" (RF-A + one
+# fixed stream) design after a genuinely good real-world use case
+# surfaced: two RF sources on the SAME frequency but different symbol
+# rates, since a tuner given one specific, known symbol rate to lock
+# onto (rather than scanning a range) does noticeably better on weak
+# signals - this needed the source list to be generic (any type, any
+# combination), not RF-vs-stream-shaped, so it was worth generalizing
+# now rather than bolting a special case onto the earlier, narrower
+# design.
+#
+# Each configured, enabled source is watched continuously in the
+# background regardless of what's actually being displayed right now -
+# no priority/arbitration logic yet (Stage 2+), and RF sources are NOT
+# automatically tuned to their configured frequency/symbol-rate by this
+# stage either (that's active control, not detection - deliberately
+# left for Stage 2, matching the same scope boundary drawn for the
+# original, narrower dual-watch design). For now, getting an RF
+# source's configured tuning actually applied still means using the
+# existing Manual Tune feature by hand.
+#
+# Created once at startup from config, since this was described as a
+# fixed, permanent setup rather than something reconfigured often -
+# changing tri_watch config currently needs a restart to take effect,
+# not a live reload.
+tri_watch_enabled: bool = False
+tri_watch_sources_cfg = []  # a STABLE SNAPSHOT of config's tri_watch.sources[]
+                             # taken once at startup, alongside tri_watch_probes
+                             # below - deliberately NOT re-read live from config,
+                             # unlike most other settings in this file. Confirmed
+                             # as a real, reported bug otherwise: tri_watch_probes
+                             # (and the arbitrator's own internal per-index state)
+                             # are only ever built once at startup from this exact
+                             # list; if the arbitrator's own loop or the status
+                             # endpoint instead read the LIVE config.tri_watch.sources
+                             # after a Config-page save (which reloads config
+                             # immediately, before any restart), a source removed
+                             # or reordered there would silently shift every
+                             # later index - a stream probe built at startup
+                             # index 2 would suddenly be looked up at whatever
+                             # index 1 now means, mismatching real probes against
+                             # the wrong sources and breaking tri_watch's actual,
+                             # live status entirely, well before the restart the
+                             # UI already warns is required actually happens.
+tri_watch_probes = {}  # maps config's tri_watch.sources[] list index -> a
+                        # lynx_rtmp_probe.RTMPStreamProbe instance, for
+                        # type:stream sources only - RF sources need no
+                        # separate probe object, since their status is
+                        # already tracked by the existing
+                        # picotuner_state/picotuner_state_b globals
+tri_watch_arbitrator = None  # a TriWatchArbitrator instance once tri_watch
+                              # is enabled, or None otherwise - actually
+                              # instantiated further down, after its own
+                              # class and callback functions are defined
+tri_watch_target_rcv = None  # 1, 2, or None - which receiver tri_watch's
+                              # own arbitrator currently wants displayed,
+                              # if any (None while a stream is showing, or
+                              # while idle). Read by rf_mpv_lifecycle_monitor()
+                              # so it knows which receiver to actually watch
+                              # and start mpv for, instead of assuming Rx1
+                              # the way it always has for normal, non-
+                              # tri_watch RF mode.
 current_preset: str = ""
 current_stream_name: str = ""  # friendly name for the OSD, set by whoever
                                 # initiated the stream — not inspected from
@@ -193,6 +257,7 @@ update_state = {
     "update_available": False,
     "commits_behind": 0,
     "new_commits": [],         # list of "abc1234 commit subject" strings, most recent first
+    "channel": None,           # 'stable' or 'beta' - populated lazily, same timing as current_version (see ensure_current_version)
 }
 
 def git_cmd(*args, timeout=15):
@@ -239,6 +304,24 @@ def get_default_branch():
         return ref.rsplit("/", 1)[-1]
     return "main"  # reasonable fallback if the symbolic ref isn't set for some reason
 
+def get_update_branch():
+    """Which branch update checks/pulls should actually use, based on
+    the configured update channel - added to support a beta channel
+    (per Justin's own request) alongside the existing stable one,
+    mirroring the model BATC's own Portsdown project already uses:
+    regular users stay on the repo's normal default branch (whatever
+    it's actually named - unaffected by any of this), while
+    experimenters can opt into tracking a separate 'beta' branch for
+    newer, less-proven code, and switch back to stable at any time.
+    'beta' is intentionally a fixed, literal branch name rather than
+    also going through get_default_branch()'s own auto-detection -
+    there's only ever one beta branch, by definition, so there's
+    nothing to detect."""
+    channel = config.get('update', {}).get('channel', 'stable')
+    if channel == 'beta':
+        return 'beta'
+    return get_default_branch()
+
 def check_for_updates():
     """Safe and read-only: git fetch, then compare local HEAD to the
     remote's HEAD - never touches working files or applies anything.
@@ -252,7 +335,7 @@ def check_for_updates():
         update_state["checked_at"] = utc_now_iso()
         return
 
-    branch = get_default_branch()
+    branch = get_update_branch()
     ok, behind_str = git_cmd("rev-list", "--count", f"HEAD..origin/{branch}")
     if not ok:
         update_state["check_error"] = f"Could not compare versions: {behind_str}"
@@ -288,6 +371,8 @@ def ensure_current_version():
         except Exception as e:
             update_state["current_version"] = "unknown"
             print(f"[update-check] version detection failed unexpectedly: {e}")
+    if update_state["channel"] is None:
+        update_state["channel"] = config.get('update', {}).get('channel', 'stable')
 
 
                                # just the initial synchronous part) — both
@@ -407,6 +492,37 @@ def get_mpv_drift_status():
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
+
+def current_rf_target_port():
+    """Returns the UDP port mpv should currently be pointed at for RF
+    playback, given whatever mode is actually active right now -
+    tri_watch's own chosen receiver, diversity's combiner output, or
+    normal single-receiver mode's own port.
+
+    Centralises this decision specifically because it was previously
+    duplicated, inconsistently, across multiple call sites - two of
+    which (both inside mpv_decoder_health_monitor(), its playback-delay
+    and hard-freeze restart triggers) were never updated for tri_watch
+    at all, and kept silently restarting to Rx1's port even while
+    tri_watch was actively, correctly displaying Rx2. Confirmed as a
+    real, reproduced bug via the diagnostics timeline: a hard-freeze
+    restart during a genuine tri_watch Rx2 session pointed mpv at the
+    wrong receiver's port, which could never render there, producing a
+    repeated "restart did not confirm rendering" failure specifically
+    during Rx2 sessions - the freeze detection itself was correct, but
+    the recovery attempt was restarting the wrong thing entirely.
+
+    rf_mpv_lifecycle_monitor()'s own tri_watch-aware branch is left as
+    it already was rather than switched over to this helper too - it's
+    already proven correct and tested, and touching genuinely-working
+    code for its own sake adds risk without benefit."""
+    cfg = config['picotuner']
+    if tri_watch_enabled and tri_watch_target_rcv == 2:
+        return cfg['ts_port_b']
+    elif diversity_enabled:
+        return config['diversity']['combiner_out_port']
+    else:
+        return cfg['ts_port']
 
 def restart_mpv(target_url: str, is_rf: bool = True):
     """Fully kill and restart the mpv process, pointing it at a fresh
@@ -571,6 +687,28 @@ def restart_mpv(target_url: str, is_rf: bool = True):
     mpv_cmd({"command": ["set_property", "volume", current_volume]})
     mpv_cmd({"command": ["set_property", "mute", False]})
 
+def _recent_hevc_decoder_error(since_ts: float) -> bool:
+    """Checks dmesg for the specific hardware HEVC decoder error
+    ("rpi-hevc-dec ... Missing inuse DPB ent") directly tied to a real,
+    confirmed freeze earlier this session - one a plain mpv restart
+    couldn't recover from, only a full Pi reboot could. Scoped to
+    entries from since_ts onwards specifically, not the whole kernel
+    ring buffer (which persists across the entire uptime) - an old,
+    already-resolved occurrence from hours or days ago must not keep
+    incorrectly flagging every future render attempt as failed forever.
+    Best-effort only: dmesg can require elevated permissions on some
+    systems, or simply be unavailable - any failure here is treated as
+    "no error found" rather than blocking rendering confirmation on
+    something that isn't itself the actual video pipeline."""
+    try:
+        since_str = datetime.fromtimestamp(since_ts).strftime("%Y-%m-%d %H:%M:%S")
+        out = subprocess.run(["dmesg", "-T", "--since", since_str],
+                              capture_output=True, text=True, timeout=2)
+        return "rpi-hevc-dec" in out.stdout and "DPB" in out.stdout
+    except Exception as e:
+        print(f"[mpv_render] dmesg check failed (non-fatal, treating as no error found): {e}")
+        return False
+
 def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
     """Polls mpv's own log (freshly truncated by restart_mpv() just
     before this is called) for concrete evidence it has actually
@@ -586,6 +724,22 @@ def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
     resolving), so a fixed guess can't reliably cover every case. This
     polls for real evidence instead, bounded by a timeout so a genuine
     problem never blocks the caller indefinitely.
+
+    Also checks dmesg for a recent hardware HEVC decoder error before
+    trusting mpv's own "AV:"/"VO:" markers - confirmed as a real gap
+    otherwise: those markers only prove mpv's own software pipeline is
+    progressing (demuxing, decoding, submitting frames onward), not
+    that a frame actually reached the screen. If an earlier freeze left
+    the GPU decoder itself wedged, a fresh mpv process can still print
+    entirely normal progress markers while the hardware never produces
+    a real frame - reported directly as a stream switch that "swapped
+    OK" (this function returning True, cover dropped) but exposed the
+    desktop underneath, recovered only by a full Pi reboot, not a
+    simple mpv restart. Treating a detected decoder error as an
+    immediate, definite failure rather than retrying within this same
+    call - the hardware is confirmed wedged at that point, not just
+    "not ready yet", so further polling here would only waste the
+    remaining timeout.
 
     Returns True if confirmed within the timeout, False if it timed
     out. Callers now check this return value (a real bug, confirmed
@@ -610,6 +764,19 @@ def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
                 content = f.read()
             if any(m in content for m in markers):
                 elapsed = time.time() - start
+                if _recent_hevc_decoder_error(start):
+                    print(f"[mpv_render] mpv log shows rendering markers after {elapsed:.1f}s, "
+                          f"but a hardware HEVC decoder error was also just logged - treating "
+                          f"this as NOT genuinely rendering despite mpv's own pipeline appearing "
+                          f"to progress normally (likely a wedged GPU decoder from an earlier "
+                          f"crash - a full Pi reboot, not just an mpv restart, may be needed)")
+                    record_diagnostic_event(
+                        "mpv_render_hevc_decoder_error",
+                        "Rendering markers present but a hardware HEVC decoder error was also "
+                        "logged - treating as a failed render, GPU may be wedged and need a full "
+                        "Pi reboot to clear",
+                        count_as_mpv_restart=False)
+                    return False
                 print(f"[mpv_render] confirmed rendering after {elapsed:.1f}s")
                 return True
         except OSError:
@@ -1124,12 +1291,12 @@ def mpv_decoder_health_monitor():
                         print(f"[mpv_decoder_health] {restart_reason} - restarting mpv for a fresh decoder")
                         start_transition_cover()
                         time.sleep(0.3)
-                        if diversity_enabled:
-                            div_cfg = config['diversity']
-                            restart_mpv(f"udp://@:{div_cfg['combiner_out_port']}")
-                        else:
-                            cfg = config['picotuner']
-                            restart_mpv(f"udp://@:{cfg['ts_port']}")
+                        # Was: hardcoded to Rx1's port outside diversity
+                        # mode, regardless of what tri_watch actually
+                        # wanted displayed - see current_rf_target_port()'s
+                        # own docstring for the confirmed, real bug this
+                        # caused.
+                        restart_mpv(f"udp://@:{current_rf_target_port()}")
                         rendering_confirmed = wait_for_mpv_rendering()  # real rendering, not a guess
                         record_diagnostic_event(restart_category, restart_reason)
                         if rendering_confirmed:
@@ -1424,12 +1591,14 @@ def mpv_drift_monitor():
                                                      "the slower playback-delay trigger")
                         start_transition_cover()
                         time.sleep(0.3)
-                        if diversity_enabled:
-                            div_cfg2 = config['diversity']
-                            restart_mpv(f"udp://@:{div_cfg2['combiner_out_port']}")
-                        else:
-                            cfg = config['picotuner']
-                            restart_mpv(f"udp://@:{cfg['ts_port']}")
+                        # Was: hardcoded to Rx1's port outside diversity
+                        # mode, regardless of what tri_watch actually
+                        # wanted displayed - the same bug as the
+                        # playback-delay trigger above, confirmed as the
+                        # real, reproduced cause of "restart did not
+                        # confirm rendering" specifically during
+                        # tri_watch Rx2 sessions.
+                        restart_mpv(f"udp://@:{current_rf_target_port()}")
                         rendering_confirmed = wait_for_mpv_rendering()  # real rendering, not a guess
                         if rendering_confirmed:
                             # Same safety margin as the stream-mode restart
@@ -1621,6 +1790,75 @@ def rf_mpv_lifecycle_monitor():
     while True:
         time.sleep(POLL_SECS)
         try:
+            # tri_watch, when enabled, gets its own genuinely separate
+            # branch here rather than being skipped entirely - it needs
+            # this same lock-confirm/start-mpv machinery just as much
+            # as normal RF mode does, just watching whichever receiver
+            # tri_watch_target_rcv currently points at (set by the
+            # arbitrator) instead of always assuming Rx1. Kept as a
+            # fully separate branch, not interleaved with the existing,
+            # proven non-tri_watch logic below, specifically to leave
+            # that logic completely untouched and at zero added risk.
+            if tri_watch_enabled:
+                if tri_watch_target_rcv is None:
+                    # No RF source is what tri_watch currently wants
+                    # displayed (a stream is showing, or it's idle) -
+                    # nothing for this monitor to do.
+                    lock_streak = 0
+                    loss_streak = 0
+                    continue
+                cfg = config['picotuner']
+                target_rcv = tri_watch_target_rcv
+                target_state = picotuner_state_b if target_rcv == 2 else picotuner_state
+                target_port = cfg['ts_port_b'] if target_rcv == 2 else cfg['ts_port']
+                raw_locked = target_state.get("locked", False)
+
+                if raw_locked:
+                    loss_streak = 0
+                    lock_streak += 1
+                    if lock_streak >= LOCK_CONFIRM_POLLS and not mpv_running_for_rf:
+                        if tune_lock.acquire(timeout=2):
+                            try:
+                                print(f"[rf_mpv_lifecycle/tri_watch] Confirmed lock on Rx{target_rcv} "
+                                      f"after {lock_streak * POLL_SECS}s - starting mpv on {target_port}")
+                                restart_mpv(f"udp://@:{target_port}")
+                                rendering_confirmed = wait_for_mpv_rendering()
+                                if rendering_confirmed:
+                                    time.sleep(0.3)
+                                    end_transition_cover()
+                                    mpv_running_for_rf = True
+                                    mpv_last_started_at = time.time()
+                                    record_diagnostic_event("rf_lock_confirmed_start",
+                                                      f"after {lock_streak * POLL_SECS}s idle (tri_watch Rx{target_rcv})")
+                                else:
+                                    print("[rf_mpv_lifecycle/tri_watch] mpv did not confirm rendering "
+                                          "in time - keeping the cover up and retrying next poll")
+                                    record_diagnostic_event("rf_lock_render_not_confirmed",
+                                                      "mpv started but did not confirm rendering within "
+                                                      "the timeout - will retry (tri_watch)", count_as_mpv_restart=False)
+                            finally:
+                                tune_lock.release()
+                        # If the lock was busy, a user-initiated tune/
+                        # stream switch is already in progress and will
+                        # itself establish the correct mpv state - try
+                        # again next poll.
+                else:
+                    lock_streak = 0
+                    loss_streak += 1
+                    if loss_streak >= LOSS_CONFIRM_POLLS and mpv_running_for_rf:
+                        if tune_lock.acquire(timeout=2):
+                            try:
+                                print(f"[rf_mpv_lifecycle/tri_watch] Confirmed loss of lock on Rx{target_rcv} "
+                                      "- stopping mpv rather than leaving it running with no data")
+                                start_transition_cover()
+                                kill_mpv()
+                                mpv_running_for_rf = False
+                                record_diagnostic_event("rf_loss_confirmed_stop",
+                                                  f"after {loss_streak * POLL_SECS}s of confirmed loss (tri_watch Rx{target_rcv})")
+                            finally:
+                                tune_lock.release()
+                continue
+
             if current_mode != "rf":
                 lock_streak = 0
                 loss_streak = 0
@@ -1874,6 +2112,24 @@ def picotuner_table_monitor_b():
     the display code). Deliberately narrow: only mer/margin for tuner
     A here, not the full field set, to avoid touching anything already
     reliably sourced elsewhere.
+
+    Rx2's row is genuinely variable-width, not a fixed 16-column
+    layout - confirmed directly against real captured broadcasts: the
+    Picotuner sends a shorter row whenever it doesn't yet have the
+    full field set (no callsign while purely searching, a modulation-
+    type field appearing partway through acquisition, different column
+    counts seen live at different stages), and symbol_rate is present
+    in every one of these shorter rows too, just at a different column
+    position each time depending on what else is or isn't present.
+    Rows with the full 16+ columns (once genuinely locked) are parsed
+    by fixed column index as before; shorter rows use a second,
+    position-independent extraction instead, built around the one
+    pattern confirmed consistent across every real, observed variant:
+    the tuned frequency (a number >= 50, matching the tuner's own
+    valid 50-2500MHz range - low enough to rule out other numeric
+    fields seen in these same rows, like MER or NUL%) is always
+    immediately followed by the symbol rate, regardless of what comes
+    before it in that particular row.
     """
     global picotuner_state_b
     cfg = config['picotuner']
@@ -1902,6 +2158,19 @@ def picotuner_table_monitor_b():
                     picotuner_state["mer"] = parts[3]
                     picotuner_state["margin"] = parts[4]
                     continue
+                if parts[0] == '2' and len(parts) < 16:
+                    # Shorter row - see docstring above. Still worth
+                    # checking for a usable symbol_rate even though it
+                    # doesn't have the full field set for MER/margin/
+                    # modcod/etc.
+                    for i, token in enumerate(parts):
+                        try:
+                            freq_val = float(token)
+                        except ValueError:
+                            continue
+                        if freq_val >= 50 and i + 1 < len(parts) and parts[i + 1].isdigit():
+                            picotuner_state_b["symbol_rate"] = parts[i + 1]
+                            break
                 if parts[0] != '2' or len(parts) < 16:
                     continue
                 # Column indices confirmed directly against real
@@ -2057,6 +2326,19 @@ class TuneRequest(BaseModel):
                              # 10489500 kHz to an IF of 739500 kHz,
                              # which is what the Picotuner actually
                              # needs to be tuned to.
+    rcv: int = 1             # 1 or 2 — which actual receiver circuit
+                             # (NOT the same thing as plug, which only
+                             # selects the physical antenna input — see
+                             # tri_watch's own config comments for the
+                             # full rcv/fplug distinction). Only
+                             # meaningful outside diversity mode, which
+                             # always tunes both receivers together.
+                             # Defaults to 1, preserving every existing
+                             # caller's behaviour exactly - added
+                             # specifically so tri_watch's arbitrator
+                             # can reuse this exact, proven tune/display
+                             # path for Rx2 too, rather than maintaining
+                             # its own, separate reimplementation of it.
 
 class StreamRequest(BaseModel):
     url: str
@@ -2108,7 +2390,18 @@ class QrzConfigUpdate(BaseModel):
     settle_secs: float
     suppress_mins: float
     portable_locator: str = ""
-
+    lookup_username: str = ""    # QRZ XML Data API login - a genuinely
+    lookup_password: str = ""    # separate credential from api_key above
+                                   # (that one's for the Logbook API only).
+                                   # Both blank by default; the lookup
+                                   # feature simply does nothing if either
+                                   # is empty, rather than erroring.
+    lookup_for_notifications: bool = False  # whether tri_watch's own
+                                              # "someone else wants in"
+                                              # notification does a name
+                                              # lookup at all - independent
+                                              # of whether QRZ logging
+                                              # itself (enabled, above) is on
 class SlackConfigUpdate(BaseModel):
     enabled: bool
     webhook_url: str
@@ -2139,6 +2432,34 @@ class GpioTxConfigUpdate(BaseModel):
 class DisplayConfigUpdate(BaseModel):
     ppm_style: str = "full_fat"  # "skeleton" or "full_fat"
 
+class TriWatchRfSourceUpdate(BaseModel):
+    enabled: bool = True   # unchecked = this source is omitted from
+                            # tri_watch entirely, same as not listing
+                            # it in config.yaml at all
+    rcv: int                # 1 or 2 - which receiver this source uses
+    fplug: str = "a"        # which physical Picotuner plug feeds this receiver
+    freq: int                # kHz, matching the same convention used
+                              # throughout Lynx's own tuning UI
+    sr: int                  # kS/s
+    lnb_lo_khz: int = 0
+    label: str = ""
+    callsign: str = ""
+
+class TriWatchStreamSourceUpdate(BaseModel):
+    enabled: bool = True
+    domain: str = ""
+    app: str = ""
+    streamname: str = ""
+    port: int = 1935
+    label: str = ""
+    waiting_message: str = ""
+
+class TriWatchSourcesUpdate(BaseModel):
+    enabled: bool
+    rx1: TriWatchRfSourceUpdate
+    rx2: TriWatchRfSourceUpdate
+    stream: TriWatchStreamSourceUpdate
+
 class ConfigUpdateRequest(BaseModel):
     site: Optional[SiteConfigUpdate] = None
     picotuner: Optional[PicotunerConfigUpdate] = None
@@ -2148,6 +2469,7 @@ class ConfigUpdateRequest(BaseModel):
     notifications_companion: Optional[CompanionConfigUpdate] = None
     notifications_gpio_tx: Optional[GpioTxConfigUpdate] = None
     display: Optional[DisplayConfigUpdate] = None
+    tri_watch: Optional[TriWatchSourcesUpdate] = None
 
 # ── Helpers ───────────────────────────────────────────────────
 def stop_current():
@@ -2181,7 +2503,23 @@ def stop_current():
         start_transition_cover()
         kill_mpv()  # deliberately NOT restart_mpv() - Stop means stop, not "switch to
                      # whatever the raw tuner happens to be showing"
-        end_transition_cover()
+        # Deliberately NOT end_transition_cover() here - confirmed as
+        # the real cause of a reported ~1s flash of raw desktop when a
+        # tri_watch stream ends. The cover's own marker file is
+        # checked by the overlay in near-real-time (every frame), but
+        # state["mode"]/state["mpv_running_for_rf"] only update via
+        # its own, much slower periodic /api/status poll. Removing the
+        # marker here happened fast enough that the overlay could
+        # still be working off stale "still streaming" state for a
+        # second or two afterwards - marker gone + stale-but-still-
+        # "locked" belief together briefly told it to show through the
+        # now-transparent cover, except mpv had already been killed,
+        # so there was nothing left behind it but the desktop. The
+        # cover should simply stay up indefinitely after a genuine
+        # stop - only a path that starts a NEW, successfully-rendering
+        # source (which already calls end_transition_cover() itself,
+        # only once rendering is actually confirmed) should ever take
+        # it back down.
     threading.Thread(target=_stop_mpv, daemon=True).start()
 
 def fetch_batc_streams_from_api() -> list:
@@ -2256,6 +2594,702 @@ def ryde_cmd(request: dict) -> dict:
     #     raise HTTPException(status_code=503, detail=f"Ryde unavailable: {e}")
 
 # ── API: Status ───────────────────────────────────────────────
+def _default_tri_watch_label(src_cfg):
+    """A sensible fallback label for a tri_watch source that wasn't
+    given an explicit one in config."""
+    if src_cfg.get('type') == 'rf':
+        return f"RF Rx{src_cfg.get('rcv', 1)} ({src_cfg.get('freq', '?')} kHz)"
+    elif src_cfg.get('type') == 'stream':
+        return src_cfg.get('streamname', 'Stream')
+    return "Unknown source"
+
+def get_tri_watch_status():
+    """Builds the /api/status "tri_watch" section - a list of every
+    configured, enabled source (up to 3, any mix of Rx1, Rx2, and a
+    stream input), each with its own current active/locked status,
+    determined however is appropriate for that source's type. Purely a
+    status snapshot - no priority/arbitration logic here (Stage 2+).
+
+    RF sources are distinguished by `rcv` (1 or 2 - which actual
+    receiver/demodulator circuit), NOT `plug` (a/b - which physical
+    antenna input that circuit reads from). Confirmed directly against
+    _tune_impl()'s own, existing logic (2026-08-01): outside diversity
+    mode, a manual tune ALWAYS sends rcv=1 regardless of which plug was
+    selected - "plug B" in ordinary use still runs through the same
+    rcv=1 circuit, not a second one. picotuner_state_b (rcv=2's status)
+    is only ever genuinely populated during diversity mode, where rcv=1
+    and rcv=2 are each tuned separately and explicitly. An earlier
+    version of this function checked plug instead of rcv, which would
+    have silently, permanently shown "no lock" for any RF source
+    configured with plug: b outside diversity mode, regardless of
+    actual signal quality - caught and fixed before ever being deployed
+    to real hardware."""
+    if not tri_watch_enabled:
+        return {"enabled": False, "sources": []}
+
+    sources_out = []
+    # Deliberately the startup snapshot, NOT config.get('tri_watch',
+    # {}).get('sources', []) - see tri_watch_sources_cfg's own
+    # module-level comment. Confirmed as a real, reported bug when this
+    # read the live config directly: saving a Tri-Watch Sources change
+    # on the Config page reassigns the in-memory config immediately,
+    # well before any restart - reading it here would desync this
+    # status display from tri_watch_probes (built once at startup) the
+    # instant a source was added/removed/reordered, breaking the whole
+    # display rather than just leaving it correctly showing the old,
+    # still-actually-running configuration until a genuine restart.
+    for idx, src_cfg in enumerate(tri_watch_sources_cfg):
+        if not src_cfg.get('enabled', False):
+            continue
+        src_type = src_cfg.get('type')
+        entry = {
+            "idx": idx,
+            "type": src_type,
+            "label": src_cfg.get('label') or _default_tri_watch_label(src_cfg),
+        }
+        if src_type == 'rf':
+            rcv = src_cfg.get('rcv', 1)
+            state = picotuner_state_b if rcv == 2 else picotuner_state
+            entry["rcv"] = rcv
+            entry["active"] = state["locked"]
+        elif src_type == 'stream':
+            probe = tri_watch_probes.get(idx)
+            entry["active"] = probe.is_active if probe is not None else None
+            entry["last_change"] = probe.last_change if probe is not None else None
+        else:
+            entry["active"] = None
+        sources_out.append(entry)
+
+    return {
+        "enabled": True,
+        "sources": sources_out,
+        "displayed_source_idx": tri_watch_arbitrator.displayed_idx,
+        "notification": tri_watch_arbitrator.get_notification(),
+    }
+
+def tri_watch_startup_tune():
+    """Actively tunes every enabled RF source in tri_watch to its own
+    configured frequency/symbol-rate at startup, rather than resuming
+    whatever was previously tuned - the whole point for a dedicated
+    repeater receiver is coming up on known, correct inputs every time,
+    regardless of what happened before the restart.
+
+    Sends raw tune commands directly rather than going through tune()/
+    _tune_impl() - confirmed neither can actually do what's needed
+    here: outside diversity mode, tune() only ever commands rcv=1
+    regardless of which plug is requested; in diversity mode it forces
+    rcv=1 and rcv=2 to the SAME frequency/symbol-rate, for combining.
+    Neither can independently tune two receivers to two different
+    values, which is exactly what two tri_watch RF sources need (e.g.
+    the same-frequency/different-symbol-rate weak-signal technique).
+
+    rcv=2 genuinely needs its own command port (cmd_port_b) - sending
+    it to the shared port with a different rcv= value in the command
+    text does NOT work, confirmed the hard way during diversity mode's
+    own development. Same 0.3s settling delay between commands that
+    diversity-mode tuning already proved necessary too: sent back-to-
+    back with no gap, rcv=1 could intermittently fail to lock despite
+    a strong signal.
+
+    Deliberately does NOT touch mpv, the display, or current_mode at
+    all - deciding what's actually worth showing is Stage 2's job
+    (once priority/arbitration logic exists), not this one's."""
+    cfg = config['picotuner']
+    # tri_watch_sources_cfg (the startup snapshot - see its own
+    # module-level comment) rather than reading config directly - by
+    # the time this runs (after _resume_on_startup's own 7s delay) the
+    # two are identical anyway, since this only ever executes once,
+    # immediately at startup, before any Config-page edit could
+    # possibly have happened - but reading the same source of truth as
+    # everything else here avoids any doubt.
+    for idx, src in enumerate(tri_watch_sources_cfg):
+        if not src.get('enabled', False) or src.get('type') != 'rf':
+            continue
+        rcv = src.get('rcv')
+        if rcv not in (1, 2):
+            print(f"[tri_watch] startup tune: source {idx} has an invalid rcv - skipping")
+            continue
+        try:
+            tuner_freq = calc_tuner_freq(src['freq'], src.get('lnb_lo_khz', 0))
+            fplug = src.get('fplug', 'a' if rcv == 1 else 'b')
+            cmd = f"[to@wh] rcv={rcv} fplug={fplug} offset=0 freq={tuner_freq} srate={src['sr']}"
+            if rcv == 1:
+                picotuner_cmd(cmd)
+            else:
+                sock_b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    sock_b.sendto(cmd.encode(), (cfg['host'], cfg['cmd_port_b']))
+                finally:
+                    sock_b.close()
+            print(f"[tri_watch] startup tune: Rx{rcv} -> {src['freq']} kHz / {src['sr']} kS/s")
+        except Exception as e:
+            print(f"[tri_watch] startup tune: source {idx} (Rx{rcv}) failed: {e}")
+        time.sleep(0.3)  # same settling delay diversity-mode tuning already proved necessary
+
+class PortDrainer:
+    """Continuously reads and discards UDP packets from a port -
+    used to keep a non-displayed RF source's TS stream from going
+    completely unread while another source is what's actually being
+    shown.
+
+    Built to test a specific hypothesis (2026-08-01, not yet confirmed
+    on real hardware): every other proven-working RF path that runs
+    both receivers simultaneously (diversity mode) always has SOMETHING
+    continuously reading from both TS ports - the combiner process.
+    tri_watch never did: only whichever port mpv is actively watching
+    ever gets read at all, and the other, non-displayed source's full
+    TS stream goes into a port with nothing on the other end. If the
+    Picotuner shares any internal buffering/resources between its two
+    output paths, a permanently unread stream could plausibly
+    destabilize the other one too - consistent with the reported
+    pattern: both receivers failing together (not just the unread one),
+    and even matching same-frequency/same-symbol-rate diversity-mode
+    settings (ruling out an RF-domain explanation) still failing under
+    tri_watch specifically, where this draining never happened.
+
+    Tested directly with real UDP sockets: correctly receives packets
+    sent to its port, and correctly releases the port on stop() so
+    something else (mpv) can bind to it afterward."""
+    def __init__(self, port):
+        self.port = port
+        self._sock = None
+        self._thread = None
+        self._stop_flag = threading.Event()
+
+    def start(self):
+        if self._thread is not None:
+            return
+        self._stop_flag.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                         name=f"tri_watch-drain-{self.port}")
+        self._thread.start()
+
+    def stop(self):
+        self._stop_flag.set()
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        self._thread = None
+        self._sock = None
+
+    def _run(self):
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.bind(('0.0.0.0', self.port))
+            self._sock.settimeout(1.0)
+            while not self._stop_flag.is_set():
+                try:
+                    self._sock.recv(65536)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+        except Exception as e:
+            print(f"[tri_watch] port drainer for port {self.port} failed: {e}")
+
+tri_watch_port_drainers = {}  # idx -> PortDrainer, for enabled RF sources not currently displayed
+
+def _tri_watch_sync_drainers(currently_displayed_rf_idx):
+    """Ensures every enabled RF source EXCEPT the one currently being
+    displayed by mpv (if any) has an active port-drainer running -
+    call this any time the displayed source changes (to RF, to
+    stream, or to idle) so the set of drained ports always matches
+    reality. Pass None if no RF source is currently displayed (stream
+    playing, or idle) - every enabled RF source gets drained in that
+    case."""
+    # Deliberately the startup snapshot - see tri_watch_sources_cfg's
+    # own module-level comment. This runs repeatedly during live
+    # operation (any time the displayed source changes), so it has the
+    # exact same index-mismatch risk as the arbitrator loop if it read
+    # the live config instead - tri_watch_port_drainers is keyed by
+    # the same startup indices as tri_watch_probes.
+    sources = tri_watch_sources_cfg
+    cfg = config['picotuner']
+    for idx, src in enumerate(sources):
+        if not src.get('enabled', False) or src.get('type') != 'rf':
+            continue
+        rcv = src.get('rcv', 1)
+        port = cfg['ts_port_b'] if rcv == 2 else cfg['ts_port']
+        if idx == currently_displayed_rf_idx:
+            drainer = tri_watch_port_drainers.pop(idx, None)
+            if drainer is not None:
+                drainer.stop()
+        else:
+            if idx not in tri_watch_port_drainers:
+                drainer = PortDrainer(port)
+                drainer.start()
+                tri_watch_port_drainers[idx] = drainer
+
+class TriWatchArbitrator:
+    """Decides which tri_watch source (if any) should currently be
+    displayed, and tracks "someone else wants in" notifications for
+    the OSD to show. Built and unit-tested as a standalone, pure-logic
+    class before ever being wired to real mpv/Picotuner control (7
+    scenarios confirmed directly: idle-to-active, notification-while-
+    displayed, no duplicate re-notification, handover on the displayed
+    source going inactive, notification expiry, everything-inactive-
+    goes-idle, and re-notification after a source drops out and comes
+    back) - kept exactly as tested, so display_callback/idle_callback
+    are the only genuinely new, untested surface here.
+
+    display_callback(idx, source_cfg) is called whenever the
+    arbitrator decides a NEW source should become the one shown -
+    responsible for actually starting mpv/RF playback. idle_callback()
+    is called when nothing should be shown anymore. Both are only ever
+    called on a genuine transition, never repeatedly for a source
+    that's already displayed.
+
+    settling_seconds: a source must be continuously active for at
+    least this long before the arbitrator acts on it at all (for
+    either display switching or a notification) - confirmed live as
+    genuinely needed: brief, noise-induced or accidental short-burst
+    "locks" were triggering notifications (and could equally have
+    triggered an unwanted switch) for something that was never a real,
+    sustained transmission. Applied uniformly to both the initial
+    display decision and notifications, not just notifications
+    specifically - a brief noise burst causing an unwanted switch when
+    nothing was previously displayed seemed just as worth filtering out
+    as an unwanted notification while something else plays.
+    """
+    def __init__(self, display_callback, idle_callback, notification_duration_secs=20,
+                 settling_seconds=15, lock_confirm_seconds=3):
+        self.display_callback = display_callback
+        self.idle_callback = idle_callback
+        self.notification_duration_secs = notification_duration_secs
+        self.settling_seconds = settling_seconds
+        self.lock_confirm_seconds = lock_confirm_seconds
+        self.displayed_idx = None
+        self.notification = None  # {"message": str, "triggered_at": float, "source_idx": int} or None
+        self._notified_while_active = set()
+        self._pending_since = {}  # idx -> monotonic time first seen active, not yet "settled" (for notifications)
+        self._confirmed_active = {}  # idx -> bool, the debounced state actually used for switching decisions
+        self._pending_confirm_change = {}  # idx -> (candidate_state, monotonic time first seen) - for the short switching debounce
+
+    def _confirm_for_switching(self, active_map: dict) -> dict:
+        """A SEPARATE, much SHORTER debounce than _settle() below -
+        requires lock_confirm_seconds of a sustained state change
+        (either direction: becoming active OR becoming inactive)
+        before it's reported here, used only for the actual display-
+        switching decision (both showing something new and noticing
+        the current source went away). Matches the same, already-
+        proven ~3s "confirm before acting" pattern normal RF mode
+        already gets from rf_mpv_lifecycle_monitor() (its own
+        LOCK_CONFIRM_POLLS/LOSS_CONFIRM_POLLS, deliberately bypassed
+        entirely while tri_watch is enabled, since that monitor has no
+        concept of tri_watch's own source selection at all - see its
+        own docstring). Without this, tri_watch's arbitrator inherited
+        none of that protection once the display decision was changed
+        to react immediately to the raw signal - confirmed live as a
+        real, reported symptom: brief flicker in the raw lock signal
+        (invisible on the OSD, which applies its own, separate
+        smoothing) was repeatedly tearing down and re-establishing the
+        display, most visible as a picture briefly appearing then
+        disappearing again, or on a source with more flicker, never
+        getting a complete cycle to show anything at all."""
+        now = time.monotonic()
+        confirmed = {}
+        for idx, raw_active in active_map.items():
+            last_confirmed = self._confirmed_active.get(idx, False)
+            if raw_active == last_confirmed:
+                self._pending_confirm_change.pop(idx, None)
+            else:
+                pending = self._pending_confirm_change.get(idx)
+                if pending is None or pending[0] != raw_active:
+                    self._pending_confirm_change[idx] = (raw_active, now)
+                elif (now - pending[1]) >= self.lock_confirm_seconds:
+                    self._confirmed_active[idx] = raw_active
+                    last_confirmed = raw_active
+                    self._pending_confirm_change.pop(idx, None)
+            confirmed[idx] = last_confirmed
+        return confirmed
+
+    def _settle(self, active_map: dict) -> dict:
+        """Filters a raw active_map down to only sources that have been
+        CONTINUOUSLY active for at least settling_seconds - a source
+        that drops out and comes back starts its settling clock over
+        from scratch, same as a genuinely fresh activation."""
+        now = time.monotonic()
+        settled = {}
+        for idx, active in active_map.items():
+            if not active:
+                self._pending_since.pop(idx, None)
+                settled[idx] = False
+                continue
+            if idx not in self._pending_since:
+                self._pending_since[idx] = now
+            settled[idx] = (now - self._pending_since[idx]) >= self.settling_seconds
+        # Sources present in _pending_since but no longer in active_map
+        # at all (e.g. a source got disabled) shouldn't linger forever.
+        for idx in list(self._pending_since):
+            if idx not in active_map:
+                self._pending_since.pop(idx, None)
+        return settled
+
+    def step(self, active_map: dict, sources_cfg: list, build_message_fn):
+        """active_map: {source_idx: bool} - current active/locked state
+        for every enabled source, RAW (not debounced at all).
+        sources_cfg: the tri_watch.sources config list.
+        build_message_fn(idx, src_cfg) -> str, called only when a
+        genuinely new notification is actually needed.
+
+        Two SEPARATE debounces, for two genuinely different concerns:
+        - _confirm_for_switching() (short, ~lock_confirm_seconds):
+          used for the actual display/switching decision - matches the
+          same, already-proven "confirm before acting" protection
+          normal RF mode already gets from rf_mpv_lifecycle_monitor(),
+          which tri_watch's arbitrator otherwise inherits none of at
+          all, since that monitor is deliberately bypassed while
+          tri_watch is enabled. Confirmed live as genuinely necessary:
+          without it, brief flicker in the raw lock signal (invisible
+          on the OSD, which applies its own, separate smoothing) was
+          repeatedly tearing the display down and re-establishing it,
+          sometimes never completing a full cycle at all.
+        - _settle() (much longer, ~settling_seconds): used ONLY for
+          deciding whether a notification appears for a new, waiting
+          source - filtering brief, noise-induced "locks" out of the
+          notification specifically, not the actual switch. Confirmed
+          live as a real bug when this and the switching decision were
+          accidentally the same debounce: a flickering raw signal could
+          then also block the actual picture from ever appearing,
+          despite the OSD showing a solid green light throughout."""
+        switch_map = self._confirm_for_switching(active_map)
+        settled_map = self._settle(active_map)
+
+        for idx in list(self._notified_while_active):
+            if not settled_map.get(idx, False):
+                self._notified_while_active.discard(idx)
+
+        # Noticing the displayed source going inactive uses the SHORT
+        # switching debounce, not the raw signal directly - a brief
+        # flicker shouldn't tear down an already-good display.
+        if self.displayed_idx is not None and not switch_map.get(self.displayed_idx, False):
+            self.displayed_idx = None
+            self.notification = None
+
+        if self.displayed_idx is None:
+            # The initial display decision ALSO uses the SHORT
+            # switching debounce - confirmed sustained for
+            # lock_confirm_seconds, not just a momentary blip, but
+            # still far short of the much longer notification-only
+            # settling_seconds. Tries every currently-confirmed-active
+            # source in order, moving on immediately if one fails,
+            # rather than stopping at the first (failing) one -
+            # confirmed as a real, live bug otherwise: if the earliest-
+            # indexed source's display attempt failed, the arbitrator
+            # would keep retrying only that same source forever on
+            # every subsequent step(), never even attempting a
+            # different, genuinely active source that might actually
+            # work.
+            last_exception = None
+            for idx in range(len(sources_cfg)):
+                if not switch_map.get(idx, False):
+                    continue
+                try:
+                    # displayed_idx is only set AFTER display_callback
+                    # genuinely succeeds (doesn't raise) - confirmed as
+                    # a real, live bug otherwise: if the switch silently
+                    # failed or got reverted by something else, the
+                    # arbitrator would believe it had already succeeded
+                    # and never retry, leaving the display stuck wrong
+                    # indefinitely with no way to notice.
+                    self.display_callback(idx, sources_cfg[idx])
+                except Exception as e:
+                    last_exception = e
+                    print(f"[tri_watch] source {idx} failed to display, trying next active source if any: {e}")
+                    continue
+                self.displayed_idx = idx
+                self._notified_while_active.discard(idx)
+                self.notification = None
+                return
+            if last_exception is not None:
+                raise last_exception  # every active source failed - still surface this rather than going silently idle
+            self.idle_callback()
+            return
+
+        # Notifications about a NEW, waiting source DO use the settled
+        # view - this is what the settling timer was actually meant
+        # for, filtering out brief, noise-induced or accidental short-
+        # burst "locks" from popping up a notification for something
+        # that was never a real, sustained transmission.
+        for idx in range(len(sources_cfg)):
+            if idx == self.displayed_idx:
+                continue
+            if settled_map.get(idx, False) and idx not in self._notified_while_active:
+                message = build_message_fn(idx, sources_cfg[idx])
+                self.notification = {"message": message, "triggered_at": time.time(), "source_idx": idx}
+                self._notified_while_active.add(idx)
+                break  # one new notification per step - avoids piling several up if multiple go active in the same instant
+
+    def get_notification(self):
+        """Returns the current notification dict if still within its
+        display window, else None."""
+        if self.notification is None:
+            return None
+        if time.time() - self.notification["triggered_at"] > self.notification_duration_secs:
+            return None
+        return self.notification
+
+def _build_tri_watch_message(idx, src_cfg):
+    """Builds the "someone else wants in" notification text for a
+    given source. RF uses a configurable template (tri_watch's own,
+    genuinely separate from the existing Slack notification system's
+    template - that one's built specifically around RF-lock events
+    with fields a stream source has no equivalent for, and wiring the
+    two together properly is Stage 4's job, not this one's) - default
+    wording matches what was actually asked for. Stream sources use
+    plain, user-typed text, since there's no live "who's transmitting"
+    data available for a stream the way there is for RF.
+
+    No format-based callsign validation here (an earlier version tried
+    filtering on "contains at least one digit", after the Picotuner's
+    own status parsing was observed picking up a stray word as though
+    it were a genuine callsign) - removed after Justin's own, direct
+    correction: callsign formats are genuinely diverse across countries
+    (his own EI3IOB/EI3IO span both 2- and 3-letter suffixes, and
+    GB3RS-style calls exist too), and a heuristic risks rejecting a
+    real, valid callsign in some format this doesn't account for. The
+    settling timer (see TriWatchArbitrator) already solves the actual
+    underlying problem more robustly - a transient parsing artifact
+    can't survive settling_seconds of sustained activity, so there's no
+    need to also guess at which specific values are "real"."""
+    if src_cfg.get('type') == 'rf':
+        rcv = src_cfg.get('rcv', 1)
+        state = picotuner_state_b if rcv == 2 else picotuner_state
+        live_callsign = state.get('callsign') or 'A station'
+
+        # QRZ name lookup, if configured, happens entirely in the
+        # BACKGROUND - never synchronously here. Confirmed as a real,
+        # serious risk otherwise: this function runs inside the
+        # arbitrator's own step() loop, which must stay responsive for
+        # tri_watch to work at all - a slow/unreachable QRZ could
+        # block it for the better part of a minute (multiple chained
+        # network timeouts: login, lookup, retry-after-expiry),
+        # delaying every other tri_watch decision for that entire
+        # window. The notification fires immediately with just the
+        # callsign; _kick_off_qrz_notification_lookup() below handles
+        # updating it in place afterwards, only if the same
+        # notification (matched by source_idx) is still showing by
+        # the time the lookup completes.
+        qrz_cfg = config.get('notifications', {}).get('qrz', {})
+        if qrz_cfg.get('lookup_for_notifications') and live_callsign != 'A station':
+            _kick_off_qrz_notification_lookup(idx, live_callsign, qrz_cfg, src_cfg)
+
+        return _format_rf_notification(live_callsign, "", src_cfg)
+    elif src_cfg.get('type') == 'stream':
+        site_callsign = config.get('site', {}).get('callsign') or 'this input'
+        return src_cfg.get('waiting_message') or f"Someone is waiting to access {site_callsign} via the web stream"
+    return "Another source wants attention"
+
+
+def _format_rf_notification(live_callsign, name, src_cfg):
+    """Builds the actual RF notification text, given whatever name is
+    currently known (empty string if none). Shared by both
+    _build_tri_watch_message()'s own immediate, name-less call and
+    _kick_off_qrz_notification_lookup()'s later, name-included one, so
+    the two can never drift apart in formatting."""
+    name_prefix = f"{name} " if name else ""
+    template = config.get('tri_watch', {}).get(
+        'rf_notification_template',
+        "{name_prefix}{callsign} is waiting to access {configured_callsign} on {frequency}")
+    try:
+        result = template.format(
+            callsign=live_callsign,
+            name=name,
+            name_prefix=name_prefix,
+            configured_callsign=src_cfg.get('callsign') or src_cfg.get('label') or 'this input',
+            frequency=f"{src_cfg.get('freq', 0) / 1000:.3f} MHz",
+        )
+    except (KeyError, ValueError) as e:
+        print(f"[tri_watch] rf_notification_template has an unusable placeholder ({e}) - using a plain fallback")
+        return f"{name_prefix}{live_callsign} is waiting on {src_cfg.get('label') or 'another input'}"
+
+    # A known name that the (possibly custom, possibly predating this
+    # feature) template doesn't actually reference anywhere would
+    # otherwise be silently dropped - confirmed as a real, reported
+    # gap: Python's str.format() ignores any keyword it's given that
+    # the template string doesn't use, so a template written before
+    # this feature existed computed the name correctly and then simply
+    # never showed it. Prepend it directly in that case, rather than
+    # requiring every existing, already-configured template to be
+    # manually updated just for the feature to do anything at all.
+    if name and "{name_prefix}" not in template and "{name}" not in template:
+        result = f"{name} {result}"
+
+    return result
+
+
+def _kick_off_qrz_notification_lookup(idx, live_callsign, qrz_cfg, src_cfg):
+    """Runs the QRZ name lookup in a background thread - see
+    _build_tri_watch_message()'s own comment for why this must never
+    run synchronously on the arbitrator's own step() loop. If it
+    completes while the SAME notification (matched by source_idx) is
+    still the one showing, rebuilds and replaces its message to
+    include the name. If a different/newer notification has since
+    replaced it, or it's already expired, the result is simply
+    discarded - never overwrites something unrelated."""
+    def _worker():
+        looked_up = lynx_notifications.qrz_callsign_lookup(
+            qrz_cfg.get('lookup_username', ''),
+            qrz_cfg.get('lookup_password', ''),
+            live_callsign)
+        if not looked_up:
+            return
+
+        # Wait briefly for the arbitrator to actually set
+        # self.notification. Confirmed as a real, reproduced race
+        # otherwise: this thread is started from INSIDE
+        # _build_tri_watch_message(), before that function has even
+        # returned its own message string back to the arbitrator's
+        # step() - which only sets self.notification on the very next
+        # line after that return. Normally a gap of microseconds, but
+        # a cached lookup (near-instant, e.g. the same callsign
+        # checked moments earlier via the /diagnostics test tool) can
+        # genuinely complete and check here before that single
+        # assignment has happened at all, silently discarding a
+        # perfectly good result. This bounded wait costs nothing in
+        # the normal case and only ever matters for this brief window.
+        deadline = time.time() + 2.0
+        current = tri_watch_arbitrator.notification
+        while (current is None or current.get("source_idx") != idx) and time.time() < deadline:
+            time.sleep(0.05)
+            current = tri_watch_arbitrator.notification
+        if current is None or current.get("source_idx") != idx:
+            return  # never appeared in time, or a different one is showing now
+
+        updated_message = _format_rf_notification(live_callsign, looked_up, src_cfg)
+        # Re-check immediately before writing - a best-effort UI
+        # enhancement, not something safety-critical, so this narrows
+        # the race against the notification expiring/changing between
+        # the check above and now without needing a full lock.
+        current = tri_watch_arbitrator.notification
+        if current is not None and current.get("source_idx") == idx:
+            current["message"] = updated_message
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _tri_watch_display_source(idx, src_cfg):
+    """The arbitrator's display_callback - actually switches to show
+    the given source. Reuses the exact same, proven tune()/
+    start_stream() paths a manual memory/preset selection would use,
+    rather than a separate, custom reimplementation of the display
+    logic - per Justin's own suggestion, after tri_watch's earlier,
+    hand-built RF-switching code missed a subtle but critical detail
+    (re-sending a fresh tune command every time, exactly like manual
+    selection always does) that a parallel reimplementation was always
+    at genuine risk of drifting from, and did.
+
+    For RF sources: sets tri_watch_target_rcv so the now tri_watch-
+    aware rf_mpv_lifecycle_monitor() knows which receiver to actually
+    watch and start mpv for, then calls tune() itself. This is
+    genuinely fire-and-forget for the mpv-starting part - exactly like
+    a normal, manual RF tune already is - since tune() itself never
+    starts mpv directly; the monitor handles confirming a stable lock
+    and getting mpv running from there, with its own, already-proven
+    retry logic, rather than this function needing its own, separate
+    copy of that same logic.
+
+    RF and stream sources need genuinely different locking: tune() and
+    start_stream() both acquire tune_lock internally, so this function
+    must never also acquire it itself, or it would deadlock against
+    itself."""
+    global tri_watch_target_rcv, mpv_running_for_rf
+    src_type = src_cfg.get('type')
+    if src_type == 'rf':
+        rcv = src_cfg.get('rcv', 1)
+        # Stop draining THIS source's own port before mpv (once
+        # rf_mpv_lifecycle_monitor confirms lock) tries to bind to it -
+        # a drainer and mpv can't both be bound to the same UDP port at
+        # once - while every other enabled RF source keeps being
+        # drained. See PortDrainer's own docstring for why this might
+        # matter.
+        _tri_watch_sync_drainers(idx)
+        tri_watch_target_rcv = rcv
+        # Confirmed as a real bug: mpv_running_for_rf is a single,
+        # shared flag that doesn't distinguish which receiver mpv is
+        # actually running for. Switching targets here (e.g. Rx1 to
+        # Rx2) left it True from the previous receiver's session, so
+        # rf_mpv_lifecycle_monitor()'s own `not mpv_running_for_rf`
+        # check believed mpv was "already running" and never attempted
+        # to start it for the new target - it only got reset
+        # asynchronously by tune()'s own _kick_mpv() thread, after a
+        # delay, which wasn't reliably resolving this. Reset it
+        # immediately, synchronously, right here instead, so the very
+        # next poll correctly sees nothing running yet for this target.
+        mpv_running_for_rf = False
+        tune(TuneRequest(
+            freq=src_cfg['freq'],
+            sr=src_cfg['sr'],
+            plug=src_cfg.get('fplug', 'a' if rcv == 1 else 'b'),
+            lnb_lo_khz=src_cfg.get('lnb_lo_khz', 0),
+            rcv=rcv,
+        ))
+        print(f"[tri_watch] now displaying source {idx}: RF Rx{rcv}")
+    elif src_type == 'stream':
+        # No RF source is being displayed while a stream plays - every
+        # enabled RF source should be drained, and tri_watch_target_rcv
+        # cleared so rf_mpv_lifecycle_monitor() knows there's nothing
+        # for it to do.
+        _tri_watch_sync_drainers(None)
+        tri_watch_target_rcv = None
+        url = f"rtmp://{src_cfg['domain']}/{src_cfg['app']}/{src_cfg['streamname']}"
+        start_stream(StreamRequest(url=url, name=src_cfg.get('label', '')))
+        print(f"[tri_watch] now displaying source {idx}: stream")
+
+def _tri_watch_go_idle():
+    global tri_watch_target_rcv
+    if current_mode != "idle":
+        stop_current()
+        print("[tri_watch] no sources active - going idle")
+    # No RF source is displayed while idle either - drain everything
+    # and clear the target so rf_mpv_lifecycle_monitor() has nothing
+    # to watch.
+    _tri_watch_sync_drainers(None)
+    tri_watch_target_rcv = None
+
+tri_watch_arbitrator = TriWatchArbitrator(
+    _tri_watch_display_source, _tri_watch_go_idle,
+    notification_duration_secs=config.get('tri_watch', {}).get('notification_duration_secs', 20),
+    settling_seconds=config.get('tri_watch', {}).get('settling_seconds', 15),
+    lock_confirm_seconds=config.get('tri_watch', {}).get('lock_confirm_seconds', 3))
+
+def tri_watch_arbitrator_loop():
+    """Background thread - periodically builds the current active/
+    locked state for every enabled tri_watch source and feeds it to
+    the arbitrator's step() to decide what, if anything, needs to
+    change. Every 2s: frequent enough that switching feels reasonably
+    prompt, infrequent enough not to spam restart_mpv()/picotuner_cmd()
+    if something is flapping right at the edge of lock."""
+    while True:
+        time.sleep(2)
+        if not tri_watch_enabled:
+            continue
+        # Deliberately the startup snapshot, NOT config.get('tri_watch',
+        # {}).get('sources', []) - see tri_watch_sources_cfg's own
+        # module-level comment for why: this list's indices must stay
+        # exactly matched to tri_watch_probes, which is also only ever
+        # built once at startup.
+        sources_cfg = tri_watch_sources_cfg
+        active_map = {}
+        for idx, src in enumerate(sources_cfg):
+            if not src.get('enabled', False):
+                continue
+            if src.get('type') == 'rf':
+                rcv = src.get('rcv', 1)
+                state = picotuner_state_b if rcv == 2 else picotuner_state
+                active_map[idx] = state['locked']
+            elif src.get('type') == 'stream':
+                probe = tri_watch_probes.get(idx)
+                active_map[idx] = probe.is_active if probe is not None else False
+        try:
+            tri_watch_arbitrator.step(active_map, sources_cfg, _build_tri_watch_message)
+        except Exception as e:
+            print(f"[tri_watch] arbitrator step failed: {e}")
+
 def _compute_downlink_frequency():
     """When an LNB LO is in use, the Picotuner reports the L-band/IF
     frequency it's actually locked on (e.g. 739.500 MHz), not the real
@@ -2375,7 +3409,8 @@ def get_status():
             # which get less representative of current conditions
             # the longer the combiner has been running.
             "stats": read_diversity_stats(),
-        }
+        },
+        "tri_watch": get_tri_watch_status()
     }
     # Ryde status block — commented out, see ryde_cmd() docstring for why.
     # if config['ryde']['enabled']:
@@ -2427,6 +3462,46 @@ def qrz_test(req: QrzTestRequest):
     )
     return result
 
+class QrzLookupTestRequest(BaseModel):
+    test_callsign: str = "G8YTZ"
+
+@app.post("/api/qrz/lookup_test", tags=["Status"],
+          summary="Test the QRZ XML Data API name lookup",
+          description="Directly tests the callsign-name lookup used for "
+                      "tri_watch's notification, independent of an actual "
+                      "notification firing - reports exactly which "
+                      "pre-condition (if any) isn't met, or the real lookup "
+                      "result. Deliberately synchronous/blocking here, unlike "
+                      "the notification path itself - this is a one-off, "
+                      "user-initiated test request, not something running "
+                      "inside any time-critical loop.")
+def qrz_lookup_test(req: QrzLookupTestRequest):
+    qrz_cfg = config.get('notifications', {}).get('qrz', {})
+    username = qrz_cfg.get('lookup_username', '')
+    password = qrz_cfg.get('lookup_password', '')
+    lookup_for_notifications = qrz_cfg.get('lookup_for_notifications', False)
+
+    if not username or not password:
+        return {
+            "success": False,
+            "reason": "No lookup_username/lookup_password configured - set both on "
+                      "the Config page (or in config.yaml directly) first. These are "
+                      "your normal QRZ.com login, separate from the Logbook API key above.",
+            "lookup_for_notifications": lookup_for_notifications,
+        }
+
+    name = lynx_notifications.qrz_callsign_lookup(username, password, req.test_callsign)
+
+    return {
+        "success": name is not None,
+        "test_callsign": req.test_callsign.strip().upper(),
+        "name_found": name,
+        "lookup_for_notifications": lookup_for_notifications,
+        "note": (None if lookup_for_notifications else
+                 "lookup_for_notifications is currently OFF - the lookup itself just "
+                 "worked, but real notifications won't use it until this is turned on."),
+    }
+
 @app.get("/diagnostics", response_class=HTMLResponse, include_in_schema=False)
 def diagnostics_page():
     return """<!DOCTYPE html>
@@ -2467,6 +3542,23 @@ def diagnostics_page():
                 configured on the Config page.</p>
             <button class="btn btn-outline-warning btn-sm" onclick="sendQrzTest()">Send Test Entry</button>
             <pre id="qrz-test-result" class="mt-3 mb-0 small" style="white-space: pre-wrap;"></pre>
+        </div>
+    </div>
+
+    <div class="card mb-3">
+        <div class="card-header">Test QRZ Name Lookup</div>
+        <div class="card-body">
+            <p class="text-muted small">Directly tests the callsign-name lookup used for tri_watch's
+                waiting-station notification, independent of an actual notification firing. Shows
+                exactly which pre-condition (if any) isn't met, or the real lookup result. Uses
+                whatever lookup_username/lookup_password are currently configured on the Config
+                page - a genuinely separate login from the Logbook API key above.</p>
+            <div class="input-group input-group-sm mb-2" style="max-width: 300px;">
+                <input type="text" class="form-control" id="qrz-lookup-test-callsign" value="G8YTZ"
+                       placeholder="Callsign to look up">
+                <button class="btn btn-outline-warning" onclick="sendQrzLookupTest()">Test Lookup</button>
+            </div>
+            <pre id="qrz-lookup-test-result" class="mt-3 mb-0 small" style="white-space: pre-wrap;"></pre>
         </div>
     </div>
 
@@ -2560,6 +3652,40 @@ async function sendQrzTest() {
     }
 }
 
+async function sendQrzLookupTest() {
+    const resultEl = document.getElementById('qrz-lookup-test-result');
+    const callsign = document.getElementById('qrz-lookup-test-callsign').value.trim() || 'G8YTZ';
+    resultEl.textContent = 'Looking up...';
+    try {
+        const r = await fetch('/api/qrz/lookup_test', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({test_callsign: callsign})
+        });
+        const data = await r.json();
+        if (!r.ok) {
+            resultEl.textContent = 'Error: ' + (data.detail || 'request failed');
+            return;
+        }
+        let lines = [
+            'success:                  ' + data.success,
+        ];
+        if (data.reason) {
+            lines.push('reason:                   ' + data.reason);
+        } else {
+            lines.push('test_callsign:            ' + data.test_callsign);
+            lines.push('name_found:               ' + data.name_found);
+        }
+        lines.push('lookup_for_notifications: ' + data.lookup_for_notifications);
+        if (data.note) {
+            lines.push('note:                     ' + data.note);
+        }
+        resultEl.textContent = lines.join('\\n');
+    } catch (e) {
+        resultEl.textContent = 'Request failed: ' + e;
+    }
+}
+
 async function refresh() {
     try {
         const r = await fetch('/api/diagnostics');
@@ -2627,6 +3753,18 @@ def config_page():
         .btn-save:hover { background: #c73652; border-color: #c73652; }
         .save-status { font-size: 0.85em; min-height: 1.2em; }
         .placeholder-card { opacity: 0.6; }
+        /* Visually masks sensitive fields (API keys, passwords) the same
+           way type="password" would, without actually using that type -
+           deliberately avoids browsers treating these as login
+           credentials to offer saving/autofilling, which type="password"
+           triggers regardless of autocomplete="off" (browsers routinely
+           ignore that specific override on real password fields).
+           -webkit-text-security is Chromium/WebKit-only (Chrome, Safari,
+           Edge) - Firefox has no equivalent, so the field there falls
+           back to showing plain text rather than being masked at all;
+           an acceptable trade-off given the alternative was a genuinely
+           broken, unwanted save-password prompt on every visit. */
+        .mask-field { -webkit-text-security: disc; }
     </style>
 </head>
 <body>
@@ -2641,6 +3779,52 @@ def config_page():
     <div class="row g-3 align-items-start">
 
         <div class="col-md-4">
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F3AC; Bitfocus Companion</div>
+                    <div class="card-body">
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="companion-enabled-input">
+                            <label class="form-check-label" for="companion-enabled">Enabled</label>
+                        </div>
+                        <label for="companion-lock-url">Lock URL</label>
+                        <input type="text" class="form-control mb-1" id="companion-lock-url-input"
+                               placeholder="http://companion-ip:8888/api/...">
+                        <label for="companion-lock-settle" class="small text-muted">Settle time (s)</label>
+                        <input type="number" step="1" min="0" class="form-control mb-2" id="companion-lock-settle-input">
+                        <label for="companion-unlock-url">Unlock URL</label>
+                        <input type="text" class="form-control mb-1" id="companion-unlock-url-input"
+                               placeholder="http://companion-ip:8888/api/...">
+                        <label for="companion-unlock-settle" class="small text-muted">Settle time (s)</label>
+                        <input type="number" step="1" min="0" class="form-control" id="companion-unlock-settle-input">
+                        <hr>
+                        <div class="form-check form-switch mb-2">
+                            <input class="form-check-input" type="checkbox" id="companion-gpio-enabled-input">
+                            <label class="form-check-label" for="companion-gpio-enabled">
+                                Also mirror on a GPIO pin (relay-based switching)
+                            </label>
+                        </div>
+                        <p class="text-muted small mb-2">
+                            Follows lock/unlock using the same settle times above - no separate timing.
+                        </p>
+                        <div class="row g-2">
+                            <div class="col-8">
+                                <label for="companion-gpio-pin" class="small">Physical pin</label>
+                                <select class="form-control" id="companion-gpio-pin-input"></select>
+                            </div>
+                            <div class="col-4">
+                                <label for="companion-gpio-polarity" class="small">Polarity</label>
+                                <select class="form-control" id="companion-gpio-polarity-input">
+                                    <option value="high">Active high</option>
+                                    <option value="low">Active low</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="mt-3 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveCompanion()">Save Companion settings</button>
+                            <span class="save-status" id="companion-save-status"></span>
+                        </div>
+                    </div>
+                </div>
                 <div class="card mb-3">
                     <div class="card-header">&#x1F50C; GPIO Tx On/Off</div>
                     <div class="card-body">
@@ -2744,6 +3928,10 @@ def config_page():
                         </div>
                     </div>
                 </div>
+
+        </div>
+
+        <div class="col-md-4">
                 <div class="card mb-3">
                     <div class="card-header">&#x1F3AF; PPM Meter Style</div>
                     <div class="card-body">
@@ -2764,56 +3952,6 @@ def config_page():
                         <span id="ppm-style-status" class="save-status ms-2"></span>
                     </div>
                 </div>
-
-        </div>
-
-        <div class="col-md-4">
-                <div class="card mb-3">
-                    <div class="card-header">&#x1F3AC; Bitfocus Companion</div>
-                    <div class="card-body">
-                        <div class="form-check form-switch mb-3">
-                            <input class="form-check-input" type="checkbox" id="companion-enabled-input">
-                            <label class="form-check-label" for="companion-enabled">Enabled</label>
-                        </div>
-                        <label for="companion-lock-url">Lock URL</label>
-                        <input type="text" class="form-control mb-1" id="companion-lock-url-input"
-                               placeholder="http://companion-ip:8888/api/...">
-                        <label for="companion-lock-settle" class="small text-muted">Settle time (s)</label>
-                        <input type="number" step="1" min="0" class="form-control mb-2" id="companion-lock-settle-input">
-                        <label for="companion-unlock-url">Unlock URL</label>
-                        <input type="text" class="form-control mb-1" id="companion-unlock-url-input"
-                               placeholder="http://companion-ip:8888/api/...">
-                        <label for="companion-unlock-settle" class="small text-muted">Settle time (s)</label>
-                        <input type="number" step="1" min="0" class="form-control" id="companion-unlock-settle-input">
-                        <hr>
-                        <div class="form-check form-switch mb-2">
-                            <input class="form-check-input" type="checkbox" id="companion-gpio-enabled-input">
-                            <label class="form-check-label" for="companion-gpio-enabled">
-                                Also mirror on a GPIO pin (relay-based switching)
-                            </label>
-                        </div>
-                        <p class="text-muted small mb-2">
-                            Follows lock/unlock using the same settle times above - no separate timing.
-                        </p>
-                        <div class="row g-2">
-                            <div class="col-8">
-                                <label for="companion-gpio-pin" class="small">Physical pin</label>
-                                <select class="form-control" id="companion-gpio-pin-input"></select>
-                            </div>
-                            <div class="col-4">
-                                <label for="companion-gpio-polarity" class="small">Polarity</label>
-                                <select class="form-control" id="companion-gpio-polarity-input">
-                                    <option value="high">Active high</option>
-                                    <option value="low">Active low</option>
-                                </select>
-                            </div>
-                        </div>
-                        <div class="mt-3 d-flex align-items-center gap-2">
-                            <button class="btn btn-save" onclick="saveCompanion()">Save Companion settings</button>
-                            <span class="save-status" id="companion-save-status"></span>
-                        </div>
-                    </div>
-                </div>
                 <div class="card mb-3">
                     <div class="card-header">&#x1F4D6; QRZ.com Logbook</div>
                     <div class="card-body">
@@ -2822,8 +3960,13 @@ def config_page():
                             <label class="form-check-label" for="qrz-enabled">Enabled</label>
                         </div>
                         <label for="qrz-api-key">API key</label>
-                        <input type="text" class="form-control mb-2" id="qrz-api-key-input"
-                               placeholder="Your QRZ Logbook API key">
+                        <div class="input-group mb-2">
+                            <input type="text" class="form-control mask-field" id="qrz-api-key-input"
+                                   autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+                                   placeholder="Your QRZ Logbook API key">
+                            <button class="btn btn-outline-secondary reveal-btn" type="button" tabindex="-1"
+                                    data-reveal-target="qrz-api-key-input" title="Hold to reveal">&#x1F441;&#xFE0F;</button>
+                        </div>
                         <div class="row g-2">
                             <div class="col-6">
                                 <label for="qrz-settle">Settle time (s)</label>
@@ -2846,6 +3989,38 @@ def config_page():
                             current one for every contact logged while it's set - clear it (empty + save)
                             once the portable session ends.
                         </p>
+                        <hr class="my-3">
+                        <p class="text-muted small mb-2">
+                            <strong>Callsign lookup</strong> (used to add a station's first name to
+                            tri_watch's "someone else wants in" notification) uses QRZ's separate XML
+                            Data API - a genuinely different login to the Logbook API key above, since
+                            it authenticates with your normal QRZ username/password rather than an API
+                            key. Requires an XML-subscriber-level QRZ account.
+                        </p>
+                        <div class="row g-2 mb-2">
+                            <div class="col-6">
+                                <label for="qrz-lookup-username">QRZ username</label>
+                                <input type="text" class="form-control" id="qrz-lookup-username-input"
+                                       autocomplete="off"
+                                       placeholder="Your QRZ.com login">
+                            </div>
+                            <div class="col-6">
+                                <label for="qrz-lookup-password">QRZ password</label>
+                                <div class="input-group">
+                                    <input type="text" class="form-control mask-field" id="qrz-lookup-password-input"
+                                           autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+                                           placeholder="Your QRZ.com password">
+                                    <button class="btn btn-outline-secondary reveal-btn" type="button" tabindex="-1"
+                                            data-reveal-target="qrz-lookup-password-input" title="Hold to reveal">&#x1F441;&#xFE0F;</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="form-check form-switch">
+                            <input class="form-check-input" type="checkbox" id="qrz-lookup-notif-input">
+                            <label class="form-check-label" for="qrz-lookup-notif">
+                                Add looked-up name to tri_watch's waiting-station notification
+                            </label>
+                        </div>
                         <div class="mt-3 d-flex align-items-center gap-2">
                             <button class="btn btn-save" onclick="saveQrz()">Save QRZ settings</button>
                             <span class="save-status" id="qrz-save-status"></span>
@@ -3001,13 +4176,191 @@ def config_page():
                         </div>
                     </div>
                 </div>
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F9EA; Update Channel</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            Stable is the recommended channel for everyday/repeater use -
+                            known-working releases only. Beta tracks newer, less-tested code
+                            for anyone who wants to try new features early, mirroring how
+                            BATC Portsdown offers its own beta channel. Switchable back to
+                            Stable at any time.
+                        </p>
+                        <div class="form-check">
+                            <input class="form-check-input" type="radio" name="update-channel"
+                                   id="channel-stable" value="stable" onchange="onChannelRadioChange()">
+                            <label class="form-check-label" for="channel-stable">
+                                <strong>Stable</strong>
+                                <span class="text-muted small">- recommended</span>
+                            </label>
+                        </div>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="radio" name="update-channel"
+                                   id="channel-beta" value="beta" onchange="onChannelRadioChange()">
+                            <label class="form-check-label" for="channel-beta">
+                                <strong>Beta</strong>
+                                <span class="text-muted small">- newer, experimental code</span>
+                            </label>
+                        </div>
+                        <div id="beta-warning" class="alert alert-warning py-2 px-3 small mb-2" style="display:none;">
+                            &#x26A0;&#xFE0F; <strong>Beta channel:</strong> newer code that hasn't
+                            been as thoroughly tested - may be less stable, and could contain
+                            bugs not yet caught. Not recommended for an unattended repeater
+                            without someone available to fix issues if something goes wrong.
+                        </div>
+                        <div class="mt-2 d-flex align-items-center gap-2">
+                            <button class="btn btn-outline-warning btn-sm" onclick="switchUpdateChannel()">Switch Channel</button>
+                            <span class="save-status" id="channel-save-status"></span>
+                        </div>
+                    </div>
+                </div>
         </div>
 
+    </div>
+
+    <div class="row g-3 mt-1">
+        <div class="col-12">
+            <div class="card mb-3">
+                <div class="card-header">&#x1F500; Tri-Watch Sources</div>
+                <div class="card-body">
+                    <div class="form-check form-switch mb-2">
+                        <input class="form-check-input" type="checkbox" id="tw-enabled-input">
+                        <label class="form-check-label" for="tw-enabled">Tri-Watch enabled</label>
+                    </div>
+                    <p class="text-muted small">
+                        Up to three sources - any mix of Rx1, Rx2, and a stream. Uncheck
+                        "Include" on a source to leave it out entirely, same as not listing
+                        it in config.yaml at all. Frequency is in kHz, matching the RF
+                        Tuning card elsewhere on this page. Changes here need a Lynx
+                        restart to take effect - tri_watch's sources are set up once at
+                        startup, unlike most other settings on this page.
+                    </p>
+                    <div class="row g-3">
+                        <div class="col-md-4">
+                            <h6 class="mb-2">Rx 1</h6>
+                            <div class="form-check form-switch mb-2">
+                                <input class="form-check-input" type="checkbox" id="tw-rx1-enabled-input">
+                                <label class="form-check-label" for="tw-rx1-enabled">Include Rx1</label>
+                            </div>
+                            <label for="tw-rx1-freq" class="small">Frequency (kHz)</label>
+                            <input type="number" step="1" class="form-control mb-2" id="tw-rx1-freq-input" placeholder="e.g. 437000">
+                            <label for="tw-rx1-sr" class="small">Symbol rate (kS/s)</label>
+                            <input type="number" step="1" class="form-control mb-2" id="tw-rx1-sr-input" placeholder="e.g. 1000">
+                            <label for="tw-rx1-plug" class="small">Plug</label>
+                            <select class="form-control mb-2" id="tw-rx1-plug-input">
+                                <option value="a">A</option>
+                                <option value="b">B</option>
+                            </select>
+                            <label for="tw-rx1-label" class="small">Label</label>
+                            <input type="text" class="form-control mb-2" id="tw-rx1-label-input" placeholder="e.g. 70cm Live">
+                            <label for="tw-rx1-callsign" class="small">Expected callsign</label>
+                            <input type="text" class="form-control" id="tw-rx1-callsign-input" placeholder="e.g. GB3JT">
+                        </div>
+                        <div class="col-md-4">
+                            <h6 class="mb-2">Rx 2</h6>
+                            <div class="form-check form-switch mb-2">
+                                <input class="form-check-input" type="checkbox" id="tw-rx2-enabled-input">
+                                <label class="form-check-label" for="tw-rx2-enabled">Include Rx2</label>
+                            </div>
+                            <label for="tw-rx2-freq" class="small">Frequency (kHz)</label>
+                            <input type="number" step="1" class="form-control mb-2" id="tw-rx2-freq-input" placeholder="e.g. 1249000">
+                            <label for="tw-rx2-sr" class="small">Symbol rate (kS/s)</label>
+                            <input type="number" step="1" class="form-control mb-2" id="tw-rx2-sr-input" placeholder="e.g. 1000">
+                            <label for="tw-rx2-plug" class="small">Plug</label>
+                            <select class="form-control mb-2" id="tw-rx2-plug-input">
+                                <option value="a">A</option>
+                                <option value="b" selected>B</option>
+                            </select>
+                            <label for="tw-rx2-label" class="small">Label</label>
+                            <input type="text" class="form-control mb-2" id="tw-rx2-label-input" placeholder="e.g. 23cm Live">
+                            <label for="tw-rx2-callsign" class="small">Expected callsign</label>
+                            <input type="text" class="form-control" id="tw-rx2-callsign-input" placeholder="e.g. GB3JT">
+                        </div>
+                        <div class="col-md-4">
+                            <h6 class="mb-2">Stream</h6>
+                            <div class="form-check form-switch mb-2">
+                                <input class="form-check-input" type="checkbox" id="tw-stream-enabled-input">
+                                <label class="form-check-label" for="tw-stream-enabled">Include stream</label>
+                            </div>
+                            <label for="tw-stream-domain" class="small">RTMP domain</label>
+                            <input type="text" class="form-control mb-2" id="tw-stream-domain-input" placeholder="e.g. rtmp.batc.org.uk">
+                            <label for="tw-stream-app" class="small">App</label>
+                            <input type="text" class="form-control mb-2" id="tw-stream-app-input" placeholder="e.g. live">
+                            <label for="tw-stream-name" class="small">Stream name</label>
+                            <input type="text" class="form-control mb-2" id="tw-stream-name-input" placeholder="e.g. gb3jtinput">
+                            <label for="tw-stream-port" class="small">Port</label>
+                            <input type="number" step="1" class="form-control mb-2" id="tw-stream-port-input" placeholder="1935">
+                            <label for="tw-stream-label" class="small">Label</label>
+                            <input type="text" class="form-control mb-2" id="tw-stream-label-input" placeholder="e.g. Live Stream">
+                            <label for="tw-stream-waiting-message" class="small">Notification text</label>
+                            <input type="text" class="form-control" id="tw-stream-waiting-message-input"
+                                   placeholder="Leave blank for the default wording">
+                        </div>
+                    </div>
+                    <div class="mt-3 d-flex align-items-center gap-2">
+                        <button class="btn btn-save" onclick="saveTriWatch()">Save Tri-Watch sources</button>
+                        <span class="save-status" id="tw-save-status"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
 </div>
 
 <script>
+// ── Reveal sensitive fields (API keys, passwords) ────────────────
+// Click-to-toggle (not hold-to-view - that was tried first and,
+// despite passing every isolated event-dispatch test, repeatedly
+// didn't work for Justin in practice; a genuinely quick click on a
+// hold-only control can reveal-and-immediately-re-hide within
+// milliseconds, easy to miss and easy to mistake for "does nothing"
+// at all). A plain click is the simplest, most universally-reliable
+// interaction there is - identical for mouse and touch, with no
+// press-duration timing involved anywhere. Auto-hides after 10s so a
+// revealed value still can't be left exposed indefinitely if someone
+// walks away - keeping the original camera/shoulder-surfing concern
+// addressed without needing a sustained hold to do it. Toggles the
+// CSS masking (see .mask-field) directly rather than the input's
+// type - these fields are genuinely type="text" throughout,
+// deliberately never type="password", so browsers never treat them
+// as login credentials to offer saving/autofilling (confirmed as a
+// real, reported annoyance when they briefly were: an unwanted
+// save-password prompt on every visit, sometimes guessing a
+// nonsensical "username" from an unrelated nearby field).
+function revealField(id) {
+    const el = document.getElementById(id);
+    if (el) el.style.webkitTextSecurity = 'none';
+}
+function hideField(id) {
+    const el = document.getElementById(id);
+    if (el) el.style.webkitTextSecurity = 'disc';
+}
+function setupRevealButtons() {
+    document.querySelectorAll('.reveal-btn').forEach(btn => {
+        const targetId = btn.getAttribute('data-reveal-target');
+        let autoHideTimer = null;
+        btn.addEventListener('click', () => {
+            const el = document.getElementById(targetId);
+            if (!el) return;
+            const isRevealed = el.style.webkitTextSecurity === 'none';
+            clearTimeout(autoHideTimer);
+            if (isRevealed) {
+                hideField(targetId);
+                btn.textContent = '\U0001F441\uFE0F';
+            } else {
+                revealField(targetId);
+                btn.textContent = '\U0001F648';  // visually distinct "currently revealed" state
+                autoHideTimer = setTimeout(() => {
+                    hideField(targetId);
+                    btn.textContent = '\U0001F441\uFE0F';
+                }, 10000);
+            }
+        });
+    });
+}
+setupRevealButtons();
+
 async function loadCurrentConfig() {
     try {
         const cfg = await fetch('/api/config').then(r => r.json());
@@ -3018,6 +4371,10 @@ async function loadCurrentConfig() {
 
         const ppmStyle = cfg.display?.ppm_style || 'full_fat';
         document.getElementById(ppmStyle === 'full_fat' ? 'ppm-style-full-fat' : 'ppm-style-skeleton').checked = true;
+
+        const updateChannel = cfg.update?.channel || 'stable';
+        document.getElementById(updateChannel === 'beta' ? 'channel-beta' : 'channel-stable').checked = true;
+        onChannelRadioChange();
 
         document.getElementById('pt-host-input').value = cfg.picotuner?.host || '';
         document.getElementById('pt-status-port-input').value = cfg.picotuner?.status_port || '';
@@ -3041,6 +4398,9 @@ async function loadCurrentConfig() {
         document.getElementById('qrz-settle-input').value = qrz.settle_secs ?? 15;
         document.getElementById('qrz-suppress-input').value = qrz.suppress_mins ?? 60;
         document.getElementById('qrz-portable-locator-input').value = qrz.portable_locator || '';
+        document.getElementById('qrz-lookup-username-input').value = qrz.lookup_username || '';
+        document.getElementById('qrz-lookup-password-input').value = qrz.lookup_password || '';
+        document.getElementById('qrz-lookup-notif-input').checked = qrz.lookup_for_notifications || false;
 
         const slack = cfg.notifications?.slack || {};
         document.getElementById('slack-enabled-input').checked = slack.enabled || false;
@@ -3069,6 +4429,39 @@ async function loadCurrentConfig() {
         // Pin dropdown is built dynamically (see loadGpioPinList) - set
         // its value once populated, defaulting sensibly if unset.
         await loadGpioPinList(gpio.pin ?? 11);
+
+        // Tri-Watch: sources is a list (any mix of Rx1/Rx2/stream, in
+        // any order) rather than fixed fields, so each is found by
+        // type/rcv rather than assumed to be at a fixed index.
+        const tw = cfg.tri_watch || {};
+        const twSources = tw.sources || [];
+        const twRx1 = twSources.find(s => s.type === 'rf' && s.rcv === 1 && s.enabled !== false);
+        const twRx2 = twSources.find(s => s.type === 'rf' && s.rcv === 2 && s.enabled !== false);
+        const twStream = twSources.find(s => s.type === 'stream' && s.enabled !== false);
+
+        document.getElementById('tw-enabled-input').checked = tw.enabled || false;
+
+        document.getElementById('tw-rx1-enabled-input').checked = !!twRx1;
+        document.getElementById('tw-rx1-freq-input').value = twRx1?.freq ?? '';
+        document.getElementById('tw-rx1-sr-input').value = twRx1?.sr ?? '';
+        document.getElementById('tw-rx1-plug-input').value = twRx1?.fplug || 'a';
+        document.getElementById('tw-rx1-label-input').value = twRx1?.label || '';
+        document.getElementById('tw-rx1-callsign-input').value = twRx1?.callsign || '';
+
+        document.getElementById('tw-rx2-enabled-input').checked = !!twRx2;
+        document.getElementById('tw-rx2-freq-input').value = twRx2?.freq ?? '';
+        document.getElementById('tw-rx2-sr-input').value = twRx2?.sr ?? '';
+        document.getElementById('tw-rx2-plug-input').value = twRx2?.fplug || 'b';
+        document.getElementById('tw-rx2-label-input').value = twRx2?.label || '';
+        document.getElementById('tw-rx2-callsign-input').value = twRx2?.callsign || '';
+
+        document.getElementById('tw-stream-enabled-input').checked = !!twStream;
+        document.getElementById('tw-stream-domain-input').value = twStream?.domain || '';
+        document.getElementById('tw-stream-app-input').value = twStream?.app || '';
+        document.getElementById('tw-stream-name-input').value = twStream?.streamname || '';
+        document.getElementById('tw-stream-port-input').value = twStream?.port ?? 1935;
+        document.getElementById('tw-stream-label-input').value = twStream?.label || '';
+        document.getElementById('tw-stream-waiting-message-input').value = twStream?.waiting_message || '';
     } catch (e) {
         console.error('Failed to load config', e);
     }
@@ -3143,6 +4536,54 @@ async function saveSite() {
         statusEl.textContent = 'Save failed - see console.';
         statusEl.className = 'save-status text-danger';
         console.error(e);
+    }
+}
+
+function onChannelRadioChange() {
+    const selected = document.querySelector('input[name="update-channel"]:checked')?.value;
+    document.getElementById('beta-warning').style.display = (selected === 'beta') ? 'block' : 'none';
+}
+
+async function switchUpdateChannel() {
+    const statusEl = document.getElementById('channel-save-status');
+    const selected = document.querySelector('input[name="update-channel"]:checked')?.value;
+    if (!selected) return;
+
+    try {
+        const current = await fetch('/api/update/status').then(r => r.json());
+        if ((current.channel || 'stable') === selected) {
+            statusEl.textContent = 'Already on this channel.';
+            statusEl.className = 'save-status text-muted';
+            return;
+        }
+    } catch (e) { /* if this check fails, fall through and let the switch itself report any real problem */ }
+
+    const warning = selected === 'beta'
+        ? 'Switch to the Beta channel? This pulls newer, less-tested code and reboots the Pi. ' +
+          'You can switch back to Stable at any time.'
+        : 'Switch back to the Stable channel? This pulls the known-working release and reboots the Pi.';
+    if (!confirm(warning)) return;
+
+    statusEl.textContent = 'Switching...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const r = await fetch('/api/update/channel', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({channel: selected})
+        });
+        const result = await r.json();
+        if (!r.ok) {
+            statusEl.textContent = 'Failed: ' + (result.detail || 'unknown error');
+            statusEl.className = 'save-status text-danger';
+            return;
+        }
+        statusEl.textContent = 'Switched - rebooting the Pi now, back in about a minute.';
+        statusEl.className = 'save-status text-warning';
+    } catch (e) {
+        // The server may already be going down as part of the reboot by
+        // the time this resolves - not itself a sign anything went wrong.
+        statusEl.textContent = 'Switched - rebooting the Pi now, back in about a minute.';
+        statusEl.className = 'save-status text-warning';
     }
 }
 
@@ -3270,6 +4711,9 @@ async function saveQrz() {
                 settle_secs: parseFloat(document.getElementById('qrz-settle-input').value),
                 suppress_mins: parseFloat(document.getElementById('qrz-suppress-input').value),
                 portable_locator: document.getElementById('qrz-portable-locator-input').value.trim(),
+                lookup_username: document.getElementById('qrz-lookup-username-input').value.trim(),
+                lookup_password: document.getElementById('qrz-lookup-password-input').value,
+                lookup_for_notifications: document.getElementById('qrz-lookup-notif-input').checked,
             }
         };
         const r = await fetch('/api/config', {
@@ -3374,6 +4818,56 @@ async function saveGpioTx() {
     }
 }
 
+async function saveTriWatch() {
+    const statusEl = document.getElementById('tw-save-status');
+    statusEl.textContent = 'Saving...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const body = {
+            tri_watch: {
+                enabled: document.getElementById('tw-enabled-input').checked,
+                rx1: {
+                    enabled: document.getElementById('tw-rx1-enabled-input').checked,
+                    rcv: 1,
+                    fplug: document.getElementById('tw-rx1-plug-input').value,
+                    freq: parseInt(document.getElementById('tw-rx1-freq-input').value) || 0,
+                    sr: parseInt(document.getElementById('tw-rx1-sr-input').value) || 0,
+                    label: document.getElementById('tw-rx1-label-input').value,
+                    callsign: document.getElementById('tw-rx1-callsign-input').value,
+                },
+                rx2: {
+                    enabled: document.getElementById('tw-rx2-enabled-input').checked,
+                    rcv: 2,
+                    fplug: document.getElementById('tw-rx2-plug-input').value,
+                    freq: parseInt(document.getElementById('tw-rx2-freq-input').value) || 0,
+                    sr: parseInt(document.getElementById('tw-rx2-sr-input').value) || 0,
+                    label: document.getElementById('tw-rx2-label-input').value,
+                    callsign: document.getElementById('tw-rx2-callsign-input').value,
+                },
+                stream: {
+                    enabled: document.getElementById('tw-stream-enabled-input').checked,
+                    domain: document.getElementById('tw-stream-domain-input').value,
+                    app: document.getElementById('tw-stream-app-input').value,
+                    streamname: document.getElementById('tw-stream-name-input').value,
+                    port: parseInt(document.getElementById('tw-stream-port-input').value) || 1935,
+                    label: document.getElementById('tw-stream-label-input').value,
+                    waiting_message: document.getElementById('tw-stream-waiting-message-input').value,
+                },
+            }
+        };
+        const r = await fetch('/api/config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+        });
+        if (!r.ok) throw new Error(await r.text());
+        statusEl.textContent = 'Saved - restart Lynx to apply.';
+        statusEl.className = 'save-status text-warning';
+    } catch (e) {
+        statusEl.textContent = 'Save failed - see console.';
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
 async function loadDiscoveredPicotuners() {
     const listEl = document.getElementById('discovered-picotuners-list');
     try {
@@ -3439,6 +4933,26 @@ def picotuner_cmd(cmd: str):
         return True
     except Exception as e:
         print(f"[picotuner_cmd] could not send (Picotuner likely not configured/reachable): {e}")
+        return False
+
+def picotuner_rcv2_cmd(cmd: str, cfg: dict):
+    """Same fire-and-forget, never-raises contract as picotuner_cmd()
+    above - sends to Rx2's own, separate command port instead of Rx1's,
+    since the Picotuner genuinely requires this (a single shared port
+    with different rcv= values in the command text does NOT work,
+    confirmed the hard way during diversity mode's own development).
+    Takes cfg explicitly (config['picotuner']) rather than reading it
+    itself, since callers already have it in scope."""
+    try:
+        host = cfg.get('host', '')
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.sendto(cmd.encode(), (host, cfg['cmd_port_b']))
+        finally:
+            sock.close()
+        return True
+    except Exception as e:
+        print(f"[picotuner_rcv2_cmd] could not send (Picotuner likely not configured/reachable): {e}")
         return False
 
 def calc_tuner_freq(freq_khz: int, lnb_lo_khz: int) -> int:
@@ -3615,10 +5129,20 @@ def _tune_impl(req: TuneRequest):
         start_diversity_combiner()
         diversity_enabled = True
     else:
-        picotuner_cmd(
-            f"[to@wh] rcv=1 fplug={req.plug} offset=0 "
-            f"freq={tuner_freq} srate={req.sr}"
-        )
+        if req.rcv == 2:
+            # Same command format and port already confirmed working
+            # via tri_watch's own startup-tuning and diversity mode's
+            # own rcv=2 command - reused directly, not reimplemented.
+            picotuner_rcv2_cmd(
+                f"[to@wh] rcv=2 fplug={req.plug} offset=0 "
+                f"freq={tuner_freq} srate={req.sr}",
+                cfg
+            )
+        else:
+            picotuner_cmd(
+                f"[to@wh] rcv=1 fplug={req.plug} offset=0 "
+                f"freq={tuner_freq} srate={req.sr}"
+            )
         if diversity_enabled:
             # Switching away from diversity mode — stop the combiner
             # rather than leaving it running with nothing using its
@@ -3644,15 +5168,36 @@ def _tune_impl(req: TuneRequest):
         global mpv_running_for_rf
         try:
             time.sleep(1)
-            # Deliberately do NOT start mpv here. It's only started once
-            # rf_mpv_lifecycle_monitor confirms a stable signal lock -
-            # see that function's docstring for why. Just ensure nothing
-            # from a previous tune/stream is left running against what
-            # is now a stale target, and leave the cover up; the
-            # overlay already shows the useful status/metadata (call-
-            # sign, MER, modcod) during acquisition on its own.
-            kill_mpv()
-            mpv_running_for_rf = False
+            if not tri_watch_enabled:
+                # Deliberately do NOT start mpv here. It's only started once
+                # rf_mpv_lifecycle_monitor confirms a stable signal lock -
+                # see that function's docstring for why. Just ensure nothing
+                # from a previous tune/stream is left running against what
+                # is now a stale target, and leave the cover up; the
+                # overlay already shows the useful status/metadata (call-
+                # sign, MER, modcod) during acquisition on its own.
+                kill_mpv()
+                mpv_running_for_rf = False
+            # else: tri_watch is enabled. Confirmed as a genuine, serious
+            # race condition otherwise: this unconditional kill_mpv(),
+            # delayed by a fixed 1s, has no way to know whether a NEWLY,
+            # correctly-started mpv process (from rf_mpv_lifecycle_monitor()'s
+            # own tri_watch-aware branch, which can legitimately fire
+            # within that same second - tri_watch's receivers are often
+            # already continuously locked, unlike normal RF mode where a
+            # genuinely fresh lock confirmation always takes at least
+            # LOCK_CONFIRM_POLLS seconds after any tune) is what's
+            # actually running by the time this delay elapses, and would
+            # kill it just as readily as a genuinely stale one - this was
+            # confirmed as the actual reason Rx2 never showed video even
+            # after the earlier mpv_running_for_rf fix, which addressed a
+            # real but different problem and didn't touch this one at
+            # all. tri_watch's own caller (_tri_watch_display_source())
+            # already resets mpv_running_for_rf itself, synchronously,
+            # and restart_mpv() (called by rf_mpv_lifecycle_monitor()'s
+            # own tri_watch-aware branch) already kills any existing
+            # process immediately before starting the new one - nothing
+            # further is needed or safe to do here in that case.
         finally:
             tune_lock.release()
     threading.Thread(target=_kick_mpv, daemon=True).start()
@@ -3920,7 +5465,17 @@ def _start_stream_impl(req: StreamRequest):
     # target address — this also frees up genuine RF/network bandwidth
     # a locked Picotuner would otherwise be consuming the whole time a
     # stream plays.
-    picotuner_cmd("[to@wh] rcv=1 fplug=a offset=0 freq=0 srate=333")
+    #
+    # Skipped entirely when tri-watch is enabled (2026-08-01, renamed
+    # from an earlier "dual-watch") - the whole point of that feature is
+    # keeping the Picotuner genuinely tuned and monitored continuously,
+    # regardless of what's currently being displayed, so real RF
+    # activity on a configured repeater frequency is never missed just
+    # because the stream happens to be on screen right now. The
+    # RF/network bandwidth this normally frees up is a deliberate,
+    # accepted trade-off for anyone who's turned this on.
+    if not tri_watch_enabled:
+        picotuner_cmd("[to@wh] rcv=1 fplug=a offset=0 freq=0 srate=333")
 
     current_mode = "stream"
     # The friendly name is whatever the caller says it is — this is our
@@ -4089,6 +5644,67 @@ def restart_lynx():
     threading.Thread(target=_do_reboot, daemon=True).start()
     return {"success": True, "message": "Rebooting the Pi - back in about a minute"}
 
+@app.post("/api/shutdown", tags=["Control"],
+          summary="Shut down (power off) the Pi",
+          description="Gracefully stops current reception, then powers off "
+                      "the entire Raspberry Pi via 'sudo shutdown -h now'. "
+                      "Unlike Reboot, the Pi does NOT come back up on its "
+                      "own afterwards - it needs power physically cycled "
+                      "(or a remote power switch) to bring the receiver "
+                      "back. Same passwordless-sudo requirement as Reboot, "
+                      "checked synchronously before responding for the same "
+                      "reason: a fire-and-forget shutdown can't report back "
+                      "if it's actually going to work.")
+def shutdown_pi():
+    check = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=5)
+    if check.returncode != 0:
+        raise HTTPException(status_code=500,
+            detail="'sudo shutdown' requires passwordless sudo for this user, which "
+                   "isn't currently configured - the Pi was NOT shut down. Fix (run "
+                   "on the Pi over SSH):\n\n"
+                   'echo "$USER ALL=(ALL) NOPASSWD: /sbin/shutdown, /sbin/poweroff" '
+                   "| sudo tee /etc/sudoers.d/lynx-shutdown\n"
+                   "sudo chmod 0440 /etc/sudoers.d/lynx-shutdown\n"
+                   "sudo visudo -c\n\n"
+                   "Or shut down manually over SSH instead.")
+
+    stop_current()  # graceful cover-up + mpv stop first, same as the Stop button
+
+    def _do_shutdown():
+        time.sleep(1.5)  # let this HTTP response actually reach the browser first
+        subprocess.Popen(["sudo", "shutdown", "-h", "now"])
+    threading.Thread(target=_do_shutdown, daemon=True).start()
+    return {"success": True, "message": "Shutting down - the Pi will power off shortly and will NOT restart on its own."}
+
+@app.post("/api/app_stop", tags=["Control"],
+          summary="Stop the Lynx app, back to the desktop",
+          description="Gracefully stops current reception, then closes the "
+                      "Lynx app itself (and its overlay) entirely, leaving "
+                      "the Pi running and returning to its desktop - unlike "
+                      "Stop, which only stops reception, and unlike Reboot/"
+                      "Shutdown, which restart or power off the whole Pi. "
+                      "Kills by process name rather than a tracked PID, "
+                      "since the overlay is started independently of this "
+                      "app rather than launched by it - works regardless of "
+                      "how both were originally started. NOTE: if something "
+                      "is separately supervising these processes with "
+                      "auto-restart (e.g. a systemd service configured with "
+                      "Restart=always), they may simply relaunch a moment "
+                      "later - that would need stopping at the supervisor "
+                      "level instead, not from here.")
+def app_stop():
+    stop_current()  # graceful cover-up + mpv stop first
+
+    def _do_app_stop():
+        time.sleep(1.0)  # let this HTTP response actually reach the browser first
+        subprocess.run(["pkill", "-f", "lynx_overlay.py"])
+        subprocess.run(["pkill", "-f", "lynx_app.py"])
+        os._exit(0)  # hard exit - simpler and more reliable here than trying
+                      # to gracefully unwind uvicorn's own event loop for what
+                      # is, by design, an abrupt full stop
+    threading.Thread(target=_do_app_stop, daemon=True).start()
+    return {"success": True, "message": "Stopping Lynx - returning to the desktop."}
+
 class VolumeRequest(BaseModel):
     level: int  # 0-100
 
@@ -4176,7 +5792,28 @@ def post_update_check():
                       "at the cost of being slower than a simple process "
                       "restart would be.")
 def post_update_apply():
-    branch = get_default_branch()
+    branch = get_update_branch()
+
+    # Defensive: git pull merges into whatever's CURRENTLY checked out
+    # locally, not necessarily the branch actually named in the
+    # command below - if the local checkout ever drifted out of sync
+    # with the configured channel (shouldn't normally happen, since
+    # POST /api/update/channel always does an explicit checkout
+    # whenever the channel itself changes, but worth guarding against
+    # regardless given the stakes: a mismatched pull here could
+    # silently merge beta content into what's meant to be a stable
+    # checkout, or vice versa), self-heal by checking out the correct
+    # branch first rather than trusting it's already right.
+    ok, current_branch = git_cmd("branch", "--show-current")
+    if ok and current_branch and current_branch != branch:
+        print(f"[update] local branch '{current_branch}' doesn't match configured "
+              f"channel's branch '{branch}' - checking out the correct one first")
+        ok, err = git_cmd("checkout", branch)
+        if not ok:
+            raise HTTPException(status_code=502,
+                detail=f"Update failed: local checkout ('{current_branch}') didn't match "
+                       f"the configured channel ('{branch}'), and switching to it failed: {err}")
+
     ok, pull_output = git_cmd("pull", "--ff-only", "origin", branch)
     if not ok:
         raise HTTPException(status_code=502,
@@ -4214,6 +5851,101 @@ def post_update_apply():
 
     return {"result": "ok", "message": "Update pulled successfully - rebooting the Pi now.",
             "pull_output": pull_output}
+
+class UpdateChannelRequest(BaseModel):
+    channel: str   # 'stable' or 'beta'
+
+@app.post("/api/update/channel", tags=["Configuration"],
+          summary="Switch update channel (stable/beta) and reboot",
+          description="Per Justin's own request, mirroring BATC Portsdown's "
+                      "existing beta-channel model: lets Lynx track a "
+                      "separate 'beta' branch of newer, less-proven code "
+                      "instead of the normal stable one, for anyone who "
+                      "wants to experiment - switchable back to stable at "
+                      "any time. Unlike a normal update (POST /api/update/"
+                      "apply, which pulls within whatever branch is "
+                      "already checked out), switching channels means "
+                      "actually checking out a DIFFERENT branch entirely - "
+                      "git checkout, not git pull. Fails safely: if the "
+                      "fetch or checkout fails for any reason, this "
+                      "returns an error and nothing is touched - no "
+                      "reboot is triggered unless the switch itself "
+                      "succeeded cleanly first.")
+def post_update_channel(req: UpdateChannelRequest):
+    global config
+    if req.channel not in ("stable", "beta"):
+        raise HTTPException(status_code=400,
+            detail="channel must be 'stable' or 'beta'")
+
+    target_branch = "beta" if req.channel == "beta" else get_default_branch()
+
+    # Make sure the remote branch's latest content is actually known
+    # locally before trying to check it out - a plain `git checkout
+    # -B x origin/x` against a stale/never-fetched remote ref would
+    # otherwise silently land on old content rather than genuinely
+    # failing, which would be a much more confusing failure mode than
+    # this fetch simply erroring out cleanly if the branch doesn't
+    # exist or the network's unreachable.
+    ok, err = git_cmd("fetch", "origin", target_branch)
+    if not ok:
+        raise HTTPException(status_code=502,
+            detail=f"Could not fetch the '{target_branch}' branch: {err}")
+
+    # -B creates the local branch if it doesn't exist yet (first time
+    # ever switching to beta) or forcibly resets it to exactly match
+    # the remote if it does (switching back again later, possibly
+    # after diverging locally somehow) - one command handles both
+    # cases identically rather than needing to detect which applies.
+    ok, err = git_cmd("checkout", "-B", target_branch, f"origin/{target_branch}")
+    if not ok:
+        raise HTTPException(status_code=502,
+            detail=f"Could not switch to the '{target_branch}' branch: {err}")
+
+    # Persist the choice - same read-fresh-from-disk, write-via-tmp-
+    # then-replace pattern as every other config write in this file.
+    with open(CONFIG_PATH) as f:
+        on_disk = yaml.safe_load(f)
+    on_disk.setdefault('update', {})['channel'] = req.channel
+    tmp_path = str(CONFIG_PATH) + ".tmp"
+    with open(tmp_path, 'w') as f:
+        yaml.safe_dump(on_disk, f, default_flow_style=False, sort_keys=False)
+    os.replace(tmp_path, CONFIG_PATH)
+    config = on_disk
+
+    # Refresh state immediately, same reasoning as post_update_apply()
+    # above - a client that doesn't reload fast enough after the
+    # reboot at least sees the truth if it asks again.
+    update_state["current_version"] = detect_current_version()
+    update_state["channel"] = req.channel
+    update_state["update_available"] = False
+    update_state["commits_behind"] = 0
+    update_state["new_commits"] = []
+
+    # Same passwordless-sudo check, and for the same reason, as Reboot/
+    # update-apply above: a fire-and-forget reboot can't report back
+    # if it silently fails to actually happen. The channel switch has
+    # already succeeded by this point though, so a failed check here
+    # still leaves the code genuinely on the new channel - just not
+    # yet running - which the error message says explicitly.
+    check = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=5)
+    if check.returncode != 0:
+        raise HTTPException(status_code=500,
+            detail=f"Switched to the '{req.channel}' channel successfully, but couldn't "
+                   "reboot automatically - passwordless sudo isn't configured for this "
+                   "user. The switch IS applied; reboot the Pi manually now, or fix this "
+                   "permanently (run on the Pi over SSH):\n\n"
+                   'echo "$USER ALL=(ALL) NOPASSWD: /sbin/reboot, /usr/sbin/reboot" '
+                   "| sudo tee /etc/sudoers.d/lynx-reboot\n"
+                   "sudo chmod 0440 /etc/sudoers.d/lynx-reboot\n"
+                   "sudo visudo -c")
+
+    def _do_reboot():
+        time.sleep(1.0)  # let this HTTP response actually reach the browser first
+        subprocess.Popen(["sudo", "reboot"])
+    threading.Thread(target=_do_reboot, daemon=True).start()
+
+    return {"result": "ok", "channel": req.channel,
+            "message": f"Switched to the '{req.channel}' channel - rebooting the Pi now."}
 
 class DefaultBootRequest(BaseModel):
     freq: int
@@ -4320,6 +6052,54 @@ def update_config(req: ConfigUpdateRequest):
     if req.display is not None:
         on_disk.setdefault('display', {}).update(req.display.model_dump())
 
+    # tri_watch: rebuilds just the `sources` list and top-level
+    # `enabled` flag from whichever of Rx1/Rx2/stream are actually
+    # enabled in the submitted form - every other tri_watch field
+    # (settling_seconds, lock_confirm_seconds, notification_duration_secs,
+    # rf_notification_template) is left completely untouched, since
+    # this form never sees or sends them. Always needs a restart to
+    # take effect - tri_watch's own probes/arbitrator are set up once
+    # at process start from this exact list, unlike most other
+    # sections here which are re-read live.
+    tri_watch_changed = req.tri_watch is not None
+    if req.tri_watch is not None:
+        new_sources = []
+        # Every existing tri_watch reader (get_tri_watch_status, the
+        # arbitrator loop, startup tune, the port drainer sync) checks
+        # src_cfg.get('enabled', False) on each individual source dict
+        # - defaulting to False if that key is absent entirely. This
+        # form only ever appends a source here when its own "Include"
+        # checkbox was on, so it's always enabled - but that must be
+        # written explicitly as its own field, not left implied by
+        # presence in the list, or every single saved source would
+        # silently fail that check and disappear, not just an
+        # intentionally-excluded one. Confirmed as a real, reported bug
+        # otherwise: a save that only meant to drop Rx2 dropped Rx1 and
+        # the stream too, since neither carried this field either.
+        if req.tri_watch.rx1.enabled:
+            r = req.tri_watch.rx1
+            new_sources.append({
+                "type": "rf", "rcv": 1, "fplug": r.fplug, "freq": r.freq, "sr": r.sr,
+                "lnb_lo_khz": r.lnb_lo_khz, "label": r.label, "callsign": r.callsign,
+                "enabled": True,
+            })
+        if req.tri_watch.rx2.enabled:
+            r = req.tri_watch.rx2
+            new_sources.append({
+                "type": "rf", "rcv": 2, "fplug": r.fplug, "freq": r.freq, "sr": r.sr,
+                "lnb_lo_khz": r.lnb_lo_khz, "label": r.label, "callsign": r.callsign,
+                "enabled": True,
+            })
+        if req.tri_watch.stream.enabled:
+            s = req.tri_watch.stream
+            new_sources.append({
+                "type": "stream", "domain": s.domain, "app": s.app,
+                "streamname": s.streamname, "port": s.port, "label": s.label,
+                "waiting_message": s.waiting_message, "enabled": True,
+            })
+        on_disk.setdefault('tri_watch', {})['enabled'] = req.tri_watch.enabled
+        on_disk.setdefault('tri_watch', {})['sources'] = new_sources
+
     tmp_path = str(CONFIG_PATH) + ".tmp"
     with open(tmp_path, 'w') as f:
         yaml.safe_dump(on_disk, f, default_flow_style=False, sort_keys=False)
@@ -4328,7 +6108,7 @@ def update_config(req: ConfigUpdateRequest):
     config = on_disk  # reload in-memory immediately - site fields take effect right away
     return {
         "success": True,
-        "restart_required": picotuner_changed or diversity_changed,
+        "restart_required": picotuner_changed or diversity_changed or tri_watch_changed,
     }
 
 @app.post("/api/config/reload", tags=["Configuration"],
@@ -4399,6 +6179,8 @@ def web_ui():
             <small class="text-muted" id="site-name">Loading...</small>
             <!-- Diversity: replaces the site-name line above with a highlighted stats box while diversity mode is active -->
             <div id="diversity-stats-line" style="display:none; background:#0f3460; color:#ffffff; font-weight:500; padding: 4px 10px; border-radius: 4px; font-size: 1rem;"></div>
+            <!-- Tri-watch (Stage 1): shows status for every currently-enabled source (any mix of RF-A/RF-B/stream), only when enabled in config. Element id kept as "dual-watch-line" from the earlier, narrower design - purely cosmetic, no need to rename it -->
+            <div id="dual-watch-line" style="display:none; background:#3a2a5c; color:#ffffff; font-weight:500; padding: 4px 10px; border-radius: 4px; font-size: 1rem;"></div>
         </div>
         <div class="col-auto d-flex align-items-start gap-2 pt-1">
             <span><span class="led led-grey" id="picotuner-led"></span><small id="picotuner-status" class="text-muted">Picotuner</small></span>
@@ -4426,6 +6208,18 @@ def web_ui():
             <div class="card mt-2" id="diversity-panel-b" style="display:none">
                 <div class="card-header">&#x1F4E1; Tuner Rx 2 (Diversity)</div>
                 <div class="card-body" id="status-panel-b"></div>
+            </div>
+            <!-- tri_watch: the active stream's own info, shown independently
+                 of Rx1's panel above rather than sharing its slot - confirmed
+                 as a real, reported bug otherwise: Rx1 stays continuously,
+                 independently tuned in the background under tri_watch
+                 regardless of what's actually being displayed, but the main
+                 panel above used to switch entirely to stream info whenever
+                 a stream was on screen, hiding Rx1's own status completely
+                 until whichever one "came up first" lost that slot again. -->
+            <div class="card mt-2" id="tri-watch-stream-panel" style="display:none">
+                <div class="card-header">&#x1F4FA; Stream</div>
+                <div class="card-body" id="tri-watch-stream-status"></div>
             </div>
         </div>
 
@@ -4512,7 +6306,8 @@ def web_ui():
                 <div class="card-header">&#x2699;&#xFE0F; Control</div>
                 <div class="card-body">
                     <div class="d-flex gap-2 mb-2">
-                        <button class="btn btn-danger flex-fill" onclick="stopAll()">&#x23F9; Stop</button>
+                        <button class="btn btn-dark flex-fill" onclick="shutdownPi()">&#x23FB; Shutdown</button>
+                        <button class="btn btn-danger flex-fill" onclick="stopApp()">&#x23F9; Stop</button>
                         <button class="btn btn-warning flex-fill" onclick="restartLynx()">&#x1F504; Reboot</button>
                     </div>
                     <hr>
@@ -4520,29 +6315,32 @@ def web_ui():
                     <div class="d-flex align-items-center gap-2 mb-1">
                         <span style="font-size:1.1em">&#x1F50A;</span>
                         <input type="range" class="form-range flex-grow-1" id="volume-slider"
-                               min="0" max="100" value="100"
+                               min="-60" max="0" step="0.5" value="0" title="These go to eleven"
                                oninput="onVolumeInput(this.value)" onchange="setVolume(this.value)">
-                        <span class="status-value" id="volume-value" style="min-width:4.5em; text-align:right;">0.0 dB</span>
+                        <span class="status-value" id="volume-value" style="min-width:9em; text-align:right;">+0.0 dB (11.0/11)</span>
                     </div>
                     <div class="text-muted small mb-2">
-                        100% = unity gain (0 dB) — correct reference for
+                        0 dB = unity gain (11) — correct reference for
                         24-bit sources already mastered to EBU R128
-                        (normal programme level ≈ -18 dBFS). Shown here
-                        as dB relative to 24-bit full scale rather than
-                        percent - mpv's own volume scale is cubic, not
-                        linear, so percent alone doesn't correspond
-                        evenly to level.
+                        (normal programme level ≈ -18 dBFS). dB shown
+                        relative to 24-bit full scale, in 0.5 dB steps -
+                        mpv's own volume scale is cubic, not linear, so
+                        percent alone doesn't correspond evenly to
+                        level. The (x/11) alongside it is exactly what
+                        it looks like.
                     </div>
                     <div class="text-muted small mb-2" style="color:#d98a1e !important">
                         &#x26A0;&#xFE0F; The OSD's PPM meter is only correctly
-                        calibrated at 0dB (100%) - it reads mpv's actual
+                        calibrated at 0dB (11) - it reads mpv's actual
                         output after this gain is applied, and doesn't
                         currently compensate for it.
                     </div>
                     <div class="input-group input-group-sm mb-2">
                         <span class="input-group-text bg-dark text-light border-secondary" style="font-size:0.8em">Default on boot</span>
                         <input type="number" class="form-control bg-dark text-light border-secondary"
-                               id="default-volume-input" min="0" max="100" value="100">
+                               id="default-volume-input" min="-60" max="0" step="0.5" value="0"
+                               oninput="onDefaultVolumeInput()">
+                        <span class="input-group-text bg-dark text-light border-secondary" id="default-volume-eleven" style="font-size:0.8em; min-width:5em;">(11.0/11)</span>
                         <button class="btn btn-outline-light" onclick="saveDefaultVolume()">Save</button>
                     </div>
                     <hr>
@@ -4593,6 +6391,22 @@ async function updateStatus() {
         badge.textContent = mode.toUpperCase();
         badge.style.background = mode === 'idle' ? '#3a4a63' : mode === 'rf' ? '#1a9850' : '#3b82c4';
 
+        // Tri-watch (Stage 1) - status of every currently-enabled source
+        // (any mix of RF-A, RF-B, a stream) shown side by side. No
+        // priority/switching logic yet - this is purely informational.
+        const tw = s.tri_watch || {};
+        const twLine = document.getElementById('dual-watch-line');
+        if (tw.enabled && (tw.sources || []).length > 0) {
+            const parts = tw.sources.map(src => {
+                const icon = src.active ? '🟢' : (src.active === false ? '⚪' : '❓');
+                return `${icon} ${src.label}`;
+            });
+            twLine.textContent = `Tri-watch: ${parts.join('  |  ')}`;
+            twLine.style.display = 'block';
+        } else {
+            twLine.style.display = 'none';
+        }
+
         // mpv restart counter - links through to /diagnostics for detail
         const restartCount = s.lynx?.mpv_restarts_total ?? 0;
         document.getElementById('mpv-restart-count').textContent = restartCount;
@@ -4628,7 +6442,17 @@ async function updateStatus() {
         const locked = pt.locked;
         const lynxMode = s.lynx?.mode || 'idle';
 
-        if (lynxMode === 'stream') {
+        // tri_watch: Rx1 stays continuously, independently tuned in the
+        // background regardless of what's currently being displayed -
+        // its own panel should never be taken over by stream info in
+        // that case, same principle already proven correct for Tuner
+        // B's own panel below. Confirmed as a real, reported bug
+        // otherwise: whichever of Rx1/stream "came up first" took this
+        // shared slot, hiding the other's status entirely.
+        const triWatchUsesRx1 = tw.enabled && (tw.sources || []).some(src => src.type === 'rf' && src.rcv === 1);
+        const showStreamInMainPanel = (lynxMode === 'stream') && !triWatchUsesRx1;
+
+        if (showStreamInMainPanel) {
             const info = s.lynx?.stream_info || {};
             const bitrate = info.bitrate_kbps;
             const protocol = s.lynx?.stream_protocol;
@@ -4680,9 +6504,18 @@ async function updateStatus() {
                 '<div class="text-muted small text-center mt-2">Searching for signal...</div>';
         }
 
-        // Diversity: second tuner panel, only shown while diversity mode is active
+        // Diversity: second tuner panel, shown while diversity mode is
+        // active OR while tri_watch has an RF source configured for
+        // rcv=2 - picotuner_state_b is always correctly populated
+        // either way, but this panel used to be the ONLY place any of
+        // that data (callsign, MER, margin, etc.) was ever shown, and
+        // it was gated to diversity mode specifically. tri_watch users
+        // previously had no way to see Rx2's detailed lock info at all
+        // beyond the arbitrator's own simple green/grey indicator -
+        // confirmed as a real, reported gap.
+        const triWatchUsesRx2 = (s.tri_watch?.sources || []).some(src => src.type === 'rf' && src.rcv === 2);
         const panelB = document.getElementById('diversity-panel-b');
-        if (div.enabled) {
+        if (div.enabled || triWatchUsesRx2) {
             panelB.style.display = '';
             const b = div.tuner_b || {};
             const bodyB = document.getElementById('status-panel-b');
@@ -4710,24 +6543,53 @@ async function updateStatus() {
             } else {
                 bodyB.innerHTML = '<div class="text-danger small text-center mt-2">Offline</div>';
             }
-            // Live combining stats — the combiner's own rolling window,
-            // not a cumulative-since-start figure. Shown in place of
-            // the site-name line at the top while diversity is active.
-            const statsLine = document.getElementById('diversity-stats-line');
-            const siteName = document.getElementById('site-name');
-            statsLine.style.display = '';
-            siteName.style.display = 'none';
-            const st = div.stats;
-            if (st) {
-                statsLine.textContent =
-                    `Diversity: A ${st.window_pct_a?.toFixed(0) ?? '—'}% \u00b7 B ${st.window_pct_b?.toFixed(0) ?? '—'}% \u00b7 gaps ${st.window_pct_gap?.toFixed(1) ?? '—'}%`;
-            } else {
-                statsLine.textContent = 'Diversity: combiner starting...';
+            // Live combining stats - the combiner's own rolling window,
+            // not a cumulative-since-start figure. Diversity-only,
+            // deliberately not shown for tri_watch - there's no
+            // combiner running in that mode, so nothing to report here.
+            if (div.enabled) {
+                const statsLine = document.getElementById('diversity-stats-line');
+                const siteName = document.getElementById('site-name');
+                statsLine.style.display = '';
+                siteName.style.display = 'none';
+                const st = div.stats;
+                if (st) {
+                    statsLine.textContent =
+                        `Diversity: A ${st.window_pct_a?.toFixed(0) ?? '—'}% \u00b7 B ${st.window_pct_b?.toFixed(0) ?? '—'}% \u00b7 gaps ${st.window_pct_gap?.toFixed(1) ?? '—'}%`;
+                } else {
+                    statsLine.textContent = 'Diversity: combiner starting...';
+                }
             }
         } else {
             panelB.style.display = 'none';
             document.getElementById('diversity-stats-line').style.display = 'none';
             document.getElementById('site-name').style.display = '';
+        }
+
+        // tri_watch: the stream's own info, shown independently of Rx1's
+        // panel above - only needed when that panel is actually showing
+        // Rx1's own RF details instead (triWatchUsesRx1), since otherwise
+        // the stream info is already correctly shown there and showing it
+        // twice would just be a duplicate.
+        const streamPanel = document.getElementById('tri-watch-stream-panel');
+        if (tw.enabled && lynxMode === 'stream' && triWatchUsesRx1) {
+            streamPanel.style.display = '';
+            const info = s.lynx?.stream_info || {};
+            const bitrate = info.bitrate_kbps;
+            const protocol = s.lynx?.stream_protocol;
+            const streamRows = [
+                ['Stream',     s.lynx?.stream_name || '—'],
+                ['Protocol',   protocol || '—'],
+                ['Bitrate',    bitrate != null ? bitrate.toFixed(0) + ' kbps' : '—'],
+                ['Video',      info.video_codec || '—'],
+                ['Audio',      info.audio_codec || '—'],
+            ];
+            document.getElementById('tri-watch-stream-status').innerHTML = streamRows.map(r =>
+                '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;"><span>' + r[0] + '</span>' +
+                '<span class="status-value">' + r[1] + '</span></div>'
+            ).join('');
+        } else {
+            streamPanel.style.display = 'none';
         }
     } catch(e) {
         document.getElementById('status-panel').innerHTML = '<div class="text-danger small">Status unavailable</div>';
@@ -4909,8 +6771,40 @@ async function playCustom() {
     if (url) await playStream(url);
 }
 
-async function stopAll() {
-    await api('POST', '/api/stop');
+async function stopApp() {
+    if (!confirm('Stop Lynx? This closes the app and returns the Pi to its desktop - ' +
+                 'the receiver will be off the air until Lynx is started again.')) {
+        return;
+    }
+    try {
+        const result = await api('POST', '/api/app_stop');
+        if (result && result.detail) {
+            alert('Could not stop: ' + result.detail);
+            return;
+        }
+    } catch (e) {
+        // The server is expected to go down as part of this - not itself
+        // a sign anything went wrong.
+    }
+}
+
+async function shutdownPi() {
+    if (!confirm('Shut down the Pi completely? Unlike Reboot, it will NOT come back up on ' +
+                 'its own - you will need to physically power it back on (or use a remote ' +
+                 'power switch) to bring the receiver back.')) {
+        return;
+    }
+    try {
+        const result = await api('POST', '/api/shutdown');
+        if (result && result.detail) {
+            alert('Could not shut down: ' + result.detail);
+            return;
+        }
+    } catch (e) {
+        // The server is expected to go down as part of this - not itself
+        // a sign anything went wrong.
+    }
+    alert('Shutting down - the Pi will power off shortly.');
 }
 
 async function restartLynx() {
@@ -4937,47 +6831,80 @@ async function restartLynx() {
 }
 
 // ── Volume ────────────────────────────────────────────────────
+// dB is the actual, functional unit throughout the UI now (0.5dB
+// steps) - the backend's own /api/volume is completely unchanged and
+// still speaks 0-100 percent, so every value crosses this conversion
+// at the boundary rather than the underlying representation changing
+// everywhere. -60dB is the slider's floor: mpv's own volume scale is
+// cubic (percent = 100 * 10^(dB/60)), so percent asymptotically
+// approaches but never reaches exactly 0 as dB decreases - a
+// continuous slider needs a genuine, finite minimum rather than -∞,
+// and -60dB (10% - already very quiet) is a practical, sensible one.
+// The "(x/11)" alongside it is the Spinal Tap joke Justin actually
+// asked for - a cosmetic-only value derived FROM the dB figure, not
+// the other way around as an earlier version of this had it.
 let volumeDebounce = null;
+const VOLUME_MIN_DB = -60;
 
-function volumeToDbText(value) {
-    // mpv's own volume scale is cubic (confirmed directly against
-    // mpv's own issue tracker, not assumed), so dB = 20*log10(gain)
-    // where gain = (value/100)^3, i.e. dB = 60*log10(value/100).
-    const v = parseInt(value);
-    if (v <= 0) return '-\u221E dB';
-    const db = 60 * Math.log10(v / 100);
-    return (db >= 0 ? '+' : '') + db.toFixed(1) + ' dB';
+function dbToPercent(db) {
+    return Math.round(100 * Math.pow(10, db / 60));
+}
+function percentToDb(percent) {
+    if (percent <= 0) return VOLUME_MIN_DB;
+    const db = 60 * Math.log10(percent / 100);
+    return Math.max(VOLUME_MIN_DB, db);
+}
+function dbToEleven(db) {
+    const raw = 11 * (db - VOLUME_MIN_DB) / (0 - VOLUME_MIN_DB);
+    return Math.max(0, Math.min(11, raw)).toFixed(1);
+}
+function volumeReadoutText(db) {
+    const dbNum = parseFloat(db);
+    const sign = dbNum >= 0 ? '+' : '';
+    return sign + dbNum.toFixed(1) + ' dB (' + dbToEleven(dbNum) + '/11)';
 }
 
-function onVolumeInput(value) {
+function onVolumeInput(dbValue) {
     // Update the live readout immediately as the slider moves, but
     // debounce the actual API call so dragging doesn't flood requests
-    document.getElementById('volume-value').textContent = volumeToDbText(value);
+    document.getElementById('volume-value').textContent = volumeReadoutText(dbValue);
     clearTimeout(volumeDebounce);
-    volumeDebounce = setTimeout(() => setVolume(value), 150);
+    volumeDebounce = setTimeout(() => setVolume(dbValue), 150);
 }
 
-async function setVolume(value) {
-    await api('POST', '/api/volume', {level: parseInt(value)});
+async function setVolume(dbValue) {
+    await api('POST', '/api/volume', {level: dbToPercent(parseFloat(dbValue))});
+}
+
+function onDefaultVolumeInput() {
+    // Keeps the (x/11) readout next to the Default on boot field live
+    // as the dB value is typed/adjusted, matching the main slider's
+    // own readout - separate from saveDefaultVolume() below, which
+    // only actually persists the value once "Save" is clicked.
+    const db = parseFloat(document.getElementById('default-volume-input').value) || 0;
+    document.getElementById('default-volume-eleven').textContent = '(' + dbToEleven(db) + '/11)';
 }
 
 async function saveDefaultVolume() {
-    const value = parseInt(document.getElementById('default-volume-input').value);
-    await api('POST', '/api/volume/default', {level: value});
+    const db = parseFloat(document.getElementById('default-volume-input').value) || 0;
+    await api('POST', '/api/volume/default', {level: dbToPercent(db)});
 }
 
 async function loadVolume() {
     try {
         const data = await api('GET', '/api/volume');
         if (data.level != null) {
-            document.getElementById('volume-slider').value = data.level;
-            document.getElementById('volume-value').textContent = volumeToDbText(data.level);
+            const db = percentToDb(data.level);
+            document.getElementById('volume-slider').value = db;
+            document.getElementById('volume-value').textContent = volumeReadoutText(db);
         }
     } catch(e) {}
     try {
         const cfg = await api('GET', '/api/config');
-        const defaultVol = cfg.audio?.default_volume ?? 100;
-        document.getElementById('default-volume-input').value = defaultVol;
+        const defaultVolPercent = cfg.audio?.default_volume ?? 100;
+        const defaultDb = percentToDb(defaultVolPercent);
+        document.getElementById('default-volume-input').value = defaultDb;
+        document.getElementById('default-volume-eleven').textContent = '(' + dbToEleven(defaultDb) + '/11)';
     } catch(e) {}
 }
 
@@ -4985,20 +6912,25 @@ function renderUpdateStatus(status) {
     const badge = document.getElementById('version-badge');
     const applyBtn = document.getElementById('update-apply-btn');
     const version = status.current_version || '?';
+    // Shown on ALL four branches below via versionText, rather than
+    // repeating it in each one separately - which channel is active
+    // matters regardless of whether an update check has ever run or
+    // what it found.
+    const versionText = 'v' + version.replace(/^v/, '') + (status.channel === 'beta' ? ' [BETA]' : '');
 
     if (status.check_error) {
-        badge.textContent = 'v' + version.replace(/^v/, '');
+        badge.textContent = versionText;
         badge.title = 'Update check failed: ' + status.check_error;
         badge.style.background = '#3a4a63';
         applyBtn.style.display = 'none';
     } else if (status.update_available) {
-        badge.textContent = 'v' + version.replace(/^v/, '') + ' — ' +
+        badge.textContent = versionText + ' — ' +
             status.commits_behind + ' update' + (status.commits_behind === 1 ? '' : 's') + ' available';
         badge.title = (status.new_commits || []).join('\\n') || 'Update available';
         badge.style.background = '#e8a33d';
         applyBtn.style.display = 'inline-block';
     } else if (status.checked_at) {
-        badge.textContent = 'v' + version.replace(/^v/, '') + ' — up to date';
+        badge.textContent = versionText + ' — up to date';
         badge.title = 'Last checked: ' + status.checked_at;
         badge.style.background = '#1a9850';
         applyBtn.style.display = 'none';
@@ -5006,7 +6938,7 @@ function renderUpdateStatus(status) {
         // Never actually checked yet - checking is entirely manual,
         // so this is the normal, expected state until "Check Updates"
         // is clicked, not an error or something stale.
-        badge.textContent = 'v' + version.replace(/^v/, '');
+        badge.textContent = versionText;
         badge.title = 'Not yet checked - click "Check Updates"';
         badge.style.background = '#3a4a63';
         applyBtn.style.display = 'none';
@@ -5136,6 +7068,51 @@ if __name__ == "__main__":
     rss_monitor.start()
     dial_discovery = threading.Thread(target=dial_discovery_responder, daemon=True)
     dial_discovery.start()
+    # Tri-watch (up to 3 sources, Stage 1) - probes for any enabled
+    # stream sources are started here, once, rather than lazily on
+    # first use, so their connect/handshake/reconnect cycle is already
+    # warmed up and settled by the time anyone actually looks at their
+    # status, matching how the Picotuner's own monitoring threads work.
+    # RF sources need no separate startup step at all - their status is
+    # already tracked by the existing picotuner_state/picotuner_state_b
+    # globals, and this stage deliberately doesn't auto-tune them (see
+    # the tri_watch_enabled global's own docstring for why).
+    # NOT yet validated against the real BATC RTMP server for more than
+    # one simultaneous stream source - the single-stream case has been
+    # confirmed working directly against real hardware; a second,
+    # concurrent stream probe alongside it is untested.
+    _tw_cfg = config.get('tri_watch', {})
+    if _tw_cfg.get('enabled', False):
+        tri_watch_enabled = True
+        tri_watch_sources_cfg = _tw_cfg.get('sources', [])
+        for _tw_idx, _tw_src in enumerate(_tw_cfg.get('sources', [])):
+            if not _tw_src.get('enabled', False):
+                continue
+            _tw_type = _tw_src.get('type')
+            if _tw_type == 'rf':
+                if _tw_src.get('rcv') not in (1, 2):
+                    print(f"[tri_watch] source {_tw_idx}: type rf needs rcv 1 or 2 - skipping")
+                    continue
+                print(f"[tri_watch] source {_tw_idx}: RF Rx{_tw_src.get('rcv')} - status tracked, not auto-tuned (Stage 2)")
+            elif _tw_type == 'stream':
+                if _tw_src.get('domain') and _tw_src.get('app') and _tw_src.get('streamname'):
+                    _probe = lynx_rtmp_probe.RTMPStreamProbe(
+                        domain=_tw_src['domain'],
+                        app=_tw_src['app'],
+                        stream_name=_tw_src['streamname'],
+                        rtmp_port=_tw_src.get('port', 1935),
+                    )
+                    _probe.start()
+                    tri_watch_probes[_tw_idx] = _probe
+                    print(f"[tri_watch] source {_tw_idx}: stream probe started for {_tw_src['domain']}/{_tw_src['app']}/{_tw_src['streamname']}")
+                else:
+                    print(f"[tri_watch] source {_tw_idx}: type stream missing domain/app/streamname - skipping")
+            else:
+                print(f"[tri_watch] source {_tw_idx}: unknown type {_tw_type!r} - skipping")
+    # Started unconditionally, matching every other monitor thread here -
+    # the loop itself checks tri_watch_enabled before doing anything.
+    tri_watch_arbitrator_thread = threading.Thread(target=tri_watch_arbitrator_loop, daemon=True)
+    tri_watch_arbitrator_thread.start()
     # Repeater-activity notifications (QRZ/Slack/Companion/GPIO Tx) - its
     # own, independent monitor, deliberately not gated on current_mode the
     # way rf_mpv_lifecycle_monitor() is (see lynx_notifications.py's own
@@ -5146,7 +7123,9 @@ if __name__ == "__main__":
     notification_manager = lynx_notifications.NotificationManager(
         picotuner_state, picotuner_state_b, lambda: config,
         record_event=record_diagnostic_event,
-        get_lnb_state=lambda: (current_lnb_lo_khz, current_lnb_side))
+        get_lnb_state=lambda: (current_lnb_lo_khz, current_lnb_side),
+        get_tri_watch_displayed_rcv=lambda: tri_watch_target_rcv,
+        get_tri_watch_enabled=lambda: tri_watch_enabled)
     notification_manager.start()
     print("Picotuner monitor started.")
 
@@ -5226,6 +7205,24 @@ if __name__ == "__main__":
 
     def _resume_on_startup():
         time.sleep(7)  # let mpv/overlay settle first
+
+        # tri_watch, when enabled, deliberately replaces the whole
+        # resume-last-state concept below - a dedicated repeater
+        # receiver should always come up on its configured inputs,
+        # not whatever a human happened to be doing before the last
+        # restart. Applies even with only one source enabled within
+        # tri_watch, not just 2 or 3 - the behavioural switch is
+        # tri_watch.enabled itself, not how many sources are in use.
+        if tri_watch_enabled:
+            print("[tri_watch] enabled - skipping resume-last-state, tuning configured RF sources instead")
+            tri_watch_startup_tune()
+            # Both receivers start transmitting TS data as soon as
+            # they're tuned, well before the arbitrator ever decides
+            # what to display - drain everything immediately so
+            # nothing goes unread even during this initial window.
+            _tri_watch_sync_drainers(None)
+            return
+
         state = load_last_state()
         if state and state.get("mode") == "rf":
             target_tuner_freq = calc_tuner_freq(state["freq"], state.get("lnb_lo_khz", 0))

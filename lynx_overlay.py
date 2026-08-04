@@ -74,6 +74,30 @@ LYNX_API = "http://localhost:8080/api/status"
 MPV_TRANSITION_MARKER = "/tmp/lynx_mpv_transitioning"
 POLL_SECS = 2
 
+# tri_watch's "someone else wants in" notification sound - place the
+# actual audio file here yourself (not fetched/bundled by Claude - see
+# chat). Any format mpv can play (mp3, wav, etc) works, since mpv
+# itself is what plays it below.
+NOTIFICATION_SOUND_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "tri_watch_notification.mp3")
+
+def play_notification_sound():
+    """Fire-and-forget playback of the notification sound via a short-
+    lived, audio-only mpv process - completely separate from the main,
+    video-playing mpv instance, so it can never interfere with it.
+    Silently does nothing if the sound file isn't present, rather than
+    erroring - this feature is opt-in by placing the file, not
+    required for Lynx to run."""
+    if not os.path.exists(NOTIFICATION_SOUND_PATH):
+        return
+    try:
+        subprocess.Popen(
+            ["mpv", "--no-video", "--really-quiet", NOTIFICATION_SOUND_PATH],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except Exception as e:
+        print(f"Could not play notification sound: {e}")
+
 # ── Magic eye calibration ───────────────────────────────────────
 # Re-calibrated 2026-07-23 against the real dBm values now available
 # from ptwh0v3k+'s look-up table (see draw_bottom_right) - the old
@@ -153,6 +177,9 @@ state = {
     "locked_b": False,
     "mer_b": "",
     "margin_b": "",
+    "frequency_b": "",
+    "sr_ks_b": "",
+    "tri_watch_show_searching_rx2": False,
     "dbm_a": "",
     "level_a": "",
     "dbm_b": "",
@@ -178,6 +205,7 @@ state = {
     "stream_protocol": "",
     "mpv_transitioning": False,
     "portable_locator": "",
+    "tri_watch_notification": None,   # the current "someone else wants in" message text, or None
     # Diversity mode — which tuner is actually the one supplying the
     # locked/displayed state.
     "diversity_enabled": False,
@@ -203,6 +231,11 @@ _raw_lock_history = []
 
 ONLINE_STABLE_POLLS = 3  # slightly more tolerant than lock, since "online" flapping is more visually jarring (whole zones disappear) than a lock badge changing colour
 _raw_online_history = []
+_last_notification_sound_played_for = None  # triggered_at of the last tri_watch
+                                              # notification a sound was played for -
+                                              # lets a genuinely new notification be
+                                              # distinguished from the same one still
+                                              # being displayed across multiple polls
 
 def audio_ppm_monitor():
     """Background thread: drives the stereo PPM meter with real, live
@@ -288,7 +321,7 @@ def audio_ppm_monitor():
 
 def poll_status():
     """Background thread — polls the Lynx API continuously."""
-    global _raw_lock_history, _raw_online_history
+    global _raw_lock_history, _raw_online_history, _last_notification_sound_played_for
     while True:
         raw_online = False
         try:
@@ -297,7 +330,7 @@ def poll_status():
             pt = data.get('picotuner', {})
             div = data.get('diversity', {})
             diversity_enabled = div.get('enabled', False)
-            tuner_b = div.get('tuner_b', {}) if diversity_enabled else {}
+            tuner_b = div.get('tuner_b', {})
 
             # Diversity mode: locked means EITHER tuner is locked, not
             # just tuner A — the combiner can produce a perfectly good
@@ -307,7 +340,44 @@ def poll_status():
             # output was playing completely fine.
             a_locked = pt.get('locked', False)
             b_locked = tuner_b.get('locked', False)
-            raw_locked = a_locked or (diversity_enabled and b_locked)
+
+            # tri_watch: which receiver (if any) is it currently
+            # displaying? Matched via the "idx" field each source entry
+            # carries, against tri_watch's own displayed_source_idx.
+            # Computed here, before raw_locked below, specifically so
+            # raw_locked (which drives the OSD's green/orange lock
+            # colour) can correctly account for it too - confirmed as
+            # the actual cause of a real, reported bug: the display
+            # stayed permanently orange while tri_watch showed Rx2, no
+            # matter how solidly locked Rx2 genuinely was, since the
+            # diversity-only formula below never considered b_locked at
+            # all outside diversity mode.
+            tri_watch = data.get('tri_watch') or {}
+            tri_watch_use_b = False
+            if tri_watch.get('enabled'):
+                displayed_idx = tri_watch.get('displayed_source_idx')
+                if displayed_idx is not None:
+                    for src in tri_watch.get('sources', []):
+                        if src.get('idx') == displayed_idx and src.get('type') == 'rf':
+                            tri_watch_use_b = (src.get('rcv') == 2)
+                            break
+
+            # Diversity mode: locked means EITHER tuner is locked, not
+            # just tuner A — the combiner can produce a perfectly good
+            # picture from just one healthy receiver. Without this,
+            # pulling A's antenna showed "SEARCHING" and covered the
+            # screen even while B alone was locked and the combined
+            # output was playing completely fine. tri_watch: locked
+            # means specifically whichever receiver it's currently
+            # displaying is locked - a genuinely different question
+            # from diversity's "is either one locked", so it needs its
+            # own branch here rather than reusing that formula.
+            if tri_watch_use_b:
+                raw_locked = b_locked
+            elif tri_watch.get('enabled') and tri_watch.get('displayed_source_idx') is not None:
+                raw_locked = a_locked
+            else:
+                raw_locked = a_locked or (diversity_enabled and b_locked)
 
             # Independent per-tuner MER/margin, for the diversity-mode
             # top-right display which shows both tuners at once -
@@ -320,6 +390,8 @@ def poll_status():
             state["locked_b"] = b_locked
             state["mer_b"] = tuner_b.get('mer', '')
             state["margin_b"] = tuner_b.get('margin', '')
+            state["frequency_b"] = tuner_b.get('frequency', '')
+            state["sr_ks_b"] = tuner_b.get('symbol_rate', '')
             # Independent per-tuner dBm (ptwh0v3k+) / level fallback,
             # for the split magic eye - top half driven by A, bottom by B.
             state["dbm_a"] = pt.get('dbm', '')
@@ -339,13 +411,32 @@ def poll_status():
             state["diversity_enabled"] = diversity_enabled
 
             # Which tuner's data actually populates the display fields
-            # below — prefer A whenever it's genuinely locked, falling
-            # back to B only when A isn't locked but B is.
-            use_b = diversity_enabled and not a_locked and b_locked
+            # below — tri_watch's own choice takes priority when it
+            # applies; otherwise, in diversity mode, prefer A whenever
+            # it's genuinely locked, falling back to B only when A
+            # isn't locked but B is. tri_watch and diversity are
+            # mutually exclusive modes, so these two conditions never
+            # genuinely compete in practice.
+            use_b = tri_watch_use_b or (diversity_enabled and not a_locked and b_locked)
             source = tuner_b if use_b else pt
             state["locked_via"] = "b" if use_b else "a"
             state["tuner_b_pct_nul"] = tuner_b.get("pct_nul", "")
             state["diversity_stats"] = div.get("stats") or {}
+
+            # While tri_watch is enabled but hasn't selected anything to
+            # display yet (still "searching" - displayed_source_idx is
+            # None), also show Rx2's own frequency on a second line, if
+            # tri_watch has an Rx2 source configured at all - neither
+            # receiver is "winning" yet in this state, and there's no
+            # video underneath being obscured by showing both. Once
+            # something is actually selected, this reverts to showing
+            # only that one receiver, same as any other RF display.
+            state["tri_watch_show_searching_rx2"] = False
+            if tri_watch.get('enabled') and tri_watch.get('displayed_source_idx') is None:
+                for src in tri_watch.get('sources', []):
+                    if src.get('type') == 'rf' and src.get('rcv') == 2:
+                        state["tri_watch_show_searching_rx2"] = True
+                        break
 
             state["callsign"]  = source.get('callsign', '')
             state["frequency"] = source.get('frequency', '')
@@ -376,6 +467,18 @@ def poll_status():
             state["stream_protocol"] = lynx.get('stream_protocol') or ""
             state["mpv_transitioning"] = lynx.get('mpv_transitioning', False)
             state["portable_locator"] = lynx.get('portable_locator', '')
+            # tri_watch's "someone else wants in" notification - the
+            # backend already handles its own expiry (get_notification()
+            # returns None once past the configured display window), so
+            # this side just needs to check presence, not compute timing.
+            tri_watch = data.get('tri_watch') or {}
+            notification = tri_watch.get('notification') if tri_watch.get('enabled') else None
+            state["tri_watch_notification"] = notification.get('message') if notification else None
+            if notification:
+                triggered_at = notification.get('triggered_at')
+                if triggered_at is not None and triggered_at != _last_notification_sound_played_for:
+                    _last_notification_sound_played_for = triggered_at
+                    play_notification_sound()
         except Exception:
             raw_online = False  # request itself failed (timeout, connection refused, etc) — treated the same as a genuine "not online" reading, fed into the same debounced history below rather than forcing the displayed state immediately
 
@@ -482,6 +585,7 @@ class LynxOverlay(Gtk.Window):
         self.draw_top_left(cr, width, height)
         self.draw_bottom_left(cr, width, height)
         self.draw_bottom_right(cr, width, height)
+        self.draw_waiting_bubble(cr, width, height)
 
     def draw_text(self, cr, x, y, text, size=30, align="left", colour=(0.0, 1.0, 0.25)):
         cr.set_font_size(size)
@@ -497,6 +601,141 @@ class LynxOverlay(Gtk.Window):
         cr.move_to(x, y)
         cr.show_text(text)
         cr.new_path()  # show_text() advances the current point rather than clearing it (unlike fill()) - without this, whatever draws next inherits a stray point and gets an unintended connector line on its first arc()/line_to()
+
+    def _wrap_text(self, cr, text, max_width):
+        """Balanced word-wrap: rather than greedily filling each line
+        all the way to max_width (which can leave an awkward, near-
+        empty final line, e.g. a single word by itself), finds the
+        narrowest width that still only needs as many lines as filling
+        to the true max_width would - a standard technique for more
+        evenly-distributed line lengths. Assumes the font/size are
+        already set on cr before calling."""
+        words = text.split()
+        if not words:
+            return []
+
+        def wrap_at(width):
+            lines = []
+            current = ""
+            for word in words:
+                candidate = (current + " " + word).strip()
+                if cr.text_extents(candidate).width <= width or not current:
+                    current = candidate
+                else:
+                    lines.append(current)
+                    current = word
+            if current:
+                lines.append(current)
+            return lines
+
+        lines_at_max = wrap_at(max_width)
+        if len(lines_at_max) <= 1:
+            return lines_at_max
+
+        target_line_count = len(lines_at_max)
+        lo = max(cr.text_extents(w).width for w in words)  # can't go narrower than the single widest word
+        hi = max_width
+        for _ in range(20):  # plenty of precision for pixel-level text
+            mid = (lo + hi) / 2
+            if len(wrap_at(mid)) <= target_line_count:
+                hi = mid
+            else:
+                lo = mid
+        return wrap_at(hi)
+
+    def _rounded_rect_path(self, cr, x, y, w, h, r):
+        """Traces a rounded-rectangle path on cr - does not fill/stroke
+        itself, so the caller can do either (or both, for a border)."""
+        cr.new_path()
+        cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+        cr.arc(x + w - r, y + r, r, 3 * math.pi / 2, 2 * math.pi)
+        cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+        cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+        cr.close_path()
+
+    def draw_waiting_bubble(self, cr, width, height):
+        """tri_watch's "someone else wants in" notification - an
+        iMessage-style speech bubble, positioned middle-right so it's
+        clearly visible without overlapping any of the existing
+        corner-anchored OSD elements. The backend already handles
+        timing/expiry (state["tri_watch_notification"] is simply None
+        once the notification's display window has passed), so this
+        only ever needs to check presence, not compute anything
+        time-based itself."""
+        message = state.get("tri_watch_notification")
+        if not message:
+            return
+
+        font_size = 26
+        line_height = font_size * 1.35
+        padding_x = 24
+        padding_y = 20
+        tail_size = 30  # made longer per feedback (was 18)
+        max_text_width = width * 0.32  # keeps the bubble from dominating the screen, since it sits over live video
+
+        cr.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(font_size)
+        lines = self._wrap_text(cr, message, max_text_width)
+        text_width = max((cr.text_extents(line).width for line in lines), default=0)
+        cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)  # restored immediately after measuring, so nothing else drawn this frame is affected
+
+        bubble_w = text_width + padding_x * 2
+        bubble_h = line_height * len(lines) + padding_y * 2
+
+        # Middle-right placement, with margin from the screen edge and
+        # room for the tail pointing left toward the video content.
+        right_margin = 40
+        bubble_x = width - right_margin - bubble_w - tail_size
+        bubble_y = height / 2 - bubble_h / 2
+
+        corner_radius = 18
+        bubble_colour = (0.0, 0.478, 1.0)  # Apple's system blue, #007AFF - the actual iMessage outgoing-bubble colour, confirmed rather than approximated
+
+        # Drop shadow first, offset slightly, so the bubble reads clearly against any video content behind it
+        cr.set_source_rgba(0, 0, 0, 0.35)
+        self._rounded_rect_path(cr, bubble_x + 4, bubble_y + 4, bubble_w, bubble_h, corner_radius)
+        cr.fill()
+
+        # Main bubble body
+        cr.set_source_rgba(*bubble_colour, 0.92)
+        self._rounded_rect_path(cr, bubble_x, bubble_y, bubble_w, bubble_h, corner_radius)
+        cr.fill()
+
+        # Tail - emerges from the lower-left corner area, pointing
+        # down and further left, matching Apple's own bubble style
+        # (moved from the middle of the left edge per feedback). Three
+        # points: one attachment higher up the left edge (past where
+        # the rounded corner starts), the outward-pointing tip below
+        # and to the left of the bubble, and a second attachment along
+        # the bottom edge (past where the rounded corner ends) - this
+        # triangle reads as a tail emerging from the corner rather than
+        # a fin sticking out of a flat edge.
+        tail_attach_top_y = bubble_y + bubble_h - corner_radius - 6
+        tail_attach_bottom_x = bubble_x + corner_radius + 12
+        cr.new_path()
+        cr.move_to(bubble_x, tail_attach_top_y)
+        cr.line_to(bubble_x - tail_size, bubble_y + bubble_h + tail_size * 0.45)
+        cr.line_to(tail_attach_bottom_x, bubble_y + bubble_h)
+        cr.close_path()
+        cr.set_source_rgba(*bubble_colour, 0.92)
+        cr.fill()
+
+        # Text, left-aligned within the bubble (matching the
+        # conventional messaging-app look, and avoiding each line
+        # appearing to float at a different horizontal position when
+        # line lengths vary, even with the balanced wrap above)
+        cr.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(font_size)
+        text_block_h = line_height * len(lines)
+        first_line_y = bubble_y + (bubble_h - text_block_h) / 2 + font_size
+        for i, line in enumerate(lines):
+            line_x = bubble_x + padding_x
+            line_y = first_line_y + i * line_height
+            cr.set_source_rgba(1, 1, 1, 0.98)
+            cr.move_to(line_x, line_y)
+            cr.show_text(line)
+        cr.new_path()
+        cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)  # restore the OSD's normal font for anything drawn after this
 
     def draw_top_right(self, cr, width, height):
         if not state["online"] and state["mode"] != "stream":
@@ -548,6 +787,16 @@ class LynxOverlay(Gtk.Window):
                 else:
                     lines.append("SEARCHING")
 
+            # tri_watch, still "searching" (nothing selected/displayed
+            # yet): Rx2 gets its own "SEARCHING" indicator too, right
+            # below Rx1's - by definition of this state, Rx2 hasn't
+            # been confirmed locked and selected yet either (otherwise
+            # tri_watch would have already picked it), so this is
+            # always exactly "SEARCHING", mirroring the top-left zone's
+            # own two-line pattern for the same state.
+            if state["tri_watch_show_searching_rx2"]:
+                lines.append("SEARCHING")
+
         for i, line in enumerate(lines):
             y = margin + size + (i * line_h)
             self.draw_text(cr, width - margin, y, line, size=size, align="right", colour=colour)
@@ -586,6 +835,18 @@ class LynxOverlay(Gtk.Window):
         line_h = size * 1.3
         freq = state["frequency"] or f"{state['freq_khz']/1000:.3f}"
         lines = [f"{freq} MHz  {state['sr_ks']} kS/s"]
+
+        # tri_watch, still "searching" (nothing selected/displayed yet):
+        # also show Rx2's own frequency on the line right below Rx1's -
+        # no naming/labelling needed, the frequency itself already
+        # tells the audience which input it is. Reverts to the normal,
+        # single-receiver view automatically once something locks and
+        # gets selected (state["tri_watch_show_searching_rx2"] goes
+        # False the moment tri_watch's own displayed_source_idx is set).
+        if state["tri_watch_show_searching_rx2"] and state["frequency_b"]:
+            sr_b = f"  {state['sr_ks_b']} kS/s" if state["sr_ks_b"] else ""
+            lines.append(f"{state['frequency_b']} MHz{sr_b}")
+
         if state["modcod"]:
             modcod_line = state["modcod"]
             if state["codec"]:

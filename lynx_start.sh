@@ -69,6 +69,24 @@ for i in $(seq 1 20); do
     fi
 done
 
+# ── Disable WiFi power-save ──────────────────────────────────────
+# brcmfmac (this hardware's WiFi driver, Broadcom BCM4345/6) has a
+# well-documented history of silently wedging or failing to
+# reconnect, specifically tied to power-save mode - confirmed
+# directly as the cause of a real overnight crash: network completely
+# dead (no SSH, no Web UI) while the rest of the system, including
+# Lynx's own process, stayed fully healthy the entire time (confirmed
+# via SIGUSR1 stack dumps showing every thread genuinely idle, not
+# stuck) - dmesg explicitly showed
+# "brcmf_cfg80211_set_power_mgmt: power save enabled" at boot.
+# Placed here, right after the network-up wait above rather than
+# before it, so wlan0 (if present at all) has already had up to 20s
+# to actually come up before this tries to configure it. Non-fatal if
+# wlan0 doesn't exist (a wired-only install) or `iw` isn't installed -
+# also re-applied every cycle in the watchdog loop further down, in
+# case a later reconnect/roam event ever resets it.
+iw wlan0 set power_save off 2>/dev/null || true
+
 # ── Wait for NTP time sync ──────────────────────────────────────
 # On boot the system clock is often wrong until NTP corrects it a few
 # seconds later — that correction (a backward time jump) was found to
@@ -243,6 +261,15 @@ while true; do
     # Cheap enough to just re-trigger every cycle rather than track
     # whether it's actually needed.
     wtype -M alt -M logo -P h 2>/dev/null || true
+
+    # Re-disable WiFi power-save every cycle too, same rationale as
+    # the cursor re-hide above - cheap, non-disruptive, and a
+    # reconnect/roam event could in principle reset this without a
+    # full reboot, so there's no reason to trust it stays off forever
+    # just because it was set once at startup. See the startup-time
+    # comment (above, near the network-wait loop) for the full
+    # rationale on why this exists at all.
+    iw wlan0 set power_save off 2>/dev/null || true
 
     status_json=$(curl -sf http://localhost:8080/api/status 2>/dev/null)
     if [ -z "$status_json" ]; then
