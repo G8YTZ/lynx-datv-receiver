@@ -4214,6 +4214,29 @@ def config_page():
                         </div>
                     </div>
                 </div>
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F4F6; WiFi</div>
+                    <div class="card-body">
+                        <p class="text-muted small" style="color:#d98a1e !important">
+                            &#x26A0;&#xFE0F; WiFi is not recommended for this receiver, especially
+                            with more than one saved network - a roaming/reconnect event can
+                            land on a different subnet and silently break the
+                            Picotuner/Knobler's local discovery. Wired Ethernet is strongly
+                            preferred. If WiFi must be used, power-save is now disabled
+                            automatically at startup.
+                        </p>
+                        <p class="text-muted small">
+                            WARNING: if this Pi is only reachable over WiFi right now,
+                            disabling it will cut off Web UI access until it's re-enabled
+                            locally or via SSH (<code>sudo rfkill unblock wifi</code>).
+                        </p>
+                        <div class="d-flex align-items-center gap-2">
+                            <button class="btn btn-outline-danger btn-sm" onclick="killWifi()">Disable WiFi</button>
+                            <button class="btn btn-outline-light btn-sm" onclick="restoreWifi()">Re-enable WiFi</button>
+                            <span class="save-status" id="wifi-status"></span>
+                        </div>
+                    </div>
+                </div>
         </div>
 
     </div>
@@ -4584,6 +4607,40 @@ async function switchUpdateChannel() {
         // the time this resolves - not itself a sign anything went wrong.
         statusEl.textContent = 'Switched - rebooting the Pi now, back in about a minute.';
         statusEl.className = 'save-status text-warning';
+    }
+}
+
+async function killWifi() {
+    const statusEl = document.getElementById('wifi-status');
+    if (!confirm('Disable WiFi now? If this Pi is only reachable over WiFi, you will lose ' +
+                 'Web UI access immediately until it is re-enabled locally or via SSH.')) return;
+    statusEl.textContent = 'Disabling...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const r = await fetch('/api/wifi/kill', {method: 'POST'});
+        const result = await r.json();
+        statusEl.textContent = r.ok ? 'WiFi disabled.' : ('Failed: ' + (result.detail || 'unknown error'));
+        statusEl.className = r.ok ? 'save-status text-success' : 'save-status text-danger';
+    } catch (e) {
+        statusEl.textContent = 'Request failed - see console.';
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
+async function restoreWifi() {
+    const statusEl = document.getElementById('wifi-status');
+    statusEl.textContent = 'Re-enabling...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const r = await fetch('/api/wifi/restore', {method: 'POST'});
+        const result = await r.json();
+        statusEl.textContent = r.ok ? 'WiFi re-enabled.' : ('Failed: ' + (result.detail || 'unknown error'));
+        statusEl.className = r.ok ? 'save-status text-success' : 'save-status text-danger';
+    } catch (e) {
+        statusEl.textContent = 'Request failed - see console.';
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
     }
 }
 
@@ -5946,6 +6003,42 @@ def post_update_channel(req: UpdateChannelRequest):
 
     return {"result": "ok", "channel": req.channel,
             "message": f"Switched to the '{req.channel}' channel - rebooting the Pi now."}
+
+@app.post("/api/wifi/kill", tags=["Control"],
+          summary="Disable WiFi entirely (rfkill block)",
+          description="For sites where WiFi is causing problems "
+                      "(power-save driver bugs, or roaming onto a "
+                      "second saved network and breaking the "
+                      "Picotuner/Knobler's local UDP broadcast "
+                      "discovery) - disables the WiFi radio "
+                      "completely via rfkill. Does NOT touch wired "
+                      "Ethernet. WARNING: if this Pi is only reachable "
+                      "over WiFi, this will cut off Web UI access "
+                      "until WiFi is re-enabled locally or via SSH.")
+def kill_wifi():
+    check = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=5)
+    if check.returncode != 0:
+        raise HTTPException(status_code=500,
+            detail="Couldn't disable WiFi - passwordless sudo isn't configured for this user.")
+    result = subprocess.run(["sudo", "rfkill", "block", "wifi"],
+                             capture_output=True, text=True, timeout=5)
+    if result.returncode != 0:
+        raise HTTPException(status_code=502, detail=f"Failed to disable WiFi: {result.stderr}")
+    return {"result": "ok", "message": "WiFi disabled."}
+
+@app.post("/api/wifi/restore", tags=["Control"],
+          summary="Re-enable WiFi (rfkill unblock)",
+          description="Reverses Kill WiFi.")
+def restore_wifi():
+    check = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=5)
+    if check.returncode != 0:
+        raise HTTPException(status_code=500,
+            detail="Couldn't re-enable WiFi - passwordless sudo isn't configured for this user.")
+    result = subprocess.run(["sudo", "rfkill", "unblock", "wifi"],
+                             capture_output=True, text=True, timeout=5)
+    if result.returncode != 0:
+        raise HTTPException(status_code=502, detail=f"Failed to re-enable WiFi: {result.stderr}")
+    return {"result": "ok", "message": "WiFi re-enabled."}
 
 class DefaultBootRequest(BaseModel):
     freq: int
