@@ -193,6 +193,7 @@ update_state = {
     "update_available": False,
     "commits_behind": 0,
     "new_commits": [],         # list of "abc1234 commit subject" strings, most recent first
+    "channel": None,           # 'stable' or 'beta' - populated lazily, same timing as current_version (see ensure_current_version)
 }
 
 def git_cmd(*args, timeout=15):
@@ -239,6 +240,18 @@ def get_default_branch():
         return ref.rsplit("/", 1)[-1]
     return "main"  # reasonable fallback if the symbolic ref isn't set for some reason
 
+def get_update_branch():
+    """Which branch update checks/pulls should actually use, based on
+    the configured update channel - stable users stay on the repo's
+    normal default branch (whatever it's actually named), while
+    anyone who's opted into 'beta' tracks that fixed, literal branch
+    name instead - there's only ever one beta branch, by definition,
+    so no auto-detection needed for that case."""
+    channel = config.get('update', {}).get('channel', 'stable')
+    if channel == 'beta':
+        return 'beta'
+    return get_default_branch()
+
 def check_for_updates():
     """Safe and read-only: git fetch, then compare local HEAD to the
     remote's HEAD - never touches working files or applies anything.
@@ -252,7 +265,7 @@ def check_for_updates():
         update_state["checked_at"] = utc_now_iso()
         return
 
-    branch = get_default_branch()
+    branch = get_update_branch()
     ok, behind_str = git_cmd("rev-list", "--count", f"HEAD..origin/{branch}")
     if not ok:
         update_state["check_error"] = f"Could not compare versions: {behind_str}"
@@ -288,6 +301,8 @@ def ensure_current_version():
         except Exception as e:
             update_state["current_version"] = "unknown"
             print(f"[update-check] version detection failed unexpectedly: {e}")
+    if update_state["channel"] is None:
+        update_state["channel"] = config.get('update', {}).get('channel', 'stable')
 
 
                                # just the initial synchronous part) — both
@@ -3001,6 +3016,66 @@ def config_page():
                         </div>
                     </div>
                 </div>
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F9EA; Update Channel</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            Stable is the recommended channel for everyday/repeater use -
+                            known-working releases only. Beta tracks newer, less-tested code
+                            for anyone who wants to try new features early. Switchable back
+                            to Stable at any time.
+                        </p>
+                        <div class="form-check">
+                            <input class="form-check-input" type="radio" name="update-channel"
+                                   id="channel-stable" value="stable" onchange="onChannelRadioChange()">
+                            <label class="form-check-label" for="channel-stable">
+                                <strong>Stable</strong>
+                                <span class="text-muted small">- recommended</span>
+                            </label>
+                        </div>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="radio" name="update-channel"
+                                   id="channel-beta" value="beta" onchange="onChannelRadioChange()">
+                            <label class="form-check-label" for="channel-beta">
+                                <strong>Beta</strong>
+                                <span class="text-muted small">- newer, experimental code</span>
+                            </label>
+                        </div>
+                        <div id="beta-warning" class="alert alert-warning py-2 px-3 small mb-2" style="display:none;">
+                            &#x26A0;&#xFE0F; <strong>Beta channel:</strong> newer code that hasn't
+                            been as thoroughly tested - may be less stable. Not recommended
+                            for an unattended repeater without someone available to fix
+                            issues if something goes wrong.
+                        </div>
+                        <div class="mt-2 d-flex align-items-center gap-2">
+                            <button class="btn btn-outline-warning btn-sm" onclick="switchUpdateChannel()">Switch Channel</button>
+                            <span class="save-status" id="channel-save-status"></span>
+                        </div>
+                    </div>
+                </div>
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F4F6; WiFi</div>
+                    <div class="card-body">
+                        <p class="text-muted small" style="color:#d98a1e !important">
+                            &#x26A0;&#xFE0F; WiFi is not recommended for this receiver, especially
+                            with more than one saved network - a roaming/reconnect event can
+                            land on a different subnet and silently break the
+                            Picotuner/Knobler's local discovery. Wired Ethernet is strongly
+                            preferred. If WiFi must be used, power-save is now disabled
+                            automatically at startup.
+                        </p>
+                        <p class="text-muted small">
+                            WARNING: if this Pi is only reachable over WiFi right now,
+                            disabling it will cut off Web UI access until it's re-enabled
+                            locally or via SSH (<code>sudo rfkill unblock wifi</code>).
+                        </p>
+                        <div class="d-flex align-items-center gap-2">
+                            <button class="btn btn-outline-danger btn-sm" onclick="killWifi()">Disable WiFi</button>
+                            <button class="btn btn-outline-light btn-sm" onclick="restoreWifi()">Re-enable WiFi</button>
+                            <span class="save-status" id="wifi-status"></span>
+                        </div>
+                    </div>
+                </div>
         </div>
 
     </div>
@@ -3018,6 +3093,10 @@ async function loadCurrentConfig() {
 
         const ppmStyle = cfg.display?.ppm_style || 'full_fat';
         document.getElementById(ppmStyle === 'full_fat' ? 'ppm-style-full-fat' : 'ppm-style-skeleton').checked = true;
+
+        const updateChannel = cfg.update?.channel || 'stable';
+        document.getElementById(updateChannel === 'beta' ? 'channel-beta' : 'channel-stable').checked = true;
+        onChannelRadioChange();
 
         document.getElementById('pt-host-input').value = cfg.picotuner?.host || '';
         document.getElementById('pt-status-port-input').value = cfg.picotuner?.status_port || '';
@@ -3141,6 +3220,86 @@ async function saveSite() {
         statusEl.className = 'save-status text-success';
     } catch (e) {
         statusEl.textContent = 'Save failed - see console.';
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
+function onChannelRadioChange() {
+    const selected = document.querySelector('input[name="update-channel"]:checked')?.value;
+    document.getElementById('beta-warning').style.display = (selected === 'beta') ? 'block' : 'none';
+}
+
+async function switchUpdateChannel() {
+    const statusEl = document.getElementById('channel-save-status');
+    const selected = document.querySelector('input[name="update-channel"]:checked')?.value;
+    if (!selected) return;
+
+    try {
+        const current = await fetch('/api/update/status').then(r => r.json());
+        if ((current.channel || 'stable') === selected) {
+            statusEl.textContent = 'Already on this channel.';
+            statusEl.className = 'save-status text-muted';
+            return;
+        }
+    } catch (e) { /* fall through and let the switch itself report any real problem */ }
+
+    const warning = selected === 'beta'
+        ? 'Switch to the Beta channel? This pulls newer, less-tested code and reboots the Pi. ' +
+          'You can switch back to Stable at any time.'
+        : 'Switch back to the Stable channel? This pulls the known-working release and reboots the Pi.';
+    if (!confirm(warning)) return;
+
+    statusEl.textContent = 'Switching...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const r = await fetch('/api/update/channel', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({channel: selected})
+        });
+        const result = await r.json();
+        if (!r.ok) {
+            statusEl.textContent = 'Failed: ' + (result.detail || 'unknown error');
+            statusEl.className = 'save-status text-danger';
+            return;
+        }
+        statusEl.textContent = 'Switched - rebooting the Pi now, back in about a minute.';
+        statusEl.className = 'save-status text-warning';
+    } catch (e) {
+        statusEl.textContent = 'Switched - rebooting the Pi now, back in about a minute.';
+        statusEl.className = 'save-status text-warning';
+    }
+}
+
+async function killWifi() {
+    const statusEl = document.getElementById('wifi-status');
+    if (!confirm('Disable WiFi now? If this Pi is only reachable over WiFi, you will lose ' +
+                 'Web UI access immediately until it is re-enabled locally or via SSH.')) return;
+    statusEl.textContent = 'Disabling...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const r = await fetch('/api/wifi/kill', {method: 'POST'});
+        const result = await r.json();
+        statusEl.textContent = r.ok ? 'WiFi disabled.' : ('Failed: ' + (result.detail || 'unknown error'));
+        statusEl.className = r.ok ? 'save-status text-success' : 'save-status text-danger';
+    } catch (e) {
+        statusEl.textContent = 'Request failed - see console.';
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
+async function restoreWifi() {
+    const statusEl = document.getElementById('wifi-status');
+    statusEl.textContent = 'Re-enabling...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const r = await fetch('/api/wifi/restore', {method: 'POST'});
+        const result = await r.json();
+        statusEl.textContent = r.ok ? 'WiFi re-enabled.' : ('Failed: ' + (result.detail || 'unknown error'));
+        statusEl.className = r.ok ? 'save-status text-success' : 'save-status text-danger';
+    } catch (e) {
+        statusEl.textContent = 'Request failed - see console.';
         statusEl.className = 'save-status text-danger';
         console.error(e);
     }
@@ -4176,7 +4335,23 @@ def post_update_check():
                       "at the cost of being slower than a simple process "
                       "restart would be.")
 def post_update_apply():
-    branch = get_default_branch()
+    branch = get_update_branch()
+
+    # Defensive: git pull merges into whatever's CURRENTLY checked out
+    # locally, not necessarily the branch named in the command below -
+    # if the local checkout ever drifted out of sync with the
+    # configured channel, self-heal by checking out the correct
+    # branch first rather than trusting it's already right.
+    ok, current_branch = git_cmd("branch", "--show-current")
+    if ok and current_branch and current_branch != branch:
+        print(f"[update] local branch '{current_branch}' doesn't match configured "
+              f"channel's branch '{branch}' - checking out the correct one first")
+        ok, err = git_cmd("checkout", branch)
+        if not ok:
+            raise HTTPException(status_code=502,
+                detail=f"Update failed: local checkout ('{current_branch}') didn't match "
+                       f"the configured channel ('{branch}'), and switching to it failed: {err}")
+
     ok, pull_output = git_cmd("pull", "--ff-only", "origin", branch)
     if not ok:
         raise HTTPException(status_code=502,
@@ -4214,6 +4389,98 @@ def post_update_apply():
 
     return {"result": "ok", "message": "Update pulled successfully - rebooting the Pi now.",
             "pull_output": pull_output}
+
+class UpdateChannelRequest(BaseModel):
+    channel: str   # 'stable' or 'beta'
+
+@app.post("/api/update/channel", tags=["Configuration"],
+          summary="Switch update channel (stable/beta) and reboot",
+          description="Lets Lynx track a separate 'beta' branch of "
+                      "newer, less-proven code instead of the normal "
+                      "stable one, for anyone who wants to experiment "
+                      "- switchable back to stable at any time. Unlike "
+                      "a normal update, switching channels means "
+                      "actually checking out a DIFFERENT branch "
+                      "entirely (git checkout, not git pull). Fails "
+                      "safely: if the fetch or checkout fails for any "
+                      "reason, nothing is touched.")
+def post_update_channel(req: UpdateChannelRequest):
+    global config
+    if req.channel not in ("stable", "beta"):
+        raise HTTPException(status_code=400,
+            detail="channel must be 'stable' or 'beta'")
+
+    target_branch = "beta" if req.channel == "beta" else get_default_branch()
+
+    ok, err = git_cmd("fetch", "origin", target_branch)
+    if not ok:
+        raise HTTPException(status_code=502,
+            detail=f"Could not fetch the '{target_branch}' branch: {err}")
+
+    ok, err = git_cmd("checkout", "-B", target_branch, f"origin/{target_branch}")
+    if not ok:
+        raise HTTPException(status_code=502,
+            detail=f"Could not switch to the '{target_branch}' branch: {err}")
+
+    config.setdefault('update', {})['channel'] = req.channel
+    save_config(config)
+
+    update_state["current_version"] = detect_current_version()
+    update_state["channel"] = req.channel
+    update_state["update_available"] = False
+    update_state["commits_behind"] = 0
+    update_state["new_commits"] = []
+
+    check = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=5)
+    if check.returncode != 0:
+        raise HTTPException(status_code=500,
+            detail=f"Switched to the '{req.channel}' channel successfully, but couldn't "
+                   "reboot automatically - passwordless sudo isn't configured for this "
+                   "user. The switch IS applied; reboot the Pi manually now.")
+
+    def _do_reboot():
+        time.sleep(1.0)
+        subprocess.Popen(["sudo", "reboot"])
+    threading.Thread(target=_do_reboot, daemon=True).start()
+
+    return {"result": "ok", "channel": req.channel,
+            "message": f"Switched to the '{req.channel}' channel - rebooting the Pi now."}
+
+@app.post("/api/wifi/kill", tags=["Control"],
+          summary="Disable WiFi entirely (rfkill block)",
+          description="For sites where WiFi is causing problems "
+                      "(power-save driver bugs, or roaming onto a "
+                      "second saved network and breaking the "
+                      "Picotuner/Knobler's local UDP broadcast "
+                      "discovery) - disables the WiFi radio "
+                      "completely via rfkill. Does NOT touch wired "
+                      "Ethernet. WARNING: if this Pi is only reachable "
+                      "over WiFi, this will cut off Web UI access "
+                      "until WiFi is re-enabled locally or via SSH.")
+def kill_wifi():
+    check = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=5)
+    if check.returncode != 0:
+        raise HTTPException(status_code=500,
+            detail="Couldn't disable WiFi - passwordless sudo isn't configured for this user.")
+    result = subprocess.run(["sudo", "rfkill", "block", "wifi"],
+                             capture_output=True, text=True, timeout=5)
+    if result.returncode != 0:
+        raise HTTPException(status_code=502, detail=f"Failed to disable WiFi: {result.stderr}")
+    return {"result": "ok", "message": "WiFi disabled."}
+
+@app.post("/api/wifi/restore", tags=["Control"],
+          summary="Re-enable WiFi (rfkill unblock)",
+          description="Reverses Kill WiFi.")
+def restore_wifi():
+    check = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=5)
+    if check.returncode != 0:
+        raise HTTPException(status_code=500,
+            detail="Couldn't re-enable WiFi - passwordless sudo isn't configured for this user.")
+    result = subprocess.run(["sudo", "rfkill", "unblock", "wifi"],
+                             capture_output=True, text=True, timeout=5)
+    if result.returncode != 0:
+        raise HTTPException(status_code=502, detail=f"Failed to re-enable WiFi: {result.stderr}")
+    return {"result": "ok", "message": "WiFi re-enabled."}
 
 class DefaultBootRequest(BaseModel):
     freq: int
@@ -4985,20 +5252,25 @@ function renderUpdateStatus(status) {
     const badge = document.getElementById('version-badge');
     const applyBtn = document.getElementById('update-apply-btn');
     const version = status.current_version || '?';
+    // Channel shown on ALL four branches below via versionText, so
+    // it's always visible next to the version regardless of update
+    // status - not just flagged when it happens to be Beta.
+    const channelTag = status.channel === 'beta' ? ' [BETA]' : ' [STABLE]';
+    const versionText = 'v' + version.replace(/^v/, '') + channelTag;
 
     if (status.check_error) {
-        badge.textContent = 'v' + version.replace(/^v/, '');
+        badge.textContent = versionText;
         badge.title = 'Update check failed: ' + status.check_error;
         badge.style.background = '#3a4a63';
         applyBtn.style.display = 'none';
     } else if (status.update_available) {
-        badge.textContent = 'v' + version.replace(/^v/, '') + ' — ' +
+        badge.textContent = versionText + ' — ' +
             status.commits_behind + ' update' + (status.commits_behind === 1 ? '' : 's') + ' available';
         badge.title = (status.new_commits || []).join('\\n') || 'Update available';
         badge.style.background = '#e8a33d';
         applyBtn.style.display = 'inline-block';
     } else if (status.checked_at) {
-        badge.textContent = 'v' + version.replace(/^v/, '') + ' — up to date';
+        badge.textContent = versionText + ' — up to date';
         badge.title = 'Last checked: ' + status.checked_at;
         badge.style.background = '#1a9850';
         applyBtn.style.display = 'none';
@@ -5006,7 +5278,7 @@ function renderUpdateStatus(status) {
         // Never actually checked yet - checking is entirely manual,
         // so this is the normal, expected state until "Check Updates"
         // is clicked, not an error or something stale.
-        badge.textContent = 'v' + version.replace(/^v/, '');
+        badge.textContent = versionText;
         badge.title = 'Not yet checked - click "Check Updates"';
         badge.style.background = '#3a4a63';
         applyBtn.style.display = 'none';
