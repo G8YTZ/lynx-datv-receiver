@@ -1,0 +1,11 @@
+[Unit]
+Description=Lynx independent network/overlay health watchdog
+# Deliberately does NOT depend on graphical-session.target or any of
+# Lynx's own units - the whole point is this keeps running even if
+# the entire Lynx stack (and its own internal watchdog loop) has
+# become completely unresponsive. See lynx_watchdog.py's own
+# top-of-file comment for the full incident this exists to catch.
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /home/pi/lynx/lynx_watchdog.py
