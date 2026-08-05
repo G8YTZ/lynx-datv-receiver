@@ -318,6 +318,37 @@ while true; do
         break
     fi
 
+    # Overlay heartbeat check - see lynx_overlay.py's own top-of-file
+    # comment for the full incident this is fixed against: a stall
+    # where the overlay process stayed alive and its threads stayed
+    # genuinely busy (confirmed directly via strace - a completely
+    # normal-looking GTK event loop), but nothing was actually
+    # reaching the screen - a plain "is the process alive" check would
+    # never catch this, only proof of a genuinely completed render
+    # will. Only checked if the heartbeat file actually exists at all
+    # - its absence just means either the overlay hasn't drawn its
+    # first frame yet (early in startup) or is running an older
+    # version that predates this feature, neither of which is itself
+    # a failure.
+    OVERLAY_HEARTBEAT_FILE="/tmp/lynx_overlay_heartbeat"
+    if [ -f "$OVERLAY_HEARTBEAT_FILE" ]; then
+        heartbeat_age=$(( $(date +%s) - $(stat -c %Y "$OVERLAY_HEARTBEAT_FILE" 2>/dev/null || echo 0) ))
+        if [ "$heartbeat_age" -gt 30 ]; then
+            echo -e "${RED}Overlay heartbeat stale (${heartbeat_age}s) — not actually rendering, exiting for restart.${NC}"
+            # Same idea as the web-app stack dump above: capture what
+            # every overlay thread is actually doing right now, before
+            # it gets killed and replaced - the one chance to catch
+            # this specific stall directly rather than losing the
+            # evidence the moment the process is restarted.
+            OVERLAY_STACKTRACE_LOG="/tmp/lynx_stacktrace_overlay.log"
+            [ -w /var/log/lynx ] 2>/dev/null && OVERLAY_STACKTRACE_LOG="/var/log/lynx/stacktrace_overlay.log"
+            echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) - overlay heartbeat stale, dumping stacks ===" >> "$OVERLAY_STACKTRACE_LOG"
+            kill -USR1 "$OVERLAY_PID" 2>/dev/null || true
+            sleep 1  # give it a moment to actually write before the kill below
+            break
+        fi
+    fi
+
     systemd-notify WATCHDOG=1 2>/dev/null || true
 done
 
