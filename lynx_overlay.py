@@ -69,6 +69,33 @@ import threading
 import time
 import subprocess
 import struct
+import signal
+import faulthandler
+
+# Same SIGUSR1-triggered stack dump lynx_app.py already has, in its
+# own, separate log file (this is a genuinely different process, so
+# sharing lynx_app.py's own stacktrace.log would interleave two
+# processes' dumps together confusingly). Prefers the persistent
+# /var/log/lynx/ directory install.sh sets up, same reasoning as
+# lynx_app.py's own version - /tmp is typically RAM-backed on
+# Raspberry Pi OS and loses its contents on every reboot, which would
+# be a real problem if a crash/reboot happens shortly after the one
+# moment this data would actually matter.
+try:
+    os.makedirs("/var/log/lynx", exist_ok=True)
+    _faulthandler_log = open('/var/log/lynx/stacktrace_overlay.log', 'a')
+except OSError:
+    _faulthandler_log = open('/tmp/lynx_stacktrace_overlay.log', 'a')
+faulthandler.register(signal.SIGUSR1, file=_faulthandler_log, all_threads=True)
+
+# Heartbeat file, touched from inside on_draw() itself (see the call
+# there for the full rationale) - deliberately /tmp, not /var/log/lynx:
+# this gets touched up to 10x/second, and /tmp being RAM-backed on
+# Raspberry Pi OS is exactly what you want for something written this
+# often, avoiding needless SD card wear the persistent log directory
+# would incur for a file that only ever needs to answer "how recently
+# did a real render last happen", not survive a reboot.
+OVERLAY_HEARTBEAT_FILE = "/tmp/lynx_overlay_heartbeat"
 
 LYNX_API = "http://localhost:8080/api/status"
 MPV_TRANSITION_MARKER = "/tmp/lynx_mpv_transitioning"
@@ -550,6 +577,17 @@ class LynxOverlay(Gtk.Window):
         return True
 
     def on_draw(self, area, cr, width, height):
+        # Proof a real render actually happened, not just that tick()
+        # requested one - see this file's own top-of-file comment for
+        # the full incident this is fixed against. try/except since a
+        # missing heartbeat write should never be the thing that takes
+        # the overlay down.
+        try:
+            with open(OVERLAY_HEARTBEAT_FILE, "w") as _hb:
+                _hb.write(str(time.time()))
+        except OSError:
+            pass
+
         mpv_transitioning = os.path.exists(MPV_TRANSITION_MARKER)
         genuinely_locked = (state["locked"] and state["mpv_running_for_rf"]) or state["mode"] == "stream"
         showing_picture = genuinely_locked and not mpv_transitioning
