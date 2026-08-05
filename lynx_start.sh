@@ -44,6 +44,22 @@ cleanup() {
 }
 trap cleanup SIGINT SIGTERM
 
+# Preserves the last part of lynx_app.py's own live log to persistent
+# storage - see this file's own patch history / CHANGELOG for the
+# full rationale on why this is only ever done here, at the moment a
+# real problem is detected, rather than continuously. Best-effort:
+# never anything this script depends on succeeding, so failing
+# quietly is correct if /var/log/lynx isn't writable (an install that
+# predates this feature, or genuinely out of space).
+save_log_tail() {
+    if [ -w /var/log/lynx ] 2>/dev/null; then
+        tail -200 /tmp/lynx_app.log > "/var/log/lynx/lynx_app_$(date -u +%Y%m%dT%H%M%SZ).log" 2>/dev/null || true
+        # Keep only the 10 most recent - each incident is small, but
+        # nothing here should be left to accumulate unbounded forever.
+        ls -t /var/log/lynx/lynx_app_*.log 2>/dev/null | tail -n +11 | xargs -r rm -- 2>/dev/null || true
+    fi
+}
+
 echo -e "${BLUE}╔══════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║       Lynx DATV Receiver             ║${NC}"
 echo -e "${BLUE}║       G8YTZ / EI3IOB  2026           ║${NC}"
@@ -337,11 +353,13 @@ while true; do
             : # resolved itself — was a normal transition, not a crash
         else
             echo -e "${RED}mpv has died — exiting for restart.${NC}"
+            save_log_tail
             break
         fi
     fi
     if ! kill -0 ${APP_PID} 2>/dev/null; then
         echo -e "${RED}Web app process has died — exiting for restart.${NC}"
+        save_log_tail
         break
     fi
 
@@ -361,7 +379,7 @@ while true; do
     if [ -f "$OVERLAY_HEARTBEAT_FILE" ]; then
         heartbeat_age=$(( $(date +%s) - $(stat -c %Y "$OVERLAY_HEARTBEAT_FILE" 2>/dev/null || echo 0) ))
         if [ "$heartbeat_age" -gt 30 ]; then
-            echo -e "${RED}Overlay heartbeat stale (${heartbeat_age}s) — not actually rendering, exiting for restart.${NC}"
+            echo -e "${RED}Overlay heartbeat stale (${heartbeat_age}s) — not actually rendering.${NC}"
             # Same idea as the web-app stack dump above: capture what
             # every overlay thread is actually doing right now, before
             # it gets killed and replaced - the one chance to catch
@@ -371,7 +389,28 @@ while true; do
             [ -w /var/log/lynx ] 2>/dev/null && OVERLAY_STACKTRACE_LOG="/var/log/lynx/stacktrace_overlay.log"
             echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) - overlay heartbeat stale, dumping stacks ===" >> "$OVERLAY_STACKTRACE_LOG"
             kill -USR1 "$OVERLAY_PID" 2>/dev/null || true
-            sleep 1  # give it a moment to actually write before the kill below
+            sleep 1  # give it a moment to actually write before rebooting/exiting
+            save_log_tail
+
+            # A plain process-level restart alone is confirmed NOT
+            # sufficient for this specific failure - see this file's
+            # own top-of-file comment (the section on this patch) for
+            # the full rationale. Rate-limited via a PERSISTENT marker
+            # (surviving the very reboot this triggers, unlike /tmp)
+            # so a genuinely bad case - this recurring immediately
+            # after every reboot - can never turn into a tight loop.
+            REBOOT_MARKER="/var/log/lynx/last_overlay_reboot"
+            [ ! -w /var/log/lynx ] 2>/dev/null && REBOOT_MARKER="/tmp/lynx_last_overlay_reboot"
+            now=$(date +%s)
+            last_attempt=$(cat "$REBOOT_MARKER" 2>/dev/null || echo 0)
+            if [ $(( now - last_attempt )) -gt 900 ] && sudo -n true 2>/dev/null; then
+                echo "$now" > "$REBOOT_MARKER"
+                echo -e "${RED}Rebooting the Pi — a process-level restart alone has not been sufficient for this.${NC}"
+                sudo reboot
+                sleep 30  # the reboot itself takes a few seconds to actually happen - avoid racing ahead into cleanup below
+            else
+                echo -e "${AMBER}Not triggering a recovery reboot (attempted recently, or passwordless sudo unavailable) — exiting for restart instead.${NC}"
+            fi
             break
         fi
     fi
