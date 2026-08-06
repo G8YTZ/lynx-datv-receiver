@@ -36,6 +36,7 @@ sudo apt install -y \
   socat \
   librsvg2-bin \
   wtype \
+  iw \
   git
 
 # --- Python dependencies -------------------------------------
