@@ -1,94 +1,85 @@
 # Changelog
 
-All notable changes to Lynx are documented here, in reverse chronological order.
-
-This file starts from 2026-07-29. Earlier changes are recorded in each document's own version history section instead (e.g. the Installation Guide, Web UI Reference) - this centralized approach begins here rather than attempting to retroactively reconstruct everything that came before it.
+All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
 ## 2026-08-06
 
-### Fixed
-- **WiFi power-save is now disabled automatically at startup** - `brcmfmac` (this hardware's WiFi driver, Broadcom BCM4345/6) has a well-documented history of silently wedging or failing to reconnect, specifically tied to power-save mode. This was confirmed directly as the root cause of a real overnight crash: the network went completely dead (no SSH, no Web UI) while the rest of the system, including Lynx's own process, stayed fully healthy the entire time (confirmed via `SIGUSR1` stack dumps showing every thread genuinely idle, not stuck) - `dmesg` explicitly showed `brcmf_cfg80211_set_power_mgmt: power save enabled` at boot. `lynx_start.sh` now runs `iw wlan0 set power_save off` right after its own network-up wait, and re-applies it every cycle of the existing health-check loop too, in case a later reconnect/roam event ever resets it. Non-fatal if `wlan0` doesn't exist (a wired-only install) or `iw` isn't installed - `iw` added to `install.sh`'s dependency list explicitly. This fix had already been running on the `beta` channel for some time; it had not yet reached `main` until now, meaning every production, stable-channel receiver had remained exposed to this exact, already-diagnosed crash in the meantime.
-- **The NTP time-sync wait at startup extended from 10s to 45s.** The original 10s cap was confirmed, directly, to be shorter than a real sync sometimes takes on real hardware (~30s observed on one boot, most likely tied to the same WiFi instability described above) - the original cap would give up and let Lynx start with a still-wrong clock before the sync had actually finished. Still capped, not indefinite: a genuinely offline site (no internet at the repeater location, isolated network, etc) still proceeds after the wait rather than blocking forever - if NTP can never reach a server, the clock never jumps at all, which is exactly the condition this wait protects against in the first place.
+**Fixed**
+- WiFi power-save disabled automatically at startup - root cause of a real overnight crash on the beta channel, ported here now that it's confirmed.
+- NTP wait at startup extended 10s → 45s (was cutting off before a real sync sometimes finished).
 
-### Added
-- **Update Channel switching (stable/beta)** - mirroring the model BATC Portsdown already uses, this receiver can now track either the normal, known-working stable branch (`main`) or opt into a separate `beta` branch of newer, less-proven code, switchable back at any time from the Config page. A clear health warning appears whenever Beta is selected, and the main page's version badge always shows a `[BETA]` marker when that channel is active, so it's never ambiguous which channel is live at a glance.
-- **Kill/Restore WiFi** - a new control to fully disable and re-enable the WiFi radio from the Web UI, for sites that want WiFi available for occasional maintenance access but otherwise prefer it off during normal, unattended operation.
-- **OS package updates are now included automatically in "Update Now".** Previously, `install.sh`'s own `apt full-upgrade` only ever ran once, at initial install - the "Check for Updates"/"Update Now" flow only ever did a `git pull`, never touching OS-level packages again after that. Every deployed receiver would otherwise drift further out of date indefinitely, silently, with no way to notice short of manually SSHing in and checking - exactly the kind of drift that turned out to matter directly this session (see the graphics-driver note below). "Update Now" now runs `apt update && apt full-upgrade` in the background (non-interactive, so it can never hang on a prompt that will never come) before its own reboot, so OS packages stay current every time Lynx's own code is updated, with no separate action needed. Confirmed working end-to-end on real hardware: a genuine kernel and Mesa/graphics-driver upgrade pulled in, applied, and the Pi rebooted cleanly onto the new kernel.
-- **Overlay stall detection.** A confirmed real incident: the overlay process stayed alive and its threads stayed genuinely busy (confirmed via `strace` - a completely normal-looking GTK event loop), but nothing was actually reaching the screen - a plain "is the process alive" check would never catch this, only proof of a genuinely completed render will. The overlay now writes a heartbeat file on every real render, and `lynx_start.sh`'s own health-check loop dumps a full stack trace and exits for restart if that heartbeat ever goes stale (>30s). The heartbeat write itself runs on its own dedicated background thread, not the main GTK/rendering thread, so it can never itself become a factor in whatever the main thread's own timing is doing.
+**Added**
+- Update Channel switching (stable/beta), mirroring the model BATC Portsdown uses.
+- Kill/Restore WiFi - a control to fully disable and re-enable the WiFi radio from the Web UI.
+- OS package updates now run automatically as part of "Update Now" - previously only ever applied once, at initial install.
+- Overlay stall detection - a heartbeat file plus a stack-trace dump if it ever goes stale, so a stalled-but-alive overlay can actually be caught and diagnosed.
 
-### Changed
-- **Volume slider redesigned around dB as the primary unit, in the same 0-11 "these go to eleven" spirit as the rest of the UI** - the slider and the "Default on boot" field now both work in dB directly (0.5dB steps, -60dB floor), with the 0-11 readout shown alongside as a cosmetic reference. The backend's own `/api/volume` is completely unchanged and still speaks 0-100 percent; the conversion happens purely in the frontend, at the point each value crosses that boundary, so existing saved volumes still load in correctly.
+**Changed**
+- Volume slider redesigned to dB as the primary unit, with a cosmetic 0-11 "Spinal Tap" readout alongside it.
 
-### Known limitation
-- `main` deliberately does **not** yet include the automatic hard-reboot recovery (triggered by the overlay-stall detection above) or the optional PoE-power-cycle recovery path that `beta` has - both are thoroughly unit-tested but have not yet been proven firing correctly against a real, live stall in the field. They're being held back from the stable channel until that real-world confirmation exists, rather than trusting automatic, unattended hard reboots on production hardware on the strength of tests alone.
+**Known limitation**
+- Automatic hard-reboot recovery and PoE-power-cycle support (both on `beta`) are deliberately not yet on `main`, pending real-world proof they work correctly.
 
 ## 2026-08-01
 
-### Added
-- A diagnostic capability for tracking down an intermittent, hard-to-reproduce hang: a confirmed real incident where the Web UI became completely unresponsive while `mpv` (a genuinely separate process) kept running normally - strongly suggesting something stuck inside `lynx_app.py` itself (a held lock, a hung background thread) rather than anything display/GPU-related, but with no direct evidence yet of exactly what. `lynx_app.py` now registers Python's own `faulthandler` on `SIGUSR1`, dumping every thread's current stack trace to `/var/log/lynx/stacktrace.log` on demand - tested directly against a genuinely hung thread before deploying, confirmed to correctly show its exact blocked location. `lynx_start.sh`'s own health-check loop now triggers this automatically right at the moment it detects the web app not responding, capturing the evidence before the process gets killed and replaced, rather than losing it. Known limitation of the automatic trigger: it only fires if `/api/status` itself stops responding - a hang isolated to a different endpoint (e.g. one waiting on `tune_lock` specifically) might not trip it, though the same capability remains available manually (`kill -USR1 $(pgrep -f lynx_app.py)`) regardless.
-- The stack-trace log above originally wrote to `/tmp`, which is typically RAM-backed on Raspberry Pi OS - confirmed directly as a real problem when a second freeze incident lost the dump entirely to exactly this, right when it would have mattered most (the system journal has the same volatile-storage issue, noted separately in the install guide's troubleshooting section). `install.sh` now creates a persistent `/var/log/lynx/` directory with the right ownership; both `lynx_app.py` and `lynx_start.sh` prefer it when writable, falling back safely to `/tmp` (tested directly, both branches) rather than failing to start at all on an install that hasn't been re-run through `install.sh` since this was added.
+**Added**
+- Diagnostic capability (`SIGUSR1` stack-trace dump) for tracking down an intermittent, hard-to-reproduce hang.
+- Persistent `/var/log/lynx/` logging directory, so diagnostic logs survive a reboot instead of living only in volatile `/tmp`.
 
-### Fixed
-- The mouse cursor-hide only ever fired once, right at Lynx's own startup - if a mouse was ever plugged in later (confirmed directly: during troubleshooting a separate, unrelated screen freeze), the cursor stayed visible indefinitely, with nothing short of a full restart to hide it again. Now re-triggered periodically from the existing health-check loop, so it recovers automatically instead.
-- `wtype` (what actually triggers the cursor-hide) was never in `install.sh`'s own dependency list at all - confirmed directly via `wtype: command not found` on a fresh install, meaning cursor-hide had been silently failing on every single install since it was introduced, with the failure swallowed by its own `2>/dev/null || true` safety net. Added to the dependency list - but since `git pull`/`Update Now` only ever pull code and never install system packages, any install that predates this fix won't get `wtype` itself just by updating (`sudo apt install -y wtype` needs running by hand once). `lynx_start.sh` now checks for this explicitly at startup and prints a clear, visible warning with the exact fix if it's missing, rather than failing silently the way it did here.
+**Fixed**
+- Mouse cursor-hide only ever fired once at startup - now re-triggered periodically so it recovers if a mouse is plugged in later.
+- `wtype` (needed for cursor-hide) was missing from `install.sh`'s dependency list.
 
-### Known limitation
-- A real, confirmed, intermittent freeze/hang on a Pi 500 - screen frozen (mouse cursor still moves), Web UI unresponsive, `mpv` and the rest of the OS otherwise healthy (no memory pressure, no thermal/undervoltage throttling per `vcgencmd get_throttled`, no gaps in a continuous background watchdog log). Not yet root-caused. Ruled out so far: memory exhaustion, thermal/power throttling, screen blanking (already disabled). The diagnostic capability added above (see "Added") is specifically aimed at catching this properly the next time it happens, rather than continuing to infer from indirect, after-the-fact evidence.
+**Known limitation**
+- A real, confirmed, intermittent freeze/hang on a Pi 500 - not yet root-caused at the time.
 
 ## 2026-07-31
 
-### Fixed
-- A genuine, serious bug that broke the main Web UI entirely (blank/frozen page - presets, live streams, status, all of it) - a JavaScript string in `renderUpdateStatus()` used the escape sequence `\n`, but since that JS lives inside a Python triple-quoted string, Python's own string parser silently converted it to an actual, literal newline character before the page was ever served. A real newline inside a single-quoted JavaScript string is a hard syntax error, and a syntax error anywhere in a script prevents the *entire* script from running - which is why the whole page froze, not just the one feature. Found via direct browser `eval()` of the live script content, after extensive other testing (backend endpoints, HTML structure, process checks, CSP, extensions) all came back clean - the actual bug was invisible to every prior syntax check because those checks read the `.py` file as raw text rather than the true, Python-processed runtime string. Re-verified properly this time using Python's own AST parser to extract the real runtime value. A second, identical instance of the same mistake was found and fixed in `applyUpdate()`.
-- `lynx.service` failing to start under systemd with a startup timeout, even though `lynx_start.sh` ran perfectly when launched directly - `Type=notify` was waiting on a `systemd-notify --ready` call that wasn't arriving reliably when launched by systemd specifically. Switched to `Type=simple`, which doesn't wait on a readiness signal at all; `Restart=always` is unaffected, since it doesn't depend on `Type`.
-- `install.sh` still setting up the (confirmed non-working, see below) systemd service as the sole auto-start mechanism, and actively removing the proven, working `lxterminal` autostart line while doing so - meaning a fresh install would reproduce the exact startup failure this session spent hours diagnosing on the existing Pi. Missed updating this at the time the underlying issue was found; caught only when an actual fresh install hit it directly. `install.sh` now sets up the `lxterminal` autostart line as the one thing it depends on, and installs `lynx.service` without enabling it - present and ready for future troubleshooting, but not relied on.
-- `lynx_start.sh` treating a genuinely idle Lynx (no previous state, no default boot preset - confirmed the exact trigger on a fresh install) as an `mpv` crash and exiting the whole stack within seconds of starting. `rf_mpv_lifecycle_monitor()` in `lynx_app.py` deliberately never starts `mpv` at all while idle - only once an RF signal lock is confirmed, or a stream is playing - so `mpv`'s absence in that state was never a crash, just the correct, intended behavior; the health-check loop had no way to tell the difference. Fixed by reading the actual mode from the same `/api/status` response the health check already fetches, and skipping the `mpv` presence check entirely whenever it's genuinely "idle".
-- Network streams (RTMP/SRT/UDP/RTSP - architecturally unrelated to the Picotuner) couldn't be played at all until the Picotuner was configured, on a receiver some people run for streaming only. `_start_stream_impl()` unconditionally sends the Picotuner a command to stop it broadcasting its own transport stream while a network stream plays - reasonable on its own, but with no error handling around that one call, an unconfigured Picotuner's placeholder host value (`192.168.0.XXX`, not a valid IP - Python tries resolving it as a hostname via DNS, which fails) crashed the entire stream-start request. `picotuner_cmd()` now never raises at all - it's fire-and-forget UDP with no response expected in the first place, so a caller was never meant to depend on it succeeding.
-- Auto-start silently failing on a fresh install for any user who chose a username other than "pi" during Raspberry Pi Imager's own setup (increasingly common, since it now commonly prompts for a custom one rather than defaulting to "pi") - confirmed via a real report: install completed cleanly, Lynx worked perfectly when started by hand, but never came up automatically on boot. `install.sh`'s own autostart line, and two places in `lynx_app.py` (`XAUTHORITY`, `XDG_RUNTIME_DIR`) setting up mpv's display environment, all hardcoded `/home/pi/...` or UID 1000 rather than resolving the actual, current user - silently pointing at a directory that simply didn't exist for anyone else. All three now resolve dynamically (`$HOME` in the shell script, `os.path.expanduser("~")` / `os.getuid()` in Python) rather than assuming.
-- `lynx_install_guide.docx`'s "Diversity Mode" section (and a related prerequisites line) incorrectly described diversity as needing a second, separate Picotuner unit with its own network connection and IP address to configure. There is only ever one Picotuner, with two tuner circuits built into the same physical unit - diversity just needs a second antenna connected to the unit's second tuner input, nothing to configure on the network at all. Bumped to Version 1.6 to reflect the correction.
-- Both the Reboot button and `Update Now`'s own error messages pointed at fixing missing passwordless sudo via `sudo visudo`, without ever giving the actual command needed - genuinely unhelpful for anyone who actually hit it. Both now include the exact, copy-pasteable fix directly (a dedicated `/etc/sudoers.d/` entry, using `$USER` rather than assuming a specific username). Also added as a new Section 11.9 in `lynx_install_guide.docx`'s own troubleshooting section, for anyone who wants to set this up proactively rather than wait to hit the error.
+**Fixed**
+- Fixed a JS-escaping bug that froze the entire main page.
+- Fixed `lynx.service` failing to start under systemd (`Type=notify` → `Type=simple`).
+- Fixed `install.sh` reintroducing a known-broken systemd-only autostart on fresh installs.
+- Fixed a false "mpv crashed" detection while genuinely idle.
+- Fixed stream playback failing when the Picotuner isn't configured.
+- Fixed autostart breaking for any non-"pi" username.
+- Fixed incorrect diversity-mode documentation in the install guide.
+- Added copy-pasteable passwordless-sudo setup instructions to error messages.
 
-### Known limitation
-- `graphical-session.target` (what `lynx.service` waits on before starting) never actually activates on this labwc setup - confirmed directly (`systemctl --user status graphical-session.target` shows inactive even after a full reboot with Lynx visibly running). A standard fix (`systemctl --user start graphical-session.target` added to labwc's own autostart) was tried and did not resolve it. Genuinely unresolved for now - `lynx.service` is disabled again, and the original, proven `lxterminal -e lynx_start.sh &` autostart line is back in `~/.config/labwc/autostart` as the sole, working auto-start mechanism. This means systemd's own auto-restart-after-a-crash benefit isn't active right now. Worth a proper, focused look in a future session rather than more guessing.
+**Known limitation**
+- `graphical-session.target` never activates on this labwc setup - genuinely unresolved, `lynx.service` disabled again in favour of the proven autostart line.
 
-  `Update Now` no longer depends on this, though - it now reboots the whole Pi directly (same mechanism, and the same passwordless-sudo check, as the existing Reboot button) rather than trying to restart just the Lynx process via systemd. Slower than a plain process restart would be, but reliably brings Lynx back up regardless via the proven autostart line, sidestepping the `graphical-session.target` issue entirely rather than depending on it being fixed first.
-
-### Changed
-- PPM meter default display style changed from "skeleton" to "full_fat" (config template and code fallback) - existing installs with an explicit `display.ppm_style` setting already in their config are unaffected, since this only changes the default for a config with no explicit value set (e.g. a fresh install).
-- First version tag created: `v2026.07.31` - the version badge on the main page now shows this directly rather than a raw commit SHA.
-- A fresh install now comes with 14 preset memories already populated, rather than an empty list: all 9 of BATC's own network stream relays (GB3OO, GB3HV, GB3TV, GB3SQ, GB3GG, GB3EN, GB3JV, GB3JT, and the Oscar 100 net) plus 5 generic 70cm/23cm RF starting points at standard symbol rates. Deliberately no site-specific RF presets (a made-up frequency claiming to be a real repeater's input would be actively misleading for anyone outside that one site) - the stream presets work for anyone with internet access regardless of location, which the RF ones genuinely can't.
+**Changed**
+- PPM meter default style changed to "full_fat".
+- First version tag created.
+- 14 preset memories now ship by default on a fresh install.
 
 ## 2026-07-30
 
-### Added
-- BBC-style stereo PPM (Peak Programme Meter) on the OSD, bottom-left. Calibrated PPM4 = -18dBFS (EBU R68), with genuine IEC 60268-10 Type IIa ballistics - confirmed against the documented spec numbers directly rather than assumed: 1.497s to fall 20dB (spec: ~1.5s), 1.20/2.79/4.68dB down for 10/5/3ms tone bursts (spec: ~1/2/4dB). Independent red (left) and green (right) needles - confirmed directly from Wikipedia's own PPM article that this is the genuine UK convention, not an arbitrary choice - driven by a live audio tap via PipeWire, running entirely separately from mpv (mpv's own metering path for this is confirmed broken upstream). Selectable "Skeleton" (needles and graduations only) or "Full Fat" (adds a round, vintage-style meter housing) display style, toggleable live from the Config page - the housing is a genuinely separate, independently-togglable piece from the needle/graduation core underneath, which stays identical either way.
-- Versioning and update checking. Date-based git tags (e.g. `v2026.07.30`), displayed on the main page via `git describe --tags`. Checking is entirely manual - a "Check Updates" button, never automatic - since not every Lynx receiver is reliably online (some run RF-only, no internet at all), and this must never touch the network on its own. Applying an update stays a fully separate, deliberate action too (a confirmation dialog, showing what's changed, before anything happens). Fails safely: if `git pull` fails for any reason, nothing is touched and the currently-running process keeps going untouched.
+**Added**
+- BBC-style stereo PPM meter on the OSD.
+- Manual version checking/updating (Check Updates / Update Now buttons).
+- `lynx.service`, a proper systemd unit replacing the bare autostart line.
 
-  Went through a real reliability scare after initial deployment: an earlier version ran a background auto-check thread, and version detection ran synchronously at startup, on the main thread, before the server even began accepting requests - a genuine, confirmed-live problem (blank Web UI, an OSD crash) on real hardware, caught only by reverting to the previous file as a direct A/B test. Root cause not fully pinned down with certainty, but rebuilt from the ground up to remove the entire class of risk: no background thread at all now, nothing runs at startup, and the only two things that ever touch git are an explicit "Check Updates" click and an explicit "Update Now" click - both fully user-initiated, both fail cleanly with a clear message rather than affecting anything else if git misbehaves.
-- `lynx.service` - a proper systemd user service, replacing the previous bare `lxterminal -e lynx_start.sh &` line in labwc's autostart. `lynx_start.sh` already called `systemd-notify` (on ready, and from its own watchdog loop) - built in for exactly this, just never wired up to a real unit before. Existing installs need a one-time manual migration (see the install guide); `install.sh` handles it automatically for fresh installs, including removing the old autostart line so Lynx isn't launched twice.
+**Changed**
+- OSD layout reshuffled for the new PPM meter.
+- Config page cards rebalanced.
+- Volume display switched to dB.
 
-### Changed
-- OSD layout rearranged to make room for the new PPM meter: tuning info (frequency, symbol rate, modcod/codec, diversity split) moved from bottom-left to top-left. Magic eye's centre reading now explicitly shows "dBm" (e.g. "-52 dBm"), matching the M5Dial's own display.
-- Config page cards rebalanced across its three columns based on actual measured size (not guessed), fixing large, uneven gaps that had built up as cards were added over the course of the evening - previously 6 column-groups wrapping into 2 rows (so an uneven row could leave the shorter columns' next row starting late), now a single row of 3, so there's no second row to start late in the first place.
-- Volume control now displays dB relative to full scale (e.g. "-18.1 dB") instead of a raw percentage - mpv's own volume scale is cubic (confirmed directly against mpv's own issue tracker, not assumed), so percent alone never corresponded evenly to level anyway. 100% is still unity gain (0dB).
-
-### Known limitation
-- The PPM meter's calibration only holds at 100% volume (0dB). Its audio tap sits downstream of mpv's own volume gain, so turning the volume down for local listening makes the PPM read quieter too, rather than reflecting genuine programme level. A compensation fix was built and verified working, but reverted deliberately - it would have amplified noise floor by the same factor at lower volumes (up to 1000x near the bottom of the range), a worse trade-off than the limitation itself. Documented directly on the Control card rather than silently left as a surprise.
+**Known limitation**
+- PPM calibration only holds at 100% volume.
 
 ## 2026-07-29
 
-### Added
-- Portable locator override for QRZ Logbook - when a contacted station is operating portable and hasn't updated their own QRZ profile, this lets you override the grid square used for that contact's distance/bearing calculation. Configurable from the Web UI's QRZ card, and shown on the OSD whenever active so it can't be silently forgotten. Deliberately built as a plain, generic config value - a future automated source (e.g. a GPS module, or a phone's GPS relayed over Bluetooth) could populate it without any changes needed downstream.
-- "Test QRZ Logging" feature on the Diagnostics page - sends one real, clearly-marked test entry (safe to delete afterwards) and shows QRZ's complete, raw response. Useful for confirming a QRZ setup genuinely works without waiting for a real RF lock.
-- New Diagnostics page event categories covering the notifications system's own lock/unlock confirmations, cancelled pending actions, and QRZ submission results (skipped/logged/failed, with full detail on failures) - previously only visible in terminal output, now on the same persistent, browser-visible timeline as everything else.
-- 3cm amateur band added to QRZ band derivation, needed for QO-100 contacts.
-- Picotuner auto-discovery on the Config page - any Picotuner currently broadcasting on the local network now shows up automatically next to the Picotuner Network Settings card, with a one-click "Use" button to fill in its IP address. No new listener needed - this reuses the existing port-9997 status broadcast, which (being a genuine UDP broadcast) was already arriving from every unit on the network, not just the configured one.
-- Mouse cursor is now hidden automatically on boot (labwc's HideCursor/WarpCursor keybind, triggered once the OSD overlay has confirmed starting) - not Pi500-specific, affects any Lynx install on labwc's default desktop behaviour. install.sh now creates the required `~/.config/labwc/rc.xml` automatically on a fresh install; existing installs need it added once by hand (see the Installation Guide).
+**Added**
+- Portable locator override for QRZ Logbook.
+- Test QRZ Logging tool on Diagnostics.
+- New Diagnostics event categories for notifications/QRZ.
+- 3cm band added to QRZ band derivation.
+- Picotuner auto-discovery on the Config page.
+- Mouse cursor auto-hide on boot.
 
-### Changed
-- Removed margin from the QRZ Logbook comment field to keep it shorter (MER is retained).
-
-### Fixed
-- **QRZ Logbook submissions from genuine RF locks were silently failing.** Root cause: the live frequency reading was being labelled as kHz without actually being converted from the MHz value the Picotuner reports - a real 437MHz signal was miscalculated as 0.437MHz, which doesn't fall into any defined amateur band, leaving QRZ's `band` field empty and the whole submission rejected. Manual/test submissions never hit this path, which is why it went unnoticed for a while - they always used a fixed, already-correct test frequency.
-- QRZ Logbook entries now correctly log the real satellite downlink frequency when an LNB is configured, rather than the raw IF frequency the Picotuner is actually tuned to (e.g. a genuine 10489.5MHz QO-100 contact was previously being logged as 739.5MHz).
-- QRZ Logbook's `mode` field now includes the DVB-S2 standard name alongside the modcod (e.g. `DVB-S2 QPSK 8/9`), matching the correct, expected ADIF format - previously sent as just the bare modcod.
-- Slack notifications' `{frequency}` placeholder was showing the wrong value (1000x too low) - same root cause as the QRZ frequency bug above, fixed by the same change.
+**Fixed**
+- QRZ Logbook silently failing due to a kHz/MHz frequency bug.
+- QRZ Logbook logging the wrong (IF, not downlink) frequency with an LNB configured.
+- QRZ mode field missing the DVB-S2 standard name.
+- Slack `{frequency}` placeholder showing 1000x too low.
