@@ -112,22 +112,27 @@ iw wlan0 set power_save off 2>/dev/null || true
 # or session-related cause at all. Waiting here avoids ever starting
 # mpv into that window.
 #
-# Capped at 10s (a real sync over an internet connection typically
-# completes in a couple of seconds, so this is still generous) rather
-# than proceeding forever, since a genuinely offline site (no internet
-# at the repeater location, isolated network, etc) would otherwise pay
-# a much longer cost on every single boot for nothing. Offline sites
-# are actually fine either way — if NTP can never reach a server, the
-# clock never jumps at all, which is exactly the condition this wait
-# exists to protect against in the first place.
+# Capped at 45s - extended from an original 10s cap per Justin's own
+# request (a future use case). Confirmed directly this cap can
+# genuinely matter: NTP sync was observed taking around 30s on this
+# exact hardware on at least one real boot, most likely tied to the
+# same WiFi instability investigated elsewhere this session - the
+# original 10s cap would have given up and proceeded before that sync
+# actually completed. Still capped, not indefinite: a genuinely
+# offline site (no internet at the repeater location, isolated
+# network, etc) would otherwise pay this full cost on every single
+# boot for nothing. Offline sites are actually fine either way — if
+# NTP can never reach a server, the clock never jumps at all, which is
+# exactly the condition this wait exists to protect against in the
+# first place.
 echo -ne "Waiting for system time sync... "
-for i in $(seq 1 10); do
+for i in $(seq 1 45); do
     if [ "$(timedatectl show --property=NTPSynchronized --value 2>/dev/null)" = "yes" ]; then
         echo -e "${GREEN}synced${NC}"
         break
     fi
     sleep 1
-    if [ "$i" = "10" ]; then
+    if [ "$i" = "45" ]; then
         echo -e "${AMBER}no internet/NTP available — proceeding (this is fine)${NC}"
     fi
 done
@@ -406,6 +411,21 @@ while true; do
             if [ $(( now - last_attempt )) -gt 900 ] && sudo -n true 2>/dev/null; then
                 echo "$now" > "$REBOOT_MARKER"
                 echo -e "${RED}Rebooting the Pi — a process-level restart alone has not been sufficient for this.${NC}"
+                # Genuine hard reset via SysRq, not a plain `sudo
+                # reboot` - see this script's own patch history /
+                # CHANGELOG for the full rationale: a plain reboot did
+                # NOT reliably clear this overnight, while a full
+                # physical power cycle did. Sync first (SysRq's own
+                # 's') to avoid needless SD card corruption, then the
+                # actual hard reboot ('b').
+                echo 1 | sudo tee /proc/sys/kernel/sysrq > /dev/null 2>&1
+                sync
+                echo s | sudo tee /proc/sysrq-trigger > /dev/null 2>&1
+                sleep 2
+                echo b | sudo tee /proc/sysrq-trigger > /dev/null 2>&1
+                sleep 5
+                # Fallback if SysRq wasn't available/didn't take effect -
+                # harmless no-op if the system already went down above.
                 sudo reboot
                 sleep 30  # the reboot itself takes a few seconds to actually happen - avoid racing ahead into cleanup below
             else
