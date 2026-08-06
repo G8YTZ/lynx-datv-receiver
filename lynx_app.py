@@ -4384,10 +4384,29 @@ def post_update_apply():
 
     def _do_reboot():
         time.sleep(1.0)  # let this HTTP response actually reach the browser first
+        # OS packages are checked and upgraded here too, not just
+        # Lynx's own code - see this function's own patch history for
+        # the full rationale. Non-interactive flags so this can never
+        # hang waiting for a prompt that will never come; a bounded
+        # timeout so even something going wrong here still lets the
+        # reboot below proceed rather than hanging indefinitely.
+        try:
+            env = os.environ.copy()
+            env["DEBIAN_FRONTEND"] = "noninteractive"
+            subprocess.run(["sudo", "apt", "update"], env=env, timeout=300)
+            subprocess.run(
+                ["sudo", "apt", "full-upgrade", "-y",
+                 "-o", "Dpkg::Options::=--force-confdef",
+                 "-o", "Dpkg::Options::=--force-confold"],
+                env=env, timeout=900)
+        except Exception as e:
+            print(f"[update] OS package upgrade failed or timed out ({e}) - "
+                  "rebooting anyway with whatever succeeded so far.")
         subprocess.Popen(["sudo", "reboot"])
     threading.Thread(target=_do_reboot, daemon=True).start()
 
-    return {"result": "ok", "message": "Update pulled successfully - rebooting the Pi now.",
+    return {"result": "ok",
+            "message": "Update pulled successfully - now updating OS packages and rebooting (this can take a few minutes).",
             "pull_output": pull_output}
 
 class UpdateChannelRequest(BaseModel):
