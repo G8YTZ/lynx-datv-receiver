@@ -4806,29 +4806,32 @@ def web_ui():
                     <div class="d-flex align-items-center gap-2 mb-1">
                         <span style="font-size:1.1em">&#x1F50A;</span>
                         <input type="range" class="form-range flex-grow-1" id="volume-slider"
-                               min="0" max="100" value="100"
+                               min="-60" max="0" step="0.5" value="0" title="These go to eleven"
                                oninput="onVolumeInput(this.value)" onchange="setVolume(this.value)">
-                        <span class="status-value" id="volume-value" style="min-width:4.5em; text-align:right;">0.0 dB</span>
+                        <span class="status-value" id="volume-value" style="min-width:9em; text-align:right;">+0.0 dB (11.0/11)</span>
                     </div>
                     <div class="text-muted small mb-2">
-                        100% = unity gain (0 dB) — correct reference for
+                        0 dB = unity gain (11) — correct reference for
                         24-bit sources already mastered to EBU R128
-                        (normal programme level ≈ -18 dBFS). Shown here
-                        as dB relative to 24-bit full scale rather than
-                        percent - mpv's own volume scale is cubic, not
-                        linear, so percent alone doesn't correspond
-                        evenly to level.
+                        (normal programme level ≈ -18 dBFS). dB shown
+                        relative to 24-bit full scale, in 0.5 dB steps -
+                        mpv's own volume scale is cubic, not linear, so
+                        percent alone doesn't correspond evenly to
+                        level. The (x/11) alongside it is exactly what
+                        it looks like.
                     </div>
                     <div class="text-muted small mb-2" style="color:#d98a1e !important">
                         &#x26A0;&#xFE0F; The OSD's PPM meter is only correctly
-                        calibrated at 0dB (100%) - it reads mpv's actual
+                        calibrated at 0dB (11) - it reads mpv's actual
                         output after this gain is applied, and doesn't
                         currently compensate for it.
                     </div>
                     <div class="input-group input-group-sm mb-2">
                         <span class="input-group-text bg-dark text-light border-secondary" style="font-size:0.8em">Default on boot</span>
                         <input type="number" class="form-control bg-dark text-light border-secondary"
-                               id="default-volume-input" min="0" max="100" value="100">
+                               id="default-volume-input" min="-60" max="0" step="0.5" value="0"
+                               oninput="onDefaultVolumeInput()">
+                        <span class="input-group-text bg-dark text-light border-secondary" id="default-volume-eleven" style="font-size:0.8em; min-width:5em;">(11.0/11)</span>
                         <button class="btn btn-outline-light" onclick="saveDefaultVolume()">Save</button>
                     </div>
                     <hr>
@@ -5223,47 +5226,80 @@ async function restartLynx() {
 }
 
 // ── Volume ────────────────────────────────────────────────────
+// dB is the actual, functional unit throughout the UI now (0.5dB
+// steps) - the backend's own /api/volume is completely unchanged and
+// still speaks 0-100 percent, so every value crosses this conversion
+// at the boundary rather than the underlying representation changing
+// everywhere. -60dB is the slider's floor: mpv's own volume scale is
+// cubic (percent = 100 * 10^(dB/60)), so percent asymptotically
+// approaches but never reaches exactly 0 as dB decreases - a
+// continuous slider needs a genuine, finite minimum rather than -∞,
+// and -60dB (10% - already very quiet) is a practical, sensible one.
+// The "(x/11)" alongside it is the Spinal Tap joke Justin actually
+// asked for - a cosmetic-only value derived FROM the dB figure, not
+// the other way around as an earlier version of this had it.
 let volumeDebounce = null;
+const VOLUME_MIN_DB = -60;
 
-function volumeToDbText(value) {
-    // mpv's own volume scale is cubic (confirmed directly against
-    // mpv's own issue tracker, not assumed), so dB = 20*log10(gain)
-    // where gain = (value/100)^3, i.e. dB = 60*log10(value/100).
-    const v = parseInt(value);
-    if (v <= 0) return '-\u221E dB';
-    const db = 60 * Math.log10(v / 100);
-    return (db >= 0 ? '+' : '') + db.toFixed(1) + ' dB';
+function dbToPercent(db) {
+    return Math.round(100 * Math.pow(10, db / 60));
+}
+function percentToDb(percent) {
+    if (percent <= 0) return VOLUME_MIN_DB;
+    const db = 60 * Math.log10(percent / 100);
+    return Math.max(VOLUME_MIN_DB, db);
+}
+function dbToEleven(db) {
+    const raw = 11 * (db - VOLUME_MIN_DB) / (0 - VOLUME_MIN_DB);
+    return Math.max(0, Math.min(11, raw)).toFixed(1);
+}
+function volumeReadoutText(db) {
+    const dbNum = parseFloat(db);
+    const sign = dbNum >= 0 ? '+' : '';
+    return sign + dbNum.toFixed(1) + ' dB (' + dbToEleven(dbNum) + '/11)';
 }
 
-function onVolumeInput(value) {
+function onVolumeInput(dbValue) {
     // Update the live readout immediately as the slider moves, but
     // debounce the actual API call so dragging doesn't flood requests
-    document.getElementById('volume-value').textContent = volumeToDbText(value);
+    document.getElementById('volume-value').textContent = volumeReadoutText(dbValue);
     clearTimeout(volumeDebounce);
-    volumeDebounce = setTimeout(() => setVolume(value), 150);
+    volumeDebounce = setTimeout(() => setVolume(dbValue), 150);
 }
 
-async function setVolume(value) {
-    await api('POST', '/api/volume', {level: parseInt(value)});
+async function setVolume(dbValue) {
+    await api('POST', '/api/volume', {level: dbToPercent(parseFloat(dbValue))});
+}
+
+function onDefaultVolumeInput() {
+    // Keeps the (x/11) readout next to the Default on boot field live
+    // as the dB value is typed/adjusted, matching the main slider's
+    // own readout - separate from saveDefaultVolume() below, which
+    // only actually persists the value once "Save" is clicked.
+    const db = parseFloat(document.getElementById('default-volume-input').value) || 0;
+    document.getElementById('default-volume-eleven').textContent = '(' + dbToEleven(db) + '/11)';
 }
 
 async function saveDefaultVolume() {
-    const value = parseInt(document.getElementById('default-volume-input').value);
-    await api('POST', '/api/volume/default', {level: value});
+    const db = parseFloat(document.getElementById('default-volume-input').value) || 0;
+    await api('POST', '/api/volume/default', {level: dbToPercent(db)});
 }
 
 async function loadVolume() {
     try {
         const data = await api('GET', '/api/volume');
         if (data.level != null) {
-            document.getElementById('volume-slider').value = data.level;
-            document.getElementById('volume-value').textContent = volumeToDbText(data.level);
+            const db = percentToDb(data.level);
+            document.getElementById('volume-slider').value = db;
+            document.getElementById('volume-value').textContent = volumeReadoutText(db);
         }
     } catch(e) {}
     try {
         const cfg = await api('GET', '/api/config');
-        const defaultVol = cfg.audio?.default_volume ?? 100;
-        document.getElementById('default-volume-input').value = defaultVol;
+        const defaultVolPercent = cfg.audio?.default_volume ?? 100;
+        const defaultDb = percentToDb(defaultVolPercent);
+        document.getElementById('default-volume-input').value = defaultDb;
+        document.getElementById('default-volume-eleven').textContent = '(' + dbToEleven(defaultDb) + '/11)';
     } catch(e) {}
 }
 
