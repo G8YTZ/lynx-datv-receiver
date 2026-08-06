@@ -97,6 +97,35 @@ faulthandler.register(signal.SIGUSR1, file=_faulthandler_log, all_threads=True)
 # did a real render last happen", not survive a reboot.
 OVERLAY_HEARTBEAT_FILE = "/tmp/lynx_overlay_heartbeat"
 
+# Mutable container (not a plain variable) so on_draw() can update it
+# with a simple index assignment, no `global` needed - written from
+# the main thread (see on_draw()), read from heartbeat_writer() below,
+# running on its own separate thread.
+_overlay_last_render_time = [0.0]
+
+def heartbeat_writer():
+    """Runs on its own dedicated thread, deliberately never the main
+    GTK/rendering thread - see on_draw()'s own comment for the full
+    rationale. Only actually writes to the heartbeat file (and so only
+    updates its mtime, which is the only thing the watchdog reading it
+    actually checks) when _overlay_last_render_time has genuinely
+    changed since the last write - if the main thread has truly
+    stalled, this value stops changing, and this correctly notices
+    there is nothing new to write rather than refreshing the file's
+    timestamp regardless, which would silently defeat the entire
+    point of this feature."""
+    last_written = None
+    while True:
+        current = _overlay_last_render_time[0]
+        if current and current != last_written:
+            try:
+                with open(OVERLAY_HEARTBEAT_FILE, "w") as f:
+                    f.write(str(current))
+                last_written = current
+            except OSError:
+                pass
+        time.sleep(5)
+
 LYNX_API = "http://localhost:8080/api/status"
 MPV_TRANSITION_MARKER = "/tmp/lynx_mpv_transitioning"
 POLL_SECS = 2
@@ -476,14 +505,14 @@ class LynxOverlay(Gtk.Window):
     def on_draw(self, area, cr, width, height):
         # Proof a real render actually happened, not just that tick()
         # requested one - see this file's own top-of-file comment for
-        # the full incident this is fixed against. try/except since a
-        # missing heartbeat write should never be the thing that takes
-        # the overlay down.
-        try:
-            with open(OVERLAY_HEARTBEAT_FILE, "w") as _hb:
-                _hb.write(str(time.time()))
-        except OSError:
-            pass
+        # the full incident this is fixed against, and heartbeat_writer()
+        # below for why the actual file write happens on a completely
+        # separate thread rather than here. This line is deliberately
+        # as cheap as it can possibly be - a plain in-memory list
+        # assignment, no syscall, no file I/O - so it can never itself
+        # become a factor in main-thread timing, no matter how often
+        # on_draw() runs or when.
+        _overlay_last_render_time[0] = time.time()
 
         mpv_transitioning = os.path.exists(MPV_TRANSITION_MARKER)
         genuinely_locked = (state["locked"] and state["mpv_running_for_rf"]) or state["mode"] == "stream"
@@ -1076,6 +1105,8 @@ if __name__ == "__main__":
     poll_thread.start()
     ppm_thread = threading.Thread(target=audio_ppm_monitor, daemon=True)
     ppm_thread.start()
+    heartbeat_thread = threading.Thread(target=heartbeat_writer, daemon=True)
+    heartbeat_thread.start()
 
     app = LynxOverlayApp()
     app.run(None)

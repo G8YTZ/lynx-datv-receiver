@@ -78,22 +78,27 @@ done
 # or session-related cause at all. Waiting here avoids ever starting
 # mpv into that window.
 #
-# Capped at 10s (a real sync over an internet connection typically
-# completes in a couple of seconds, so this is still generous) rather
-# than proceeding forever, since a genuinely offline site (no internet
-# at the repeater location, isolated network, etc) would otherwise pay
-# a much longer cost on every single boot for nothing. Offline sites
-# are actually fine either way — if NTP can never reach a server, the
-# clock never jumps at all, which is exactly the condition this wait
-# exists to protect against in the first place.
+# Capped at 45s - extended from an original 10s cap per Justin's own
+# request (a future use case). Confirmed directly this cap can
+# genuinely matter: NTP sync was observed taking around 30s on the
+# beta receiver's hardware on at least one real boot, most likely tied
+# to the same WiFi instability investigated elsewhere this session -
+# the original 10s cap would have given up and proceeded before that
+# sync actually completed. Still capped, not indefinite: a genuinely
+# offline site (no internet at the repeater location, isolated
+# network, etc) would otherwise pay this full cost on every single
+# boot for nothing. Offline sites are actually fine either way — if
+# NTP can never reach a server, the clock never jumps at all, which is
+# exactly the condition this wait exists to protect against in the
+# first place.
 echo -ne "Waiting for system time sync... "
-for i in $(seq 1 10); do
+for i in $(seq 1 45); do
     if [ "$(timedatectl show --property=NTPSynchronized --value 2>/dev/null)" = "yes" ]; then
         echo -e "${GREEN}synced${NC}"
         break
     fi
     sleep 1
-    if [ "$i" = "10" ]; then
+    if [ "$i" = "45" ]; then
         echo -e "${AMBER}no internet/NTP available — proceeding (this is fine)${NC}"
     fi
 done
