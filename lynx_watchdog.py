@@ -117,6 +117,117 @@ def save_state(state):
         pass
 
 
+LYNX_CONFIG_PATH = "/home/pi/lynx/config/lynx_config.yaml"
+
+
+def load_poe_config():
+    """Reads the optional poe_recovery section from the same
+    lynx_config.yaml the rest of Lynx uses - read-only, never written
+    here. Returns None if not present, not enabled, or missing any
+    required field, so the caller can cleanly fall through to the
+    SysRq hard reset without any special-casing."""
+    try:
+        import yaml
+        with open(LYNX_CONFIG_PATH) as f:
+            config = yaml.safe_load(f) or {}
+        poe = config.get("poe_recovery", {}) or {}
+        if not poe.get("enabled"):
+            return None
+        required = ["controller_url", "site", "username", "password", "switch_mac", "port_idx"]
+        if not all(poe.get(k) for k in required):
+            return None
+        return poe
+    except Exception:
+        return None
+
+
+def try_poe_power_cycle():
+    """Attempts a genuine PoE power cycle via the UniFi controller API
+    - see this file's own top-of-file comment for the full rationale
+    and the IMPORTANT caveat that this is not yet field-tested against
+    real hardware. Returns True if a power-cycle request was
+    successfully SENT (not necessarily confirmed complete - there's no
+    reliable way to verify that from this side, since the Pi is about
+    to lose power), False if not configured or the attempt itself
+    failed outright, in which case the caller falls through to the
+    SysRq hard reset instead."""
+    poe = load_poe_config()
+    if not poe:
+        return False
+
+    import urllib.request
+    import http.cookiejar
+    import ssl
+    import json as json_module
+
+    # UniFi controllers commonly use self-signed certificates by
+    # default on the local LAN - not a meaningful security concern for
+    # a purely local controller/switch relationship, but urllib will
+    # otherwise refuse the connection outright.
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    cookie_jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPCookieProcessor(cookie_jar),
+        urllib.request.HTTPSHandler(context=ctx),
+    )
+
+    controller_url = poe["controller_url"].rstrip("/")
+    is_udm = poe.get("controller_type") == "udm"
+    login_path = "/api/auth/login" if is_udm else "/api/login"
+    cmd_prefix = "/proxy/network" if is_udm else ""
+
+    try:
+        login_body = json_module.dumps(
+            {"username": poe["username"], "password": poe["password"]}).encode()
+        login_req = urllib.request.Request(
+            controller_url + login_path, data=login_body,
+            headers={"Content-Type": "application/json"}, method="POST")
+        opener.open(login_req, timeout=10)
+
+        cycle_body = json_module.dumps({
+            "cmd": "power-cycle",
+            "mac": poe["switch_mac"],
+            "port_idx": poe["port_idx"],
+        }).encode()
+        cycle_req = urllib.request.Request(
+            f"{controller_url}{cmd_prefix}/api/s/{poe['site']}/cmd/devmgr",
+            data=cycle_body, headers={"Content-Type": "application/json"}, method="POST")
+        opener.open(cycle_req, timeout=10)
+
+        print("[lynx-watchdog] PoE power-cycle request sent successfully.")
+        return True
+    except Exception as e:
+        print(f"[lynx-watchdog] PoE power-cycle attempt failed ({e}) - falling back to SysRq hard reset.")
+        return False
+
+
+def hard_reboot():
+    """Genuine hard reset via SysRq, not a plain `sudo reboot` - see
+    this file's own patch history for the full rationale: a plain
+    reboot did NOT reliably clear this overnight, while a full
+    physical power cycle did. Explicitly enables sysrq first rather
+    than assuming it's already on. Syncs filesystems (SysRq's own 's'
+    function) before the actual reboot ('b'), to avoid needless SD
+    card corruption. Falls back to a plain `sudo reboot` if SysRq
+    itself wasn't available or somehow didn't take effect - a harmless
+    no-op if the system already went down via the SysRq trigger."""
+    try:
+        subprocess.run(["sudo", "sh", "-c", "echo 1 > /proc/sys/kernel/sysrq"], timeout=5)
+        subprocess.run(["sync"], timeout=10)
+        subprocess.run(["sudo", "sh", "-c", "echo s > /proc/sysrq-trigger"], timeout=5)
+        time.sleep(2)
+        subprocess.run(["sudo", "sh", "-c", "echo b > /proc/sysrq-trigger"], timeout=5)
+        time.sleep(5)
+    except Exception:
+        pass
+    # Fallback if SysRq wasn't available/didn't take effect - harmless
+    # no-op if the system already went down above.
+    subprocess.run(["sudo", "reboot"])
+
+
 def main():
     state = load_state()
 
@@ -135,7 +246,8 @@ def main():
         state["network_failures"] = 0
         state["overlay_failures"] = 0
         save_state(state)
-        subprocess.run(["sudo", "reboot"])
+        if not try_poe_power_cycle():
+            hard_reboot()
         return
 
     save_state(state)
