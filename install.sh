@@ -48,6 +48,17 @@ sudo apt install -y \
 echo "--- Installing Python dependencies ---"
 pip install --break-system-packages fastapi uvicorn pyyaml requests gpiozero
 
+# --deps-only stops here - used by "Update Now" (lynx_app.py) to
+# re-confirm every OS/apt/pip dependency above is genuinely present
+# on an existing install, without touching the repo clone, config, or
+# anything else below that would be unsafe to redo on an
+# already-configured system. See this section's own comment further
+# up (near the apt install list) for the full rationale.
+if [ "$1" = "--deps-only" ]; then
+  echo "--- Dependencies confirmed (--deps-only) ---"
+  exit 0
+fi
+
 # --- Clone the repo --------------------------------------------
 echo "--- Fetching Lynx ---"
 if [ -d ~/lynx ]; then

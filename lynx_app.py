@@ -4384,23 +4384,28 @@ def post_update_apply():
 
     def _do_reboot():
         time.sleep(1.0)  # let this HTTP response actually reach the browser first
-        # OS packages are checked and upgraded here too, not just
-        # Lynx's own code - see this function's own patch history for
-        # the full rationale. Non-interactive flags so this can never
-        # hang waiting for a prompt that will never come; a bounded
-        # timeout so even something going wrong here still lets the
-        # reboot below proceed rather than hanging indefinitely.
+        # OS packages, AND every one of Lynx's own apt/pip
+        # dependencies, are (re-)confirmed here too, not just Lynx's
+        # own code - see this function's own patch history for the
+        # full rationale. Delegates to install.sh's own "--deps-only"
+        # mode rather than duplicating its dependency lists here -
+        # install.sh is itself pulled fresh as part of this same
+        # update, so this always runs whatever the current, correct
+        # list actually is, with only one place that list is ever
+        # maintained. Non-interactive under the hood (install.sh's
+        # own apt calls), so this can never hang on a prompt that
+        # will never come; a bounded timeout so even something going
+        # wrong here still lets the reboot below proceed rather than
+        # hanging indefinitely.
         try:
+            install_script = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "install.sh")
             env = os.environ.copy()
             env["DEBIAN_FRONTEND"] = "noninteractive"
-            subprocess.run(["sudo", "apt", "update"], env=env, timeout=300)
-            subprocess.run(
-                ["sudo", "apt", "full-upgrade", "-y",
-                 "-o", "Dpkg::Options::=--force-confdef",
-                 "-o", "Dpkg::Options::=--force-confold"],
-                env=env, timeout=900)
+            subprocess.run(["bash", install_script, "--deps-only"],
+                            env=env, timeout=1200)
         except Exception as e:
-            print(f"[update] OS package upgrade failed or timed out ({e}) - "
+            print(f"[update] Dependency check failed or timed out ({e}) - "
                   "rebooting anyway with whatever succeeded so far.")
         subprocess.Popen(["sudo", "reboot"])
     threading.Thread(target=_do_reboot, daemon=True).start()
