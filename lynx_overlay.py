@@ -1138,8 +1138,14 @@ class LynxOverlay(Gtk.Window):
         eye_radius = 75
 
         def dbm_to_fraction(dbm_str, level_str):
+            # A literal "0" is a confirmed, documented Picotuner firmware
+            # quirk (seen consistently for tuner B) rather than a genuine
+            # reading - a real dBm value is always meaningfully negative.
+            # Treated the same as "no reading" here, same fix as the Web
+            # UI's own equivalent logic.
+            dbm_valid = bool(dbm_str) and dbm_str != "0"
             try:
-                if dbm_str:
+                if dbm_valid:
                     # ptwh0v3k+ (2026-07-23): real dBm from the firmware's
                     # own look-up table - already correctly signed.
                     dbm = float(dbm_str)
@@ -1152,7 +1158,7 @@ class LynxOverlay(Gtk.Window):
             frac = (dbm - EYE_DBM_MIN) / (EYE_DBM_MAX - EYE_DBM_MIN)
             frac = max(0.0, min(1.0, frac))
             frac = frac ** 0.5
-            text = f"{dbm:.0f} dBm" if (dbm_str or level_str) else "--"
+            text = f"{dbm:.0f} dBm" if (dbm_valid or level_str) else "--"
             return frac, text
 
         if state["mode"] == "stream":

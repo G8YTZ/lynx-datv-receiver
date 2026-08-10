@@ -6616,7 +6616,7 @@ async function updateStatus() {
                 ['Symbol Rate', pt.symbol_rate ? pt.symbol_rate + ' kS/s' : '—'],
                 ['MER',       pt.mer ? pt.mer + ' dB' : '—'],
                 ['Margin',    pt.margin ? pt.margin + ' dB' : '—'],
-                ['Level',     pt.dbm ? pt.dbm + ' dBm' : (pt.level ? '-' + pt.level + ' dBm' : '—')],
+                ['Level',     (pt.dbm && pt.dbm !== '0') ? pt.dbm + ' dBm' : (pt.level ? '-' + pt.level + ' dBm' : '—')],
                 ['Mode',      pt.modcod || '—'],
                 ['Codec',     pt.codec || '—'],
                 ['Audio Codec', pt.audio_codec || '—'],
@@ -6657,7 +6657,7 @@ async function updateStatus() {
                     ['Symbol Rate', b.symbol_rate ? b.symbol_rate + ' kS/s' : '—'],
                     ['MER',       b.mer ? b.mer + ' dB' : '—'],
                     ['Margin',    b.margin ? b.margin + ' dB' : '—'],
-                    ['Level',     b.dbm ? b.dbm + ' dBm' : '—'],  // ptwh0v3k+ (2026-07-23): now genuinely available for rcv=2
+                    ['Level',     (b.dbm && b.dbm !== '0') ? b.dbm + ' dBm' : '—'],  // a literal "0" is a known, documented Picotuner firmware quirk for rcv=2, not a genuine reading - treated the same as no data
                     ['Mode',      b.modcod || '—'],
                     ['Codec',     b.codec || '—'],
                     ['Audio Codec', b.audio_codec || '—'],
