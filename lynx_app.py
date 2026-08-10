@@ -5867,7 +5867,7 @@ if __name__ == "__main__":
     # module docstring for the real-hardware evidence behind this.
     # Only pauses if a PSU command was genuinely sent above.
     if current_lnb_psu_a != "off" or current_lnb_psu_b != "off":
-        LNB_PSU_STARTUP_SETTLE_SECS = 2.0
+        LNB_PSU_STARTUP_SETTLE_SECS = 5.0
         time.sleep(LNB_PSU_STARTUP_SETTLE_SECS)
 
     # Resume whatever Lynx was last doing before this restart — crash,
