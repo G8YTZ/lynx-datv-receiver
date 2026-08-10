@@ -2,6 +2,27 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-08-08
+
+**Fixed**
+- `install.sh` dependency check now runs as part of every "Update Now", not just at initial install - closes a real gap: `wtype` was found missing on production despite being correctly listed, since a fresh dependency added (or somehow lost) after initial install had no path to ever reach an existing system.
+- A literal `dbm=0` from the Picotuner was being shown as a real reading (both Web UI and OSD) - confirmed as a genuine Picotuner firmware quirk at higher Tx gain, specific to tuner B. Now treated the same as "no reading."
+- Startup network-wait check now pings the local default gateway instead of a fixed internet host - fixes a misleading "no network detected" when outbound ICMP is blocked but the local network (and internet access generally) is fine; also correctly supports genuinely offline/RF-only setups. Extended 20s → 45s after confirming the route can genuinely take longer than that to appear on some hardware. `PATH` is now also set explicitly at script start, as a defensive measure.
+
+**Added**
+- Consistent button-style navigation on all three pages (previously only the main page had it).
+- LNB PSU control - independent H/V (18V/13V) buttons per plug, plus a Tone toggle for Hi-Band LNBs (defaults off, since Amateur TV never needs it). Sent as a standalone command, re-applied on every startup with a settling delay for the voltage to stabilise before the first tune attempt. The indicator reflects the Picotuner's own reported state, not just "a command was sent."
+- Shutdown and a redefined Stop button, ported from beta - Shutdown gracefully powers the whole Pi off (does not come back up on its own); Stop now closes the Lynx app and returns to the desktop.
+- A general diversity stuck-lock watchdog - catches the known "correctly tuned, good margin, but never locking" state whenever it happens, not just at startup. Deliberately keyed on margin rather than MER, so a genuinely empty tuner (e.g. the opposite polarisation) is correctly left alone rather than endlessly re-tuned.
+
+**Changed**
+- "Manual Tune" label clarified to "Manual Tune (kHz)".
+- Configured site name removed from the header.
+
+**Docs**
+- Web UI manual updated (v1.5) - new navigation, LNB PSU, Shutdown/Stop, and a note that only the v3 Picotuner board is supported.
+- Installation guide updated (v1.8) - recommends a genuine SSH terminal over VNC/remote-desktop sessions for pasting commands, after a real install was broken by a locale-related encoding issue introduced that way.
+
 ## 2026-08-06
 
 **Fixed**
