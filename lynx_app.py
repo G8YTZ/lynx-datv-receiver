@@ -4840,7 +4840,12 @@ def web_ui():
     <div class="row mb-3">
         <div class="col">
             <h2 class="lynx-title">&#x25B6; LYNX DATV RECEIVER</h2>
-            <small class="text-muted" id="site-name">Loading...</small>
+            <div class="d-flex gap-2 mb-2">
+                <a href="/diagnostics" class="btn btn-sm btn-outline-light">&#x1F4CA; Diagnostics</a>
+                <a href="/config" class="btn btn-sm btn-outline-light">&#x2699;&#xFE0F; Config</a>
+                <a href="/docs" class="btn btn-sm btn-outline-light">&#x1F4D6; API Docs</a>
+            </div>
+            <small class="text-muted" id="site-name"></small>
             <!-- Diversity: replaces the site-name line above with a highlighted stats box while diversity mode is active -->
             <div id="diversity-stats-line" style="display:none; background:#0f3460; color:#ffffff; font-weight:500; padding: 4px 10px; border-radius: 4px; font-size: 1rem;"></div>
         </div>
@@ -4863,9 +4868,6 @@ def web_ui():
             <span class="btn btn-sm" id="version-badge" style="background:#3a4a63; color:#fff; cursor:default;" title="Current version">v?</span>
             <button class="btn btn-sm btn-outline-light" onclick="checkForUpdates()" id="update-check-btn" title="Check for updates now">&#x1F504; Check Updates</button>
             <button class="btn btn-sm btn-success" onclick="applyUpdate()" id="update-apply-btn" style="display:none" title="Pull the latest code and restart">&#x2B06;&#xFE0F; Update</button>
-            <a href="/diagnostics" class="btn btn-sm btn-outline-light">&#x1F4CA; Diagnostics</a>
-            <a href="/config" class="btn btn-sm btn-outline-light">&#x2699;&#xFE0F; Config</a>
-            <a href="/docs" class="btn btn-sm btn-outline-light">&#x1F4D6; API Docs</a>
         </div>
     </div>
 
@@ -5395,7 +5397,6 @@ async function refreshLiveStreams() {
 async function loadConfig() {
     try {
         const cfg = await api('GET', '/api/config');
-        document.getElementById('site-name').textContent = cfg.site?.name || 'Lynx Receiver';
         document.getElementById('config-panel').innerHTML = `
             <div class="d-flex justify-content-between"><span>Picotuner</span><span class="status-value">${cfg.picotuner?.host}</span></div>
             <div class="d-flex justify-content-between"><span>Callsign</span><span class="status-value">${cfg.site?.callsign}</span></div>
