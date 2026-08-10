@@ -229,6 +229,27 @@ current_lnb_side: str = "low"  # "low" (Ku-band, IF=downlink-LO) or
                                 # "high" (C-band, IF=LO-downlink) —
                                 # needed to correctly reverse the
                                 # calculation for display.
+current_lnb_psu_a: str = config.get('lnb_psu', {}).get('plug_a', 'off')
+                                # "off"/"lo"/"hi" - Plug A's (rcv=1's
+                                # own) LNB PSU voltage, sent to the
+                                # Picotuner as its own standalone
+                                # command (VGX=), independent of
+                                # tuning - see set_lnb_psu() for the
+                                # full rationale.
+current_lnb_psu_b: str = config.get('lnb_psu', {}).get('plug_b', 'off')
+                                # Same as above, for Plug B (rcv=2's
+                                # own LNB PSU / VGY=) - only relevant
+                                # on units with the optional second
+                                # LNB PSU board fitted.
+current_lnb_tone_a: bool = config.get('lnb_psu', {}).get('plug_a_tone', False)
+                                # Hi-Band LO tone for Plug A - defaults
+                                # off (Lo-Band), since Amateur TV never
+                                # uses the Hi-Band LO. Combines with
+                                # current_lnb_psu_a into the Picotuner's
+                                # own single combined value (see
+                                # set_lnb_psu()).
+current_lnb_tone_b: bool = config.get('lnb_psu', {}).get('plug_b_tone', False)
+                                # Same as above, for Plug B.
 current_volume: int = config.get('audio', {}).get('default_volume', 100)
                                 # the user's actual current session
                                 # volume, distinct from the config's
@@ -971,6 +992,35 @@ def picotuner_monitor():
 
             picotuner_state["online"] = True
             picotuner_state["last_seen"] = time.time()
+
+            # Reflects the Picotuner's own reported LNB supply state
+            # (voltage + Hi-Band tone), not just "a command was last
+            # sent" - confirmed directly as a real gap: a voltage/tone
+            # changed via the API directly, or a Picotuner that
+            # already had a state configured before Lynx ever sent a
+            # command, would otherwise show incorrectly. Same
+            # "Label   Value" broadcast format as the discovery block
+            # above (not reused directly since that dict is scoped to
+            # this specific, gated, configured-host branch instead of
+            # every broadcast on the network). Falls back gracefully
+            # (leaves the existing value alone) if this field is ever
+            # absent/unrecognized in a given broadcast (e.g. older
+            # firmware) rather than incorrectly resetting to "off".
+            global current_lnb_psu_a, current_lnb_psu_b, current_lnb_tone_a, current_lnb_tone_b
+            lnb_supply_map = {
+                "off": ("off", False), "absent": ("off", False),
+                "hi": ("hi", False), "hit": ("hi", True),
+                "lo": ("lo", False), "lot": ("lo", True),
+            }
+            for line in text.splitlines():
+                parts = re.split(r'\s{2,}', line.strip())
+                if len(parts) != 2:
+                    continue
+                label, value = parts[0].strip().lower(), parts[1].strip().lower()
+                if label == "lnb supply x" and value in lnb_supply_map:
+                    current_lnb_psu_a, current_lnb_tone_a = lnb_supply_map[value]
+                elif label == "lnb supply y" and value in lnb_supply_map:
+                    current_lnb_psu_b, current_lnb_tone_b = lnb_supply_map[value]
 
             # Parse RX1 line: "437.024 G8YTZ" or "437.000T search"
             for line in text.splitlines():
@@ -3373,6 +3423,10 @@ def get_status():
             "dbm": picotuner_state["dbm"],
             "agc1": picotuner_state["agc1"],
             "agc2": picotuner_state["agc2"],
+            "lnb_psu": {
+                "plug_a": current_lnb_psu_a, "plug_a_tone": current_lnb_tone_a,
+                "plug_b": current_lnb_psu_b, "plug_b_tone": current_lnb_tone_b,
+            },
         },
         "diversity": {
             "enabled": diversity_enabled,
@@ -5813,6 +5867,75 @@ def set_default_volume(req: VolumeRequest):
     save_config(config)
     return {"success": True, "default_volume": level}
 
+class LnbPsuRequest(BaseModel):
+    plug: str                       # "a" or "b"
+    voltage: Optional[str] = None   # "off"/"lo"/"hi" - omit to leave voltage unchanged
+    tone: Optional[bool] = None     # Hi-Band LO tone - omit to leave tone unchanged
+
+@app.get("/api/lnb_psu", tags=["Control"],
+         summary="Get the current LNB PSU voltage/tone for both plugs",
+         description="Returns the Picotuner's own last-reported LNB "
+                     "supply state for each plug (voltage + Hi-Band "
+                     "tone), parsed from its status broadcast - falls "
+                     "back to the last-commanded value if that "
+                     "broadcast field is ever briefly unavailable.")
+def get_lnb_psu():
+    return {
+        "plug_a": current_lnb_psu_a, "plug_a_tone": current_lnb_tone_a,
+        "plug_b": current_lnb_psu_b, "plug_b_tone": current_lnb_tone_b,
+    }
+
+@app.post("/api/lnb_psu", tags=["Control"],
+          summary="Set the LNB PSU voltage and/or tone for one plug",
+          description="voltage: off/lo (13V, Vertical)/hi (18V, "
+                      "Horizontal - the correct setting for Amateur "
+                      "TV). tone: Hi-Band LO (almost never needed for "
+                      "Amateur TV - default is Lo-Band/off). Either "
+                      "can be omitted to change only the other, "
+                      "leaving the current value of whichever is "
+                      "omitted untouched. Combined into the "
+                      "Picotuner's own single VGX=/VGY= command value "
+                      "(off/lo/hi/lot/hit) and sent immediately, "
+                      "independent of any tune command - deliberately "
+                      "persistent rather than tied to a preset, since "
+                      "an LNB is normally meant to stay powered "
+                      "continuously once connected. Also saved to "
+                      "config so it's correctly re-applied on every "
+                      "future Lynx startup, since the Picotuner's own "
+                      "remote settings aren't guaranteed to survive "
+                      "its own power cycle. Toggling tone while "
+                      "voltage is currently off only updates the "
+                      "stored preference - there's no voltage to "
+                      "apply a tone to yet.")
+def set_lnb_psu(req: LnbPsuRequest):
+    global current_lnb_psu_a, current_lnb_psu_b, current_lnb_tone_a, current_lnb_tone_b
+    plug = req.plug.lower()
+    if plug not in ("a", "b"):
+        return {"success": False, "error": "plug must be 'a' or 'b'"}
+
+    cur_voltage = current_lnb_psu_a if plug == "a" else current_lnb_psu_b
+    cur_tone = current_lnb_tone_a if plug == "a" else current_lnb_tone_b
+    new_voltage = req.voltage.lower() if req.voltage is not None else cur_voltage
+    new_tone = req.tone if req.tone is not None else cur_tone
+    if new_voltage not in ("off", "lo", "hi"):
+        return {"success": False, "error": "voltage must be 'off'/'lo'/'hi'"}
+
+    # "off" always means genuinely off, regardless of the stored tone
+    # preference - tone is only meaningful once voltage is actually on.
+    combined = new_voltage if new_voltage == "off" else (new_voltage + ("t" if new_tone else ""))
+
+    if plug == "a":
+        picotuner_cmd(f"[to@wh] vgx={combined}")
+        current_lnb_psu_a, current_lnb_tone_a = new_voltage, new_tone
+    else:
+        picotuner_rcv2_cmd(f"[to@wh] vgy={combined}", config['picotuner'])
+        current_lnb_psu_b, current_lnb_tone_b = new_voltage, new_tone
+
+    config.setdefault('lnb_psu', {})[f'plug_{plug}'] = new_voltage
+    config.setdefault('lnb_psu', {})[f'plug_{plug}_tone'] = new_tone
+    save_config(config)
+    return {"success": True, "plug": plug, "voltage": new_voltage, "tone": new_tone}
+
 @app.get("/api/update/status", tags=["Configuration"],
          summary="Current version and update-check status",
          description="Populates current_version on first call (local-"
@@ -6315,6 +6438,18 @@ def web_ui():
         </div>
         <div class="col-auto d-flex align-items-start gap-2 pt-1">
             <span><span class="led led-grey" id="picotuner-led"></span><small id="picotuner-status" class="text-muted">Picotuner</small></span>
+            <span class="d-flex align-items-center gap-1" title="LNB PSU, Plug A - press the active button again to turn off. Amateur TV is always Horizontal (18V), labelled by voltage since some LNBs are physically mounted rotated 90 degrees.">
+                <small class="text-muted">LNB&nbsp;A</small>
+                <button class="btn btn-sm" id="lnb-psu-a-h" onclick="onLnbPsuClick('a','hi')" title="18V (Horizontal, for Amateur TV)">18V</button>
+                <button class="btn btn-sm" id="lnb-psu-a-v" onclick="onLnbPsuClick('a','lo')" title="13V (Vertical)">13V</button>
+                <button class="btn btn-sm" id="lnb-psu-a-tone" onclick="onLnbToneClick('a')" title="Hi-Band LO (22kHz tone) - almost never needed for Amateur TV, default is Lo-Band">Tone</button>
+            </span>
+            <span class="d-flex align-items-center gap-1" title="LNB PSU, Plug B - press the active button again to turn off. Amateur TV is always Horizontal (18V), labelled by voltage since some LNBs are physically mounted rotated 90 degrees.">
+                <small class="text-muted">LNB&nbsp;B</small>
+                <button class="btn btn-sm" id="lnb-psu-b-h" onclick="onLnbPsuClick('b','hi')" title="18V (Horizontal, for Amateur TV)">18V</button>
+                <button class="btn btn-sm" id="lnb-psu-b-v" onclick="onLnbPsuClick('b','lo')" title="13V (Vertical)">13V</button>
+                <button class="btn btn-sm" id="lnb-psu-b-tone" onclick="onLnbToneClick('b')" title="Hi-Band LO (22kHz tone) - almost never needed for Amateur TV, default is Lo-Band">Tone</button>
+            </span>
             <span class="btn btn-sm" id="mode-badge" style="background:#3a4a63; color:#fff; cursor:default;">IDLE</span>
             <a href="/diagnostics" class="btn btn-sm btn-outline-light" title="mpv restart/stop diagnostics" id="diagnostics-link">mpv: <span id="mpv-restart-count">0</span></a>
             <span class="btn btn-sm" id="version-badge" style="background:#3a4a63; color:#fff; cursor:default;" title="Current version">v?</span>
@@ -6510,6 +6645,67 @@ async function api(method, path, body) {
 }
 
 // ── Status polling ────────────────────────────────────────────
+function renderLnbPsuButtons(lnbPsu) {
+    // Green = on, grey = off - reads the Picotuner's own last-reported
+    // state from /api/status (parsed from its real status broadcast,
+    // not just "a command was last sent" - see this feature's own
+    // backend comments for the full rationale) so this stays correct
+    // across a page reload, a second browser tab, or a change made
+    // some other way entirely (direct API call, pre-existing
+    // Picotuner configuration), not just within one session's own
+    // in-memory state.
+    const lnbPsuState = lnbPsu || {plug_a: 'off', plug_a_tone: false, plug_b: 'off', plug_b_tone: false};
+    for (const plug of ['a', 'b']) {
+        const current = lnbPsuState['plug_' + plug] || 'off';
+        const tone = lnbPsuState['plug_' + plug + '_tone'] || false;
+        const hBtn = document.getElementById('lnb-psu-' + plug + '-h');
+        const vBtn = document.getElementById('lnb-psu-' + plug + '-v');
+        const toneBtn = document.getElementById('lnb-psu-' + plug + '-tone');
+        hBtn.className = 'btn btn-sm ' + (current === 'hi' ? 'btn-success' : 'btn-outline-secondary');
+        vBtn.className = 'btn btn-sm ' + (current === 'lo' ? 'btn-success' : 'btn-outline-secondary');
+        toneBtn.className = 'btn btn-sm ' + (tone ? 'btn-success' : 'btn-outline-secondary');
+    }
+}
+
+async function onLnbPsuClick(plug, voltage) {
+    // Pressing the currently-active button again turns it off, rather
+    // than needing a separate Off button - matches exactly what was
+    // asked for. Reads the CURRENT state from the button's own class
+    // (already kept in sync by renderLnbPsuButtons() on every status
+    // poll) rather than a separate tracked variable, so there's only
+    // ever one source of truth for what's currently showing. Only
+    // ever touches this one plug's own two buttons - the other
+    // plug's state, and the tone toggle, are untouched either way
+    // (the backend preserves the current tone when only voltage is
+    // sent - see set_lnb_psu()'s own docstring).
+    const hBtn = document.getElementById('lnb-psu-' + plug + '-h');
+    const vBtn = document.getElementById('lnb-psu-' + plug + '-v');
+    const clickedBtn = voltage === 'hi' ? hBtn : vBtn;
+    const alreadyActive = clickedBtn.classList.contains('btn-success');
+    const newVoltage = alreadyActive ? 'off' : voltage;
+    const result = await api('POST', '/api/lnb_psu', {plug: plug, voltage: newVoltage});
+    if (result.success) {
+        hBtn.className = 'btn btn-sm ' + (newVoltage === 'hi' ? 'btn-success' : 'btn-outline-secondary');
+        vBtn.className = 'btn btn-sm ' + (newVoltage === 'lo' ? 'btn-success' : 'btn-outline-secondary');
+    }
+}
+
+async function onLnbToneClick(plug) {
+    // Simple on/off toggle, unlike the mutually-exclusive H/V pair
+    // above - Hi-Band is rarely/never needed for Amateur TV, so this
+    // stays a single button rather than a Hi-Band/Lo-Band pair.
+    // Sending only {plug, tone} leaves the current voltage untouched
+    // on the backend (see set_lnb_psu()'s own docstring) - if voltage
+    // is currently off, this only updates the stored preference for
+    // whenever it's next turned on, without sending a voltage change.
+    const toneBtn = document.getElementById('lnb-psu-' + plug + '-tone');
+    const newTone = !toneBtn.classList.contains('btn-success');
+    const result = await api('POST', '/api/lnb_psu', {plug: plug, tone: newTone});
+    if (result.success) {
+        toneBtn.className = 'btn btn-sm ' + (newTone ? 'btn-success' : 'btn-outline-secondary');
+    }
+}
+
 async function updateStatus() {
     try {
         const s = await api('GET', '/api/status');
@@ -6539,6 +6735,8 @@ async function updateStatus() {
         // mpv restart counter - links through to /diagnostics for detail
         const restartCount = s.lynx?.mpv_restarts_total ?? 0;
         document.getElementById('mpv-restart-count').textContent = restartCount;
+
+        renderLnbPsuButtons(s.picotuner?.lnb_psu);
         
         // Picotuner LED — in diversity mode, "locked" should mean
         // EITHER tuner is locked, since the combiner can produce a
@@ -7293,6 +7491,32 @@ if __name__ == "__main__":
                 return
             time.sleep(2.0)
     threading.Thread(target=_apply_default_volume, daemon=True).start()
+
+    # Re-apply the saved LNB PSU voltage for both plugs every startup -
+    # the Picotuner's own remote settings aren't guaranteed to survive
+    # its own power cycle, and this needs to be sent regardless of
+    # what's being tuned (or whether anything is), unlike a tune
+    # command - see set_lnb_psu()'s own docstring for the full
+    # rationale. Fire-and-forget, same as every other picotuner_cmd()
+    # call - if the Picotuner isn't reachable yet at this exact
+    # moment, there's nothing more useful to do than what already
+    # happens (a clear, logged failure) rather than blocking startup
+    # on it.
+    if current_lnb_psu_a != "off":
+        picotuner_cmd(f"[to@wh] vgx={current_lnb_psu_a}{'t' if current_lnb_tone_a else ''}")
+    if current_lnb_psu_b != "off":
+        picotuner_rcv2_cmd(f"[to@wh] vgy={current_lnb_psu_b}{'t' if current_lnb_tone_b else ''}", config['picotuner'])
+
+    # A short pause for the LNB PSU voltage to physically stabilise
+    # before the very first tune attempt below - confirmed directly on
+    # real hardware (main): a cold PoE power cycle with Plug A's PSU
+    # freshly turned on saw Rx A take roughly 4 minutes to lock on an
+    # otherwise genuinely good signal; follow-up testing found 2s
+    # wasn't quite enough margin, 5s resolved it reliably. Only pauses
+    # if a PSU command was genuinely sent above.
+    if current_lnb_psu_a != "off" or current_lnb_psu_b != "off":
+        LNB_PSU_STARTUP_SETTLE_SECS = 5.0
+        time.sleep(LNB_PSU_STARTUP_SETTLE_SECS)
 
     # Resume whatever Lynx was last doing before this restart — crash,
     # watchdog recovery, scheduled 12-hour reboot, or a genuine power
