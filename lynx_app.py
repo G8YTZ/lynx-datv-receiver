@@ -1643,6 +1643,66 @@ def mer_publisher():
         except Exception as e:
             print(f"[mer_publisher] error: {e}")
 
+DIVERSITY_STUCK_UNLOCKED_SECS = 25.0    # how long unlocked-with-margin counts as "stuck"
+DIVERSITY_STUCK_MARGIN_THRESHOLD = 0.0  # a positive margin means this SHOULD be locking
+DIVERSITY_STUCK_RETUNE_COOLDOWN_SECS = 60.0  # don't re-trigger more often than this
+_diversity_stuck_since = {"a": None, "b": None}
+_diversity_stuck_last_retune = 0.0
+
+def diversity_stuck_lock_monitor():
+    """Background thread, diversity mode only: watches for a receiver
+    that's genuinely unlocked despite reporting a positive margin -
+    see this patch's own module docstring for the full rationale and
+    real-hardware evidence behind it."""
+    global _diversity_stuck_last_retune
+    while True:
+        time.sleep(5)
+        try:
+            if not diversity_enabled:
+                _diversity_stuck_since["a"] = None
+                _diversity_stuck_since["b"] = None
+                continue
+
+            def check(key, state):
+                if state.get("locked"):
+                    _diversity_stuck_since[key] = None
+                    return False
+                try:
+                    margin = float(state.get("margin", ""))
+                except (ValueError, TypeError):
+                    _diversity_stuck_since[key] = None
+                    return False
+                if margin <= DIVERSITY_STUCK_MARGIN_THRESHOLD:
+                    _diversity_stuck_since[key] = None
+                    return False
+                if _diversity_stuck_since[key] is None:
+                    _diversity_stuck_since[key] = time.time()
+                    return False
+                return (time.time() - _diversity_stuck_since[key]) >= DIVERSITY_STUCK_UNLOCKED_SECS
+
+            stuck_a = check("a", picotuner_state)
+            stuck_b = check("b", picotuner_state_b)
+
+            if stuck_a or stuck_b:
+                now = time.time()
+                if now - _diversity_stuck_last_retune < DIVERSITY_STUCK_RETUNE_COOLDOWN_SECS:
+                    continue
+                last_state = load_last_state()
+                if last_state and last_state.get("mode") == "rf" and last_state.get("plug", "").lower() == "diversity":
+                    which = "A" if stuck_a else "B"
+                    detail = f"Rx {which} unlocked with positive margin for {DIVERSITY_STUCK_UNLOCKED_SECS:.0f}s+ - auto re-tune sent"
+                    print(f"Diversity: {detail}")
+                    record_diagnostic_event("Diversity: stuck-lock auto-recovery", detail, count_as_mpv_restart=False)
+                    _diversity_stuck_last_retune = now
+                    _diversity_stuck_since["a"] = None
+                    _diversity_stuck_since["b"] = None
+                    tune(TuneRequest(
+                        freq=last_state["freq"], sr=last_state["sr"],
+                        plug=last_state["plug"], lnb_lo_khz=last_state.get("lnb_lo_khz", 0)
+                    ))
+        except Exception as e:
+            print(f"[diversity_stuck_lock_monitor] error: {e}")
+
 def rf_mpv_lifecycle_monitor():
     """Background thread, RF mode only: mpv is only ever STARTED once a
     signal lock has been confirmed stable for a few seconds, and is
@@ -5782,6 +5842,8 @@ if __name__ == "__main__":
     quality_b.start()
     freshness = threading.Thread(target=rf_mpv_lifecycle_monitor, daemon=True)
     freshness.start()
+    diversity_stuck = threading.Thread(target=diversity_stuck_lock_monitor, daemon=True)
+    diversity_stuck.start()
     mer_pub = threading.Thread(target=mer_publisher, daemon=True)
     mer_pub.start()
     decoder_health = threading.Thread(target=mpv_decoder_health_monitor, daemon=True)
