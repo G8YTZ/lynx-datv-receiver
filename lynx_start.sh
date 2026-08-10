@@ -13,6 +13,16 @@
 #  players again later needs no OSD changes at all.
 # ============================================================
 
+# Explicitly guarantee the standard system directories are always
+# searched, regardless of what PATH (if any) the launching environment
+# provided - a reasonable defensive change given this script's own
+# top-of-file comment already notes NTP "has been observed to NEVER
+# succeed at all when this script is launched via labwc's autostart"
+# versus working fine from a manual SSH-triggered launch. Prepended,
+# not replaced - anything already present in an inherited PATH is
+# still searched too.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
 LYNX_DIR="$(cd "$(dirname $0)" && pwd)"
 # No command-line arguments needed — tuning is entirely handled by
 # lynx_app.py's own startup resume logic (previous state, or the
@@ -58,14 +68,19 @@ echo -e "${BLUE}╚════════════════════�
 # script is launched via labwc's autostart. A genuine reachability
 # check (not just "interface has an IP") catches this properly.
 echo -ne "Waiting for network... "
-for i in $(seq 1 20); do
-    if ping -c1 -W1 1.1.1.1 > /dev/null 2>&1; then
+for i in $(seq 1 45); do
+    GATEWAY=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
+    if [ -n "$GATEWAY" ] && ping -c1 -W1 "$GATEWAY" > /dev/null 2>&1; then
         echo -e "${GREEN}up${NC}"
         break
     fi
     sleep 1
-    if [ "$i" = "20" ]; then
-        echo -e "${AMBER}no network detected — proceeding anyway${NC}"
+    if [ "$i" = "45" ]; then
+        if [ -z "$GATEWAY" ]; then
+            echo -e "${AMBER}no default route found — proceeding anyway${NC}"
+        else
+            echo -e "${AMBER}default gateway ($GATEWAY) not responding to ping — proceeding anyway${NC}"
+        fi
     fi
 done
 
