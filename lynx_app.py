@@ -5862,6 +5862,14 @@ if __name__ == "__main__":
     if current_lnb_psu_b != "off":
         picotuner_rcv2_cmd(f"[to@wh] vgy={current_lnb_psu_b}{'t' if current_lnb_tone_b else ''}")
 
+    # A short pause for the LNB PSU voltage to physically stabilise
+    # before the very first tune attempt below - see this patch's own
+    # module docstring for the real-hardware evidence behind this.
+    # Only pauses if a PSU command was genuinely sent above.
+    if current_lnb_psu_a != "off" or current_lnb_psu_b != "off":
+        LNB_PSU_STARTUP_SETTLE_SECS = 2.0
+        time.sleep(LNB_PSU_STARTUP_SETTLE_SECS)
+
     # Resume whatever Lynx was last doing before this restart — crash,
     # watchdog recovery, scheduled 12-hour reboot, or a genuine power
     # cycle. Falls back to the explicitly-configured default boot
