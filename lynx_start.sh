@@ -84,14 +84,14 @@ echo -e "${BLUE}╚════════════════════�
 # script is launched via labwc's autostart. A genuine reachability
 # check (not just "interface has an IP") catches this properly.
 echo -ne "Waiting for network... "
-for i in $(seq 1 20); do
+for i in $(seq 1 45); do
     GATEWAY=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
     if [ -n "$GATEWAY" ] && ping -c1 -W1 "$GATEWAY" > /dev/null 2>&1; then
         echo -e "${GREEN}up${NC}"
         break
     fi
     sleep 1
-    if [ "$i" = "20" ]; then
+    if [ "$i" = "45" ]; then
         if [ -z "$GATEWAY" ]; then
             echo -e "${AMBER}no default route found — proceeding anyway${NC}"
         else
