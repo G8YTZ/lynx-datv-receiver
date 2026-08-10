@@ -1812,6 +1812,16 @@ def picotuner_quality_monitor():
 
             rx_id = fields.get('$0')
 
+            # TEMPORARY DIAGNOSTIC - logs every packet mentioning
+            # receiver 2 in any way, to find what's setting tuner B's
+            # dbm/agc2 to "0". Remove once root-caused.
+            if rx_id == '2' or (rx_id == '0' and fields.get('$77') == '2'):
+                try:
+                    with open('/tmp/dbm_diagnostic.log', 'a') as _f:
+                        _f.write(f"{time.strftime('%H:%M:%S')} rx_id={rx_id!r} fields={fields!r}\n")
+                except Exception:
+                    pass
+
             if rx_id == '1':
                 picotuner_state["mer"]         = fields.get('$12', '')
                 picotuner_state["symbol_rate"] = fields.get('$9', '')
