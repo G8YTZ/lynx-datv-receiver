@@ -4332,6 +4332,67 @@ def restart_lynx():
     threading.Thread(target=_do_reboot, daemon=True).start()
     return {"success": True, "message": "Rebooting the Pi - back in about a minute"}
 
+@app.post("/api/shutdown", tags=["Control"],
+          summary="Shut down (power off) the Pi",
+          description="Gracefully stops current reception, then powers off "
+                      "the entire Raspberry Pi via 'sudo shutdown -h now'. "
+                      "Unlike Reboot, the Pi does NOT come back up on its "
+                      "own afterwards - it needs power physically cycled "
+                      "(or a remote power switch) to bring the receiver "
+                      "back. Same passwordless-sudo requirement as Reboot, "
+                      "checked synchronously before responding for the same "
+                      "reason: a fire-and-forget shutdown can't report back "
+                      "if it's actually going to work.")
+def shutdown_pi():
+    check = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=5)
+    if check.returncode != 0:
+        raise HTTPException(status_code=500,
+            detail="'sudo shutdown' requires passwordless sudo for this user, which "
+                   "isn't currently configured - the Pi was NOT shut down. Fix (run "
+                   "on the Pi over SSH):\n\n"
+                   'echo "$USER ALL=(ALL) NOPASSWD: /sbin/shutdown, /sbin/poweroff" '
+                   "| sudo tee /etc/sudoers.d/lynx-shutdown\n"
+                   "sudo chmod 0440 /etc/sudoers.d/lynx-shutdown\n"
+                   "sudo visudo -c\n\n"
+                   "Or shut down manually over SSH instead.")
+
+    stop_current()  # graceful cover-up + mpv stop first, same as the Stop button
+
+    def _do_shutdown():
+        time.sleep(1.5)  # let this HTTP response actually reach the browser first
+        subprocess.Popen(["sudo", "shutdown", "-h", "now"])
+    threading.Thread(target=_do_shutdown, daemon=True).start()
+    return {"success": True, "message": "Shutting down - the Pi will power off shortly and will NOT restart on its own."}
+
+@app.post("/api/app_stop", tags=["Control"],
+          summary="Stop the Lynx app, back to the desktop",
+          description="Gracefully stops current reception, then closes the "
+                      "Lynx app itself (and its overlay) entirely, leaving "
+                      "the Pi running and returning to its desktop - unlike "
+                      "Stop, which only stops reception, and unlike Reboot/"
+                      "Shutdown, which restart or power off the whole Pi. "
+                      "Kills by process name rather than a tracked PID, "
+                      "since the overlay is started independently of this "
+                      "app rather than launched by it - works regardless of "
+                      "how both were originally started. NOTE: if something "
+                      "is separately supervising these processes with "
+                      "auto-restart (e.g. a systemd service configured with "
+                      "Restart=always), they may simply relaunch a moment "
+                      "later - that would need stopping at the supervisor "
+                      "level instead, not from here.")
+def app_stop():
+    stop_current()  # graceful cover-up + mpv stop first
+
+    def _do_app_stop():
+        time.sleep(1.0)  # let this HTTP response actually reach the browser first
+        subprocess.run(["pkill", "-f", "lynx_overlay.py"])
+        subprocess.run(["pkill", "-f", "lynx_app.py"])
+        os._exit(0)  # hard exit - simpler and more reliable here than trying
+                      # to gracefully unwind uvicorn's own event loop for what
+                      # is, by design, an abrupt full stop
+    threading.Thread(target=_do_app_stop, daemon=True).start()
+    return {"success": True, "message": "Stopping Lynx - returning to the desktop."}
+
 class VolumeRequest(BaseModel):
     level: int  # 0-100
 
@@ -4971,7 +5032,8 @@ def web_ui():
                 <div class="card-header">&#x2699;&#xFE0F; Control</div>
                 <div class="card-body">
                     <div class="d-flex gap-2 mb-2">
-                        <button class="btn btn-danger flex-fill" onclick="stopAll()">&#x23F9; Stop</button>
+                        <button class="btn btn-dark flex-fill" onclick="shutdownPi()">&#x23FB; Shutdown</button>
+                        <button class="btn btn-danger flex-fill" onclick="stopApp()">&#x23F9; Stop</button>
                         <button class="btn btn-warning flex-fill" onclick="restartLynx()">&#x1F504; Reboot</button>
                     </div>
                     <hr>
@@ -5435,6 +5497,42 @@ async function playCustom() {
 
 async function stopAll() {
     await api('POST', '/api/stop');
+}
+
+async function stopApp() {
+    if (!confirm('Stop Lynx? This closes the app and returns the Pi to its desktop - ' +
+                 'the receiver will be off the air until Lynx is started again.')) {
+        return;
+    }
+    try {
+        const result = await api('POST', '/api/app_stop');
+        if (result && result.detail) {
+            alert('Could not stop: ' + result.detail);
+            return;
+        }
+    } catch (e) {
+        // The server is expected to go down as part of this - not itself
+        // a sign anything went wrong.
+    }
+}
+
+async function shutdownPi() {
+    if (!confirm('Shut down the Pi completely? Unlike Reboot, it will NOT come back up on ' +
+                 'its own - you will need to physically power it back on (or use a remote ' +
+                 'power switch) to bring the receiver back.')) {
+        return;
+    }
+    try {
+        const result = await api('POST', '/api/shutdown');
+        if (result && result.detail) {
+            alert('Could not shut down: ' + result.detail);
+            return;
+        }
+    } catch (e) {
+        // The server is expected to go down as part of this - not itself
+        // a sign anything went wrong.
+    }
+    alert('Shutting down - the Pi will power off shortly.');
 }
 
 async function restartLynx() {
