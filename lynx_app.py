@@ -2522,7 +2522,12 @@ def diagnostics_page():
     <div class="row mb-3">
         <div class="col">
             <h2 class="lynx-title">&#x25B6; LYNX DIAGNOSTICS</h2>
-            <small class="text-muted">mpv start/stop events - auto-refreshes every 5s. <a href="/">&larr; Back to receiver</a></small>
+            <div class="d-flex gap-2 mb-2">
+                <a href="/" class="btn btn-sm btn-outline-light">&#x1F3E0; Receiver</a>
+                <a href="/config" class="btn btn-sm btn-outline-light">&#x2699;&#xFE0F; Config</a>
+                <a href="/docs" class="btn btn-sm btn-outline-light">&#x1F4D6; API Docs</a>
+            </div>
+            <small class="text-muted">mpv start/stop events - auto-refreshes every 5s.</small>
         </div>
     </div>
 
@@ -2703,7 +2708,11 @@ def config_page():
     <div class="row mb-3">
         <div class="col">
             <h2 class="lynx-title">&#x25B6; LYNX CONFIGURATION</h2>
-            <small class="text-muted"><a href="/">&larr; Back to receiver</a></small>
+            <div class="d-flex gap-2">
+                <a href="/" class="btn btn-sm btn-outline-light">&#x1F3E0; Receiver</a>
+                <a href="/diagnostics" class="btn btn-sm btn-outline-light">&#x1F4CA; Diagnostics</a>
+                <a href="/docs" class="btn btn-sm btn-outline-light">&#x1F4D6; API Docs</a>
+            </div>
         </div>
     </div>
 
@@ -4856,6 +4865,7 @@ def web_ui():
             <button class="btn btn-sm btn-success" onclick="applyUpdate()" id="update-apply-btn" style="display:none" title="Pull the latest code and restart">&#x2B06;&#xFE0F; Update</button>
             <a href="/diagnostics" class="btn btn-sm btn-outline-light">&#x1F4CA; Diagnostics</a>
             <a href="/config" class="btn btn-sm btn-outline-light">&#x2699;&#xFE0F; Config</a>
+            <a href="/docs" class="btn btn-sm btn-outline-light">&#x1F4D6; API Docs</a>
         </div>
     </div>
 
@@ -4888,7 +4898,7 @@ def web_ui():
                     </div>
                     <hr>
                     <!-- Manual tune -->
-                    <h6 class="text-muted">Manual Tune</h6>
+                    <h6 class="text-muted">Manual Tune (kHz)</h6>
                     <div class="row g-2">
                         <div class="col">
                             <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary" 
