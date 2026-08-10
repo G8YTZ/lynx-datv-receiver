@@ -75,13 +75,18 @@ echo -e "${BLUE}╚════════════════════�
 # check (not just "interface has an IP") catches this properly.
 echo -ne "Waiting for network... "
 for i in $(seq 1 20); do
-    if ping -c1 -W1 1.1.1.1 > /dev/null 2>&1; then
+    GATEWAY=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
+    if [ -n "$GATEWAY" ] && ping -c1 -W1 "$GATEWAY" > /dev/null 2>&1; then
         echo -e "${GREEN}up${NC}"
         break
     fi
     sleep 1
     if [ "$i" = "20" ]; then
-        echo -e "${AMBER}no network detected — proceeding anyway${NC}"
+        if [ -z "$GATEWAY" ]; then
+            echo -e "${AMBER}no default route found — proceeding anyway${NC}"
+        else
+            echo -e "${AMBER}default gateway ($GATEWAY) not responding to ping — proceeding anyway${NC}"
+        fi
     fi
 done
 
