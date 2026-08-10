@@ -13,6 +13,16 @@
 #  players again later needs no OSD changes at all.
 # ============================================================
 
+# Explicitly guarantee the standard system directories are always
+# searched, regardless of what PATH (if any) the launching environment
+# provided - confirmed directly as a real, plausible cause of commands
+# like ping/ip silently failing (command not found, indistinguishable
+# from a genuine timeout inside a redirected `if` check) specifically
+# when launched via labwc's autostart, versus working fine from a
+# manual SSH-triggered launch. Prepended, not replaced - anything
+# already present in an inherited PATH is still searched too.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
+
 LYNX_DIR="$(cd "$(dirname $0)" && pwd)"
 # No command-line arguments needed — tuning is entirely handled by
 # lynx_app.py's own startup resume logic (previous state, or the
