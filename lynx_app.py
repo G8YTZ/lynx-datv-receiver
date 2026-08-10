@@ -1812,16 +1812,6 @@ def picotuner_quality_monitor():
 
             rx_id = fields.get('$0')
 
-            # TEMPORARY DIAGNOSTIC - logs every packet mentioning
-            # receiver 2 in any way, to find what's setting tuner B's
-            # dbm/agc2 to "0". Remove once root-caused.
-            if rx_id == '2' or (rx_id == '0' and fields.get('$77') == '2'):
-                try:
-                    with open('/tmp/dbm_diagnostic.log', 'a') as _f:
-                        _f.write(f"{time.strftime('%H:%M:%S')} rx_id={rx_id!r} fields={fields!r}\n")
-                except Exception:
-                    pass
-
             if rx_id == '1':
                 picotuner_state["mer"]         = fields.get('$12', '')
                 picotuner_state["symbol_rate"] = fields.get('$9', '')
@@ -5260,7 +5250,7 @@ async function updateStatus() {
                 ['Symbol Rate', pt.symbol_rate ? pt.symbol_rate + ' kS/s' : '—'],
                 ['MER',       pt.mer ? pt.mer + ' dB' : '—'],
                 ['Margin',    pt.margin ? pt.margin + ' dB' : '—'],
-                ['Level',     pt.dbm ? pt.dbm + ' dBm' : (pt.level ? '-' + pt.level + ' dBm' : '—')],
+                ['Level',     (pt.dbm && pt.dbm !== '0') ? pt.dbm + ' dBm' : (pt.level ? '-' + pt.level + ' dBm' : '—')],
                 ['Mode',      pt.modcod || '—'],
                 ['Codec',     pt.codec || '—'],
                 ['Audio Codec', pt.audio_codec || '—'],
@@ -5292,7 +5282,7 @@ async function updateStatus() {
                     ['Symbol Rate', b.symbol_rate ? b.symbol_rate + ' kS/s' : '—'],
                     ['MER',       b.mer ? b.mer + ' dB' : '—'],
                     ['Margin',    b.margin ? b.margin + ' dB' : '—'],
-                    ['Level',     b.dbm ? b.dbm + ' dBm' : '—'],  // ptwh0v3k+ (2026-07-23): now genuinely available for rcv=2
+                    ['Level',     (b.dbm && b.dbm !== '0') ? b.dbm + ' dBm' : '—'],  // a literal "0" is a known, documented Picotuner firmware quirk for rcv=2, not a genuine reading - treated the same as no data
                     ['Mode',      b.modcod || '—'],
                     ['Codec',     b.codec || '—'],
                     ['Audio Codec', b.audio_codec || '—'],
