@@ -3546,6 +3546,218 @@ def _pathfinder_arm(callsign, rcv):
     threading.Thread(target=_lookup, daemon=True).start()
 
 
+# ---------------------------------------------------------------------
+#  Picotuner tuning watchdog
+# ---------------------------------------------------------------------
+#  The Picotuner is powered separately from the Pi, so it can restart on
+#  its own - a PoE renegotiation, a supply blip, a knocked plug, static.
+#  Its WinterHill firmware keeps NEITHER tuning nor LNB supply across a
+#  power cycle: it comes back with nothing tuned at all.
+#
+#  Lynx would previously never notice. Broadcasts resume, the Web UI
+#  shows a healthy tuner, and the receiver sits deaf indefinitely -
+#  because the only things that ever tune are Lynx's own startup and an
+#  explicit API call. At an unattended repeater that is silent, total,
+#  and indistinguishable from a quiet band.
+#
+#  WHY THIS WATCHES STATE, NOT TIMING
+#  ----------------------------------
+#  The obvious approach is to spot the broadcasts stopping and restarting.
+#  It is also the wrong one. A Pico reboots in a couple of seconds and
+#  most of the outage is the W5100S bringing its Ethernet link back, so
+#  the gap to catch is short and unpredictable - too short and a reboot
+#  is missed entirely; too eager and network jitter triggers spurious
+#  re-tunes. Worse, it only catches that one cause. Anything else that
+#  leaves the tuner untuned - a command lost in flight, static, a
+#  firmware hiccup - looks completely normal to a timing check.
+#
+#  So this compares what the Picotuner REPORTS it is tuned to against
+#  what Lynx believes it should be, and fixes any disagreement. That is
+#  safe to do continuously because a tuned receiver keeps reporting its
+#  frequency even with no signal on it at all - confirmed directly:
+#  "437.000B lost" and "1249.000T search" are both a correctly tuned
+#  receiver saying it can't hear anything. Only a receiver that has
+#  genuinely lost its tuning reports nothing. A quiet band is therefore
+#  left completely alone, which is the trap a naive level-triggered
+#  check would fall into.
+
+PICOTUNER_CHECK_SECS = 2.0          # how often to compare
+PICOTUNER_MISMATCH_SECS = 20.0      # sustained disagreement before acting
+PICOTUNER_RETUNE_SETTLE_SECS = 8.0  # let its firmware finish booting first
+PICOTUNER_RETUNE_COOLDOWN_SECS = 90.0   # don't hammer a tuner that won't take
+
+
+def _picotuner_expected_tuning():
+    """What each receiver SHOULD be tuned to, in kHz at the tuner.
+
+    Returns {rcv: freq_khz}. Empty when Lynx has no opinion - idle, a
+    web stream, or nothing ever tuned - in which case there is nothing
+    to check and the watchdog stays quiet.
+    """
+    out = {}
+    try:
+        if tri_watch_enabled:
+            for src in tri_watch_sources_cfg:
+                if not src.get('enabled') or src.get('type') != 'rf':
+                    continue
+                rcv = src.get('rcv')
+                if rcv in (1, 2):
+                    out[rcv] = calc_tuner_freq(src['freq'],
+                                               src.get('lnb_lo_khz', 0))
+            return out
+
+        if current_mode != "rf":
+            return out
+
+        state = load_last_state()
+        if not state or state.get("mode") != "rf":
+            return out
+        f = calc_tuner_freq(state["freq"], state.get("lnb_lo_khz", 0))
+        out[1] = f
+        # Diversity drives both receivers to the same frequency
+        if str(state.get("plug", "")).lower() == "diversity" or diversity_enabled:
+            out[2] = f
+    except Exception as e:
+        print(f"[picotuner] could not work out expected tuning: {e}")
+    return out
+
+
+def _picotuner_reported_khz(st):
+    """The frequency a receiver says it is tuned to, in kHz, or None if
+    it isn't reporting one at all - which is what an untuned receiver
+    looks like."""
+    raw = str(st.get("frequency", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        mhz = float(raw)
+    except ValueError:
+        return None
+    if mhz <= 0:
+        return None          # a freshly booted, untuned receiver
+    return mhz * 1000.0
+
+
+def picotuner_tuning_watchdog():
+    """Puts the Picotuner back where it belongs whenever it has lost its
+    tuning, whatever the cause."""
+    bad_since = None
+    last_fix = 0.0
+    while True:
+        time.sleep(PICOTUNER_CHECK_SECS)
+        try:
+            if not picotuner_state.get("online"):
+                bad_since = None      # can't judge what we can't hear
+                continue
+
+            expected = _picotuner_expected_tuning()
+            if not expected:
+                bad_since = None
+                continue
+
+            wrong = []
+            for rcv, want_khz in expected.items():
+                st = picotuner_state_b if rcv == 2 else picotuner_state
+                if rcv == 2 and not st.get("online"):
+                    continue          # Rx2 not reporting at all - nothing to compare
+                got_khz = _picotuner_reported_khz(st)
+                if got_khz is None:
+                    wrong.append((rcv, want_khz, "not tuned"))
+                elif abs(got_khz - want_khz) > 1000.0:
+                    # 1 MHz of slack. A locked receiver reports the
+                    # frequency it actually found, not the one it was
+                    # asked for - "437.023" against a commanded 437.000
+                    # is a transmitter's own offset, not a fault. Only a
+                    # genuinely different channel is worth acting on.
+                    wrong.append((rcv, want_khz, f"on {got_khz/1000:.3f} MHz"))
+
+            if not wrong:
+                bad_since = None
+                continue
+
+            now = time.time()
+            if bad_since is None:
+                bad_since = now
+                continue
+            if now - bad_since < PICOTUNER_MISMATCH_SECS:
+                continue
+            if now - last_fix < PICOTUNER_RETUNE_COOLDOWN_SECS:
+                continue
+
+            for rcv, want_khz, why in wrong:
+                print(f"[picotuner] Rx{rcv} should be on {want_khz/1000:.3f} MHz "
+                      f"but is {why} - its firmware does not keep tuning across "
+                      f"a power cycle, so re-tuning")
+            last_fix = now
+            bad_since = None
+            threading.Thread(target=_picotuner_restore_tuning,
+                             daemon=True).start()
+
+        except Exception as e:
+            print(f"[picotuner] tuning watchdog: {e}")
+
+
+def _picotuner_restore_tuning():
+    """Re-applies LNB supply then tuning, in the same order and with the
+    same settling delays startup uses - so there is one behaviour to
+    reason about rather than two."""
+    try:
+        time.sleep(PICOTUNER_RETUNE_SETTLE_SECS)
+
+        if not picotuner_state.get("online"):
+            print("[picotuner] went away before restore - will pick it up "
+                  "again when it returns")
+            return
+
+        # ---- LNB supply first, same as startup ----
+        sent_psu = False
+        try:
+            if current_lnb_psu_a != "off":
+                picotuner_cmd(f"[to@wh] vgx={current_lnb_psu_a}"
+                              f"{'t' if current_lnb_tone_a else ''}")
+                sent_psu = True
+            if current_lnb_psu_b != "off":
+                picotuner_rcv2_cmd(f"[to@wh] vgy={current_lnb_psu_b}"
+                                   f"{'t' if current_lnb_tone_b else ''}",
+                                   config['picotuner'])
+                sent_psu = True
+        except Exception as e:
+            print(f"[picotuner] restore: LNB supply failed ({e}) - "
+                  "continuing to the tune anyway")
+
+        if sent_psu:
+            # Same 5s the startup path uses, for the same confirmed
+            # reason: a cold PSU start with the tune sent too soon after
+            # took minutes to lock on a genuinely good signal.
+            time.sleep(5.0)
+
+        # ---- then the tuning ----
+        if tri_watch_enabled:
+            print("[picotuner] restore: re-tuning tri_watch RF sources")
+            tri_watch_startup_tune()
+            try:
+                _tri_watch_sync_drainers(tri_watch_arbitrator.displayed_idx
+                                         if tri_watch_arbitrator else None)
+            except Exception as e:
+                print(f"[picotuner] restore: drainer sync failed: {e}")
+            return
+
+        state = load_last_state()
+        if not state or state.get("mode") != "rf":
+            print("[picotuner] restore: no previous RF tuning to restore")
+            return
+
+        req = TuneRequest(freq=state["freq"], sr=state["sr"],
+                          plug=state.get("plug", "a"),
+                          lnb_lo_khz=state.get("lnb_lo_khz", 0))
+        print(f"[picotuner] restore: re-tuning to {state['freq']} kHz / "
+              f"{state['sr']} kS/s on plug {req.plug}")
+        _tune_impl(req)
+
+    except Exception as e:
+        print(f"[picotuner] restore failed: {e}")
+
+
 def tri_watch_arbitrator_loop():
     """Background thread - periodically builds the current active/
     locked state for every enabled tri_watch source and feeds it to
@@ -7911,6 +8123,12 @@ if __name__ == "__main__":
     # whether plain RF, diversity or tri_watch rules apply.
     pathfinder_thread = threading.Thread(target=pathfinder_watcher, daemon=True)
     pathfinder_thread.start()
+    # Picotuner tuning watchdog - catches the tuner losing its tuning
+    # for ANY reason (its own reboot, a lost command, static), which
+    # otherwise leaves a repeater deaf and reporting itself healthy.
+    picotuner_watchdog_thread = threading.Thread(
+        target=picotuner_tuning_watchdog, daemon=True)
+    picotuner_watchdog_thread.start()
     # Repeater-activity notifications (QRZ/Slack/Companion/GPIO Tx) - its
     # own, independent monitor, deliberately not gated on current_mode the
     # way rf_mpv_lifecycle_monitor() is (see lynx_notifications.py's own

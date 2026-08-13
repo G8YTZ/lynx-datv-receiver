@@ -141,6 +141,19 @@ mkdir -p ~/.config/systemd/user
 cp ~/lynx/lynx.service ~/.config/systemd/user/lynx.service
 systemctl --user daemon-reload
 
+# --- Scheduled reboot (installed, NOT enabled) ------------------
+# A twice-daily reboot as a blunt backstop: it recovers from states
+# nobody has specifically thought of yet, which is exactly the sort of
+# thing that matters at an unattended repeater where the alternative is
+# a site visit. Deliberately NOT enabled automatically - a receiver
+# rebooting itself twice a day is right for a hilltop and wrong for a
+# desk, so that call belongs to whoever installed it. System units
+# rather than user ones, since rebooting needs root.
+echo "--- Installing (not enabling) scheduled reboot units ---"
+sudo cp ~/lynx/lynx-scheduled-reboot.service /etc/systemd/system/
+sudo cp ~/lynx/lynx-scheduled-reboot.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+
 # --- Cursor-hide keybind (labwc rc.xml) ------------------------
 # Only created if rc.xml doesn't exist at all - same reasoning as
 # the auto-login decision above: rc.xml is a general-purpose labwc
@@ -174,6 +187,15 @@ fi
 
 echo ""
 echo "=== Install complete ==="
+echo ""
+echo "For a repeater or other unattended site, consider enabling the"
+echo "scheduled reboot - twice daily, at 04:00 and 16:00 with a few"
+echo "minutes of jitter so several receivers don't all drop at once:"
+echo ""
+echo "    sudo systemctl enable --now lynx-scheduled-reboot.timer"
+echo ""
+echo "  Check when it will next fire:  systemctl list-timers lynx-scheduled-reboot.timer"
+echo "  Turn it off again:            sudo systemctl disable --now lynx-scheduled-reboot.timer"
 echo ""
 echo "One thing still needs doing by hand:"
 echo ""
