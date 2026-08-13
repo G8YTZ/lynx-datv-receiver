@@ -354,7 +354,9 @@ def qrz_callsign_lookup(username, password, callsign):
 
     cached = _qrz_lookup_cache.get(callsign)
     if cached and (time.time() - cached[1]) < QRZ_LOOKUP_CACHE_TTL_SECS:
-        return cached[0]
+        # Entries are (name, grid) since the map feature; older entries
+        # may still be a bare name, hence _as_details().
+        return _as_details(cached[0])[0]
 
     if (_qrz_lookup_session_key is None or
             (time.time() - _qrz_lookup_session_obtained_at) > QRZ_LOOKUP_SESSION_MAX_AGE_SECS):
@@ -379,13 +381,48 @@ def qrz_callsign_lookup(username, password, callsign):
 
     callsign_el = root.find(f'{ns}Callsign')
     fname = None
+    grid = None
     if callsign_el is not None:
         fname_el = callsign_el.find(f'{ns}fname')
         if fname_el is not None and fname_el.text:
             fname = fname_el.text.strip()
+        # The grid comes from the same response at no extra cost - the
+        # end-of-contact map needs it, and a second lookup purely for
+        # the locator would double QRZ traffic for nothing.
+        grid_el = callsign_el.find(f'{ns}grid')
+        if grid_el is not None and grid_el.text:
+            grid = grid_el.text.strip().upper() or None
 
-    _qrz_lookup_cache[callsign] = (fname, time.time())
+    _qrz_lookup_cache[callsign] = ((fname, grid), time.time())
     return fname
+
+
+def qrz_callsign_details(username, password, callsign):
+    """Same lookup as qrz_callsign_lookup(), but returns (name, grid).
+
+    Both come from a single QRZ response and share one cache entry, so
+    calling this costs nothing beyond the name lookup that tri_watch
+    already performs. Returns (None, None) on any failure - a lookup
+    problem must never break the thing it was meant to enhance.
+    """
+    callsign = (callsign or "").strip().upper()
+    if not callsign or not username or not password:
+        return (None, None)
+    cached = _qrz_lookup_cache.get(callsign)
+    if cached and (time.time() - cached[1]) < QRZ_LOOKUP_CACHE_TTL_SECS:
+        return _as_details(cached[0])
+    qrz_callsign_lookup(username, password, callsign)
+    cached = _qrz_lookup_cache.get(callsign)
+    return _as_details(cached[0]) if cached else (None, None)
+
+
+def _as_details(value):
+    """Cache entries were plain names before the map feature needed
+    grids; tolerate either shape so an in-flight cache can't break a
+    lookup after an upgrade."""
+    if isinstance(value, tuple):
+        return value
+    return (value, None)
 
 
 def submit_qrz_logbook(api_key, station_callsign, rx_callsign, freq_khz,

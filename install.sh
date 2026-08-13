@@ -45,8 +45,12 @@ sudo apt install -y \
 # actual source tonight, both are genuinely required (Slack
 # webhook notifications and GPIO Tx control respectively).
 # Corrected here rather than reproducing the guide's stale list.
+# `pyshp` reads the Natural Earth shapefiles in geo/ for Pathfinder
+# (the end-of-contact station map). 74KB, pure Python - deliberately
+# chosen over geopandas, which would drag in GEOS, PROJ, pandas and
+# NumPy for what amounts to reading a few polygons.
 echo "--- Installing Python dependencies ---"
-pip install --break-system-packages fastapi uvicorn pyyaml requests gpiozero
+pip install --break-system-packages fastapi uvicorn pyyaml requests gpiozero pyshp
 
 # --deps-only stops here - used by "Update Now" (lynx_app.py) to
 # re-confirm every OS/apt/pip dependency above is genuinely present

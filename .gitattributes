@@ -1,2 +1,13 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Map data for the station map (geo/). Shapefiles are binary; without
+# this, "* text=auto" above can guess wrong and silently mangle them
+# through line-ending normalisation - which would only show up as a
+# map that fails to draw on someone else's clone.
+geo/*.shp binary
+geo/*.shx binary
+geo/*.dbf binary
+geo/*.prj text
+geo/*.cpg text
+geo/towns.csv text

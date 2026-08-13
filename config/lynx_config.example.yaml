@@ -311,6 +311,32 @@ ryde:
   host: 192.168.XXX.XXX   # <-- your Ryde host's IP, if using Ryde
   port: 8765
 
+# IMPORTANT, AT A REPEATER SITE
+# The end-of-contact card appears AFTER the station has stopped
+# transmitting - by default 15s later, staying up for 30s, so the last
+# of it is on screen 45s after unlock. Anything that reacts to the
+# unlock transition can cut away before viewers ever see it:
+#
+#   * a repeater controller's hang/tail timer dropping the transmitter
+#   * a video switcher or Bitfocus Companion action changing source on
+#     the unlock webhook
+#   * any external "no signal, switch to test card" logic
+#
+# Give those a hold-off of at least delay_secs + duration_secs (45s
+# with the defaults below), or shorten the card to fit the hang time
+# you already have. Lynx's own gpio_tx keying needs no change - its
+# power_down_settle_secs is far longer than this window.
+pathfinder:
+  enabled: true
+  delay_secs: 15          # quiet gap after a station stops, before the card appears
+  duration_secs: 30       # how long the card stays on screen
+  min_span_km: 15         # closest zoom, so a local contact still shows context
+  max_span_km: 1000       # widest zoom - beyond this the frame stops growing
+  max_distance_km: 1200   # further than this, the locator is assumed stale
+                          # rather than the contact genuinely extraordinary,
+                          # and no card is drawn. Matches the extent of the
+                          # map data shipped in geo/.
+
 site:
   callsign: XXXXX          # <-- your callsign
   location: ''             # <-- your site location, e.g. "Anytown, Anyshire"

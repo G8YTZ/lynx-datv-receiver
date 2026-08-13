@@ -60,6 +60,7 @@ gi.require_version('Gtk4LayerShell', '1.0')
 gi.require_version('GdkPixbuf', '2.0')
 from gi.repository import Gtk, Gtk4LayerShell, GLib, Gdk, GdkPixbuf
 import cairo
+import lynx_map
 import os
 import math
 
@@ -262,6 +263,9 @@ state = {
     "mpv_transitioning": False,
     "portable_locator": "",
     "tri_watch_notification": None,   # the current "someone else wants in" message text, or None
+    "pathfinder": None,              # end-of-contact card dict, or None if none is due
+    "site_locator": "",
+    "site_location": "",
     # Diversity mode — which tuner is actually the one supplying the
     # locked/displayed state.
     "diversity_enabled": False,
@@ -523,6 +527,12 @@ def poll_status():
             state["stream_protocol"] = lynx.get('stream_protocol') or ""
             state["mpv_transitioning"] = lynx.get('mpv_transitioning', False)
             state["portable_locator"] = lynx.get('portable_locator', '')
+            state["site_locator"] = lynx.get('site_locator', '')
+            state["site_location"] = lynx.get('site_location', '')
+            # End-of-contact map. As with the tri_watch bubble, the
+            # backend has already decided whether a card is due - this
+            # side only ever checks presence.
+            state["pathfinder"] = lynx.get('pathfinder')
             # tri_watch's "someone else wants in" notification - the
             # backend already handles its own expiry (get_notification()
             # returns None once past the configured display window), so
@@ -601,6 +611,10 @@ class LynxOverlay(Gtk.Window):
 
         GLib.timeout_add(100, self.tick)
 
+        self._pf_surface = None
+        self._pf_surface_key = None
+        self._pf_renderer = None
+
     def tick(self):
         self.drawing_area.queue_draw()
         return True
@@ -617,6 +631,7 @@ class LynxOverlay(Gtk.Window):
         # on_draw() runs or when.
         _overlay_last_render_time[0] = time.time()
 
+        showing_map = False
         mpv_transitioning = os.path.exists(MPV_TRANSITION_MARKER)
         genuinely_locked = (state["locked"] and state["mpv_running_for_rf"]) or state["mode"] == "stream"
         showing_picture = genuinely_locked and not mpv_transitioning
@@ -638,8 +653,13 @@ class LynxOverlay(Gtk.Window):
                 cr.set_operator(cairo.OPERATOR_SOURCE)
                 cr.paint()
                 cr.set_operator(cairo.OPERATOR_OVER)
-                if self.logo_pixbuf:
-                    self.draw_centered_logo(cr, width, height)
+                # The end-of-contact map replaces the logo screen when
+                # one is due; if it declines to draw (no card, no site
+                # locator, render failure) the logo appears as normal.
+                showing_map = self.draw_pathfinder(cr, width, height)
+                if not showing_map:
+                    if self.logo_pixbuf:
+                        self.draw_centered_logo(cr, width, height)
         else:
             cr.set_source_rgba(0, 0, 0, 0)
             cr.set_operator(cairo.OPERATOR_SOURCE)
@@ -648,10 +668,20 @@ class LynxOverlay(Gtk.Window):
 
         cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
 
-        self.draw_top_right(cr, width, height)
-        self.draw_top_left(cr, width, height)
-        self.draw_bottom_left(cr, width, height)
-        self.draw_bottom_right(cr, width, height)
+        # The end-of-contact map is a full-screen card with its own
+        # header and data strip, so the normal corner-anchored OSD zones
+        # are suppressed while it is up - otherwise the frequency block,
+        # SEARCHING flag, PPM and magic eye all land straight on top of
+        # it. They are meaningless at that moment anyway: the contact is
+        # over and the tuner is back to searching.
+        if not showing_map:
+            self.draw_top_right(cr, width, height)
+            self.draw_top_left(cr, width, height)
+            self.draw_bottom_left(cr, width, height)
+            self.draw_bottom_right(cr, width, height)
+        # The tri_watch bubble is NOT suppressed - someone waiting to
+        # get in matters more than finishing the card, and it is drawn
+        # over the middle-right where the card has no text of its own.
         self.draw_waiting_bubble(cr, width, height)
 
     def draw_text(self, cr, x, y, text, size=30, align="left", colour=(0.0, 1.0, 0.25)):
@@ -719,6 +749,60 @@ class LynxOverlay(Gtk.Window):
         cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
         cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
         cr.close_path()
+
+    def draw_pathfinder(self, cr, width, height):
+        """End-of-contact card - full screen, drawn INSTEAD of the idle
+        logo rather than over the top of live video.
+
+        The card only ever appears once a station has stopped
+        transmitting, so there is no picture underneath worth
+        protecting, and using the whole frame lets the map be read at a
+        glance from across a room.
+
+        Rendering takes a few tenths of a second, so the surface is
+        built once when the card first appears and cached for the rest
+        of its display window - redrawing identical geography 60 times a
+        second would be pointless work on a Pi that may also be decoding
+        video for the web stream.
+        """
+        card = state.get("pathfinder")
+        if not card:
+            self._pf_surface = None
+            self._pf_surface_key = None
+            return False
+
+        home = state.get("site_locator") or ""
+        if not home:
+            return False
+
+        key = (card.get('callsign'), card.get('locator'),
+               card.get('unlocked_at'), int(width), int(height))
+        if key != getattr(self, '_pf_surface_key', None):
+            if getattr(self, '_pf_renderer', None) is None or \
+                    self._pf_renderer.home_locator != home.upper():
+                self._pf_renderer = lynx_map.MapRenderer(home)
+            try:
+                self._pf_surface = self._pf_renderer.render(
+                    int(width), int(height),
+                    card.get('callsign', ''), card.get('locator', ''),
+                    name=card.get('name'), mer=card.get('mer'),
+                    modcod=card.get('modcod'),
+                    symbol_rate=card.get('symbol_rate'),
+                    frequency=card.get('frequency'),
+                    site_name=state.get("site_location") or "")
+            except Exception as e:
+                # A map that will not draw must never take the OSD down -
+                # fall back silently to the normal idle screen.
+                print(f"[overlay] station map render failed: {e}")
+                self._pf_surface = None
+            self._pf_surface_key = key
+
+        if self._pf_surface is None:
+            return False
+
+        cr.set_source_surface(self._pf_surface, 0, 0)
+        cr.paint()
+        return True
 
     def draw_waiting_bubble(self, cr, width, height):
         """tri_watch's "someone else wants in" notification - an

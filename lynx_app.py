@@ -53,6 +53,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import lynx_notifications
+import lynx_map
 import lynx_rtmp_probe
 
 # Diagnostic: dump every thread's current stack trace to a log file on
@@ -2570,6 +2571,16 @@ class TriWatchSourcesUpdate(BaseModel):
     rx2: TriWatchRfSourceUpdate
     stream: TriWatchStreamSourceUpdate
 
+class PathfinderConfigUpdate(BaseModel):
+    """Only the three settings worth changing from the UI. The span and
+    distance limits stay in config.yaml deliberately - they are tuned
+    once against the shipped map data and then never touched, and
+    exposing every knob makes the page harder to scan."""
+    enabled: bool = True
+    delay_secs: float = 15.0
+    duration_secs: float = 30.0
+
+
 class ConfigUpdateRequest(BaseModel):
     site: Optional[SiteConfigUpdate] = None
     picotuner: Optional[PicotunerConfigUpdate] = None
@@ -2580,6 +2591,7 @@ class ConfigUpdateRequest(BaseModel):
     notifications_gpio_tx: Optional[GpioTxConfigUpdate] = None
     display: Optional[DisplayConfigUpdate] = None
     tri_watch: Optional[TriWatchSourcesUpdate] = None
+    pathfinder: Optional[PathfinderConfigUpdate] = None
 
 # ── Helpers ───────────────────────────────────────────────────
 def stop_current():
@@ -3367,6 +3379,173 @@ tri_watch_arbitrator = TriWatchArbitrator(
     settling_seconds=config.get('tri_watch', {}).get('settling_seconds', 15),
     lock_confirm_seconds=config.get('tri_watch', {}).get('lock_confirm_seconds', 3))
 
+# ---------------------------------------------------------------------
+#  End-of-contact station map
+# ---------------------------------------------------------------------
+#  Shows a full-screen card - where the station was, the path back here,
+#  and the signal figures from the contact - for a configurable window
+#  after the station stops transmitting. It replaces the idle logo
+#  screen rather than compositing over video, so it can never obscure a
+#  live picture.
+#
+#  No timers anywhere, deliberately. This follows the same pattern as
+#  TriWatchArbitrator.get_notification(): store a timestamp, work out on
+#  read whether the card is due, showing, or finished. A stale timer
+#  firing a card over a station that has since come back simply cannot
+#  happen, because nothing is ever scheduled.
+#
+#  WHY A WATCHER LOOP AND NOT A HOOK IN picotuner_monitor()
+#  --------------------------------------------------------
+#  The first version of this hooked the RX1 lock transition directly
+#  inside picotuner_monitor(), which is wrong in both of the modes that
+#  matter:
+#
+#    * Diversity - A and B receive the SAME station, and either one
+#      alone can carry the picture. Arming on A dropping would put a
+#      card up while B was still locked and the picture still playing.
+#      "Unlocked" here has to mean BOTH tuners unlocked, exactly as the
+#      OSD's own lock indicator already treats it.
+#
+#    * Tri-Watch - RX1 dropping is irrelevant if the arbitrator is
+#      currently displaying RX2 or a stream, and a station stopping on
+#      RX2 wouldn't have armed anything at all, because that monitor
+#      only parses RX1.
+#
+#  So the question is not "did a tuner unlock" but "did the thing we
+#  were actually SHOWING stop", which is a composite of mode, diversity
+#  state and the arbitrator's current choice. That is computed in one
+#  place below and evaluated on a slow poll - the same shape as the
+#  arbitrator's own loop.
+
+_pathfinder_cfg = config.get('pathfinder', {}) or {}
+pathfinder_tracker = lynx_map.PathfinderTracker(
+    delay_secs=_pathfinder_cfg.get('delay_secs', 15),
+    duration_secs=_pathfinder_cfg.get('duration_secs', 30),
+    max_distance_km=_pathfinder_cfg.get('max_distance_km', 1200),
+    enabled=_pathfinder_cfg.get('enabled', True))
+
+_pathfinder_prev = {"receiving": False, "callsign": "", "rcv": 1}
+
+
+def _pathfinder_current_source():
+    """Which tuner, if any, is currently supplying the displayed picture.
+
+    Returns (receiving, rcv) where rcv is 1 or 2. receiving is False
+    whenever nothing RF is on screen - including when Tri-Watch is
+    showing a stream, which has no callsign or locator and therefore no
+    card to draw.
+    """
+    tw = config.get('tri_watch', {}) or {}
+    if tw.get('enabled') and tri_watch_arbitrator is not None:
+        idx = tri_watch_arbitrator.displayed_idx
+        if idx is None:
+            return (False, 1)
+        try:
+            src = tri_watch_sources_cfg[idx]
+        except (IndexError, TypeError):
+            return (False, 1)
+        if src.get('type') != 'rf':
+            return (False, 1)          # a stream is showing - no card
+        rcv = src.get('rcv', 1)
+        st = picotuner_state_b if rcv == 2 else picotuner_state
+        return (bool(st.get('locked')), rcv)
+
+    if config.get('diversity', {}).get('enabled'):
+        # Either tuner alone can carry the picture, so the contact is
+        # only over once both have dropped.
+        a = bool(picotuner_state.get('locked'))
+        b = bool(picotuner_state_b.get('locked'))
+        if a:
+            return (True, 1)
+        if b:
+            return (True, 2)
+        return (False, 1)
+
+    return (bool(picotuner_state.get('locked')), 1)
+
+
+def pathfinder_watcher():
+    """Background thread - watches for the displayed station stopping,
+    and arms the end-of-contact card when it does.
+
+    Polls every second: fast enough that the configured delay is
+    accurate to within a second, slow enough to be free. Deliberately
+    tolerant of anything going wrong, since nothing here is worth taking
+    the receiver down for.
+    """
+    while True:
+        time.sleep(1)
+        try:
+            if not pathfinder_tracker.enabled:
+                continue
+            receiving, rcv = _pathfinder_current_source()
+            prev = _pathfinder_prev
+
+            if receiving:
+                st = picotuner_state_b if rcv == 2 else picotuner_state
+                cs = st.get('callsign', '')
+                if cs:
+                    prev['callsign'] = cs
+                    prev['rcv'] = rcv
+                if not prev['receiving']:
+                    # Something is on air again - cancel any card that
+                    # is pending or currently showing.
+                    pathfinder_tracker.station_locked()
+                prev['receiving'] = True
+                continue
+
+            if prev['receiving']:
+                prev['receiving'] = False
+                if prev['callsign']:
+                    _pathfinder_arm(prev['callsign'], prev['rcv'])
+        except Exception as e:
+            print(f"[map] watcher: {e}")
+
+
+def _pathfinder_arm(callsign, rcv):
+    """Looks the station up and arms the card if it has a usable
+    locator. The QRZ lookup runs on its own thread - never inline, for
+    the same reason tri_watch's name lookup doesn't: a slow or
+    unreachable QRZ must not stall anything."""
+    st = picotuner_state_b if rcv == 2 else picotuner_state
+    snapshot = {
+        'mer': st.get('mer', ''),
+        'modcod': st.get('modcod', ''),
+        'symbol_rate': st.get('symbol_rate', ''),
+        'frequency': st.get('frequency', ''),
+    }
+
+    def _lookup():
+        try:
+            qrz_cfg = config.get('notifications', {}).get('qrz', {})
+            name, grid = lynx_notifications.qrz_callsign_details(
+                qrz_cfg.get('lookup_username', ''),
+                qrz_cfg.get('lookup_password', ''),
+                callsign)
+            if not grid:
+                print(f"[map] {callsign}: no locator on QRZ - no card")
+                return
+            home = config.get('site', {}).get('locator', '')
+            pos_h = lynx_map.locator_to_latlon(home)
+            pos_s = lynx_map.locator_to_latlon(grid)
+            if pos_h and pos_s:
+                d = lynx_map.haversine_km(*pos_h, *pos_s)
+                if d > pathfinder_tracker.max_distance_km:
+                    # Almost always a stale or default QRZ locator rather
+                    # than a genuinely extraordinary contact. Better to
+                    # show nothing than to publish a confidently wrong
+                    # map on a live stream.
+                    print(f"[map] {callsign}: {d:.0f}km exceeds max_distance_km "
+                          f"- treating locator {grid} as unreliable, no card")
+                    return
+            pathfinder_tracker.station_unlocked(
+                callsign, grid, name=name, **snapshot)
+        except Exception as e:
+            print(f"[map] lookup for {callsign} failed: {e}")
+
+    threading.Thread(target=_lookup, daemon=True).start()
+
+
 def tri_watch_arbitrator_loop():
     """Background thread - periodically builds the current active/
     locked state for every enabled tri_watch source and feeds it to
@@ -3457,6 +3636,12 @@ def get_status():
             "mpv_drift": get_mpv_drift_status(),
             "portable_locator": config.get('notifications', {}).get('qrz', {}).get('portable_locator', ''),
             "ppm_style": config.get('display', {}).get('ppm_style', 'full_fat'),
+            "site_locator": config.get('site', {}).get('locator', ''),
+            "site_location": config.get('site', {}).get('location', ''),
+            # End-of-contact map: None unless a card is due to be on
+            # screen right now. The overlay only has to check presence -
+            # all the timing is worked out here, from a timestamp.
+            "pathfinder": pathfinder_tracker.get_card(),
             "timestamp": utc_now_iso()
         },
         "picotuner": {
@@ -3547,6 +3732,53 @@ def get_diagnostics():
         "mpv_restarts_by_reason": diagnostics["mpv_restarts_by_reason"],
         "events": list(reversed(diagnostics["events"])),  # newest first
     }
+
+class PathfinderTestRequest(BaseModel):
+    """Injects a card directly, bypassing lock detection and QRZ - the
+    only practical way to iterate on the layout without waiting for a
+    real station to appear and then stop."""
+    callsign: str = "DL5BCA"
+    locator: str = "JO31KL"
+    name: str = ""
+    mer: str = "9.4"
+    modcod: str = "QPSK 2/3"
+    symbol_rate: str = "333"
+
+
+@app.post("/api/pathfinder/test", tags=["Status"],
+          summary="Show a test end-of-contact map card",
+          description="Arms the end-of-contact map for the given callsign "
+                      "and locator as though that station had just stopped "
+                      "transmitting. Honours the configured delay, so the "
+                      "card appears after delay_secs and clears after "
+                      "duration_secs. Any real station locking will cancel "
+                      "it, exactly as it would a genuine card.")
+def pathfinder_test(req: PathfinderTestRequest):
+    if not pathfinder_tracker.enabled:
+        raise HTTPException(status_code=400,
+                            detail="pathfinder is disabled in the config")
+    pos = lynx_map.locator_to_latlon(req.locator)
+    if pos is None:
+        raise HTTPException(status_code=400,
+                            detail=f"'{req.locator}' is not a usable Maidenhead locator")
+    pathfinder_tracker.station_unlocked(
+        req.callsign, req.locator, name=req.name or None, mer=req.mer,
+        modcod=req.modcod, symbol_rate=req.symbol_rate)
+    home = config.get('site', {}).get('locator', '')
+    pos_h = lynx_map.locator_to_latlon(home)
+    dist = lynx_map.haversine_km(*pos_h, *pos) if pos_h else None
+    return {
+        "armed": True,
+        "callsign": req.callsign,
+        "locator": req.locator,
+        "distance_km": round(dist, 1) if dist is not None else None,
+        "home_locator": home,
+        "appears_in_secs": pathfinder_tracker.delay_secs,
+        "visible_for_secs": pathfinder_tracker.duration_secs,
+        "note": None if home else
+                "site.locator is not set in the config - no card can be drawn",
+    }
+
 
 class QrzTestRequest(BaseModel):
     mode: str = "DVB-S2"
@@ -3919,6 +4151,7 @@ def config_page():
                                placeholder="http://companion-ip:8888/api/...">
                         <label for="companion-unlock-settle" class="small text-muted">Settle time (s)</label>
                         <input type="number" step="1" min="0" class="form-control" id="companion-unlock-settle-input">
+                        <div id="companion-pathfinder-warning" class="alert alert-warning py-2 px-2 small mt-2 mb-0" style="display:none;"></div>
                         <hr>
                         <div class="form-check form-switch mb-2">
                             <input class="form-check-input" type="checkbox" id="companion-gpio-enabled-input">
@@ -4071,8 +4304,44 @@ def config_page():
                                 Full Fat <span class="text-muted small">- with the round meter housing</span>
                             </label>
                         </div>
-                        <button class="btn btn-outline-light btn-sm" onclick="savePpmStyle()">Save</button>
+                        <button class="btn btn-save" onclick="savePpmStyle()">Save PPM style</button>
                         <span id="ppm-style-status" class="save-status ms-2"></span>
+                    </div>
+                </div>
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F5FA;&#xFE0F; Pathfinder</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            Shows a full-screen map after a station stops transmitting -
+                            where they were, the path back here, and the signal figures
+                            from the contact. Needs the QRZ.com lookup below configured,
+                            since the station's position comes from their QRZ locator.
+                        </p>
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="pf-enabled">
+                            <label class="form-check-label" for="pf-enabled">Enabled</label>
+                        </div>
+                        <div class="row g-2 mb-2">
+                            <div class="col-6">
+                                <label class="form-label small mb-1" for="pf-delay">Delay (s)</label>
+                                <input type="number" min="0" max="300" step="1" class="form-control form-control-sm" id="pf-delay">
+                                <div class="small text-muted mt-1">Quiet gap after unlock</div>
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label small mb-1" for="pf-duration">Duration (s)</label>
+                                <input type="number" min="1" max="300" step="1" class="form-control form-control-sm" id="pf-duration">
+                                <div class="small text-muted mt-1">How long it stays up</div>
+                            </div>
+                        </div>
+                        <div id="pf-window" class="text-muted small mb-2"></div>
+                        <div id="pf-warning" class="alert alert-warning py-2 px-2 small mb-2" style="display:none;"></div>
+                        <div class="text-muted small mb-2">
+                            At a repeater, also check your controller's own hang/tail timer -
+                            Lynx can't see that, and it will cut the transmitter regardless
+                            of anything set here.
+                        </div>
+                        <button class="btn btn-save" onclick="savePathfinder()">Save Pathfinder settings</button>
+                        <span id="pf-status" class="save-status ms-2"></span>
                     </div>
                 </div>
                 <div class="card mb-3">
@@ -4515,6 +4784,27 @@ async function loadCurrentConfig() {
         document.getElementById('site-location-input').value = cfg.site?.location || '';
         document.getElementById('site-locator-input').value = cfg.site?.locator || '';
 
+        const smap = cfg.pathfinder || {};
+        document.getElementById('pf-enabled').checked = smap.enabled !== false;
+        document.getElementById('pf-delay').value = smap.delay_secs ?? 15;
+        document.getElementById('pf-duration').value = smap.duration_secs ?? 30;
+        updatePathfinderWarning();
+        // Re-check whenever any of the four inputs move, so the warning
+        // appears the moment a conflict is created rather than only on
+        // reload. Bound here (after the values are populated) rather
+        // than at page load, so setting the initial values can't itself
+        // fire the handler before the config has arrived.
+        ['pf-enabled', 'pf-delay', 'pf-duration',
+         'companion-unlock-settle-input', 'companion-enabled-input'
+        ].forEach(id => {
+            const el = document.getElementById(id);
+            if (el && !el.dataset.pfBound) {
+                el.addEventListener('change', updatePathfinderWarning);
+                el.addEventListener('input', updatePathfinderWarning);
+                el.dataset.pfBound = '1';
+            }
+        });
+
         const ppmStyle = cfg.display?.ppm_style || 'full_fat';
         document.getElementById(ppmStyle === 'full_fat' ? 'ppm-style-full-fat' : 'ppm-style-skeleton').checked = true;
 
@@ -4762,6 +5052,114 @@ async function restoreWifi() {
         statusEl.className = r.ok ? 'save-status text-success' : 'save-status text-danger';
     } catch (e) {
         statusEl.textContent = 'Request failed - see console.';
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
+// The card is on screen from delay_secs to delay_secs + duration_secs
+// after unlock. Anything reacting to that unlock can cut away before
+// viewers see it - so cross-check the Companion unlock action here and
+// say so, rather than silently rewriting a value the operator set
+// deliberately. Note unlock_settle_secs is a DEBOUNCE ("has it really
+// unlocked?"), not a hold-off, so lengthening it delays every unlock
+// notification, not just the source switch. That is the operator's call
+// to make knowingly, which is why the field stays editable.
+function pathfinderWindow() {
+    const d = parseFloat(document.getElementById('pf-delay').value) || 0;
+    const u = parseFloat(document.getElementById('pf-duration').value) || 0;
+    return d + u;
+}
+
+function updatePathfinderWarning() {
+    const on = document.getElementById('pf-enabled').checked;
+    const total = pathfinderWindow();
+    const winEl = document.getElementById('pf-window');
+    const warnEl = document.getElementById('pf-warning');
+    const compWarnEl = document.getElementById('companion-pathfinder-warning');
+
+    winEl.textContent = on
+        ? `Card is on screen until ${total.toFixed(0)}s after the station stops.`
+        : '';
+
+    const hide = () => {
+        if (warnEl) warnEl.style.display = 'none';
+        if (compWarnEl) compWarnEl.style.display = 'none';
+    };
+
+    const settleEl = document.getElementById('companion-unlock-settle-input');
+    const compEnabled = document.getElementById('companion-enabled-input');
+    // No conflict worth flagging if the map is off, or if Companion
+    // isn't enabled - nothing is firing on unlock to switch away.
+    if (!on || !settleEl || !compEnabled || !compEnabled.checked) { hide(); return; }
+
+    const settle = parseFloat(settleEl.value);
+    if (isNaN(settle) || settle >= total) { hide(); return; }
+
+    const btn = `<button type="button" class="btn btn-sm btn-outline-dark py-0 px-2 ms-1" ` +
+                `onclick="matchCompanionSettle()">Match to ${total.toFixed(0)}s</button>`;
+
+    // Shown in BOTH cards deliberately. The Station Map card is where
+    // the timings were just changed; the Companion card is where the
+    // field that needs changing actually lives, and someone editing
+    // settle times may never scroll past it.
+    if (warnEl) {
+        warnEl.innerHTML =
+            `&#9888; The Companion unlock action fires at <strong>${settle}s</strong>, ` +
+            `before this card finishes at <strong>${total.toFixed(0)}s</strong>. ` +
+            `If it switches the output away from Lynx, nobody will see the map. ` + btn;
+        warnEl.style.display = 'block';
+    }
+    if (compWarnEl) {
+        compWarnEl.innerHTML =
+            `&#9888; Pathfinder shows a card until <strong>${total.toFixed(0)}s</strong> ` +
+            `after unlock, but this action fires at <strong>${settle}s</strong>. ` +
+            `If it switches the output away from Lynx, the map won't be seen. ` + btn;
+        compWarnEl.style.display = 'block';
+    }
+}
+
+function matchCompanionSettle() {
+    const settleEl = document.getElementById('companion-unlock-settle-input');
+    if (settleEl) {
+        settleEl.value = pathfinderWindow().toFixed(0);
+        settleEl.dispatchEvent(new Event('change'));
+        updatePathfinderWarning();
+        const st = document.getElementById('pf-status');
+        if (st) {
+            st.textContent = 'Companion settle updated - save the Companion section too.';
+            st.className = 'save-status text-warning';
+        }
+        // Deliberately not saved for you: writing to another section on
+        // your behalf is exactly the silent-change behaviour this design
+        // set out to avoid.
+        const cs = document.getElementById('companion-save-status');
+        if (cs) {
+            cs.textContent = 'Settle time changed - press Save Companion settings.';
+            cs.className = 'save-status text-warning';
+        }
+    }
+}
+
+async function savePathfinder() {
+    const statusEl = document.getElementById('pf-status');
+    statusEl.textContent = 'Saving...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const body = { pathfinder: {
+            enabled: document.getElementById('pf-enabled').checked,
+            delay_secs: parseFloat(document.getElementById('pf-delay').value),
+            duration_secs: parseFloat(document.getElementById('pf-duration').value)
+        }};
+        const r = await fetch('/api/config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+        });
+        if (!r.ok) throw new Error(await r.text());
+        statusEl.textContent = 'Saved - restart required.';
+        statusEl.className = 'save-status text-success';
+        updatePathfinderWarning();
+    } catch (e) {
+        statusEl.textContent = 'Save failed - see console.';
         statusEl.className = 'save-status text-danger';
         console.error(e);
     }
@@ -6361,6 +6759,12 @@ def update_config(req: ConfigUpdateRequest):
     if req.display is not None:
         on_disk.setdefault('display', {}).update(req.display.model_dump())
 
+    # pathfinder: merges only the three fields the form sends, leaving
+    # min_span_km/max_span_km/max_distance_km untouched - the form never
+    # sees them, and a blind update() would wipe them.
+    if req.pathfinder is not None:
+        on_disk.setdefault('pathfinder', {}).update(req.pathfinder.model_dump())
+
     # tri_watch: rebuilds just the `sources` list and top-level
     # `enabled` flag from whichever of Rx1/Rx2/stream are actually
     # enabled in the submitted form - every other tri_watch field
@@ -7501,6 +7905,12 @@ if __name__ == "__main__":
     # the loop itself checks tri_watch_enabled before doing anything.
     tri_watch_arbitrator_thread = threading.Thread(target=tri_watch_arbitrator_loop, daemon=True)
     tri_watch_arbitrator_thread.start()
+    # End-of-contact station map - started unconditionally for the same
+    # reason as the arbitrator above; the loop checks whether the
+    # feature is enabled before doing anything, and works out for itself
+    # whether plain RF, diversity or tri_watch rules apply.
+    pathfinder_thread = threading.Thread(target=pathfinder_watcher, daemon=True)
+    pathfinder_thread.start()
     # Repeater-activity notifications (QRZ/Slack/Companion/GPIO Tx) - its
     # own, independent monitor, deliberately not gated on current_mode the
     # way rf_mpv_lifecycle_monitor() is (see lynx_notifications.py's own

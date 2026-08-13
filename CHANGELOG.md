@@ -2,6 +2,23 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-08-13
+
+**Added**
+- **Pathfinder** — the end-of-contact station map: after a station stops transmitting, a full-screen card shows where they were, the great-circle path back to this receiver, and the signal figures from the contact just ended - locator, distance, bearing, MER, MODCOD and symbol rate. Replaces the idle logo screen rather than overlaying live video, so it can never obscure a picture, and a station keying up cancels it immediately. Enabled/delay/duration are on the Config page; span and distance limits stay in `config.yaml`.
+- Map data (`geo/`) pre-clipped to a 1200km radius and bundled with the receiver - nothing is fetched at runtime, so this works at a site with no outbound connectivity beyond the QRZ lookup. Natural Earth (public domain) for coastlines, borders, rivers, lakes and urban areas; GeoNames (CC BY) for towns, which carries far more places than Natural Earth's own populated-places layer (13 across the whole of southern England, against ~360 in the same window).
+- The station's position comes from their QRZ.com locator, reusing the existing lookup - `qrz_callsign_details()` now returns the grid alongside the name from the same response, at no extra API cost. No QRZ entry, no locator, or a locator implying an improbable distance all skip the card and log the reason, rather than publishing a confidently wrong map.
+- Config page cross-check: if Bitfocus Companion's unlock action would fire before the card finishes, a warning appears in both sections with a one-click button to match the two. The field stays editable - `unlock_settle_secs` is a debounce, not a hold-off, so lengthening it delays every unlock notification and that is the operator's call to make knowingly.
+- New dependency: `pyshp` (74KB, pure Python). Rendering is Cairo, reusing the overlay's existing stack - no matplotlib or geopandas.
+
+**Fixed**
+- Save buttons on the Config page now all use the same style; PPM Meter Style was the only one still using the old outline style.
+
+**Docs**
+- Web UI manual v1.7: new §3.10 covering the station map, its settings, the diversity/Tri-Watch behaviour, the test endpoint, and the repeater timing warning (the card is on screen until `delay_secs + duration_secs` after unlock - controller hang timers and source switching need to allow for that).
+- Install guide Appendix A: moving a working installation from microSD to NVMe, including firmware, boot order and troubleshooting.
+- `geo/README.md` documents the data sources, licences and how to regenerate.
+
 ## 2026-08-08
 
 **Fixed**
