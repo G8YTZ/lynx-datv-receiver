@@ -710,7 +710,7 @@ class PathfinderTracker:
     showing card immediately.
     """
 
-    def __init__(self, delay_secs=15.0, duration_secs=30.0,
+    def __init__(self, delay_secs=2.0, duration_secs=30.0,
                  max_distance_km=1200.0, enabled=True):
         self.delay_secs = float(delay_secs)
         self.duration_secs = float(duration_secs)

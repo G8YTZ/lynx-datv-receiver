@@ -2577,7 +2577,7 @@ class PathfinderConfigUpdate(BaseModel):
     once against the shipped map data and then never touched, and
     exposing every knob makes the page harder to scan."""
     enabled: bool = True
-    delay_secs: float = 15.0
+    delay_secs: float = 2.0
     duration_secs: float = 30.0
 
 
@@ -3419,7 +3419,7 @@ tri_watch_arbitrator = TriWatchArbitrator(
 
 _pathfinder_cfg = config.get('pathfinder', {}) or {}
 pathfinder_tracker = lynx_map.PathfinderTracker(
-    delay_secs=_pathfinder_cfg.get('delay_secs', 15),
+    delay_secs=_pathfinder_cfg.get('delay_secs', 2),
     duration_secs=_pathfinder_cfg.get('duration_secs', 30),
     max_distance_km=_pathfinder_cfg.get('max_distance_km', 1200),
     enabled=_pathfinder_cfg.get('enabled', True))
@@ -4784,10 +4784,10 @@ async function loadCurrentConfig() {
         document.getElementById('site-location-input').value = cfg.site?.location || '';
         document.getElementById('site-locator-input').value = cfg.site?.locator || '';
 
-        const smap = cfg.pathfinder || {};
-        document.getElementById('pf-enabled').checked = smap.enabled !== false;
-        document.getElementById('pf-delay').value = smap.delay_secs ?? 15;
-        document.getElementById('pf-duration').value = smap.duration_secs ?? 30;
+        const pf = cfg.pathfinder || {};
+        document.getElementById('pf-enabled').checked = pf.enabled !== false;
+        document.getElementById('pf-delay').value = pf.delay_secs ?? 2;
+        document.getElementById('pf-duration').value = pf.duration_secs ?? 30;
         updatePathfinderWarning();
         // Re-check whenever any of the four inputs move, so the warning
         // appears the moment a conflict is created rather than only on
