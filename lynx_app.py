@@ -898,6 +898,10 @@ def stop_ffmpeg_bg():
 
 # ── Picotuner monitor state ──────────────────────────────────
 # Updated by background thread reading port 9997 broadcast.
+# Unrecognised "LNB supply X/Y" values already reported, so each one is
+# logged once rather than at one broadcast per second.
+_lnb_unknown_seen = set()
+
 picotuner_state = {
     "online": False,
     "locked": False,
@@ -1008,8 +1012,19 @@ def picotuner_monitor():
             # absent/unrecognized in a given broadcast (e.g. older
             # firmware) rather than incorrectly resetting to "off".
             global current_lnb_psu_a, current_lnb_psu_b, current_lnb_tone_a, current_lnb_tone_b
+            # "absent" is NOT the same as "off" and must not be folded
+            # into it. The PicoTuner has only one LNB voltage generator
+            # fitted; a second (VGY, plug B) can be added by hand but
+            # normally isn't, and the firmware reports "absent" to say
+            # there is no hardware there to switch. Mapping that to
+            # "off" made plug B look like a working control that simply
+            # refused to stay on - the button went green on click and
+            # reverted on the next broadcast, with no way to tell that
+            # nothing was ever going to happen. Confirmed against the
+            # BATC wiki and by sending vgy to every documented command
+            # port (9920, 9921, 9922): the state never changes.
             lnb_supply_map = {
-                "off": ("off", False), "absent": ("off", False),
+                "off": ("off", False), "absent": ("absent", False),
                 "hi": ("hi", False), "hit": ("hi", True),
                 "lo": ("lo", False), "lot": ("lo", True),
             }
@@ -1018,10 +1033,34 @@ def picotuner_monitor():
                 if len(parts) != 2:
                     continue
                 label, value = parts[0].strip().lower(), parts[1].strip().lower()
-                if label == "lnb supply x" and value in lnb_supply_map:
-                    current_lnb_psu_a, current_lnb_tone_a = lnb_supply_map[value]
-                elif label == "lnb supply y" and value in lnb_supply_map:
-                    current_lnb_psu_b, current_lnb_tone_b = lnb_supply_map[value]
+                if label in ("lnb supply x", "lnb supply y"):
+                    if value in lnb_supply_map:
+                        if label.endswith("x"):
+                            current_lnb_psu_a, current_lnb_tone_a = lnb_supply_map[value]
+                        else:
+                            current_lnb_psu_b, current_lnb_tone_b = lnb_supply_map[value]
+                    else:
+                        # Deliberately logged rather than silently ignored.
+                        # The existing value is still left alone (an
+                        # unrecognised state must not be mistaken for
+                        # "off"), but an unknown value is worth knowing
+                        # about: the firmware already distinguishes real
+                        # hardware states in this field ("absent" means no
+                        # generator fitted), so a future overload or fault
+                        # indication would most naturally appear here too.
+                        # Without this, a new state would be invisible -
+                        # Lynx would quietly carry on showing the last
+                        # thing it understood. Logged once per distinct
+                        # value so a persistent fault can't flood the log
+                        # at one broadcast per second.
+                        if value not in _lnb_unknown_seen:
+                            _lnb_unknown_seen.add(value)
+                            print(f"[picotuner] {parts[0].strip()} reports "
+                                  f"'{parts[1].strip()}', which this version "
+                                  f"doesn't recognise - leaving the displayed "
+                                  f"state unchanged. If this is a fault or "
+                                  f"overload indication, please report it so "
+                                  f"it can be shown properly.")
 
             # Parse RX1 line: "437.024 G8YTZ" or "437.000T search"
             for line in text.splitlines():
@@ -3742,6 +3781,11 @@ def picotuner_tuning_watchdog():
                 # an antenna that isn't expecting it. Failing to apply a
                 # supply costs a picture; applying one that shouldn't be
                 # there can cost hardware.
+                if got_v == 'absent':
+                    # No voltage generator fitted on this plug - there is
+                    # nothing to correct, and retrying forever would just
+                    # fill the log.
+                    continue
                 if got_v != want_v or (want_v != 'off' and got_t != want_t):
                     wrong.append(f"LNB supply {plug.upper()} is "
                                  f"{got_v}{'+tone' if got_t else ''} "
@@ -3808,7 +3852,9 @@ def _picotuner_restore_tuning():
 
             v_b, t_b = want_lnb['b']
             cmd_b = v_b if v_b == "off" else f"{v_b}{'t' if t_b else ''}"
-            if current_lnb_psu_b != v_b or (v_b != "off" and current_lnb_tone_b != t_b):
+            if current_lnb_psu_b == 'absent':
+                pass          # no generator fitted - nothing to command
+            elif current_lnb_psu_b != v_b or (v_b != "off" and current_lnb_tone_b != t_b):
                 picotuner_rcv2_cmd(f"[to@wh] vgy={cmd_b}", config['picotuner'])
                 print(f"[picotuner] restore: LNB supply B -> {cmd_b}")
                 sent_psu = sent_psu or v_b != "off"
@@ -7428,13 +7474,57 @@ function renderLnbPsuButtons(lnbPsu) {
         const hBtn = document.getElementById('lnb-psu-' + plug + '-h');
         const vBtn = document.getElementById('lnb-psu-' + plug + '-v');
         const toneBtn = document.getElementById('lnb-psu-' + plug + '-tone');
-        hBtn.className = 'btn btn-sm ' + (current === 'hi' ? 'btn-success' : 'btn-outline-secondary');
-        vBtn.className = 'btn btn-sm ' + (current === 'lo' ? 'btn-success' : 'btn-outline-secondary');
-        toneBtn.className = 'btn btn-sm ' + (tone ? 'btn-success' : 'btn-outline-secondary');
+
+        // "absent" means the Picotuner has no voltage generator fitted
+        // on this plug - normally the case for plug B, since only one
+        // is populated as standard and a second has to be added by
+        // hand. Disable rather than leave the buttons looking live:
+        // clicking them turned the button green for one poll and then
+        // reverted, which looked like a fault in Lynx rather than
+        // hardware that simply isn't there.
+        const absent = (current === 'absent');
+        const why = absent
+            ? 'No LNB voltage generator is fitted on plug ' + plug.toUpperCase() +
+              '. The PicoTuner has only one as standard (plug A); a second ' +
+              'can be added by hand - see the BATC PicoTuner wiki.'
+            : null;
+
+        for (const [btn, active] of [[hBtn, current === 'hi'],
+                                     [vBtn, current === 'lo'],
+                                     [toneBtn, tone]]) {
+            btn.disabled = absent;
+            btn.className = 'btn btn-sm ' +
+                (absent ? 'btn-outline-secondary opacity-50'
+                        : (active ? 'btn-success' : 'btn-outline-secondary'));
+            if (absent) {
+                if (!btn.dataset.titleOrig) btn.dataset.titleOrig = btn.title || '';
+                btn.title = why;
+                btn.style.cursor = 'not-allowed';
+                btn.style.pointerEvents = 'auto';   // so the tooltip still shows
+            } else if (btn.dataset.titleOrig !== undefined) {
+                btn.title = btn.dataset.titleOrig;
+                btn.style.cursor = '';
+            }
+        }
+
+        // The surrounding span carries its own explanatory tooltip -
+        // replace it too, or hovering anywhere but the buttons still
+        // claims this is a working control.
+        const wrap = hBtn.parentElement;
+        if (wrap) {
+            if (!wrap.dataset.titleOrig) wrap.dataset.titleOrig = wrap.title || '';
+            wrap.title = absent ? why : wrap.dataset.titleOrig;
+        }
     }
 }
 
 async function onLnbPsuClick(plug, voltage) {
+    // Disabled buttons shouldn't fire, but guard anyway - a keyboard
+    // activation or a stale page could still get here, and sending a
+    // command to a plug with no generator just produces a button that
+    // flicks green and reverts.
+    const probe = document.getElementById('lnb-psu-' + plug + '-h');
+    if (probe && probe.disabled) return;
     // Pressing the currently-active button again turns it off, rather
     // than needing a separate Off button - matches exactly what was
     // asked for. Reads the CURRENT state from the button's own class
@@ -7458,6 +7548,8 @@ async function onLnbPsuClick(plug, voltage) {
 }
 
 async function onLnbToneClick(plug) {
+    const probeT = document.getElementById('lnb-psu-' + plug + '-tone');
+    if (probeT && probeT.disabled) return;
     // Simple on/off toggle, unlike the mutually-exclusive H/V pair
     // above - Hi-Band is rarely/never needed for Amateur TV, so this
     // stays a single button rather than a Hi-Band/Lo-Band pair.
@@ -8296,8 +8388,11 @@ if __name__ == "__main__":
     _v_b = str(_startup_lnb.get('plug_b', 'off')).lower()
     _t_b = bool(_startup_lnb.get('plug_b_tone', False))
     picotuner_cmd(f"[to@wh] vgx={_v_a if _v_a == 'off' else _v_a + ('t' if _t_a else '')}")
-    picotuner_rcv2_cmd(f"[to@wh] vgy={_v_b if _v_b == 'off' else _v_b + ('t' if _t_b else '')}",
-                       config['picotuner'])
+    # Plug B skipped entirely when the Picotuner reports no generator
+    # fitted - the usual case, since only one is populated as standard.
+    if current_lnb_psu_b != 'absent':
+        picotuner_rcv2_cmd(f"[to@wh] vgy={_v_b if _v_b == 'off' else _v_b + ('t' if _t_b else '')}",
+                           config['picotuner'])
 
     # A short pause for the LNB PSU voltage to physically stabilise
     # before the very first tune attempt below - confirmed directly on
