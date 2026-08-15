@@ -3588,11 +3588,11 @@ PICOTUNER_RETUNE_COOLDOWN_SECS = 90.0   # don't hammer a tuner that won't take
 
 
 def _picotuner_expected_tuning():
-    """What each receiver SHOULD be tuned to, in kHz at the tuner.
+    """What each receiver SHOULD be tuned to.
 
-    Returns {rcv: freq_khz}. Empty when Lynx has no opinion - idle, a
-    web stream, or nothing ever tuned - in which case there is nothing
-    to check and the watchdog stays quiet.
+    Returns {rcv: (freq_khz, symbol_rate)}. Empty when Lynx has no
+    opinion - idle, a web stream, or nothing ever tuned - in which case
+    there is nothing to check and the watchdog stays quiet.
     """
     out = {}
     try:
@@ -3602,8 +3602,9 @@ def _picotuner_expected_tuning():
                     continue
                 rcv = src.get('rcv')
                 if rcv in (1, 2):
-                    out[rcv] = calc_tuner_freq(src['freq'],
-                                               src.get('lnb_lo_khz', 0))
+                    out[rcv] = (calc_tuner_freq(src['freq'],
+                                                src.get('lnb_lo_khz', 0)),
+                                src.get('sr'))
             return out
 
         if current_mode != "rf":
@@ -3613,13 +3614,35 @@ def _picotuner_expected_tuning():
         if not state or state.get("mode") != "rf":
             return out
         f = calc_tuner_freq(state["freq"], state.get("lnb_lo_khz", 0))
-        out[1] = f
+        sr = state.get("sr")
+        out[1] = (f, sr)
         # Diversity drives both receivers to the same frequency
         if str(state.get("plug", "")).lower() == "diversity" or diversity_enabled:
-            out[2] = f
+            out[2] = (f, sr)
     except Exception as e:
         print(f"[picotuner] could not work out expected tuning: {e}")
     return out
+
+
+def _picotuner_expected_lnb():
+    """The LNB supply each plug SHOULD have, from the CONFIG.
+
+    Deliberately not from current_lnb_psu_a/b: those track what the
+    Picotuner is REPORTING, since the broadcast carries "LNB supply X/Y"
+    and Lynx updates them from it so the UI buttons show the truth.
+
+    That reporting is exactly why the first version of this restore was
+    useless. When the Picotuner power-cycles it comes back with the
+    supply off and says so, Lynx dutifully updates its globals to "off",
+    and a restore built on those globals then faithfully re-applies...
+    off. The configured value is the only thing that still knows what
+    the supply is meant to be.
+    """
+    cfg = config.get('lnb_psu', {}) or {}
+    return {
+        'a': (str(cfg.get('plug_a', 'off')).lower(), bool(cfg.get('plug_a_tone', False))),
+        'b': (str(cfg.get('plug_b', 'off')).lower(), bool(cfg.get('plug_b_tone', False))),
+    }
 
 
 def _picotuner_reported_khz(st):
@@ -3636,6 +3659,20 @@ def _picotuner_reported_khz(st):
     if mhz <= 0:
         return None          # a freshly booted, untuned receiver
     return mhz * 1000.0
+
+
+def _picotuner_reported_sr(st):
+    """The symbol rate a receiver reports, or None if it isn't reporting
+    one - which, like a missing frequency, is what an untuned receiver
+    looks like."""
+    raw = str(st.get("symbol_rate", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        sr = float(raw)
+    except ValueError:
+        return None
+    return sr if sr > 0 else None
 
 
 def picotuner_tuning_watchdog():
@@ -3656,20 +3693,51 @@ def picotuner_tuning_watchdog():
                 continue
 
             wrong = []
-            for rcv, want_khz in expected.items():
+            for rcv, (want_khz, want_sr) in expected.items():
                 st = picotuner_state_b if rcv == 2 else picotuner_state
                 if rcv == 2 and not st.get("online"):
                     continue          # Rx2 not reporting at all - nothing to compare
                 got_khz = _picotuner_reported_khz(st)
                 if got_khz is None:
-                    wrong.append((rcv, want_khz, "not tuned"))
-                elif abs(got_khz - want_khz) > 1000.0:
+                    wrong.append(f"Rx{rcv} not tuned "
+                                 f"(should be {want_khz/1000:.3f} MHz)")
+                    continue
+                if abs(got_khz - want_khz) > 1000.0:
                     # 1 MHz of slack. A locked receiver reports the
                     # frequency it actually found, not the one it was
                     # asked for - "437.023" against a commanded 437.000
                     # is a transmitter's own offset, not a fault. Only a
                     # genuinely different channel is worth acting on.
-                    wrong.append((rcv, want_khz, f"on {got_khz/1000:.3f} MHz"))
+                    wrong.append(f"Rx{rcv} on {got_khz/1000:.3f} MHz "
+                                 f"(should be {want_khz/1000:.3f})")
+                    continue
+                # Symbol rate, checked only once the frequency is right -
+                # otherwise a receiver on the wrong channel would report
+                # two faults for one cause.
+                if want_sr:
+                    got_sr = _picotuner_reported_sr(st)
+                    if got_sr is None:
+                        wrong.append(f"Rx{rcv} reports no symbol rate "
+                                     f"(should be {want_sr} kS)")
+                    elif abs(got_sr - float(want_sr)) > 2.0:
+                        wrong.append(f"Rx{rcv} at {got_sr:.0f} kS "
+                                     f"(should be {want_sr})")
+
+            # LNB supply. The configured value is the intent; the global
+            # is what the Picotuner is reporting back. They disagree when
+            # the tuner has lost its supply setting - which it does on
+            # every power cycle, silently, while continuing to look
+            # perfectly healthy.
+            want_lnb = _picotuner_expected_lnb()
+            for plug, (want_v, want_t) in want_lnb.items():
+                got_v = current_lnb_psu_a if plug == 'a' else current_lnb_psu_b
+                got_t = current_lnb_tone_a if plug == 'a' else current_lnb_tone_b
+                if want_v == 'off':
+                    continue          # nothing to lose, nothing to restore
+                if got_v != want_v or (want_v != 'off' and got_t != want_t):
+                    wrong.append(f"LNB supply {plug.upper()} is "
+                                 f"{got_v}{'+tone' if got_t else ''} "
+                                 f"(should be {want_v}{'+tone' if want_t else ''})")
 
             if not wrong:
                 bad_since = None
@@ -3684,10 +3752,11 @@ def picotuner_tuning_watchdog():
             if now - last_fix < PICOTUNER_RETUNE_COOLDOWN_SECS:
                 continue
 
-            for rcv, want_khz, why in wrong:
-                print(f"[picotuner] Rx{rcv} should be on {want_khz/1000:.3f} MHz "
-                      f"but is {why} - its firmware does not keep tuning across "
-                      f"a power cycle, so re-tuning")
+            print("[picotuner] state does not match what it should be - "
+                  "its firmware keeps neither tuning nor LNB supply across a "
+                  "power cycle, so restoring:")
+            for why in wrong:
+                print(f"[picotuner]     {why}")
             last_fix = now
             bad_since = None
             threading.Thread(target=_picotuner_restore_tuning,
@@ -3710,15 +3779,22 @@ def _picotuner_restore_tuning():
             return
 
         # ---- LNB supply first, same as startup ----
+        # Commanded from the CONFIG, never from current_lnb_psu_a/b.
+        # Those globals are overwritten by the Picotuner's own broadcast,
+        # so after a power cycle they already say "off" - and an earlier
+        # version of this restore, built on them, therefore re-applied
+        # "off" and achieved precisely nothing. The configured value is
+        # the only thing that still knows what the supply is meant to be.
+        want_lnb = _picotuner_expected_lnb()
         sent_psu = False
         try:
-            if current_lnb_psu_a != "off":
-                picotuner_cmd(f"[to@wh] vgx={current_lnb_psu_a}"
-                              f"{'t' if current_lnb_tone_a else ''}")
+            v_a, t_a = want_lnb['a']
+            if v_a != "off":
+                picotuner_cmd(f"[to@wh] vgx={v_a}{'t' if t_a else ''}")
                 sent_psu = True
-            if current_lnb_psu_b != "off":
-                picotuner_rcv2_cmd(f"[to@wh] vgy={current_lnb_psu_b}"
-                                   f"{'t' if current_lnb_tone_b else ''}",
+            v_b, t_b = want_lnb['b']
+            if v_b != "off":
+                picotuner_rcv2_cmd(f"[to@wh] vgy={v_b}{'t' if t_b else ''}",
                                    config['picotuner'])
                 sent_psu = True
         except Exception as e:

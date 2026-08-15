@@ -2,6 +2,13 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-08-15
+
+**Fixed**
+- The Picotuner watchdog restored LNB supply from the wrong source, making it useless in exactly the case it existed for. The broadcast carries "LNB supply X/Y" and Lynx updates its own globals from it so the UI buttons show the truth - which means that after a power cycle those globals already read "off", and a restore built on them faithfully re-applied "off". Both the check and the restore now use the configured value from `lnb_psu`, which is the only thing that still knows what the supply is meant to be.
+- The watchdog now also detects LNB supply loss rather than only restoring it blindly, so a tuner that came back with tuning intact but no supply is caught. Plugs configured "off" are ignored - nothing to lose, nothing to restore.
+- Symbol rate is now checked alongside frequency, with 2 kS of slack. Checked only once the frequency is right, so a receiver on the wrong channel reports one fault rather than two.
+
 ## 2026-08-13
 
 **Added**
