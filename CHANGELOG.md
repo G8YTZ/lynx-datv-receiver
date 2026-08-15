@@ -2,6 +2,15 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-08-15
+
+**Fixed**
+- The Picotuner losing its tuning left the receiver permanently deaf. Its WinterHill firmware keeps neither tuning, symbol rate nor LNB supply across a power cycle, so anything that restarts it - a PoE renegotiation, a supply blip, static - brought it back with nothing set. It would resume broadcasting, Lynx would report a perfectly healthy tuner, and the receiver would never lock again. At an unattended repeater that is silent, total, and indistinguishable from a quiet band. Lynx now continuously compares the frequency, symbol rate and LNB supply the Picotuner reports against what they should be, and restores any sustained disagreement. Deliberately a state comparison rather than a timing check: a Pico reboots in seconds, so watching for a gap in its broadcasts is both easy to miss and blind to every other cause. Safe to run continuously because a tuned receiver keeps reporting its frequency even with no signal on it ("437.000B lost" is a correctly tuned receiver hearing nothing), so a quiet band is left completely alone.
+- LNB supply is restored from the configured value, not the reported one. The broadcast carries "LNB supply X/Y" and Lynx updates its own globals from it so the UI buttons show the truth - which means that after a power cycle those globals already read "off". The configured value is the only thing that still knows what the supply is meant to be. Checked in BOTH directions: a Picotuner powers up with its supply ON (18V observed on plug A on real hardware), so a plug configured "off" coming back live matters most - failing to apply a supply costs a picture, applying one that should not be there can reach a preamp or antenna that is not expecting it.
+- Same fix at startup, which had the identical flaw: the LNB re-apply skipped any plug configured "off", so a Pi rebooting while its Picotuner sat at 18V left the voltage on.
+- Plug B's LNB controls looked broken when they were simply absent. The PicoTuner has only one LNB voltage generator fitted as standard, and its firmware reports the second plug as "absent" - but Lynx mapped that to "off", so the buttons appeared live, turned green on a click and reverted on the next status poll. Confirmed by sending `vgy` to every documented command port (9920, 9921 and 9922): the state never changes, because there is no hardware there to switch. "absent" is now its own state - the buttons are disabled and explain why on hover, and the tuning watchdog skips that plug. A second generator can be fitted by hand; see the BATC PicoTuner wiki.
+- Unrecognised "LNB supply X/Y" values are now logged once each rather than silently ignored, so a future overload or fault indication from the firmware would be visible rather than quietly leaving Lynx showing the last value it understood.
+
 ## 2026-08-08
 
 **Fixed**

@@ -745,6 +745,10 @@ def stop_ffmpeg_bg():
 
 # ── Picotuner monitor state ──────────────────────────────────
 # Updated by background thread reading port 9997 broadcast.
+# Unrecognised "LNB supply X/Y" values already reported, so each one is
+# logged once rather than at one broadcast per second.
+_lnb_unknown_seen = set()
+
 picotuner_state = {
     "online": False,
     "locked": False,
@@ -855,8 +859,19 @@ def picotuner_monitor():
             # absent/unrecognized in a given broadcast (e.g. older
             # firmware) rather than incorrectly resetting to "off".
             global current_lnb_psu_a, current_lnb_psu_b, current_lnb_tone_a, current_lnb_tone_b
+            # "absent" is NOT the same as "off" and must not be folded
+            # into it. The PicoTuner has only one LNB voltage generator
+            # fitted; a second (VGY, plug B) can be added by hand but
+            # normally isn't, and the firmware reports "absent" to say
+            # there is no hardware there to switch. Mapping that to
+            # "off" made plug B look like a working control that simply
+            # refused to stay on - the button went green on click and
+            # reverted on the next broadcast, with no way to tell that
+            # nothing was ever going to happen. Confirmed against the
+            # BATC wiki and by sending vgy to every documented command
+            # port (9920, 9921, 9922): the state never changes.
             lnb_supply_map = {
-                "off": ("off", False), "absent": ("off", False),
+                "off": ("off", False), "absent": ("absent", False),
                 "hi": ("hi", False), "hit": ("hi", True),
                 "lo": ("lo", False), "lot": ("lo", True),
             }
@@ -865,10 +880,34 @@ def picotuner_monitor():
                 if len(parts) != 2:
                     continue
                 label, value = parts[0].strip().lower(), parts[1].strip().lower()
-                if label == "lnb supply x" and value in lnb_supply_map:
-                    current_lnb_psu_a, current_lnb_tone_a = lnb_supply_map[value]
-                elif label == "lnb supply y" and value in lnb_supply_map:
-                    current_lnb_psu_b, current_lnb_tone_b = lnb_supply_map[value]
+                if label in ("lnb supply x", "lnb supply y"):
+                    if value in lnb_supply_map:
+                        if label.endswith("x"):
+                            current_lnb_psu_a, current_lnb_tone_a = lnb_supply_map[value]
+                        else:
+                            current_lnb_psu_b, current_lnb_tone_b = lnb_supply_map[value]
+                    else:
+                        # Deliberately logged rather than silently ignored.
+                        # The existing value is still left alone (an
+                        # unrecognised state must not be mistaken for
+                        # "off"), but an unknown value is worth knowing
+                        # about: the firmware already distinguishes real
+                        # hardware states in this field ("absent" means no
+                        # generator fitted), so a future overload or fault
+                        # indication would most naturally appear here too.
+                        # Without this, a new state would be invisible -
+                        # Lynx would quietly carry on showing the last
+                        # thing it understood. Logged once per distinct
+                        # value so a persistent fault can't flood the log
+                        # at one broadcast per second.
+                        if value not in _lnb_unknown_seen:
+                            _lnb_unknown_seen.add(value)
+                            print(f"[picotuner] {parts[0].strip()} reports "
+                                  f"'{parts[1].strip()}', which this version "
+                                  f"doesn't recognise - leaving the displayed "
+                                  f"state unchanged. If this is a fault or "
+                                  f"overload indication, please report it so "
+                                  f"it can be shown properly.")
 
             # Parse RX1 line: "437.024 G8YTZ" or "437.000T search"
             for line in text.splitlines():
@@ -2419,6 +2458,344 @@ def get_discovered_picotuners():
             if now - info["last_seen"] <= 10
         ]
     }
+
+# ---------------------------------------------------------------------
+#  Picotuner tuning watchdog
+# ---------------------------------------------------------------------
+#  The Picotuner is powered separately from the Pi, so it can restart on
+#  its own - a PoE renegotiation, a supply blip, a knocked plug, static.
+#  Its WinterHill firmware keeps NEITHER tuning nor LNB supply across a
+#  power cycle: it comes back with nothing tuned at all.
+#
+#  Lynx would previously never notice. Broadcasts resume, the Web UI
+#  shows a healthy tuner, and the receiver sits deaf indefinitely -
+#  because the only things that ever tune are Lynx's own startup and an
+#  explicit API call. At an unattended repeater that is silent, total,
+#  and indistinguishable from a quiet band.
+#
+#  WHY THIS WATCHES STATE, NOT TIMING
+#  ----------------------------------
+#  The obvious approach is to spot the broadcasts stopping and restarting.
+#  It is also the wrong one. A Pico reboots in a couple of seconds and
+#  most of the outage is the W5100S bringing its Ethernet link back, so
+#  the gap to catch is short and unpredictable - too short and a reboot
+#  is missed entirely; too eager and network jitter triggers spurious
+#  re-tunes. Worse, it only catches that one cause. Anything else that
+#  leaves the tuner untuned - a command lost in flight, static, a
+#  firmware hiccup - looks completely normal to a timing check.
+#
+#  So this compares what the Picotuner REPORTS it is tuned to against
+#  what Lynx believes it should be, and fixes any disagreement. That is
+#  safe to do continuously because a tuned receiver keeps reporting its
+#  frequency even with no signal on it at all - confirmed directly:
+#  "437.000B lost" and "1249.000T search" are both a correctly tuned
+#  receiver saying it can't hear anything. Only a receiver that has
+#  genuinely lost its tuning reports nothing. A quiet band is therefore
+#  left completely alone, which is the trap a naive level-triggered
+#  check would fall into.
+
+PICOTUNER_CHECK_SECS = 2.0          # how often to compare
+PICOTUNER_MISMATCH_SECS = 20.0      # sustained disagreement before acting
+PICOTUNER_RETUNE_SETTLE_SECS = 8.0  # let its firmware finish booting first
+PICOTUNER_RETUNE_COOLDOWN_SECS = 90.0   # don't hammer a tuner that won't take
+
+
+def _tri_watch_present():
+    """True only on builds that actually have tri_watch.
+
+    The main branch doesn't yet, so this code must not assume the name
+    exists - a bare reference would raise NameError inside the watchdog
+    thread, and since that loop catches exceptions it would log the same
+    error every couple of seconds and silently protect nothing at all.
+
+    Deliberately a runtime lookup rather than two different versions of
+    this file: keeping main and beta identical here means no divergence
+    to merge, and no conflict to resolve wrongly the day tri_watch does
+    land on main.
+    """
+    return bool(globals().get('tri_watch_enabled'))
+
+
+def _picotuner_expected_tuning():
+    """What each receiver SHOULD be tuned to.
+
+    Returns {rcv: (freq_khz, symbol_rate)}. Empty when Lynx has no
+    opinion - idle, a web stream, or nothing ever tuned - in which case
+    there is nothing to check and the watchdog stays quiet.
+    """
+    out = {}
+    try:
+        if _tri_watch_present():
+            for src in globals().get('tri_watch_sources_cfg', []):
+                if not src.get('enabled') or src.get('type') != 'rf':
+                    continue
+                rcv = src.get('rcv')
+                if rcv in (1, 2):
+                    out[rcv] = (calc_tuner_freq(src['freq'],
+                                                src.get('lnb_lo_khz', 0)),
+                                src.get('sr'))
+            return out
+
+        if current_mode != "rf":
+            return out
+
+        state = load_last_state()
+        if not state or state.get("mode") != "rf":
+            return out
+        f = calc_tuner_freq(state["freq"], state.get("lnb_lo_khz", 0))
+        sr = state.get("sr")
+        out[1] = (f, sr)
+        # Diversity drives both receivers to the same frequency
+        if str(state.get("plug", "")).lower() == "diversity" or diversity_enabled:
+            out[2] = (f, sr)
+    except Exception as e:
+        print(f"[picotuner] could not work out expected tuning: {e}")
+    return out
+
+
+def _picotuner_expected_lnb():
+    """The LNB supply each plug SHOULD have, from the CONFIG.
+
+    Deliberately not from current_lnb_psu_a/b: those track what the
+    Picotuner is REPORTING, since the broadcast carries "LNB supply X/Y"
+    and Lynx updates them from it so the UI buttons show the truth.
+
+    That reporting is exactly why the first version of this restore was
+    useless. When the Picotuner power-cycles it comes back with the
+    supply off and says so, Lynx dutifully updates its globals to "off",
+    and a restore built on those globals then faithfully re-applies...
+    off. The configured value is the only thing that still knows what
+    the supply is meant to be.
+    """
+    cfg = config.get('lnb_psu', {}) or {}
+    return {
+        'a': (str(cfg.get('plug_a', 'off')).lower(), bool(cfg.get('plug_a_tone', False))),
+        'b': (str(cfg.get('plug_b', 'off')).lower(), bool(cfg.get('plug_b_tone', False))),
+    }
+
+
+def _picotuner_reported_khz(st):
+    """The frequency a receiver says it is tuned to, in kHz, or None if
+    it isn't reporting one at all - which is what an untuned receiver
+    looks like."""
+    raw = str(st.get("frequency", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        mhz = float(raw)
+    except ValueError:
+        return None
+    if mhz <= 0:
+        return None          # a freshly booted, untuned receiver
+    return mhz * 1000.0
+
+
+def _picotuner_reported_sr(st):
+    """The symbol rate a receiver reports, or None if it isn't reporting
+    one - which, like a missing frequency, is what an untuned receiver
+    looks like."""
+    raw = str(st.get("symbol_rate", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        sr = float(raw)
+    except ValueError:
+        return None
+    return sr if sr > 0 else None
+
+
+def picotuner_tuning_watchdog():
+    """Puts the Picotuner back where it belongs whenever it has lost its
+    tuning, whatever the cause."""
+    bad_since = None
+    last_fix = 0.0
+    while True:
+        time.sleep(PICOTUNER_CHECK_SECS)
+        try:
+            if not picotuner_state.get("online"):
+                bad_since = None      # can't judge what we can't hear
+                continue
+
+            expected = _picotuner_expected_tuning()
+            if not expected:
+                bad_since = None
+                continue
+
+            wrong = []
+            for rcv, (want_khz, want_sr) in expected.items():
+                st = picotuner_state_b if rcv == 2 else picotuner_state
+                if rcv == 2 and not st.get("online"):
+                    continue          # Rx2 not reporting at all - nothing to compare
+                got_khz = _picotuner_reported_khz(st)
+                if got_khz is None:
+                    wrong.append(f"Rx{rcv} not tuned "
+                                 f"(should be {want_khz/1000:.3f} MHz)")
+                    continue
+                if abs(got_khz - want_khz) > 1000.0:
+                    # 1 MHz of slack. A locked receiver reports the
+                    # frequency it actually found, not the one it was
+                    # asked for - "437.023" against a commanded 437.000
+                    # is a transmitter's own offset, not a fault. Only a
+                    # genuinely different channel is worth acting on.
+                    wrong.append(f"Rx{rcv} on {got_khz/1000:.3f} MHz "
+                                 f"(should be {want_khz/1000:.3f})")
+                    continue
+                # Symbol rate, checked only once the frequency is right -
+                # otherwise a receiver on the wrong channel would report
+                # two faults for one cause.
+                if want_sr:
+                    got_sr = _picotuner_reported_sr(st)
+                    if got_sr is None:
+                        wrong.append(f"Rx{rcv} reports no symbol rate "
+                                     f"(should be {want_sr} kS)")
+                    elif abs(got_sr - float(want_sr)) > 2.0:
+                        wrong.append(f"Rx{rcv} at {got_sr:.0f} kS "
+                                     f"(should be {want_sr})")
+
+            # LNB supply. The configured value is the intent; the global
+            # is what the Picotuner is reporting back. They disagree when
+            # the tuner has lost its supply setting - which it does on
+            # every power cycle, silently, while continuing to look
+            # perfectly healthy.
+            want_lnb = _picotuner_expected_lnb()
+            for plug, (want_v, want_t) in want_lnb.items():
+                got_v = current_lnb_psu_a if plug == 'a' else current_lnb_psu_b
+                got_t = current_lnb_tone_a if plug == 'a' else current_lnb_tone_b
+                # Checked in BOTH directions. An earlier version skipped
+                # plugs configured "off" on the reasoning that there was
+                # nothing to restore - which was exactly backwards. A
+                # Picotuner comes back from a power cycle with its supply
+                # ON (18V observed on plug A on real hardware, every
+                # time), so a plug that should be off is the case that
+                # matters most: unexpected voltage can reach a preamp or
+                # an antenna that isn't expecting it. Failing to apply a
+                # supply costs a picture; applying one that shouldn't be
+                # there can cost hardware.
+                if got_v == 'absent':
+                    # No voltage generator fitted on this plug - there is
+                    # nothing to correct, and retrying forever would just
+                    # fill the log.
+                    continue
+                if got_v != want_v or (want_v != 'off' and got_t != want_t):
+                    wrong.append(f"LNB supply {plug.upper()} is "
+                                 f"{got_v}{'+tone' if got_t else ''} "
+                                 f"(should be {want_v}{'+tone' if want_t else ''})")
+
+            if not wrong:
+                bad_since = None
+                continue
+
+            now = time.time()
+            if bad_since is None:
+                bad_since = now
+                continue
+            if now - bad_since < PICOTUNER_MISMATCH_SECS:
+                continue
+            if now - last_fix < PICOTUNER_RETUNE_COOLDOWN_SECS:
+                continue
+
+            print("[picotuner] state does not match what it should be - "
+                  "its firmware keeps neither tuning nor LNB supply across a "
+                  "power cycle, so restoring:")
+            for why in wrong:
+                print(f"[picotuner]     {why}")
+            last_fix = now
+            bad_since = None
+            threading.Thread(target=_picotuner_restore_tuning,
+                             daemon=True).start()
+
+        except Exception as e:
+            print(f"[picotuner] tuning watchdog: {e}")
+
+
+def _picotuner_restore_tuning():
+    """Re-applies LNB supply then tuning, in the same order and with the
+    same settling delays startup uses - so there is one behaviour to
+    reason about rather than two."""
+    try:
+        time.sleep(PICOTUNER_RETUNE_SETTLE_SECS)
+
+        if not picotuner_state.get("online"):
+            print("[picotuner] went away before restore - will pick it up "
+                  "again when it returns")
+            return
+
+        # ---- LNB supply first, same as startup ----
+        # Commanded from the CONFIG, never from current_lnb_psu_a/b.
+        # Those globals are overwritten by the Picotuner's own broadcast,
+        # so after a power cycle they already say "off" - and an earlier
+        # version of this restore, built on them, therefore re-applied
+        # "off" and achieved precisely nothing. The configured value is
+        # the only thing that still knows what the supply is meant to be.
+        want_lnb = _picotuner_expected_lnb()
+        sent_psu = False
+        try:
+            # "off" is commanded explicitly, not skipped. The Picotuner
+            # powers up with its supply ON, so leaving a plug alone
+            # because it is configured off would leave 18V sitting on it.
+            v_a, t_a = want_lnb['a']
+            cmd_a = v_a if v_a == "off" else f"{v_a}{'t' if t_a else ''}"
+            if current_lnb_psu_a != v_a or (v_a != "off" and current_lnb_tone_a != t_a):
+                picotuner_cmd(f"[to@wh] vgx={cmd_a}")
+                print(f"[picotuner] restore: LNB supply A -> {cmd_a}")
+                sent_psu = sent_psu or v_a != "off"
+
+            v_b, t_b = want_lnb['b']
+            cmd_b = v_b if v_b == "off" else f"{v_b}{'t' if t_b else ''}"
+            if current_lnb_psu_b == 'absent':
+                pass          # no generator fitted - nothing to command
+            elif current_lnb_psu_b != v_b or (v_b != "off" and current_lnb_tone_b != t_b):
+                picotuner_rcv2_cmd(f"[to@wh] vgy={cmd_b}", config['picotuner'])
+                print(f"[picotuner] restore: LNB supply B -> {cmd_b}")
+                sent_psu = sent_psu or v_b != "off"
+        except Exception as e:
+            print(f"[picotuner] restore: LNB supply failed ({e}) - "
+                  "continuing to the tune anyway")
+
+        if sent_psu:
+            # Same 5s the startup path uses, for the same confirmed
+            # reason: a cold PSU start with the tune sent too soon after
+            # took minutes to lock on a genuinely good signal.
+            time.sleep(5.0)
+
+        # ---- then the tuning ----
+        if _tri_watch_present():
+            print("[picotuner] restore: re-tuning tri_watch RF sources")
+            # Looked up rather than called directly, for the same reason
+            # as _tri_watch_present(): this file is identical on main,
+            # which has no tri_watch at all. The branch can't be reached
+            # there, but relying on that is fragile - an explicit lookup
+            # can't turn into a NameError if anything ever changes.
+            _startup_tune = globals().get('tri_watch_startup_tune')
+            if not _startup_tune:
+                print("[picotuner] restore: tri_watch enabled but its tune "
+                      "function is missing - nothing to re-tune")
+                return
+            _startup_tune()
+            try:
+                _arb = globals().get('tri_watch_arbitrator')
+                _sync = globals().get('_tri_watch_sync_drainers')
+                if _sync:
+                    _sync(_arb.displayed_idx if _arb else None)
+            except Exception as e:
+                print(f"[picotuner] restore: drainer sync failed: {e}")
+            return
+
+        state = load_last_state()
+        if not state or state.get("mode") != "rf":
+            print("[picotuner] restore: no previous RF tuning to restore")
+            return
+
+        req = TuneRequest(freq=state["freq"], sr=state["sr"],
+                          plug=state.get("plug", "a"),
+                          lnb_lo_khz=state.get("lnb_lo_khz", 0))
+        print(f"[picotuner] restore: re-tuning to {state['freq']} kHz / "
+              f"{state['sr']} kS/s on plug {req.plug}")
+        _tune_impl(req)
+
+    except Exception as e:
+        print(f"[picotuner] restore failed: {e}")
+
 
 @app.get("/api/status", tags=["Status"],
          summary="Get current receiver status",
@@ -5183,13 +5560,57 @@ function renderLnbPsuButtons(lnbPsu) {
         const hBtn = document.getElementById('lnb-psu-' + plug + '-h');
         const vBtn = document.getElementById('lnb-psu-' + plug + '-v');
         const toneBtn = document.getElementById('lnb-psu-' + plug + '-tone');
-        hBtn.className = 'btn btn-sm ' + (current === 'hi' ? 'btn-success' : 'btn-outline-secondary');
-        vBtn.className = 'btn btn-sm ' + (current === 'lo' ? 'btn-success' : 'btn-outline-secondary');
-        toneBtn.className = 'btn btn-sm ' + (tone ? 'btn-success' : 'btn-outline-secondary');
+
+        // "absent" means the Picotuner has no voltage generator fitted
+        // on this plug - normally the case for plug B, since only one
+        // is populated as standard and a second has to be added by
+        // hand. Disable rather than leave the buttons looking live:
+        // clicking them turned the button green for one poll and then
+        // reverted, which looked like a fault in Lynx rather than
+        // hardware that simply isn't there.
+        const absent = (current === 'absent');
+        const why = absent
+            ? 'No LNB voltage generator is fitted on plug ' + plug.toUpperCase() +
+              '. The PicoTuner has only one as standard (plug A); a second ' +
+              'can be added by hand - see the BATC PicoTuner wiki.'
+            : null;
+
+        for (const [btn, active] of [[hBtn, current === 'hi'],
+                                     [vBtn, current === 'lo'],
+                                     [toneBtn, tone]]) {
+            btn.disabled = absent;
+            btn.className = 'btn btn-sm ' +
+                (absent ? 'btn-outline-secondary opacity-50'
+                        : (active ? 'btn-success' : 'btn-outline-secondary'));
+            if (absent) {
+                if (!btn.dataset.titleOrig) btn.dataset.titleOrig = btn.title || '';
+                btn.title = why;
+                btn.style.cursor = 'not-allowed';
+                btn.style.pointerEvents = 'auto';   // so the tooltip still shows
+            } else if (btn.dataset.titleOrig !== undefined) {
+                btn.title = btn.dataset.titleOrig;
+                btn.style.cursor = '';
+            }
+        }
+
+        // The surrounding span carries its own explanatory tooltip -
+        // replace it too, or hovering anywhere but the buttons still
+        // claims this is a working control.
+        const wrap = hBtn.parentElement;
+        if (wrap) {
+            if (!wrap.dataset.titleOrig) wrap.dataset.titleOrig = wrap.title || '';
+            wrap.title = absent ? why : wrap.dataset.titleOrig;
+        }
     }
 }
 
 async function onLnbPsuClick(plug, voltage) {
+    // Disabled buttons shouldn't fire, but guard anyway - a keyboard
+    // activation or a stale page could still get here, and sending a
+    // command to a plug with no generator just produces a button that
+    // flicks green and reverts.
+    const probe = document.getElementById('lnb-psu-' + plug + '-h');
+    if (probe && probe.disabled) return;
     // Pressing the currently-active button again turns it off, rather
     // than needing a separate Off button - matches exactly what was
     // asked for. Reads the CURRENT state from the button's own class
@@ -5213,6 +5634,8 @@ async function onLnbPsuClick(plug, voltage) {
 }
 
 async function onLnbToneClick(plug) {
+    const probeT = document.getElementById('lnb-psu-' + plug + '-tone');
+    if (probeT && probeT.disabled) return;
     // Simple on/off toggle, unlike the mutually-exclusive H/V pair
     // above - Hi-Band is rarely/never needed for Amateur TV, so this
     // stays a single button rather than a Hi-Band/Lo-Band pair.
@@ -5842,6 +6265,12 @@ if __name__ == "__main__":
     quality_b.start()
     freshness = threading.Thread(target=rf_mpv_lifecycle_monitor, daemon=True)
     freshness.start()
+    # Picotuner tuning watchdog - catches the tuner losing its tuning
+    # for ANY reason (its own reboot, a lost command, static), which
+    # otherwise leaves a repeater deaf and reporting itself healthy.
+    picotuner_watchdog_thread = threading.Thread(
+        target=picotuner_tuning_watchdog, daemon=True)
+    picotuner_watchdog_thread.start()
     diversity_stuck = threading.Thread(target=diversity_stuck_lock_monitor, daemon=True)
     diversity_stuck.start()
     mer_pub = threading.Thread(target=mer_publisher, daemon=True)
@@ -5919,16 +6348,30 @@ if __name__ == "__main__":
     # moment, there's nothing more useful to do than what already
     # happens (a clear, logged failure) rather than blocking startup
     # on it.
-    if current_lnb_psu_a != "off":
-        picotuner_cmd(f"[to@wh] vgx={current_lnb_psu_a}{'t' if current_lnb_tone_a else ''}")
-    if current_lnb_psu_b != "off":
-        picotuner_rcv2_cmd(f"[to@wh] vgy={current_lnb_psu_b}{'t' if current_lnb_tone_b else ''}")
+    # Sent for both plugs unconditionally, INCLUDING "off". A Picotuner
+    # powers up with its supply on - 18V observed on plug A on real
+    # hardware, every time - so skipping a plug configured off would
+    # leave voltage sitting on it after any power cycle the Pi didn't
+    # share. Commanded from the config rather than current_lnb_psu_a/b,
+    # which by this point may already have been overwritten by the
+    # Picotuner's own broadcast telling us what IT came up with.
+    _startup_lnb = config.get('lnb_psu', {}) or {}
+    _v_a = str(_startup_lnb.get('plug_a', 'off')).lower()
+    _t_a = bool(_startup_lnb.get('plug_a_tone', False))
+    _v_b = str(_startup_lnb.get('plug_b', 'off')).lower()
+    _t_b = bool(_startup_lnb.get('plug_b_tone', False))
+    picotuner_cmd(f"[to@wh] vgx={_v_a if _v_a == 'off' else _v_a + ('t' if _t_a else '')}")
+    # Plug B skipped entirely when the Picotuner reports no generator
+    # fitted - the usual case, since only one is populated as standard.
+    if current_lnb_psu_b != 'absent':
+        picotuner_rcv2_cmd(f"[to@wh] vgy={_v_b if _v_b == 'off' else _v_b + ('t' if _t_b else '')}",
+                           config['picotuner'])
 
     # A short pause for the LNB PSU voltage to physically stabilise
     # before the very first tune attempt below - see this patch's own
     # module docstring for the real-hardware evidence behind this.
     # Only pauses if a PSU command was genuinely sent above.
-    if current_lnb_psu_a != "off" or current_lnb_psu_b != "off":
+    if _v_a != "off" or _v_b != "off":
         LNB_PSU_STARTUP_SETTLE_SECS = 5.0
         time.sleep(LNB_PSU_STARTUP_SETTLE_SECS)
 
