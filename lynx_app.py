@@ -3732,8 +3732,16 @@ def picotuner_tuning_watchdog():
             for plug, (want_v, want_t) in want_lnb.items():
                 got_v = current_lnb_psu_a if plug == 'a' else current_lnb_psu_b
                 got_t = current_lnb_tone_a if plug == 'a' else current_lnb_tone_b
-                if want_v == 'off':
-                    continue          # nothing to lose, nothing to restore
+                # Checked in BOTH directions. An earlier version skipped
+                # plugs configured "off" on the reasoning that there was
+                # nothing to restore - which was exactly backwards. A
+                # Picotuner comes back from a power cycle with its supply
+                # ON (18V observed on plug A on real hardware, every
+                # time), so a plug that should be off is the case that
+                # matters most: unexpected voltage can reach a preamp or
+                # an antenna that isn't expecting it. Failing to apply a
+                # supply costs a picture; applying one that shouldn't be
+                # there can cost hardware.
                 if got_v != want_v or (want_v != 'off' and got_t != want_t):
                     wrong.append(f"LNB supply {plug.upper()} is "
                                  f"{got_v}{'+tone' if got_t else ''} "
@@ -3788,15 +3796,22 @@ def _picotuner_restore_tuning():
         want_lnb = _picotuner_expected_lnb()
         sent_psu = False
         try:
+            # "off" is commanded explicitly, not skipped. The Picotuner
+            # powers up with its supply ON, so leaving a plug alone
+            # because it is configured off would leave 18V sitting on it.
             v_a, t_a = want_lnb['a']
-            if v_a != "off":
-                picotuner_cmd(f"[to@wh] vgx={v_a}{'t' if t_a else ''}")
-                sent_psu = True
+            cmd_a = v_a if v_a == "off" else f"{v_a}{'t' if t_a else ''}"
+            if current_lnb_psu_a != v_a or (v_a != "off" and current_lnb_tone_a != t_a):
+                picotuner_cmd(f"[to@wh] vgx={cmd_a}")
+                print(f"[picotuner] restore: LNB supply A -> {cmd_a}")
+                sent_psu = sent_psu or v_a != "off"
+
             v_b, t_b = want_lnb['b']
-            if v_b != "off":
-                picotuner_rcv2_cmd(f"[to@wh] vgy={v_b}{'t' if t_b else ''}",
-                                   config['picotuner'])
-                sent_psu = True
+            cmd_b = v_b if v_b == "off" else f"{v_b}{'t' if t_b else ''}"
+            if current_lnb_psu_b != v_b or (v_b != "off" and current_lnb_tone_b != t_b):
+                picotuner_rcv2_cmd(f"[to@wh] vgy={cmd_b}", config['picotuner'])
+                print(f"[picotuner] restore: LNB supply B -> {cmd_b}")
+                sent_psu = sent_psu or v_b != "off"
         except Exception as e:
             print(f"[picotuner] restore: LNB supply failed ({e}) - "
                   "continuing to the tune anyway")
@@ -8268,10 +8283,21 @@ if __name__ == "__main__":
     # moment, there's nothing more useful to do than what already
     # happens (a clear, logged failure) rather than blocking startup
     # on it.
-    if current_lnb_psu_a != "off":
-        picotuner_cmd(f"[to@wh] vgx={current_lnb_psu_a}{'t' if current_lnb_tone_a else ''}")
-    if current_lnb_psu_b != "off":
-        picotuner_rcv2_cmd(f"[to@wh] vgy={current_lnb_psu_b}{'t' if current_lnb_tone_b else ''}", config['picotuner'])
+    # Sent for both plugs unconditionally, INCLUDING "off". A Picotuner
+    # powers up with its supply on - 18V observed on plug A on real
+    # hardware, every time - so skipping a plug configured off would
+    # leave voltage sitting on it after any power cycle the Pi didn't
+    # share. Commanded from the config rather than current_lnb_psu_a/b,
+    # which by this point may already have been overwritten by the
+    # Picotuner's own broadcast telling us what IT came up with.
+    _startup_lnb = config.get('lnb_psu', {}) or {}
+    _v_a = str(_startup_lnb.get('plug_a', 'off')).lower()
+    _t_a = bool(_startup_lnb.get('plug_a_tone', False))
+    _v_b = str(_startup_lnb.get('plug_b', 'off')).lower()
+    _t_b = bool(_startup_lnb.get('plug_b_tone', False))
+    picotuner_cmd(f"[to@wh] vgx={_v_a if _v_a == 'off' else _v_a + ('t' if _t_a else '')}")
+    picotuner_rcv2_cmd(f"[to@wh] vgy={_v_b if _v_b == 'off' else _v_b + ('t' if _t_b else '')}",
+                       config['picotuner'])
 
     # A short pause for the LNB PSU voltage to physically stabilise
     # before the very first tune attempt below - confirmed directly on
@@ -8279,8 +8305,11 @@ if __name__ == "__main__":
     # freshly turned on saw Rx A take roughly 4 minutes to lock on an
     # otherwise genuinely good signal; follow-up testing found 2s
     # wasn't quite enough margin, 5s resolved it reliably. Only pauses
-    # if a PSU command was genuinely sent above.
-    if current_lnb_psu_a != "off" or current_lnb_psu_b != "off":
+    # if a voltage was actually turned ON above - keyed off the CONFIG,
+    # not current_lnb_psu_a/b, which may already have been overwritten
+    # by the Picotuner reporting whatever it powered up with, and would
+    # then skip this pause in precisely the case it exists for.
+    if _v_a != "off" or _v_b != "off":
         LNB_PSU_STARTUP_SETTLE_SECS = 5.0
         time.sleep(LNB_PSU_STARTUP_SETTLE_SECS)
 
