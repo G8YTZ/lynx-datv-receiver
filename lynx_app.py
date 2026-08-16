@@ -3626,22 +3626,6 @@ PICOTUNER_RETUNE_SETTLE_SECS = 8.0  # let its firmware finish booting first
 PICOTUNER_RETUNE_COOLDOWN_SECS = 90.0   # don't hammer a tuner that won't take
 
 
-def _tri_watch_present():
-    """True only on builds that actually have tri_watch.
-
-    The main branch doesn't yet, so this code must not assume the name
-    exists - a bare reference would raise NameError inside the watchdog
-    thread, and since that loop catches exceptions it would log the same
-    error every couple of seconds and silently protect nothing at all.
-
-    Deliberately a runtime lookup rather than two different versions of
-    this file: keeping main and beta identical here means no divergence
-    to merge, and no conflict to resolve wrongly the day tri_watch does
-    land on main.
-    """
-    return bool(globals().get('tri_watch_enabled'))
-
-
 def _picotuner_expected_tuning():
     """What each receiver SHOULD be tuned to.
 
@@ -3651,8 +3635,8 @@ def _picotuner_expected_tuning():
     """
     out = {}
     try:
-        if _tri_watch_present():
-            for src in globals().get('tri_watch_sources_cfg', []):
+        if tri_watch_enabled:
+            for src in tri_watch_sources_cfg:
                 if not src.get('enabled') or src.get('type') != 'rf':
                     continue
                 rcv = src.get('rcv')
@@ -3885,24 +3869,12 @@ def _picotuner_restore_tuning():
             time.sleep(5.0)
 
         # ---- then the tuning ----
-        if _tri_watch_present():
+        if tri_watch_enabled:
             print("[picotuner] restore: re-tuning tri_watch RF sources")
-            # Looked up rather than called directly, for the same reason
-            # as _tri_watch_present(): this file is identical on main,
-            # which has no tri_watch at all. The branch can't be reached
-            # there, but relying on that is fragile - an explicit lookup
-            # can't turn into a NameError if anything ever changes.
-            _startup_tune = globals().get('tri_watch_startup_tune')
-            if not _startup_tune:
-                print("[picotuner] restore: tri_watch enabled but its tune "
-                      "function is missing - nothing to re-tune")
-                return
-            _startup_tune()
+            tri_watch_startup_tune()
             try:
-                _arb = globals().get('tri_watch_arbitrator')
-                _sync = globals().get('_tri_watch_sync_drainers')
-                if _sync:
-                    _sync(_arb.displayed_idx if _arb else None)
+                _tri_watch_sync_drainers(tri_watch_arbitrator.displayed_idx
+                                         if tri_watch_arbitrator else None)
             except Exception as e:
                 print(f"[picotuner] restore: drainer sync failed: {e}")
             return
@@ -8352,7 +8324,8 @@ if __name__ == "__main__":
         record_event=record_diagnostic_event,
         get_lnb_state=lambda: (current_lnb_lo_khz, current_lnb_side),
         get_tri_watch_displayed_rcv=lambda: tri_watch_target_rcv,
-        get_tri_watch_enabled=lambda: tri_watch_enabled)
+        get_tri_watch_enabled=lambda: tri_watch_enabled,
+        get_stream_active=_stream_is_being_shown)
     notification_manager.start()
     print("Picotuner monitor started.")
 

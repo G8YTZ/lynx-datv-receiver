@@ -2,6 +2,11 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-08-16
+
+**Fixed**
+- The GPIO Tx pin and Bitfocus Companion's source-switching webhook never fired for a web stream. Both followed the RF tuners' lock state alone, so a repeater relaying a stream would neither key its transmitter nor switch its vision mixer to the receiver. Worse under Tri-Watch, where a stream is a first-class source: the transmitter would drop the moment the arbitrator switched to it, with the picture still going out on the network. Reported from DB0OV. Both now follow "is there a picture to transmit" rather than "is RF locked" - stream, single Rx, diversity and Tri-Watch all drive the pin and the webhook, with the settling timers and schedule-window behaviour unchanged. Deliberately a SEPARATE signal from the RF lock rather than a widening of it, so each output gets the question it actually wants: Companion, the GPIO Tx pin and Slack all fire for a stream, while QRZ does not - a logbook entry needs a callsign and a stream has none. Slack uses its own `stream_message_template`, since the RF template's placeholders (callsign, MER, MODCOD, frequency) mean nothing for a stream; only `{site_callsign}` and `{site_callsign_lower}` apply. The point of the Slack alert is telling people the repeater is in use, and someone watching for that does not care how the picture arrived.
+
 ## 2026-08-15
 
 **Fixed**

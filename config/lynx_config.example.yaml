@@ -82,6 +82,14 @@ notifications:
       MER: {mer}dB
 
       Watch the web stream at: rtmp://rtmp.batc.org.uk/live/{site_callsign_lower}'
+    # Sent when a STREAM becomes the active input, rather than RF. Only
+    # {site_callsign} and {site_callsign_lower} are available here - a
+    # stream has no callsign, MER or MODCOD to report. Fired so people
+    # still get told the repeater is in use; QRZ is deliberately not,
+    # since a logbook entry needs a callsign.
+    stream_message_template: '{site_callsign}''s stream input is active!
+
+      Watch the web stream at: rtmp://rtmp.batc.org.uk/live/{site_callsign_lower}'
     settle_secs: 15.0
     webhook_url: ''       # your Slack incoming webhook URL, if using Slack notifications
 
