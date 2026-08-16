@@ -3626,6 +3626,53 @@ PICOTUNER_RETUNE_SETTLE_SECS = 8.0  # let its firmware finish booting first
 PICOTUNER_RETUNE_COOLDOWN_SECS = 90.0   # don't hammer a tuner that won't take
 
 
+def _tri_watch_present():
+    """True only on builds that actually have tri_watch.
+
+    The main branch doesn't yet, so this code must not assume the name
+    exists - a bare reference would raise NameError inside the watchdog
+    thread, and since that loop catches exceptions it would log the same
+    error every couple of seconds and silently protect nothing at all.
+
+    Deliberately a runtime lookup rather than two different versions of
+    this file: keeping main and beta identical here means no divergence
+    to merge, and no conflict to resolve wrongly the day tri_watch does
+    land on main.
+    """
+    return bool(globals().get('tri_watch_enabled'))
+
+
+def _stream_is_being_shown():
+    """True when a web stream is what's currently on screen.
+
+    Supplied to the notifications manager so Companion's source-switching
+    webhook and the GPIO Tx pin can follow "is there a picture to
+    transmit" rather than "is RF locked" - which are different questions
+    in three of the four modes. A repeater relaying a stream needs its
+    transmitter keyed and its vision mixer switched exactly as it would
+    for an RF signal.
+
+    Under tri_watch, follows whichever source the arbitrator is actually
+    displaying, so a background stream that isn't on screen doesn't key
+    anything. Outside it, plain stream mode is the whole answer.
+    """
+    try:
+        tw = config.get('tri_watch', {}) or {}
+        if tw.get('enabled') and tri_watch_arbitrator is not None:
+            idx = tri_watch_arbitrator.displayed_idx
+            if idx is None:
+                return False
+            try:
+                src = tri_watch_sources_cfg[idx]
+            except (IndexError, TypeError):
+                return False
+            return src.get('type') == 'stream'
+        return current_mode == 'stream'
+    except Exception as e:
+        print(f"[notifications] stream-active check failed: {e}")
+        return False
+
+
 def _picotuner_expected_tuning():
     """What each receiver SHOULD be tuned to.
 
@@ -3635,8 +3682,8 @@ def _picotuner_expected_tuning():
     """
     out = {}
     try:
-        if tri_watch_enabled:
-            for src in tri_watch_sources_cfg:
+        if _tri_watch_present():
+            for src in globals().get('tri_watch_sources_cfg', []):
                 if not src.get('enabled') or src.get('type') != 'rf':
                     continue
                 rcv = src.get('rcv')
@@ -3869,12 +3916,22 @@ def _picotuner_restore_tuning():
             time.sleep(5.0)
 
         # ---- then the tuning ----
-        if tri_watch_enabled:
+        if _tri_watch_present():
             print("[picotuner] restore: re-tuning tri_watch RF sources")
-            tri_watch_startup_tune()
+            # Looked up rather than called directly, for the same reason
+            # as _tri_watch_present(): this file is identical on main,
+            # which has no tri_watch at all.
+            _startup_tune = globals().get('tri_watch_startup_tune')
+            if not _startup_tune:
+                print("[picotuner] restore: tri_watch enabled but its tune "
+                      "function is missing - nothing to re-tune")
+                return
+            _startup_tune()
             try:
-                _tri_watch_sync_drainers(tri_watch_arbitrator.displayed_idx
-                                         if tri_watch_arbitrator else None)
+                _arb = globals().get('tri_watch_arbitrator')
+                _sync = globals().get('_tri_watch_sync_drainers')
+                if _sync:
+                    _sync(_arb.displayed_idx if _arb else None)
             except Exception as e:
                 print(f"[picotuner] restore: drainer sync failed: {e}")
             return
