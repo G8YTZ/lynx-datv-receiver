@@ -2516,6 +2516,43 @@ def _tri_watch_present():
     return bool(globals().get('tri_watch_enabled'))
 
 
+def _stream_is_being_shown():
+    """True when a web stream is what's currently on screen.
+
+    Supplied to the notifications manager so Companion's source-switching
+    webhook and the GPIO Tx pin can follow "is there a picture to
+    transmit" rather than "is RF locked" - which are different questions
+    in three of the four modes. A repeater relaying a stream needs its
+    transmitter keyed and its vision mixer switched exactly as it would
+    for an RF signal.
+
+    tri_watch names are looked up rather than referenced directly, for
+    the same reason as _tri_watch_present(): this function is identical
+    on main, which has no tri_watch at all, and a bare reference would
+    raise NameError the first time it ran. Under tri_watch it follows
+    whichever source the arbitrator is actually displaying, so a
+    background stream that isn't on screen doesn't key anything.
+    Outside it, plain stream mode is the whole answer.
+    """
+    try:
+        if _tri_watch_present():
+            arb = globals().get('tri_watch_arbitrator')
+            if arb is None:
+                return False
+            idx = arb.displayed_idx
+            if idx is None:
+                return False
+            try:
+                src = globals().get('tri_watch_sources_cfg', [])[idx]
+            except (IndexError, TypeError):
+                return False
+            return src.get('type') == 'stream'
+        return current_mode == 'stream'
+    except Exception as e:
+        print(f"[notifications] stream-active check failed: {e}")
+        return False
+
+
 def _picotuner_expected_tuning():
     """What each receiver SHOULD be tuned to.
 
@@ -2745,7 +2782,10 @@ def _picotuner_restore_tuning():
             if current_lnb_psu_b == 'absent':
                 pass          # no generator fitted - nothing to command
             elif current_lnb_psu_b != v_b or (v_b != "off" and current_lnb_tone_b != t_b):
-                picotuner_rcv2_cmd(f"[to@wh] vgy={cmd_b}", config['picotuner'])
+                # NB: main's picotuner_rcv2_cmd() takes the command
+                # ONLY - beta's takes a config dict as well. Lifting
+                # beta's call form across broke main's startup entirely.
+                picotuner_rcv2_cmd(f"[to@wh] vgy={cmd_b}")
                 print(f"[picotuner] restore: LNB supply B -> {cmd_b}")
                 sent_psu = sent_psu or v_b != "off"
         except Exception as e:
@@ -6297,7 +6337,8 @@ if __name__ == "__main__":
     notification_manager = lynx_notifications.NotificationManager(
         picotuner_state, picotuner_state_b, lambda: config,
         record_event=record_diagnostic_event,
-        get_lnb_state=lambda: (current_lnb_lo_khz, current_lnb_side))
+        get_lnb_state=lambda: (current_lnb_lo_khz, current_lnb_side),
+        get_stream_active=_stream_is_being_shown)
     notification_manager.start()
     print("Picotuner monitor started.")
 
@@ -6364,8 +6405,7 @@ if __name__ == "__main__":
     # Plug B skipped entirely when the Picotuner reports no generator
     # fitted - the usual case, since only one is populated as standard.
     if current_lnb_psu_b != 'absent':
-        picotuner_rcv2_cmd(f"[to@wh] vgy={_v_b if _v_b == 'off' else _v_b + ('t' if _t_b else '')}",
-                           config['picotuner'])
+        picotuner_rcv2_cmd(f"[to@wh] vgy={_v_b if _v_b == 'off' else _v_b + ('t' if _t_b else '')}")
 
     # A short pause for the LNB PSU voltage to physically stabilise
     # before the very first tune attempt below - see this patch's own

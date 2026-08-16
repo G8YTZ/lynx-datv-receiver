@@ -2,6 +2,12 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-08-16
+
+**Fixed**
+- Lynx would not start at all on main. The Picotuner LNB restore added on 2026-08-15 was ported across from beta, where `picotuner_rcv2_cmd()` takes a config dict as a second argument; on main it takes the command only. Both call sites raised `TypeError` at startup, before the web app came up. Fixed by matching main's own signature.
+- The GPIO Tx pin and Bitfocus Companion's source-switching webhook never fired for a web stream. Both followed the RF tuners' lock state alone, so a repeater relaying a stream would neither key its transmitter nor switch its vision mixer to the receiver. Reported from DB0OV. Both now follow "is there a picture to transmit" rather than "is RF locked", with the settling timers and schedule-window behaviour unchanged. Deliberately a SEPARATE signal from the RF lock rather than a widening of it, so each output gets the question it actually wants: Companion, the GPIO Tx pin and Slack all fire for a stream, while QRZ does not - a logbook entry needs a callsign and a stream has none. Slack uses its own `stream_message_template`, since the RF template's placeholders (callsign, MER, MODCOD, frequency) mean nothing for a stream; only `{site_callsign}` and `{site_callsign_lower}` apply.
+
 ## 2026-08-15
 
 **Fixed**

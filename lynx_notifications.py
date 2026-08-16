@@ -420,10 +420,16 @@ class NotificationManager:
     POLL_SECS = 1.0
 
     def __init__(self, picotuner_state, picotuner_state_b, get_config, record_event=None,
-                 get_lnb_state=None):
+                 get_lnb_state=None, get_stream_active=None):
         self.picotuner_state = picotuner_state
         self.picotuner_state_b = picotuner_state_b
         self.get_config = get_config
+        # Answers "is a web stream what's currently being shown". Supplied
+        # as a callable for the same reason get_config is: it has to be
+        # evaluated fresh, and this module deliberately doesn't reach into
+        # lynx_app's globals. Optional, so an older caller still works -
+        # it just never reports a stream as active input.
+        self.get_stream_active = get_stream_active or (lambda: False)
         # Lets this module log onto the same, persistent Diagnostics page
         # timeline lynx_app.py already uses for mpv events, rather than
         # only to the terminal - defaults to a harmless no-op so this
@@ -464,6 +470,11 @@ class NotificationManager:
         self._tx_power_up_action = None
         self._tx_power_down_action = None
         self._tx_was_in_window = False
+        # Companion + GPIO Tx run off "is there a picture to transmit",
+        # which is NOT the same question as "is RF locked" - see _poll().
+        self._confirmed_active = False
+        self._active_streak = 0
+        self._inactive_streak = 0
         self._tx_was_locked = False   # Tx pin's own view of lock state, tracked
                                         # separately from self._confirmed_locked so the
                                         # schedule-driven and signal-driven paths can
@@ -558,6 +569,44 @@ class NotificationManager:
         raw_locked = self.picotuner_state.get("locked", False) or \
                      (diversity_enabled and self.picotuner_state_b.get("locked", False))
 
+        # "Is there a picture to transmit" - which is NOT the same
+        # question as "is RF locked", and conflating the two was a real,
+        # reported bug (DB0OV, Aug 2026). Companion's source-switching
+        # webhook and the GPIO Tx pin exist to key a transmitter and
+        # switch a vision mixer to the receiver when it has something to
+        # show. A web stream is something to show.
+        #
+        # Deliberately kept SEPARATE from raw_locked rather than folded
+        # into it, so each output gets the question it actually wants:
+        # Companion, the Tx pin and Slack all fire for a stream, while
+        # QRZ does not - a logbook entry needs a callsign, and a stream
+        # has none.
+        try:
+            stream_active = bool(self.get_stream_active())
+        except Exception as e:
+            print(f"[notifications] stream-active check failed: {e}")
+            stream_active = False
+        raw_active = raw_locked or stream_active
+
+        if raw_active:
+            self._inactive_streak = 0
+            self._active_streak += 1
+        else:
+            self._active_streak = 0
+            self._inactive_streak += 1
+
+        if self._active_streak >= self.LOCK_CONFIRM_POLLS and not self._confirmed_active:
+            self._confirmed_active = True
+            why = "RF lock" if raw_locked else "stream"
+            print(f"[notifications] confirmed ACTIVE INPUT ({why}) - "
+                  f"arming Companion/GPIO Tx settle timers")
+            self._on_confirmed_active(notif_cfg, cfg, stream_only=not raw_locked)
+        elif self._inactive_streak >= self.LOCK_CONFIRM_POLLS and self._confirmed_active:
+            self._confirmed_active = False
+            print("[notifications] confirmed NO ACTIVE INPUT - "
+                  "cancelling pending Companion/GPIO Tx timers")
+            self._on_confirmed_inactive(notif_cfg)
+
         if raw_locked:
             self._loss_streak = 0
             self._lock_streak += 1
@@ -621,12 +670,6 @@ class NotificationManager:
     def _on_confirmed_lock(self, notif_cfg, cfg):
         site_callsign = cfg.get('site', {}).get('callsign', '')
 
-        # We're locked again - cancel anything the unlock side had
-        # pending a moment ago, so it can't fire late against a signal
-        # that's actually back.
-        self._cancel_action('companion_unlock')
-        self._cancel_action('companion_gpio_unlock')
-
         qrz_cfg = notif_cfg.get('qrz', {})
         if qrz_cfg.get('enabled', False):
             delay = float(qrz_cfg.get('settle_secs', 15.0))
@@ -636,6 +679,30 @@ class NotificationManager:
         if slack_cfg.get('enabled', False):
             delay = float(slack_cfg.get('settle_secs', 15.0))
             self._arm_action('slack', delay, lambda: self._fire_slack(slack_cfg, site_callsign), "Slack")
+
+    def _on_confirmed_active(self, notif_cfg, cfg=None, stream_only=False):
+        """Companion webhook + its GPIO mirror: driven by "there is a
+        picture to transmit", not by RF lock alone. Settling timers and
+        cancellation behaviour are unchanged - only the question that
+        triggers them.
+
+        Also fires Slack when the activity is a STREAM rather than RF.
+        The point of the Slack alert is telling people the repeater is
+        in use, and someone watching for that doesn't care how the
+        picture arrived. QRZ is not fired: a logbook entry needs a
+        callsign and a stream has none.
+        """
+        self._cancel_action('companion_unlock')
+        self._cancel_action('companion_gpio_unlock')
+
+        if stream_only and cfg is not None:
+            slack_cfg = notif_cfg.get('slack', {})
+            if slack_cfg.get('enabled', False):
+                site_callsign = cfg.get('site', {}).get('callsign', '')
+                delay = float(slack_cfg.get('settle_secs', 15.0))
+                self._arm_action('slack_stream', delay,
+                                  lambda: self._fire_slack_stream(slack_cfg, site_callsign),
+                                  "Slack-stream")
 
         comp_cfg = notif_cfg.get('companion', {})
         if comp_cfg.get('enabled', False) and comp_cfg.get('lock_url'):
@@ -648,21 +715,16 @@ class NotificationManager:
             if gpio is not None and gpio.available:
                 # Deliberately the SAME settling timer as the Companion
                 # webhook above, not a separate one - this pin exists to
-                # mirror the webhook-driven lock/unlock for relay-based
+                # mirror the webhook-driven switching for relay-based
                 # input switching, not to introduce its own timing.
                 delay = float(comp_cfg.get('lock_settle_secs', 5.0))
                 self._arm_action('companion_gpio_lock', delay,
                                   lambda: gpio.set(True), "Companion-GPIO-lock")
 
-    def _on_confirmed_unlock(self, notif_cfg):
-        # We're unlocked again - cancel anything the lock side had
-        # pending, matching the reference code's explicit design: a
-        # webhook (or now, GPIO change) must not fire if the state goes
-        # back to unlocked during its own settling time.
-        self._cancel_action('qrz')
-        self._cancel_action('slack')
+    def _on_confirmed_inactive(self, notif_cfg):
         self._cancel_action('companion_lock')
         self._cancel_action('companion_gpio_lock')
+        self._cancel_action('slack_stream')
 
         comp_cfg = notif_cfg.get('companion', {})
         if comp_cfg.get('enabled', False) and comp_cfg.get('unlock_url'):
@@ -676,6 +738,14 @@ class NotificationManager:
                 delay = float(comp_cfg.get('unlock_settle_secs', 5.0))
                 self._arm_action('companion_gpio_unlock', delay,
                                   lambda: gpio.set(False), "Companion-GPIO-unlock")
+
+    def _on_confirmed_unlock(self, notif_cfg):
+        # We're unlocked again - cancel anything the lock side had
+        # pending, matching the reference code's explicit design: a
+        # webhook (or now, GPIO change) must not fire if the state goes
+        # back to unlocked during its own settling time.
+        self._cancel_action('qrz')
+        self._cancel_action('slack')
 
     def _fire_qrz(self, qrz_cfg, site_callsign):
         api_key = qrz_cfg.get('api_key', '')
@@ -742,6 +812,37 @@ class NotificationManager:
             self.record_event("qrz_failed", f"Exception during submission - {type(e).__name__}: {e}",
                                count_as_mpv_restart=False)
 
+    def _fire_slack_stream(self, slack_cfg, site_callsign):
+        """Slack for stream activity.
+
+        A stream is worth telling people about - that's the whole point
+        of the alert, and someone watching for activity on the repeater
+        doesn't care how the picture arrived. But the normal template's
+        placeholders (rx_callsign, MER, MODCOD, frequency) mean nothing
+        for a stream, so this uses its own template with only the
+        placeholders that do apply. QRZ is deliberately NOT fired for a
+        stream: a logbook entry needs a callsign, and there isn't one.
+        """
+        webhook_url = slack_cfg.get('webhook_url', '')
+        template = slack_cfg.get(
+            'stream_message_template',
+            "{site_callsign}'s stream input is active!\n\n"
+            "Watch the web stream at: rtmp://rtmp.batc.org.uk/live/{site_callsign_lower}")
+        if not webhook_url or not template:
+            return
+        placeholders = {
+            "site_callsign": site_callsign,
+            "site_callsign_lower": site_callsign.lower(),
+        }
+        try:
+            send_slack_message(webhook_url, template, placeholders)
+        except KeyError as e:
+            print(f"[notifications] Slack: stream template uses unknown "
+                  f"placeholder {e} - skipping. Only {{site_callsign}} and "
+                  f"{{site_callsign_lower}} are available for a stream.")
+        except Exception as e:
+            print(f"[notifications] Slack: stream send failed - {type(e).__name__}: {e}")
+
     def _fire_slack(self, slack_cfg, site_callsign):
         webhook_url = slack_cfg.get('webhook_url', '')
         template = slack_cfg.get('message_template', '')
@@ -799,7 +900,10 @@ class NotificationManager:
             tx_cfg.get('schedule_weekend_start', ''),
             tx_cfg.get('schedule_weekend_end', ''),
         )
-        locked = self._confirmed_locked
+        # "Is there a picture to transmit", not "is RF locked" - a
+        # stream is equally something worth keying a transmitter for.
+        # The schedule-window logic below is untouched.
+        locked = self._confirmed_active
         power_up_secs = float(tx_cfg.get('power_up_settle_secs', 5.0))
         power_down_secs = float(tx_cfg.get('power_down_settle_secs', 900.0))
 
