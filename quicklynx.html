@@ -15,7 +15,12 @@
     --cyan: #4fc3f7;
     --red: #ff5a5a;
     --text: #d7dde5;
-    --text-dim: #6b7684;
+    /* Raised from #6b7684, which measured 4.2:1 against the darkest
+       background - below the 4.5:1 minimum for small text, and reported
+       as hard to read. #9aa7b8 gives 8.0:1 on the dark panels and 7.4:1
+       on the lighter ones, comfortable without losing the distinction
+       from --text. */
+    --text-dim: #9aa7b8;
     --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Consolas, monospace;
   }
   * { box-sizing: border-box; }
@@ -52,7 +57,9 @@
   .status-item { display: flex; align-items: center; gap: 6px; color: var(--text-dim); }
   .dot {
     width: 8px; height: 8px; border-radius: 50%;
-    background: var(--text-dim);
+    /* Kept at the old, dimmer value: this is an "inactive" indicator,
+       and brightening it would make an idle dot look lit. */
+    background: #6b7684;
     transition: background 0.2s;
   }
   .dot.ok { background: var(--trace); box-shadow: 0 0 6px var(--trace); }
@@ -134,7 +141,7 @@
     /* Set from settings at runtime - see applyChatWidth(). 300px is a
        sensible minimum but looks cramped on a 1920-wide display, where
        around 600px reads much better (reported by G8GKQ). */
-    width: var(--chat-width, 300px);
+    width: var(--chat-width, 500px);
     flex-shrink: 0;
     display: flex;
     flex-direction: column;
@@ -255,8 +262,8 @@
     </div>
 
     <label>Chat column width (px)</label>
-    <input id="chatWidth" type="number" min="200" max="900" step="10" value="300">
-    <div class="hint">300 suits a narrow window; around 600 reads better on a 1920-wide display.</div>
+    <input id="chatWidth" type="number" min="200" max="900" step="10" value="500">
+    <div class="hint">500 by default. Narrower suits a small window; around 600 reads well on a 1920-wide display.</div>
   </div>
   <div class="field">
     <label>Default tuner</label>
@@ -374,7 +381,7 @@ const DEFAULT_SETTINGS = {
     lnbOffsetKhz: 9750000,
     defaultTuner: 'a',
     wsUrl: 'wss://eshail.batc.org.uk/wb/fft',
-    chatWidthPx: 300,
+    chatWidthPx: 500,
 };
 let settings = Object.assign({}, DEFAULT_SETTINGS);
 
@@ -420,7 +427,7 @@ function applyChatWidth() {
     // Clamped rather than trusted: a stray keystroke in the settings box
     // could otherwise leave the chat filling the window with no spectrum
     // visible, and no obvious way back.
-    const w = Math.max(200, Math.min(900, parseInt(settings.chatWidthPx) || 300));
+    const w = Math.max(200, Math.min(900, parseInt(settings.chatWidthPx) || 500));
     document.documentElement.style.setProperty('--chat-width', w + 'px');
     if (typeof resizeCanvas === 'function') resizeCanvas();
 }
@@ -430,7 +437,7 @@ function saveSettings() {
     settings.lnbOffsetKhz = parseInt(document.getElementById('lnbOffset').value) || 9750000;
     settings.defaultTuner = document.getElementById('defaultTuner').value;
     settings.wsUrl = document.getElementById('wsUrl').value.trim();
-    settings.chatWidthPx = parseInt(document.getElementById('chatWidth').value) || 300;
+    settings.chatWidthPx = parseInt(document.getElementById('chatWidth').value) || 500;
     applyChatWidth();
     localStorage.setItem('quicklynx-settings', JSON.stringify(settings));
     toggleSettings();
