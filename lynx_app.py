@@ -809,6 +809,27 @@ def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
     print(f"[mpv_render] did NOT confirm rendering within {timeout:.1f}s timeout")
     return False
 
+_audio_resolved_cache = {"value": "", "at": 0.0}
+
+
+def _cached_audio_device_resolved():
+    """What the configured device actually resolves to.
+
+    Cached for a minute: resolving "hdmi" shells out to mpv, and the
+    status endpoint is polled every second by the overlay - running mpv
+    that often to answer a question whose answer almost never changes
+    would be silly.
+    """
+    dev = str(config.get('display', {}).get('audio_device', 'hdmi')).strip()
+    if dev.lower() != 'hdmi':
+        return dev
+    now = time.time()
+    if now - _audio_resolved_cache["at"] > 60:
+        _audio_resolved_cache["value"] = _first_hdmi_device() or ""
+        _audio_resolved_cache["at"] = now
+    return _audio_resolved_cache["value"]
+
+
 def audio_device_flag():
     """The --audio-device flag for mpv, or nothing if set to auto.
 
@@ -4113,6 +4134,12 @@ def get_status():
             "portable_locator": config.get('notifications', {}).get('qrz', {}).get('portable_locator', ''),
             "ppm_style": config.get('display', {}).get('ppm_style', 'full_fat'),
             "site_locator": config.get('site', {}).get('locator', ''),
+            # Published so the overlay's PPM can follow mpv to whichever
+            # device it is actually using. Without this the meter taps
+            # the default sink and would read silence whenever mpv is
+            # sent somewhere else.
+            "audio_device": config.get('display', {}).get('audio_device', 'hdmi'),
+            "audio_device_resolved": _cached_audio_device_resolved(),
             "site_location": config.get('site', {}).get('location', ''),
             # End-of-contact map: None unless a card is due to be on
             # screen right now. The overlay only has to check presence -

@@ -69,6 +69,7 @@ import json
 import threading
 import time
 import subprocess
+import re
 import struct
 import signal
 import faulthandler
@@ -243,6 +244,8 @@ state = {
     "level_b": "",
     "level": "",
     "dbm": "",
+    "audio_device": "hdmi",           # which device mpv is sending audio to
+    "audio_device_resolved": "",      # what "hdmi" actually resolved to
     "ppm_position_l": None,   # set by audio_ppm_monitor() - None until the audio tap produces its first real reading
     "ppm_level_dbfs_l": None,
     "ppm_position_r": None,
@@ -297,6 +300,103 @@ _last_notification_sound_played_for = None  # triggered_at of the last tri_watch
                                               # distinguished from the same one still
                                               # being displayed across multiple polls
 
+def _alsa_card_from_mpv_device(mpv_device):
+    """The ALSA card name inside an mpv --audio-device string.
+
+    mpv reports devices as e.g.:
+        alsa/sysdefault:CARD=vc4hdmi0
+        alsa/hdmi:CARD=vc4hdmi0,DEV=0
+        alsa/front:CARD=Device,DEV=0
+
+    The CARD= token is the stable part, and it is also what PipeWire
+    records against its own nodes, so it is the sensible thing to match
+    on. Returns None for anything without one.
+    """
+    if not mpv_device:
+        return None
+    m = re.search(r'CARD=([A-Za-z0-9_\-]+)', mpv_device)
+    return m.group(1) if m else None
+
+
+def _pipewire_monitor_for_card(card_name):
+    """The PipeWire monitor source matching an ALSA card, or None.
+
+    Asks pw-dump for the node list and looks for a sink whose ALSA card
+    properties match. Node names look like
+
+        alsa_output.platform-fef00700.hdmi.hdmi-stereo
+
+    which cannot be derived from mpv's name by string manipulation - so
+    this matches on the card recorded in each node's properties rather
+    than trying to translate one naming scheme into the other.
+    """
+    if not card_name:
+        return None
+    try:
+        r = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=10)
+        nodes = json.loads(r.stdout)
+    except Exception as e:
+        print(f"[ppm] could not read the PipeWire node list: {e}")
+        return None
+
+    for n in nodes:
+        try:
+            if n.get("type") != "PipeWire:Interface:Node":
+                continue
+            props = n.get("info", {}).get("props", {})
+            if props.get("media.class") != "Audio/Sink":
+                continue
+            haystack = " ".join(str(props.get(k, "")) for k in (
+                "alsa.card_name", "api.alsa.card.name", "alsa.long_card_name",
+                "api.alsa.path", "node.name", "device.name"))
+            if card_name.lower() in haystack.lower():
+                name = props.get("node.name")
+                if name:
+                    return name + ".monitor"
+        except Exception:
+            continue
+    return None
+
+
+def ppm_monitor_target():
+    """What pw-cat should listen to for the PPM.
+
+    The meter taps the system's audio output independently of mpv, which
+    is deliberate - mpv's own astats path is broken upstream. But that
+    independence became a problem once mpv's output device was made
+    selectable: with mpv sent to HDMI while the default sink is, say, a
+    USB dongle, the meter would sit watching a silent dongle and read
+    nothing, with no indication why.
+
+    So the target follows mpv's configured device where it can be
+    resolved, and falls back to the default sink otherwise - which is
+    the previous behaviour, and correct when mpv is on the default sink
+    anyway.
+    """
+    fallback = "@DEFAULT_SINK@.monitor"
+    try:
+        dev = state.get("audio_device", "hdmi")
+        if not dev or str(dev).lower() == "auto":
+            return fallback
+        # "hdmi" is resolved by lynx_app into a real device name and
+        # published in the status, so the overlay does not have to
+        # duplicate that logic.
+        resolved = state.get("audio_device_resolved") or dev
+        card = _alsa_card_from_mpv_device(resolved)
+        if not card:
+            return fallback
+        target = _pipewire_monitor_for_card(card)
+        if not target:
+            print(f"[ppm] no PipeWire sink found for ALSA card '{card}' - "
+                  f"falling back to the default sink. The meter may read "
+                  f"nothing if mpv is playing to a different device.")
+            return fallback
+        return target
+    except Exception as e:
+        print(f"[ppm] target resolution failed ({e}) - using the default sink")
+        return fallback
+
+
 def audio_ppm_monitor():
     """Background thread: drives the stereo PPM meter with real, live
     audio levels - taps the system's actual audio output via PipeWire
@@ -336,12 +436,29 @@ def audio_ppm_monitor():
     meter_l = PpmBallistics()
     meter_r = PpmBallistics()
     proc = None
+    target = None
+    target_for_device = None
 
     while True:
         try:
+            # Re-resolve when the configured device changes, so altering
+            # it on the Config page moves the meter with it rather than
+            # needing a restart.
+            current_device = state.get("audio_device", "hdmi")
+            if target is None or current_device != target_for_device:
+                target = ppm_monitor_target()
+                target_for_device = current_device
+                print(f"[ppm] monitoring {target}")
+                if proc is not None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    proc = None
+
             if proc is None or proc.poll() is not None:
                 proc = subprocess.Popen(
-                    ["pw-cat", "-r", "--target=@DEFAULT_SINK@.monitor",
+                    ["pw-cat", "-r", f"--target={target}",
                      "--format=s16", "--rate", str(SAMPLE_RATE),
                      "--channels", str(CHANNELS), "-"],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
@@ -528,6 +645,8 @@ def poll_status():
             state["mpv_transitioning"] = lynx.get('mpv_transitioning', False)
             state["portable_locator"] = lynx.get('portable_locator', '')
             state["site_locator"] = lynx.get('site_locator', '')
+            state["audio_device"] = lynx.get('audio_device', 'hdmi')
+            state["audio_device_resolved"] = lynx.get('audio_device_resolved', '')
             state["site_location"] = lynx.get('site_location', '')
             # End-of-contact map. As with the tri_watch bubble, the
             # backend has already decided whether a card is due - this
