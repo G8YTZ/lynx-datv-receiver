@@ -8071,6 +8071,27 @@ async function updateStatus() {
     try {
         const s = await api('GET', '/api/status');
         
+        // QuickLynx button. Deliberately here, at the top of
+        // updateStatus and outside every branch: an earlier version sat
+        // inside the tuner-B handling, so on a plain RF receiver it
+        // never ran and the button stayed greyed however the setting
+        // was saved.
+        const qlBtn = document.getElementById('quicklynx-btn');
+        if (qlBtn) {
+            if (s.lynx?.quicklynx_enabled) {
+                qlBtn.classList.remove('disabled');
+                qlBtn.removeAttribute('aria-disabled');
+                qlBtn.title = 'Open QuickLynx - the QO-100 wideband spectrum, '
+                            + 'click a signal to tune this receiver to it.';
+            } else {
+                qlBtn.classList.add('disabled');
+                qlBtn.setAttribute('aria-disabled', 'true');
+                qlBtn.title = 'QuickLynx is switched off. It shows the QO-100 '
+                            + 'wideband spectrum and lets you click a signal to '
+                            + 'tune this receiver to it. Turn it on in Config to use it.';
+            }
+        }
+
         // Mode badge
         const mode = s.lynx?.mode || 'idle';
         const badge = document.getElementById('mode-badge');
@@ -8235,25 +8256,6 @@ async function updateStatus() {
             // not a cumulative-since-start figure. Diversity-only,
             // deliberately not shown for tri_watch - there's no
             // combiner running in that mode, so nothing to report here.
-            // QuickLynx button: enabled or greyed with an explanation,
-            // rather than appearing and disappearing - a button that is
-            // simply absent teaches nobody the feature exists.
-            const qlBtn = document.getElementById('quicklynx-btn');
-            if (qlBtn) {
-                if (data.lynx?.quicklynx_enabled) {
-                    qlBtn.classList.remove('disabled');
-                    qlBtn.removeAttribute('aria-disabled');
-                    qlBtn.title = 'Open QuickLynx - the QO-100 wideband spectrum, '
-                                + 'click a signal to tune this receiver to it.';
-                } else {
-                    qlBtn.classList.add('disabled');
-                    qlBtn.setAttribute('aria-disabled', 'true');
-                    qlBtn.title = 'QuickLynx is switched off. It shows the QO-100 '
-                                + 'wideband spectrum and lets you click a signal to '
-                                + 'tune this receiver to it. Turn it on in Config to use it.';
-                }
-            }
-
             if (div.enabled) {
                 const statsLine = document.getElementById('diversity-stats-line');
                 const siteName = document.getElementById('site-name');
@@ -8307,6 +8309,8 @@ async function updateStatus() {
 async function loadPresets() {
     try {
         const data = await api('GET', '/api/presets');
+
+        }
         const local = (data.local || []).map(p => ({...p, _local: true}));
         const all = [...local, ...(data.ryde || [])];
         const el = document.getElementById('preset-list');
