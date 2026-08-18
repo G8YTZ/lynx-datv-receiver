@@ -391,10 +391,30 @@ class MapRenderer:
             return H - (lat - y0) / (y1 - y0) * H
 
         def visible(parts):
+            """Does this shape's bounding box overlap the window?
+
+            Deliberately a bounding-box test, not a "does any vertex fall
+            inside the window" test. The latter is the obvious thing to
+            write and it fails badly at close range: for a local contact
+            the window may be only 20-30km across and sit entirely INSIDE
+            a country's outline, so not one vertex of that polygon is in
+            view and the whole country gets skipped as invisible. The
+            result is a card showing town names floating on an empty sea,
+            with no land at all - reported from Nordenham at 19km.
+
+            A bounding box that merely overlaps is cheap to compute and
+            cannot make that mistake: a polygon enclosing the window has
+            a box that contains it.
+            """
+            pad = 0.5
             for ring in parts:
-                for px, py in ring:
-                    if x0 - 0.5 < px < x1 + 0.5 and y0 - 0.5 < py < y1 + 0.5:
-                        return True
+                if not ring:
+                    continue
+                xs = [pt[0] for pt in ring]
+                ys = [pt[1] for pt in ring]
+                if (min(xs) <= x1 + pad and max(xs) >= x0 - pad and
+                        min(ys) <= y1 + pad and max(ys) >= y0 - pad):
+                    return True
             return False
 
         def path(parts, close):

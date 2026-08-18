@@ -2,6 +2,11 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-08-18
+
+**Fixed**
+- Pathfinder drew no land at all for close-range contacts outside the UK - just town names floating on an empty sea. Reported from Nordenham (DL5BCA) at 19km. The visibility test asked whether any VERTEX of a shape fell inside the window, which fails when the window is smaller than the shape and sits entirely inside it: at 19km the frame is about 27km across and lies well within Germany's outline, so not one vertex of that polygon was in view and the whole country was skipped as invisible. Now a bounding-box overlap test, which cannot make that mistake. Nobody had seen it before because Great Britain is an island - the UK's country polygon IS its coastline, so any UK contact has vertices within a few tens of kilometres and passed by luck. The first continental user at close range hit it immediately.
+
 ## 2026-08-16
 
 **Fixed**
