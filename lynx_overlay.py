@@ -318,6 +318,12 @@ def _alsa_card_from_mpv_device(mpv_device):
     return m.group(1) if m else None
 
 
+def _squash(text):
+    """Lowercase with punctuation removed, for comparing names that the
+    same system spells differently in different places."""
+    return re.sub(r'[^a-z0-9]', '', str(text or "").lower())
+
+
 def _pipewire_monitor_for_card(card_name):
     """The PipeWire monitor source matching an ALSA card, or None.
 
@@ -348,8 +354,15 @@ def _pipewire_monitor_for_card(card_name):
                 continue
             haystack = " ".join(str(props.get(k, "")) for k in (
                 "alsa.card_name", "api.alsa.card.name", "alsa.long_card_name",
-                "api.alsa.path", "node.name", "device.name"))
-            if card_name.lower() in haystack.lower():
+                "api.alsa.path", "api.alsa.pcm.card", "alsa.card",
+                "node.name", "device.name", "node.description"))
+            # Compared with punctuation stripped from both sides. ALSA
+            # calls the card "vc4hdmi0" while PipeWire records it as
+            # "vc4-hdmi-0", so a plain substring test fails on the
+            # hyphens and every Pi would silently fall back to the
+            # default sink - which is precisely the failure this whole
+            # function exists to avoid.
+            if _squash(card_name) and _squash(card_name) in _squash(haystack):
                 name = props.get("node.name")
                 if name:
                     return name + ".monitor"

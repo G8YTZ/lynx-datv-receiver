@@ -886,11 +886,72 @@ def list_audio_devices():
     return out
 
 
+def physical_audio_devices():
+    """One entry per real output, rather than everything mpv can name.
+
+    mpv's raw list is dominated by plumbing. A Pi with two HDMI ports
+    reports around twenty devices: five ALSA access paths to each card
+    (plughw, default, sysdefault, hdmi, dmix), plus backend defaults for
+    pipewire, pulse, alsa, jack, sdl and sndio. Only two of those are
+    things a person would recognise as an output.
+
+    So this keeps one entry per ALSA card, preferring the access path
+    that handles format conversion, and gives it a name someone would
+    recognise. The raw list is still available to anything that needs
+    it - this is purely what the Config page offers.
+    """
+    # Ranked by preference: sysdefault does software conversion, which
+    # is what you want when the source format may not match the
+    # hardware. hw/plughw are last because they are the least forgiving.
+    PREFER = ["sysdefault", "default", "hdmi", "dmix", "plughw", "hw"]
+
+    by_card = {}
+    for d in list_audio_devices():
+        name = d["name"]
+        card = _alsa_card_from_device_name(name)
+        if not card:
+            continue          # a backend default, not a physical device
+        access = name.split("/", 1)[1].split(":", 1)[0] if "/" in name else ""
+        rank = PREFER.index(access) if access in PREFER else len(PREFER)
+        if card not in by_card or rank < by_card[card][0]:
+            by_card[card] = (rank, d)
+
+    out = []
+    for card, (_, d) in sorted(by_card.items()):
+        out.append({
+            "name": d["name"],
+            "description": _friendly_audio_name(card, d["description"]),
+            "card": card,
+        })
+    return out
+
+
+def _alsa_card_from_device_name(name):
+    """The ALSA card in an mpv device string, or None if it hasn't one."""
+    m = re.search(r'CARD=([A-Za-z0-9_\-]+)', name or "")
+    return m.group(1) if m else None
+
+
+def _friendly_audio_name(card, description):
+    """Something a person would recognise, instead of
+    'vc4-hdmi-0, MAI PCM i2s-hifi-0/Default Audio Device'."""
+    m = re.match(r'vc4hdmi(\d+)$', card, re.I)
+    if m:
+        return f"HDMI {int(m.group(1)) + 1}"
+    # Otherwise take the part before the access-path description, which
+    # is the card's own name, and tidy it.
+    base = description.split("/")[0].strip()
+    base = re.sub(r',\s*(MAI PCM|USB Audio).*$', '', base).strip()
+    return base or card
+
+
 def _first_hdmi_device():
     """The first HDMI output mpv reports, or None."""
-    for d in list_audio_devices():
-        blob = (d["name"] + " " + d["description"]).lower()
-        if "hdmi" in blob:
+    # Uses the filtered list so "hdmi" resolves to exactly the device
+    # the Config page offers, rather than some other access path to the
+    # same card that happens to sort first.
+    for d in physical_audio_devices():
+        if "hdmi" in (d["name"] + " " + d["description"]).lower():
             return d["name"]
     return None
 
@@ -4254,7 +4315,7 @@ class PathfinderTestRequest(BaseModel):
                      "what the audio_device setting will accept. Used to "
                      "populate the Config page selector.")
 def api_audio_devices():
-    devices = list_audio_devices()
+    devices = physical_audio_devices()
     current = str(config.get('display', {}).get('audio_device', 'hdmi'))
     return {
         "current": current,
@@ -4814,7 +4875,9 @@ def config_page():
                             Which device mpv sends audio to. Defaults to HDMI, so sound
                             follows the picture to the television. Left on automatic,
                             a USB audio dongle plugged in for some other purpose can
-                            quietly capture the audio instead.
+                            quietly capture the audio instead. The PPM meter follows
+                            this setting, so it always reads whatever is actually
+                            being sent out.
                         </p>
                         <label class="small text-muted mb-1" for="audio-device-select">Device</label>
                         <select class="form-select form-select-sm mb-2" id="audio-device-select">
