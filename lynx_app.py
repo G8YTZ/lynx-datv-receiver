@@ -4254,13 +4254,38 @@ def proxy_quicklynx_chat():
     """
     if not config.get('quicklynx', {}).get('enabled', False):
         return HTMLResponse("QuickLynx is not enabled", status_code=404)
+    CHAT_URL = "https://eshail.batc.org.uk/wb/chat/"
     try:
         req = urllib.request.Request(
-            "https://eshail.batc.org.uk/wb/chat/",
+            CHAT_URL,
+            # Some servers reject urllib's default User-Agent outright.
             headers={"User-Agent": "Mozilla/5.0 (compatible; Lynx QuickLynx proxy)"})
         with urllib.request.urlopen(req, timeout=15) as r:
-            body = r.read().decode('utf-8', errors='replace')
-        return HTMLResponse(body)
+            charset = r.headers.get_content_charset() or "utf-8"
+            html = r.read().decode(charset, errors="replace")
+
+        # A <base> tag is essential, not cosmetic. Without it every
+        # relative URL in the page - stylesheets, scripts, and any
+        # relative Socket.IO connection its own JavaScript builds -
+        # resolves against THIS server instead of BATC. The browser then
+        # fetches a pile of files that do not exist here and renders a
+        # blank white block, which is exactly what happened when this was
+        # first written without one.
+        base_tag = f'<base href="{CHAT_URL}">'
+        if "<head>" in html:
+            html = html.replace("<head>", "<head>" + base_tag, 1)
+        elif "<head " in html:
+            # a <head> with attributes: insert just after its closing >
+            idx = html.index("<head ")
+            close = html.index(">", idx) + 1
+            html = html[:close] + base_tag + html[close:]
+        else:
+            html = base_tag + html
+
+        # Deliberately a fresh response from this origin rather than a
+        # forwarding of BATC's own headers - not carrying their
+        # X-Frame-Options across is the entire point of proxying.
+        return HTMLResponse(html)
     except Exception as e:
         print(f"[quicklynx] chat proxy failed: {e}")
         return HTMLResponse(
