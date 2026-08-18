@@ -4986,32 +4986,6 @@ def config_page():
                     </div>
                 </div>
 
-        </div>
-
-        <div class="col-md-4">
-                <div class="card mb-3">
-                <div class="card mb-3">
-                    <div class="card-header">&#x1F50A; Audio Output</div>
-                    <div class="card-body">
-                        <p class="text-muted small">
-                            Which device mpv sends audio to. Defaults to HDMI, so sound
-                            follows the picture to the television. Left on automatic,
-                            a USB audio dongle plugged in for some other purpose can
-                            quietly capture the audio instead. The PPM meter follows
-                            this setting, so it always reads whatever is actually
-                            being sent out.
-                        </p>
-                        <label class="small text-muted mb-1" for="audio-device-select">Device</label>
-                        <select class="form-select form-select-sm mb-2" id="audio-device-select">
-                            <option value="hdmi">HDMI (recommended)</option>
-                            <option value="auto">Automatic - let mpv choose</option>
-                        </select>
-                        <div id="audio-device-resolved" class="small text-muted mb-2"></div>
-                        <button class="btn btn-save" onclick="saveAudioDevice()">Save Audio settings</button>
-                        <span id="audio-save-status" class="save-status ms-2"></span>
-                    </div>
-                </div>
-
                 <div class="card mb-3">
                     <div class="card-header">&#x1F4E1; QuickLynx Spectrum Tuner</div>
                     <div class="card-body">
@@ -5032,6 +5006,31 @@ def config_page():
                         </div>
                         <button class="btn btn-save" onclick="saveQuickLynx()">Save QuickLynx settings</button>
                         <span id="quicklynx-status" class="save-status ms-2"></span>
+                    </div>
+                </div>
+
+        </div>
+
+        <div class="col-md-4">
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F50A; Audio Output</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            Which device mpv sends audio to. Defaults to HDMI, so sound
+                            follows the picture to the television. Left on automatic,
+                            a USB audio dongle plugged in for some other purpose can
+                            quietly capture the audio instead. The PPM meter follows
+                            this setting, so it always reads whatever is actually
+                            being sent out.
+                        </p>
+                        <label class="small text-muted mb-1" for="audio-device-select">Device</label>
+                        <select class="form-select form-select-sm mb-2" id="audio-device-select">
+                            <option value="hdmi">HDMI (recommended)</option>
+                            <option value="auto">Automatic - let mpv choose</option>
+                        </select>
+                        <div id="audio-device-resolved" class="small text-muted mb-2"></div>
+                        <button class="btn btn-save" onclick="saveAudioDevice()">Save Audio settings</button>
+                        <span id="audio-save-status" class="save-status ms-2"></span>
                     </div>
                 </div>
 
