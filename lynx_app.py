@@ -887,43 +887,61 @@ def list_audio_devices():
 
 
 def physical_audio_devices():
-    """One entry per real output, rather than everything mpv can name.
+    """One entry per real output, and via PipeWire where it exists.
 
-    mpv's raw list is dominated by plumbing. A Pi with two HDMI ports
-    reports around twenty devices: five ALSA access paths to each card
-    (plughw, default, sysdefault, hdmi, dmix), plus backend defaults for
-    pipewire, pulse, alsa, jack, sdl and sndio. Only two of those are
-    things a person would recognise as an output.
+    Two things matter here, and the first version got the second wrong.
 
-    So this keeps one entry per ALSA card, preferring the access path
-    that handles format conversion, and gives it a name someone would
-    recognise. The raw list is still available to anything that needs
-    it - this is purely what the Config page offers.
+    mpv's raw list is mostly plumbing: a Pi with two HDMI ports reports
+    around twenty devices, being several ALSA access paths to each card
+    plus backend defaults for pipewire, pulse, alsa, jack, sdl and
+    sndio. Only a couple are things anyone would recognise.
+
+    But on a PipeWire system the "pipewire/..." entries are the ones to
+    use, not the raw ALSA ones. PipeWire owns the sound card; telling
+    mpv to open alsa/sysdefault:CARD=... directly either fights it for
+    the device or bypasses the graph altogether. Filtering those entries
+    out as "not physical devices" produced exactly that - no sound at
+    all, and no PPM either, since nothing then appeared on any PipeWire
+    node for the meter to tap.
+
+    So: prefer PipeWire node entries when they exist, and fall back to
+    grouped ALSA cards only on systems without it. The bonus is that a
+    PipeWire device name carries its node name, which makes the PPM's
+    monitor target exact rather than something to be inferred.
     """
-    # Ranked by preference: sysdefault does software conversion, which
-    # is what you want when the source format may not match the
-    # hardware. hw/plughw are last because they are the least forgiving.
-    PREFER = ["sysdefault", "default", "hdmi", "dmix", "plughw", "hw"]
+    raw = list_audio_devices()
 
+    pw = []
+    for d in raw:
+        name = d["name"]
+        if name.startswith("pipewire/"):
+            pw.append({
+                "name": name,
+                "description": _friendly_audio_name(name, d["description"]),
+                "node": name.split("/", 1)[1],
+            })
+    if pw:
+        return pw
+
+    # No PipeWire: group the ALSA access paths down to one per card.
+    # sysdefault first because it does software format conversion;
+    # plughw and hw are the least forgiving, dmix is a mixing layer.
+    PREFER = ["sysdefault", "default", "hdmi", "dmix", "plughw", "hw"]
     by_card = {}
-    for d in list_audio_devices():
+    for d in raw:
         name = d["name"]
         card = _alsa_card_from_device_name(name)
         if not card:
-            continue          # a backend default, not a physical device
+            continue
         access = name.split("/", 1)[1].split(":", 1)[0] if "/" in name else ""
         rank = PREFER.index(access) if access in PREFER else len(PREFER)
         if card not in by_card or rank < by_card[card][0]:
             by_card[card] = (rank, d)
 
-    out = []
-    for card, (_, d) in sorted(by_card.items()):
-        out.append({
-            "name": d["name"],
-            "description": _friendly_audio_name(card, d["description"]),
-            "card": card,
-        })
-    return out
+    return [{"name": d["name"],
+             "description": _friendly_audio_name(card, d["description"]),
+             "node": ""}
+            for card, (_, d) in sorted(by_card.items())]
 
 
 def _alsa_card_from_device_name(name):
@@ -932,24 +950,26 @@ def _alsa_card_from_device_name(name):
     return m.group(1) if m else None
 
 
-def _friendly_audio_name(card, description):
-    """Something a person would recognise, instead of
+def _friendly_audio_name(key, description):
+    """Something a person would recognise, rather than
     'vc4-hdmi-0, MAI PCM i2s-hifi-0/Default Audio Device'."""
-    m = re.match(r'vc4hdmi(\d+)$', card, re.I)
+    blob = f"{key} {description}"
+    m = re.search(r'vc4hdmi(\d+)', key, re.I)
     if m:
         return f"HDMI {int(m.group(1)) + 1}"
-    # Otherwise take the part before the access-path description, which
-    # is the card's own name, and tidy it.
+    if "hdmi" in blob.lower():
+        # PipeWire names its HDMI sinks by platform address rather than
+        # port number, so there is nothing reliable to number them by.
+        return description.split("(")[0].strip() or "HDMI"
     base = description.split("/")[0].strip()
     base = re.sub(r',\s*(MAI PCM|USB Audio).*$', '', base).strip()
-    return base or card
+    return base or key
 
 
 def _first_hdmi_device():
     """The first HDMI output mpv reports, or None."""
-    # Uses the filtered list so "hdmi" resolves to exactly the device
-    # the Config page offers, rather than some other access path to the
-    # same card that happens to sort first.
+    # Uses the same filtered list the Config page offers, so the
+    # automatic choice and the visible choice can never disagree.
     for d in physical_audio_devices():
         if "hdmi" in (d["name"] + " " + d["description"]).lower():
             return d["name"]

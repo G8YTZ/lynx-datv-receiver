@@ -300,17 +300,17 @@ _last_notification_sound_played_for = None  # triggered_at of the last tri_watch
                                               # distinguished from the same one still
                                               # being displayed across multiple polls
 
+def _squash(text):
+    """Lowercase with punctuation removed, for comparing names the same
+    system spells differently in different places."""
+    return re.sub(r'[^a-z0-9]', '', str(text or "").lower())
+
+
 def _alsa_card_from_mpv_device(mpv_device):
-    """The ALSA card name inside an mpv --audio-device string.
+    """The ALSA card name inside an mpv --audio-device string, or None.
 
-    mpv reports devices as e.g.:
-        alsa/sysdefault:CARD=vc4hdmi0
-        alsa/hdmi:CARD=vc4hdmi0,DEV=0
-        alsa/front:CARD=Device,DEV=0
-
-    The CARD= token is the stable part, and it is also what PipeWire
-    records against its own nodes, so it is the sensible thing to match
-    on. Returns None for anything without one.
+    mpv reports ALSA devices as e.g. alsa/sysdefault:CARD=vc4hdmi0.
+    Only needed on systems without PipeWire - see ppm_monitor_target().
     """
     if not mpv_device:
         return None
@@ -318,23 +318,13 @@ def _alsa_card_from_mpv_device(mpv_device):
     return m.group(1) if m else None
 
 
-def _squash(text):
-    """Lowercase with punctuation removed, for comparing names that the
-    same system spells differently in different places."""
-    return re.sub(r'[^a-z0-9]', '', str(text or "").lower())
-
-
 def _pipewire_monitor_for_card(card_name):
     """The PipeWire monitor source matching an ALSA card, or None.
 
-    Asks pw-dump for the node list and looks for a sink whose ALSA card
-    properties match. Node names look like
-
-        alsa_output.platform-fef00700.hdmi.hdmi-stereo
-
-    which cannot be derived from mpv's name by string manipulation - so
-    this matches on the card recorded in each node's properties rather
-    than trying to translate one naming scheme into the other.
+    Only used as a fallback: when mpv is on a pipewire/... device the
+    node name is already in the device string and no searching is
+    needed. This covers the case where mpv is on a raw ALSA device but
+    PipeWire is nonetheless running.
     """
     if not card_name:
         return None
@@ -354,14 +344,10 @@ def _pipewire_monitor_for_card(card_name):
                 continue
             haystack = " ".join(str(props.get(k, "")) for k in (
                 "alsa.card_name", "api.alsa.card.name", "alsa.long_card_name",
-                "api.alsa.path", "api.alsa.pcm.card", "alsa.card",
-                "node.name", "device.name", "node.description"))
-            # Compared with punctuation stripped from both sides. ALSA
-            # calls the card "vc4hdmi0" while PipeWire records it as
-            # "vc4-hdmi-0", so a plain substring test fails on the
-            # hyphens and every Pi would silently fall back to the
-            # default sink - which is precisely the failure this whole
-            # function exists to avoid.
+                "api.alsa.path", "node.name", "device.name", "node.description"))
+            # Punctuation stripped from both sides: ALSA calls a card
+            # "vc4hdmi0" while PipeWire records it as "vc4-hdmi-0", so a
+            # plain substring test fails on the hyphens.
             if _squash(card_name) and _squash(card_name) in _squash(haystack):
                 name = props.get("node.name")
                 if name:
@@ -376,25 +362,29 @@ def ppm_monitor_target():
 
     The meter taps the system's audio output independently of mpv, which
     is deliberate - mpv's own astats path is broken upstream. But that
-    independence became a problem once mpv's output device was made
-    selectable: with mpv sent to HDMI while the default sink is, say, a
-    USB dongle, the meter would sit watching a silent dongle and read
+    independence became a problem once the output device was made
+    selectable: with mpv sent to HDMI while the default sink was a USB
+    dongle, the meter would sit watching a silent dongle and read
     nothing, with no indication why.
 
-    So the target follows mpv's configured device where it can be
-    resolved, and falls back to the default sink otherwise - which is
-    the previous behaviour, and correct when mpv is on the default sink
-    anyway.
+    So it follows mpv. On a PipeWire system that is exact rather than
+    inferred: mpv's device name is "pipewire/<node>", so the monitor is
+    simply "<node>.monitor". Falling back, in order, to searching
+    PipeWire for a matching ALSA card, then to the default sink.
     """
     fallback = "@DEFAULT_SINK@.monitor"
     try:
         dev = state.get("audio_device", "hdmi")
         if not dev or str(dev).lower() == "auto":
             return fallback
-        # "hdmi" is resolved by lynx_app into a real device name and
-        # published in the status, so the overlay does not have to
-        # duplicate that logic.
+
+        # "hdmi" is resolved by lynx_app and published in the status, so
+        # the overlay does not duplicate that logic.
         resolved = state.get("audio_device_resolved") or dev
+
+        if str(resolved).startswith("pipewire/"):
+            return resolved.split("/", 1)[1] + ".monitor"
+
         card = _alsa_card_from_mpv_device(resolved)
         if not card:
             return fallback
