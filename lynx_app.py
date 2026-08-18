@@ -7753,6 +7753,7 @@ def web_ui():
                      feature exists. Greyed with an explanation on hover does. -->
                 <a href="/quicklynx" target="_blank" rel="noopener"
                    id="quicklynx-btn"
+                   style="pointer-events: auto; cursor: help;"
                    class="btn btn-sm btn-outline-light disabled"
                    aria-disabled="true"
                    title="QuickLynx is switched off. It shows the QO-100 wideband spectrum and lets you click a signal to tune this receiver to it. Turn it on in Config to use it.">&#x1F4E1; QuickLynx</a>
@@ -8737,6 +8738,21 @@ setInterval(loadLiveStreams, 3600000);
 // the middle of that function is what broke this page once already;
 // keeping it separate means a fault here cannot stop the rest of the
 // page updating.
+// Bootstrap's .disabled class sets pointer-events:none, which stops the
+// browser registering a hover at all - so the title never appeared,
+// which defeated the point of greying the button rather than hiding it.
+// Pointer events are re-enabled inline; this handler then swallows the
+// click so a disabled button still does not navigate.
+document.addEventListener('DOMContentLoaded', () => {
+    const b = document.getElementById('quicklynx-btn');
+    if (b) b.addEventListener('click', (ev) => {
+        if (b.classList.contains('disabled')) {
+            ev.preventDefault();
+            ev.stopPropagation();
+        }
+    });
+});
+
 async function refreshQuickLynxButton() {
     const btn = document.getElementById('quicklynx-btn');
     if (!btn) return;
@@ -8748,12 +8764,14 @@ async function refreshQuickLynxButton() {
             btn.removeAttribute('aria-disabled');
             btn.title = 'Open QuickLynx - the QO-100 wideband spectrum, '
                       + 'click a signal to tune this receiver to it.';
+            btn.style.cursor = 'pointer';
         } else {
             btn.classList.add('disabled');
             btn.setAttribute('aria-disabled', 'true');
             btn.title = 'QuickLynx is switched off. It shows the QO-100 '
                       + 'wideband spectrum and lets you click a signal to '
                       + 'tune this receiver to it. Turn it on in Config to use it.';
+            btn.style.cursor = 'help';
         }
     } catch (e) {
         // Silent: the status poll elsewhere already reports connection
