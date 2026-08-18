@@ -2748,13 +2748,6 @@ class GpioTxConfigUpdate(BaseModel):
     schedule_weekend_start: str
     schedule_weekend_end: str
 
-class QuickLynxConfigUpdate(BaseModel):
-    """Off by default: it holds an outbound connection to BATC, and most
-    Lynx installations are terrestrial repeaters that would never use
-    it. Opt-in rather than opt-out."""
-    enabled: bool = False
-
-
 class DisplayConfigUpdate(BaseModel):
     ppm_style: str = "full_fat"  # "skeleton" or "full_fat"
     # "hdmi" (resolved to the first HDMI output at launch), "auto" to let
@@ -2808,7 +2801,6 @@ class ConfigUpdateRequest(BaseModel):
     notifications_companion: Optional[CompanionConfigUpdate] = None
     notifications_gpio_tx: Optional[GpioTxConfigUpdate] = None
     display: Optional[DisplayConfigUpdate] = None
-    quicklynx: Optional[QuickLynxConfigUpdate] = None
     tri_watch: Optional[TriWatchSourcesUpdate] = None
     pathfinder: Optional[PathfinderConfigUpdate] = None
 
@@ -4227,7 +4219,6 @@ def get_status():
             # device it is actually using. Without this the meter taps
             # the default sink and would read silence whenever mpv is
             # sent somewhere else.
-            "quicklynx_enabled": bool(config.get('quicklynx', {}).get('enabled', False)),
             "audio_device": config.get('display', {}).get('audio_device', 'hdmi'),
             "audio_device_resolved": _cached_audio_device_resolved(),
             "site_location": config.get('site', {}).get('location', ''),
@@ -4336,75 +4327,6 @@ class PathfinderTestRequest(BaseModel):
     mer: str = "9.4"
     modcod: str = "QPSK 2/3"
     symbol_rate: str = "333"
-
-
-@app.get("/quicklynx", include_in_schema=False)
-def serve_quicklynx():
-    """Serves QuickLynx from this receiver, when enabled.
-
-    Two things this buys over running it from a laptop. Served from the
-    same origin as /api/tune, there is no host to configure and no
-    cross-origin question - which is the setting most likely to be got
-    wrong otherwise. And it is reachable from any device on the network
-    without running anything locally.
-
-    Off by default: it holds an outbound connection to BATC, and most
-    Lynx installations are repeaters that would never use it. The
-    standalone server in the QuickLynx repository still works for anyone
-    who prefers it.
-    """
-    if not config.get('quicklynx', {}).get('enabled', False):
-        return HTMLResponse(
-            "<h3>QuickLynx is not enabled</h3>"
-            "<p>Turn it on in <a href='/config'>Config</a>, under "
-            "QuickLynx Spectrum Tuner.</p>", status_code=404)
-
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                        "quicklynx.html")
-    if not os.path.exists(path):
-        return HTMLResponse(
-            "<h3>quicklynx.html not found</h3>"
-            "<p>Expected it alongside lynx_app.py. It ships with Lynx; "
-            "if this is a hand-built install, copy it from the QuickLynx "
-            "repository.</p>", status_code=404)
-    with open(path, encoding='utf-8') as f:
-        html = f.read()
-    # Tells the page which server it is running under, so it can use the
-    # right chat proxy path and default the receiver address to this
-    # origin. The same file is also served by QuickLynx's own standalone
-    # server, where neither applies.
-    html = html.replace("<head>", "<head>\n<meta name=\"lynx-hosted\" content=\"1\">", 1)
-    return HTMLResponse(html)
-
-
-@app.get("/quicklynx/chat", include_in_schema=False)
-def proxy_quicklynx_chat():
-    """Re-serves BATC's wideband chat page so it can be framed.
-
-    BATC send X-Frame-Options, which stops the page being embedded from
-    another origin - it loads fine in its own tab but comes up blank in
-    an iframe. Fetching it here and serving it from this origin sidesteps
-    that: the browser's frame check only cares where the framed DOCUMENT
-    came from, not where its own scripts and sockets subsequently talk
-    to, which continue to reach BATC directly and are unaffected.
-
-    Same approach as QuickLynx's standalone server, which is where this
-    was worked out.
-    """
-    if not config.get('quicklynx', {}).get('enabled', False):
-        return HTMLResponse("QuickLynx is not enabled", status_code=404)
-    try:
-        req = urllib.request.Request(
-            "https://eshail.batc.org.uk/wb/chat/",
-            headers={"User-Agent": "Mozilla/5.0 (compatible; Lynx QuickLynx proxy)"})
-        with urllib.request.urlopen(req, timeout=15) as r:
-            body = r.read().decode('utf-8', errors='replace')
-        return HTMLResponse(body)
-    except Exception as e:
-        print(f"[quicklynx] chat proxy failed: {e}")
-        return HTMLResponse(
-            f"<p style='font-family:sans-serif;padding:1em'>"
-            f"Chat unavailable: {e}</p>", status_code=502)
 
 
 @app.get("/api/audio/devices", tags=["Control"],
@@ -4812,22 +4734,8 @@ def config_page():
 
         <div class="col-md-4">
                 <div class="card mb-3">
-                    <div class="card-header">&#x1F3AC; Video Switching (Bitfocus Companion / GPIO)</div>
+                    <div class="card-header">&#x1F3AC; Bitfocus Companion</div>
                     <div class="card-body">
-                        <p class="text-muted small">
-                            Switches your video source to this receiver when it has
-                            something to show, and away again when it hasn't. Fires a
-                            webhook, a GPIO pin, or both. Bitfocus Companion is the
-                            usual thing on the other end, but anything that accepts an
-                            HTTP request or a contact closure will do - you don't need
-                            Companion to use this.
-                        </p>
-                        <p class="text-muted small">
-                            Follows RF <em>and</em> streams: a relayed stream switches
-                            the source just as an off-air signal does. To key a
-                            transmitter rather than switch a source, see GPIO Tx On/Off
-                            below.
-                        </p>
                         <div class="form-check form-switch mb-3">
                             <input class="form-check-input" type="checkbox" id="companion-enabled-input">
                             <label class="form-check-label" for="companion-enabled">Enabled</label>
@@ -4875,16 +4783,6 @@ def config_page():
                 <div class="card mb-3">
                     <div class="card-header">&#x1F50C; GPIO Tx On/Off</div>
                     <div class="card-body">
-                        <p class="text-muted small">
-                            Keys a transmitter when there is something to send, with
-                            long settle times so it isn't cycled by brief gaps, and
-                            optional scheduled on-air windows.
-                        </p>
-                        <p class="text-muted small">
-                            This is <em>not</em> the pin for switching a video source -
-                            for that use Video Switching above, which has its own pin
-                            and much shorter timings.
-                        </p>
                         <div class="form-check form-switch mb-3">
                             <input class="form-check-input" type="checkbox" id="gpio-enabled-input">
                             <label class="form-check-label" for="gpio-enabled">Enabled</label>
@@ -4986,32 +4884,10 @@ def config_page():
                     </div>
                 </div>
 
-                <div class="card mb-3">
-                    <div class="card-header">&#x1F4E1; QuickLynx Spectrum Tuner</div>
-                    <div class="card-body">
-                        <p class="text-muted small">
-                            Serves QuickLynx from this receiver: the QO-100 wideband
-                            spectrum, with click-to-tune straight into Lynx. Off by
-                            default, since it holds an outbound connection to BATC and
-                            most installations are terrestrial. Served from here, it
-                            needs no address configuring and can be opened from any
-                            device on your network.
-                        </p>
-                        <div class="form-check form-switch mb-2">
-                            <input class="form-check-input" type="checkbox" id="quicklynx-enabled">
-                            <label class="form-check-label" for="quicklynx-enabled">Enabled</label>
-                        </div>
-                        <div class="small text-muted mb-2">
-                            Needs internet access for the spectrum feed and the chat pane.
-                        </div>
-                        <button class="btn btn-save" onclick="saveQuickLynx()">Save QuickLynx settings</button>
-                        <span id="quicklynx-status" class="save-status ms-2"></span>
-                    </div>
-                </div>
-
         </div>
 
         <div class="col-md-4">
+                <div class="card mb-3">
                 <div class="card mb-3">
                     <div class="card-header">&#x1F50A; Audio Output</div>
                     <div class="card-body">
@@ -5034,7 +4910,6 @@ def config_page():
                     </div>
                 </div>
 
-                <div class="card mb-3">
                     <div class="card-header">&#x1F3AF; PPM Meter Style</div>
                     <div class="card-body">
                         <p class="text-muted small">Applies live within a few seconds - no restart needed.</p>
@@ -5552,8 +5427,6 @@ async function loadCurrentConfig() {
         });
 
         loadAudioDevices(cfg.display?.audio_device || 'hdmi');
-        const qlEl = document.getElementById('quicklynx-enabled');
-        if (qlEl) qlEl.checked = !!(cfg.quicklynx?.enabled);
 
         const ppmStyle = cfg.display?.ppm_style || 'full_fat';
         document.getElementById(ppmStyle === 'full_fat' ? 'ppm-style-full-fat' : 'ppm-style-skeleton').checked = true;
@@ -5911,28 +5784,6 @@ async function savePathfinder() {
     } catch (e) {
         statusEl.textContent = 'Save failed - see console.';
         statusEl.className = 'save-status text-danger';
-        console.error(e);
-    }
-}
-
-async function saveQuickLynx() {
-    const st = document.getElementById('quicklynx-status');
-    st.textContent = 'Saving...';
-    st.className = 'save-status text-muted';
-    try {
-        const body = { quicklynx: {
-            enabled: document.getElementById('quicklynx-enabled').checked
-        }};
-        const r = await fetch('/api/config', {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify(body)
-        });
-        if (!r.ok) throw new Error(await r.text());
-        st.textContent = 'Saved.';
-        st.className = 'save-status text-success';
-    } catch (e) {
-        st.textContent = 'Save failed - see console.';
-        st.className = 'save-status text-danger';
         console.error(e);
     }
 }
@@ -7595,9 +7446,6 @@ def update_config(req: ConfigUpdateRequest):
     # Display: takes effect live, no restart - the overlay picks this
     # up on its own next /api/status poll (a few seconds), same as
     # portable_locator and the notification settings above.
-    if req.quicklynx is not None:
-        on_disk.setdefault('quicklynx', {}).update(req.quicklynx.model_dump())
-
     if req.display is not None:
         on_disk.setdefault('display', {}).update(req.display.model_dump())
 
@@ -7735,15 +7583,6 @@ def web_ui():
                 <a href="/diagnostics" class="btn btn-sm btn-outline-light">&#x1F4CA; Diagnostics</a>
                 <a href="/config" class="btn btn-sm btn-outline-light">&#x2699;&#xFE0F; Config</a>
                 <a href="/docs" class="btn btn-sm btn-outline-light">&#x1F4D6; API Docs</a>
-                <!-- Rendered disabled until the feature is switched on, rather
-                     than hidden: a button that simply isn't there teaches
-                     nobody the feature exists. Greyed out with an explanation
-                     on hover does. -->
-                <a href="/quicklynx" target="_blank" rel="noopener"
-                   id="quicklynx-btn"
-                   class="btn btn-sm btn-outline-light disabled"
-                   aria-disabled="true"
-                   title="QuickLynx is switched off. It shows the QO-100 wideband spectrum and lets you click a signal to tune this receiver to it. Turn it on in Config to use it.">&#x1F4E1; QuickLynx</a>
             </div>
             <small class="text-muted" id="site-name"></small>
             <!-- Diversity: replaces the site-name line above with a highlighted stats box while diversity mode is active -->
@@ -8071,27 +7910,6 @@ async function updateStatus() {
     try {
         const s = await api('GET', '/api/status');
         
-        // QuickLynx button. Deliberately here, at the top of
-        // updateStatus and outside every branch: an earlier version sat
-        // inside the tuner-B handling, so on a plain RF receiver it
-        // never ran and the button stayed greyed however the setting
-        // was saved.
-        const qlBtn = document.getElementById('quicklynx-btn');
-        if (qlBtn) {
-            if (s.lynx?.quicklynx_enabled) {
-                qlBtn.classList.remove('disabled');
-                qlBtn.removeAttribute('aria-disabled');
-                qlBtn.title = 'Open QuickLynx - the QO-100 wideband spectrum, '
-                            + 'click a signal to tune this receiver to it.';
-            } else {
-                qlBtn.classList.add('disabled');
-                qlBtn.setAttribute('aria-disabled', 'true');
-                qlBtn.title = 'QuickLynx is switched off. It shows the QO-100 '
-                            + 'wideband spectrum and lets you click a signal to '
-                            + 'tune this receiver to it. Turn it on in Config to use it.';
-            }
-        }
-
         // Mode badge
         const mode = s.lynx?.mode || 'idle';
         const badge = document.getElementById('mode-badge');
@@ -8309,8 +8127,6 @@ async function updateStatus() {
 async function loadPresets() {
     try {
         const data = await api('GET', '/api/presets');
-
-        }
         const local = (data.local || []).map(p => ({...p, _local: true}));
         const all = [...local, ...(data.ryde || [])];
         const el = document.getElementById('preset-list');
