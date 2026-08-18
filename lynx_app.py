@@ -2748,6 +2748,13 @@ class GpioTxConfigUpdate(BaseModel):
     schedule_weekend_start: str
     schedule_weekend_end: str
 
+class QuickLynxConfigUpdate(BaseModel):
+    """Off by default. It holds an outbound connection to BATC, and most
+    Lynx installations are terrestrial repeaters that would never use
+    it - so opt-in rather than opt-out."""
+    enabled: bool = False
+
+
 class DisplayConfigUpdate(BaseModel):
     ppm_style: str = "full_fat"  # "skeleton" or "full_fat"
     # "hdmi" (resolved to the first HDMI output at launch), "auto" to let
@@ -2800,6 +2807,7 @@ class ConfigUpdateRequest(BaseModel):
     notifications_slack: Optional[SlackConfigUpdate] = None
     notifications_companion: Optional[CompanionConfigUpdate] = None
     notifications_gpio_tx: Optional[GpioTxConfigUpdate] = None
+    quicklynx: Optional[QuickLynxConfigUpdate] = None
     display: Optional[DisplayConfigUpdate] = None
     tri_watch: Optional[TriWatchSourcesUpdate] = None
     pathfinder: Optional[PathfinderConfigUpdate] = None
@@ -4196,6 +4204,70 @@ def get_discovered_picotuners():
         ]
     }
 
+@app.get("/quicklynx", include_in_schema=False)
+def serve_quicklynx():
+    """Serves QuickLynx from this receiver, when enabled.
+
+    Two things this buys over running it from a laptop. Served from the
+    same origin as /api/tune there is no host to configure and no
+    cross-origin question - the setting people most often get wrong
+    otherwise. And it is reachable from any device on the network
+    without running anything locally.
+
+    Off by default: it holds an outbound connection to BATC, and most
+    installations are repeaters that would never use it. QuickLynx's own
+    standalone server still works unchanged for anyone who prefers it.
+    """
+    if not config.get('quicklynx', {}).get('enabled', False):
+        return HTMLResponse(
+            "<h3>QuickLynx is not enabled</h3>"
+            "<p>Turn it on in <a href='/config'>Config</a>, under "
+            "QuickLynx Spectrum Tuner.</p>", status_code=404)
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "quicklynx.html")
+    if not os.path.exists(path):
+        return HTMLResponse(
+            "<h3>quicklynx.html not found</h3>"
+            "<p>It is expected alongside lynx_app.py. Copy it from the "
+            "QuickLynx repository.</p>", status_code=404)
+    with open(path, encoding='utf-8') as f:
+        html = f.read()
+    # Tells the page which server it is under, so it can pick the right
+    # chat proxy path and default the receiver address to this origin.
+    # The same file is also served by QuickLynx's own standalone server,
+    # where neither applies.
+    html = html.replace("<head>", '<head>\n<meta name="lynx-hosted" content="1">', 1)
+    return HTMLResponse(html)
+
+
+@app.get("/quicklynx/chat", include_in_schema=False)
+def proxy_quicklynx_chat():
+    """Re-serves BATC's wideband chat page so it can be framed.
+
+    BATC send X-Frame-Options, which stops the page being embedded from
+    another origin - it loads fine in its own tab but comes up blank in
+    an iframe. Fetching it here and serving it from this origin sidesteps
+    that: the browser's frame check only cares where the framed DOCUMENT
+    came from, not where its scripts and sockets subsequently talk to,
+    which continue to reach BATC directly.
+    """
+    if not config.get('quicklynx', {}).get('enabled', False):
+        return HTMLResponse("QuickLynx is not enabled", status_code=404)
+    try:
+        req = urllib.request.Request(
+            "https://eshail.batc.org.uk/wb/chat/",
+            headers={"User-Agent": "Mozilla/5.0 (compatible; Lynx QuickLynx proxy)"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            body = r.read().decode('utf-8', errors='replace')
+        return HTMLResponse(body)
+    except Exception as e:
+        print(f"[quicklynx] chat proxy failed: {e}")
+        return HTMLResponse(
+            f"<p style='font-family:sans-serif;padding:1em'>"
+            f"Chat unavailable: {e}</p>", status_code=502)
+
+
 @app.get("/api/status", tags=["Status"],
          summary="Get current receiver status",
          description="Returns lock state, MER, callsign, frequency and more. "
@@ -4214,6 +4286,7 @@ def get_status():
             "mpv_drift": get_mpv_drift_status(),
             "portable_locator": config.get('notifications', {}).get('qrz', {}).get('portable_locator', ''),
             "ppm_style": config.get('display', {}).get('ppm_style', 'full_fat'),
+            "quicklynx_enabled": bool(config.get('quicklynx', {}).get('enabled', False)),
             "site_locator": config.get('site', {}).get('locator', ''),
             # Published so the overlay's PPM can follow mpv to whichever
             # device it is actually using. Without this the meter taps
@@ -4881,6 +4954,29 @@ def config_page():
                             <button class="btn btn-save" onclick="saveDiversity()">Save diversity settings</button>
                             <span class="save-status" id="div-save-status"></span>
                         </div>
+                    </div>
+                </div>
+
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F4E1; QuickLynx Spectrum Tuner</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            Serves QuickLynx from this receiver: the QO-100 wideband
+                            spectrum, with click-to-tune straight into Lynx. Served
+                            from here it needs no address configuring and can be
+                            opened from any device on your network.
+                        </p>
+                        <div class="form-check form-switch mb-2">
+                            <input class="form-check-input" type="checkbox" id="quicklynx-enabled">
+                            <label class="form-check-label" for="quicklynx-enabled">Enabled</label>
+                        </div>
+                        <div class="small text-muted mb-2">
+                            Off by default. Needs internet access for the spectrum feed
+                            and the chat pane, so it is opt-in rather than something a
+                            repeater carries unasked.
+                        </div>
+                        <button class="btn btn-save" onclick="saveQuickLynx()">Save QuickLynx settings</button>
+                        <span id="quicklynx-status" class="save-status ms-2"></span>
                     </div>
                 </div>
 
@@ -6162,6 +6258,47 @@ async function loadDiscoveredPicotuners() {
 loadCurrentConfig();
 loadDiscoveredPicotuners();
 setInterval(loadDiscoveredPicotuners, 5000);
+
+// ── QuickLynx ────────────────────────────────────────────────
+// Deliberately self-contained, with its own polling rather than a hook
+// into an existing update function. An earlier attempt edited the middle
+// of a large handler and left it broken, which took the whole page down
+// with it. This way a fault here fails alone.
+async function saveQuickLynx() {
+    const st = document.getElementById('quicklynx-status');
+    if (!st) return;
+    st.textContent = 'Saving...';
+    st.className = 'save-status text-muted';
+    try {
+        const r = await fetch('/api/config', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ quicklynx: {
+                enabled: document.getElementById('quicklynx-enabled').checked
+            }})
+        });
+        if (!r.ok) throw new Error(await r.text());
+        st.textContent = 'Saved.';
+        st.className = 'save-status text-success';
+    } catch (e) {
+        st.textContent = 'Save failed - see console.';
+        st.className = 'save-status text-danger';
+        console.error('QuickLynx save failed', e);
+    }
+}
+
+async function loadQuickLynxSetting() {
+    try {
+        const r = await fetch('/api/config');
+        const cfg = await r.json();
+        const el = document.getElementById('quicklynx-enabled');
+        if (el) el.checked = !!(cfg.quicklynx && cfg.quicklynx.enabled);
+    } catch (e) {
+        console.error('QuickLynx setting load failed', e);
+    }
+}
+document.addEventListener('DOMContentLoaded', loadQuickLynxSetting);
+
 </script>
 </body>
 </html>"""
@@ -7446,6 +7583,9 @@ def update_config(req: ConfigUpdateRequest):
     # Display: takes effect live, no restart - the overlay picks this
     # up on its own next /api/status poll (a few seconds), same as
     # portable_locator and the notification settings above.
+    if req.quicklynx is not None:
+        on_disk.setdefault('quicklynx', {}).update(req.quicklynx.model_dump())
+
     if req.display is not None:
         on_disk.setdefault('display', {}).update(req.display.model_dump())
 
@@ -7583,6 +7723,14 @@ def web_ui():
                 <a href="/diagnostics" class="btn btn-sm btn-outline-light">&#x1F4CA; Diagnostics</a>
                 <a href="/config" class="btn btn-sm btn-outline-light">&#x2699;&#xFE0F; Config</a>
                 <a href="/docs" class="btn btn-sm btn-outline-light">&#x1F4D6; API Docs</a>
+                <!-- Rendered disabled rather than hidden when switched off:
+                     a button that simply is not there teaches nobody the
+                     feature exists. Greyed with an explanation on hover does. -->
+                <a href="/quicklynx" target="_blank" rel="noopener"
+                   id="quicklynx-btn"
+                   class="btn btn-sm btn-outline-light disabled"
+                   aria-disabled="true"
+                   title="QuickLynx is switched off. It shows the QO-100 wideband spectrum and lets you click a signal to tune this receiver to it. Turn it on in Config to use it.">&#x1F4E1; QuickLynx</a>
             </div>
             <small class="text-muted" id="site-name"></small>
             <!-- Diversity: replaces the site-name line above with a highlighted stats box while diversity mode is active -->
@@ -8558,6 +8706,39 @@ loadUpdateStatus();
 updateStatus();
 setInterval(updateStatus, 3000);
 setInterval(loadLiveStreams, 3600000);
+
+// ── QuickLynx button ─────────────────────────────────────────
+// Its own poll, deliberately not hooked into updateStatus(). Editing
+// the middle of that function is what broke this page once already;
+// keeping it separate means a fault here cannot stop the rest of the
+// page updating.
+async function refreshQuickLynxButton() {
+    const btn = document.getElementById('quicklynx-btn');
+    if (!btn) return;
+    try {
+        const r = await fetch('/api/status');
+        const s = await r.json();
+        if (s.lynx && s.lynx.quicklynx_enabled) {
+            btn.classList.remove('disabled');
+            btn.removeAttribute('aria-disabled');
+            btn.title = 'Open QuickLynx - the QO-100 wideband spectrum, '
+                      + 'click a signal to tune this receiver to it.';
+        } else {
+            btn.classList.add('disabled');
+            btn.setAttribute('aria-disabled', 'true');
+            btn.title = 'QuickLynx is switched off. It shows the QO-100 '
+                      + 'wideband spectrum and lets you click a signal to '
+                      + 'tune this receiver to it. Turn it on in Config to use it.';
+        }
+    } catch (e) {
+        // Silent: the status poll elsewhere already reports connection
+        // trouble, and a second complaint about the same thing helps
+        // nobody.
+    }
+}
+refreshQuickLynxButton();
+setInterval(refreshQuickLynxButton, 5000);
+
 </script>
 </body>
 </html>"""
