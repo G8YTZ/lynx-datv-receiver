@@ -37,6 +37,7 @@ import os
 import re
 import signal
 import socket
+import shlex
 import subprocess
 import time
 import urllib.request
@@ -616,6 +617,7 @@ def restart_mpv(target_url: str, is_rf: bool = True):
     cmd = (
         f"mpv --fullscreen --ontop --border=no --no-osc --no-input-default-bindings "
         f"--cursor-autohide=always --force-window=yes --vo=gpu --hwdec=drm-copy --mute=yes "
+        f"{audio_device_flag()}"
         f"--audio-pitch-correction=no --script={DRIFT_SCRIPT_PATH} "
         f"{source_flags}"
         f"--keep-open=yes --idle=yes "
@@ -806,6 +808,71 @@ def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
         time.sleep(0.1)
     print(f"[mpv_render] did NOT confirm rendering within {timeout:.1f}s timeout")
     return False
+
+def audio_device_flag():
+    """The --audio-device flag for mpv, or nothing if set to auto.
+
+    Defaults to HDMI rather than mpv's own auto-selection. Auto picks
+    whatever ALSA offers first, and a USB audio dongle left plugged in
+    outsorts the HDMI output - so sound disappears into a device nobody
+    is listening to, with no indication anything is wrong. Reported by
+    G8GKQ, who spent a while on it before finding a dongle was the
+    cause. A receiver driving a television should send its audio to the
+    television unless told otherwise.
+    """
+    dev = str(config.get('display', {}).get('audio_device', 'hdmi')).strip()
+    if not dev or dev.lower() == 'auto':
+        return ""
+    if dev.lower() == 'hdmi':
+        # Ask mpv for the first HDMI output ALSA is offering. Resolved
+        # at launch rather than baked in, since the card number varies
+        # between Pi models and between HDMI ports.
+        found = _first_hdmi_device()
+        if not found:
+            print("[mpv] audio_device is 'hdmi' but no HDMI output found - "
+                  "letting mpv choose")
+            return ""
+        dev = found
+    return f"--audio-device={shlex.quote(dev)} "
+
+
+def list_audio_devices():
+    """Every audio output mpv can see, as (name, description) pairs.
+
+    Asks mpv itself rather than parsing ALSA directly, so the names are
+    exactly what --audio-device will accept.
+    """
+    out = []
+    try:
+        r = subprocess.run(["mpv", "--audio-device=help"],
+                           capture_output=True, text=True, timeout=10)
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line.startswith("'"):
+                continue
+            # Format: 'name' (Description)
+            try:
+                name = line.split("'")[1]
+            except IndexError:
+                continue
+            desc = ""
+            if "(" in line:
+                desc = line[line.index("(") + 1:].rstrip(")").strip()
+            if name and name != "auto":
+                out.append({"name": name, "description": desc or name})
+    except Exception as e:
+        print(f"[mpv] could not list audio devices: {e}")
+    return out
+
+
+def _first_hdmi_device():
+    """The first HDMI output mpv reports, or None."""
+    for d in list_audio_devices():
+        blob = (d["name"] + " " + d["description"]).lower()
+        if "hdmi" in blob:
+            return d["name"]
+    return None
+
 
 def mpv_cmd(cmd: dict):
     """Send a JSON command to mpv via IPC socket (fire and forget)."""
@@ -2581,6 +2648,9 @@ class GpioTxConfigUpdate(BaseModel):
 
 class DisplayConfigUpdate(BaseModel):
     ppm_style: str = "full_fat"  # "skeleton" or "full_fat"
+    # "hdmi" (resolved to the first HDMI output at launch), "auto" to let
+    # mpv choose, or an explicit mpv device name from /api/audio/devices.
+    audio_device: str = "hdmi"
 
 class TriWatchRfSourceUpdate(BaseModel):
     enabled: bool = True   # unchecked = this source is omitted from
@@ -4151,6 +4221,21 @@ class PathfinderTestRequest(BaseModel):
     symbol_rate: str = "333"
 
 
+@app.get("/api/audio/devices", tags=["Control"],
+         summary="List the audio outputs mpv can see",
+         description="Asks mpv directly, so the names returned are exactly "
+                     "what the audio_device setting will accept. Used to "
+                     "populate the Config page selector.")
+def api_audio_devices():
+    devices = list_audio_devices()
+    current = str(config.get('display', {}).get('audio_device', 'hdmi'))
+    return {
+        "current": current,
+        "resolved": _first_hdmi_device() if current.lower() == 'hdmi' else current,
+        "devices": devices,
+    }
+
+
 @app.post("/api/pathfinder/test", tags=["Status"],
           summary="Show a test end-of-contact map card",
           description="Arms the end-of-contact map for the given callsign "
@@ -4695,6 +4780,26 @@ def config_page():
 
         <div class="col-md-4">
                 <div class="card mb-3">
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F50A; Audio Output</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            Which device mpv sends audio to. Defaults to HDMI, so sound
+                            follows the picture to the television. Left on automatic,
+                            a USB audio dongle plugged in for some other purpose can
+                            quietly capture the audio instead.
+                        </p>
+                        <label class="small text-muted mb-1" for="audio-device-select">Device</label>
+                        <select class="form-select form-select-sm mb-2" id="audio-device-select">
+                            <option value="hdmi">HDMI (recommended)</option>
+                            <option value="auto">Automatic - let mpv choose</option>
+                        </select>
+                        <div id="audio-device-resolved" class="small text-muted mb-2"></div>
+                        <button class="btn btn-save" onclick="saveAudioDevice()">Save Audio settings</button>
+                        <span id="audio-save-status" class="save-status ms-2"></span>
+                    </div>
+                </div>
+
                     <div class="card-header">&#x1F3AF; PPM Meter Style</div>
                     <div class="card-body">
                         <p class="text-muted small">Applies live within a few seconds - no restart needed.</p>
@@ -5211,6 +5316,8 @@ async function loadCurrentConfig() {
             }
         });
 
+        loadAudioDevices(cfg.display?.audio_device || 'hdmi');
+
         const ppmStyle = cfg.display?.ppm_style || 'full_fat';
         document.getElementById(ppmStyle === 'full_fat' ? 'ppm-style-full-fat' : 'ppm-style-skeleton').checked = true;
 
@@ -5571,13 +5678,80 @@ async function savePathfinder() {
     }
 }
 
+async function loadAudioDevices(current) {
+    const sel = document.getElementById('audio-device-select');
+    const note = document.getElementById('audio-device-resolved');
+    if (!sel) return;
+    try {
+        const r = await fetch('/api/audio/devices');
+        const d = await r.json();
+        // Keep the two friendly options at the top, then whatever mpv
+        // actually reports - asked of mpv rather than ALSA so the names
+        // are exactly what --audio-device will accept.
+        sel.length = 2;
+        (d.devices || []).forEach(dev => {
+            const o = document.createElement('option');
+            o.value = dev.name;
+            o.textContent = dev.description + '  (' + dev.name + ')';
+            sel.appendChild(o);
+        });
+        sel.value = current;
+        if (sel.value !== current) {
+            // The saved device is no longer present - a dongle unplugged,
+            // or a card renumbered. Say so rather than silently showing
+            // something else as selected.
+            const o = document.createElement('option');
+            o.value = current;
+            o.textContent = current + '  (not currently present)';
+            sel.appendChild(o);
+            sel.value = current;
+        }
+        if (note) {
+            note.textContent = (current === 'hdmi' && d.resolved)
+                ? 'Currently resolves to: ' + d.resolved
+                : '';
+        }
+    } catch (e) {
+        console.error('audio device list failed', e);
+        if (note) note.textContent = 'Could not read the device list from mpv.';
+    }
+}
+
+async function saveAudioDevice() {
+    const st = document.getElementById('audio-save-status');
+    st.textContent = 'Saving...';
+    st.className = 'save-status text-muted';
+    try {
+        const body = { display: {
+            ppm_style: document.querySelector('input[name="ppm-style"]:checked')?.value || 'full_fat',
+            audio_device: document.getElementById('audio-device-select').value
+        }};
+        const r = await fetch('/api/config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body)
+        });
+        if (!r.ok) throw new Error(await r.text());
+        st.textContent = 'Saved - takes effect when mpv next starts.';
+        st.className = 'save-status text-success';
+    } catch (e) {
+        st.textContent = 'Save failed - see console.';
+        st.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
 async function savePpmStyle() {
     const statusEl = document.getElementById('ppm-style-status');
     statusEl.textContent = 'Saving...';
     statusEl.className = 'save-status text-muted';
     try {
         const style = document.querySelector('input[name="ppm-style"]:checked').value;
-        const body = { display: { ppm_style: style } };
+        // Both fields are sent together: the config save merges the
+        // whole display block, so sending only one would drop the other.
+        const body = { display: {
+            ppm_style: style,
+            audio_device: document.getElementById('audio-device-select')?.value || 'hdmi'
+        }};
         const r = await fetch('/api/config', {
             method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
         });
