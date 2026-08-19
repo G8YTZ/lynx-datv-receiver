@@ -3716,7 +3716,15 @@ def _pathfinder_current_source():
         st = picotuner_state_b if rcv == 2 else picotuner_state
         return (bool(st.get('locked')), rcv)
 
-    if config.get('diversity', {}).get('enabled'):
+    # The RUNTIME flag, not config['diversity']['enabled']. Turning
+    # diversity on by tuning sets the global and does not write the
+    # config, so reading the file reports False - this branch was
+    # skipped entirely and the fall-through below looked only at tuner
+    # A. Pathfinder therefore drew nothing for a contact carried by Rx2
+    # alone, while mpv and the OSD showed it perfectly. The same
+    # mistake, in the same session, as the one that stopped QRZ logging
+    # an Rx2-only diversity contact.
+    if diversity_enabled:
         # Either tuner alone can carry the picture, so the contact is
         # only over once both have dropped.
         a = bool(picotuner_state.get('locked'))
