@@ -592,7 +592,7 @@ class NotificationManager:
 
     def __init__(self, picotuner_state, picotuner_state_b, get_config, record_event=None,
                  get_lnb_state=None, get_tri_watch_displayed_rcv=None, get_tri_watch_enabled=None,
-                 get_stream_active=None):
+                 get_stream_active=None, get_diversity_enabled=None):
         self.picotuner_state = picotuner_state
         self.picotuner_state_b = picotuner_state_b
         self.get_config = get_config
@@ -602,6 +602,11 @@ class NotificationManager:
         # lynx_app's globals. Optional, so an older caller still works -
         # it just never reports a stream as active input.
         self.get_stream_active = get_stream_active or (lambda: False)
+        # Diversity's RUNTIME state. The config file is not updated when
+        # diversity is turned on by tuning, so reading it there reports
+        # False and tuner B's lock gets ignored. Optional, falling back
+        # to the config, so an older caller still behaves as before.
+        self.get_diversity_enabled = get_diversity_enabled
         # Lets this module log onto the same, persistent Diagnostics page
         # timeline lynx_app.py already uses for mpv events, rather than
         # only to the terminal - defaults to a harmless no-op so this
@@ -837,7 +842,14 @@ class NotificationManager:
     def _poll(self):
         cfg = self.get_config()
         notif_cfg = cfg.get('notifications', {})
-        diversity_enabled = cfg.get('diversity', {}).get('enabled', False)
+        # Runtime state first, config as a fallback - see __init__.
+        if self.get_diversity_enabled is not None:
+            try:
+                diversity_enabled = bool(self.get_diversity_enabled())
+            except Exception:
+                diversity_enabled = cfg.get('diversity', {}).get('enabled', False)
+        else:
+            diversity_enabled = cfg.get('diversity', {}).get('enabled', False)
         # Rx2's lock status is only meaningful to consider when it's
         # actually, deliberately being monitored - true during diversity
         # mode (as before), but also true during tri_watch whenever it

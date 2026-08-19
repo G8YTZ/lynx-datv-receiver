@@ -8937,7 +8937,16 @@ if __name__ == "__main__":
         get_lnb_state=lambda: (current_lnb_lo_khz, current_lnb_side),
         get_tri_watch_displayed_rcv=lambda: tri_watch_target_rcv,
         get_tri_watch_enabled=lambda: tri_watch_enabled,
-        get_stream_active=_stream_is_being_shown)
+        get_stream_active=_stream_is_being_shown,
+        # Runtime diversity state, not the saved config. Turning
+        # diversity on by tuning sets a module global and does NOT write
+        # the config file, so the manager was reading a flag that stayed
+        # False - and tuner B's lock was therefore ignored for QRZ,
+        # Slack, Companion and GPIO Tx. Pathfinder, mpv and the OSD all
+        # read the tuner state directly, so they worked perfectly and
+        # hid the problem: a receiver could sit showing a picture from
+        # Rx2 while logging nothing at all.
+        get_diversity_enabled=lambda: diversity_enabled)
     notification_manager.start()
     print("Picotuner monitor started.")
 
