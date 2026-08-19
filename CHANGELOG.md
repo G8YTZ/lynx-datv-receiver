@@ -2,6 +2,12 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-08-19
+
+**Fixed**
+- The Picotuner's callsign field was accepted as a callsign unless it was "search", "lost" or empty. That is a blocklist, and blocklists are always one surprise behind: the tuner also emits "header", which sailed through and produced 53 pointless QRZ lookups in a single overnight session - one every eight minutes, none of which could ever have succeeded. Now tested positively instead: every callsign has at least one digit and at least two letters, which "header" and its kind all fail. Deliberately permissive about length and about "/" and "-", so portable and special-event suffixes are unaffected. Verified against 20 real callsigns from this station's logbook and 18 status tokens, and against real lines captured from the tuner's own broadcast.
+- "header" is now recognised explicitly as a not-locked state alongside "search" and "lost". Watching the broadcast showed what it actually means: WinterHill has found something transport-stream-shaped and is trying to acquire, but has no callsign and no picture yet - a "header" line carries a wandering frequency (436.085, 436.281, 436.351...) while "search" sits exactly on the tuned value. Lynx previously treated it as a lock with the callsign "header".
+
 ## 2026-08-18
 
 **Added**

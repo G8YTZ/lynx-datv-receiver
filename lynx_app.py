@@ -1098,6 +1098,41 @@ picotuner_state = {
     "agc2": "",
 }
 
+def looks_like_callsign(token):
+    """Is this plausibly an amateur callsign?
+
+    The parser used to accept anything that was not "search", "lost" or
+    empty. That is a blocklist, and blocklists are always one surprise
+    behind: the Picotuner also emits "header", which sailed through and
+    produced 53 pointless QRZ lookups in a single overnight session -
+    one every eight minutes, none of which could ever succeed.
+
+    So test positively instead. Every callsign in the world has at least
+    one digit and at least two letters, which "header", "search",
+    "lost", "idle" and anything else of that kind all fail. Deliberately
+    permissive about length and about "/" and "-", so portable and
+    special-event suffixes are not rejected.
+    """
+    if not token:
+        return False
+    t = str(token).strip().upper()
+    if not (3 <= len(t) <= 16):
+        return False
+    if not all(c.isalnum() or c in "/-" for c in t):
+        return False
+    if not any(c.isdigit() for c in t):
+        return False
+    if sum(1 for c in t if c.isalpha()) < 2:
+        return False
+    # A short blocklist as well, for the handful of status tokens that
+    # happen to share a valid callsign's shape. Secondary to the test
+    # above, not a replacement for it - "K1A" is a real callsign and
+    # "RX1" is not, and nothing about their form distinguishes them.
+    if t in {"RX1", "RX2", "RX3", "RX4"}:
+        return False
+    return True
+
+
 def picotuner_monitor():
     """Background thread: reads Picotuner broadcast on port 9997.
     Keeps the socket open continuously for efficiency. Also parses
@@ -1238,9 +1273,18 @@ def picotuner_monitor():
                     rx1 = line.replace("RX1", "").strip()
                     picotuner_state["rx1_raw"] = rx1
                     parts = rx1.split()
-                    # "search" and "lost" both mean not locked
-                    unlocked_states = {"search", "lost", ""}
-                    if len(parts) >= 2 and parts[-1] not in unlocked_states:
+                    # Not-locked states. "header" is WinterHill's
+                    # intermediate state: it has found something
+                    # transport-stream-shaped and is trying to acquire,
+                    # but has no callsign and no picture yet - confirmed
+                    # by watching the broadcast, where a "header" line
+                    # carries a wandering frequency (436.085, 436.281,
+                    # 436.351...) while "search" sits exactly on the
+                    # tuned value. It was previously accepted as a
+                    # callsign and looked up on QRZ 53 times overnight.
+                    unlocked_states = {"search", "lost", "header", ""}
+                    if (len(parts) >= 2 and parts[-1] not in unlocked_states
+                            and looks_like_callsign(parts[-1])):
                         picotuner_state["locked"] = True
                         picotuner_state["callsign"] = parts[-1]
                         picotuner_state["frequency"] = parts[0].rstrip("TB")
@@ -1258,8 +1302,11 @@ def picotuner_monitor():
                     picotuner_state_b["online"] = True
                     picotuner_state_b["last_seen"] = time.time()
                     parts = rx2.split()
-                    unlocked_states = {"search", "lost", ""}
-                    if len(parts) >= 2 and parts[-1] not in unlocked_states:
+                    # Same set as RX1 above - see the note there on
+                    # "header".
+                    unlocked_states = {"search", "lost", "header", ""}
+                    if (len(parts) >= 2 and parts[-1] not in unlocked_states
+                            and looks_like_callsign(parts[-1])):
                         picotuner_state_b["locked"] = True
                         picotuner_state_b["callsign"] = parts[-1]
                         picotuner_state_b["frequency"] = parts[0].rstrip("TB")
