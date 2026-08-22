@@ -9,6 +9,25 @@ set -e   # stop on any error, rather than leaving a half-installed system
 
 REPO_URL="https://github.com/G8YTZ/lynx-datv-receiver.git"
 
+# Which branch to install. Defaults to beta, because that is the branch
+# this script itself lives on and is fetched from - the quick-install
+# one-liner in the guide points at .../beta/install.sh, so cloning
+# anything else silently installs code that does not match the installer.
+#
+# That was a real, confirmed bug: `git clone` with no branch takes the
+# repository default (main), so fetching this script from beta and
+# running it produced a main checkout. The failure was not obvious -
+# it surfaced much later as "cannot stat lynx-scheduled-reboot.service",
+# because the systemd units only exist on beta.
+#
+# Override on the command line if you genuinely want another branch:
+#   ./install.sh --branch main
+BRANCH="beta"
+if [ "$1" = "--branch" ] && [ -n "$2" ]; then
+  BRANCH="$2"
+  shift 2
+fi
+
 echo "=== Lynx DATV Receiver — Installer ==="
 echo ""
 
@@ -167,8 +186,19 @@ echo "--- Fetching Lynx ---"
 if [ -d ~/lynx ]; then
   echo "~/lynx already exists - leaving it as-is."
   echo "(Delete it first if you want a completely fresh clone instead.)"
+  # Warn if what is already there is not the branch being installed -
+  # otherwise the rest of this script runs against unexpected code and
+  # fails later in ways that do not point back to here.
+  EXISTING_BRANCH="$(git -C ~/lynx rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
+  if [ "$EXISTING_BRANCH" != "$BRANCH" ]; then
+    echo ""
+    echo ">>> WARNING: ~/lynx is on branch '$EXISTING_BRANCH', but this"
+    echo ">>> installer expects '$BRANCH'. Files this script needs may be"
+    echo ">>> missing. To switch:  cd ~/lynx && git checkout $BRANCH"
+    echo ""
+  fi
 else
-  git clone "$REPO_URL" ~/lynx
+  git clone -b "$BRANCH" "$REPO_URL" ~/lynx
 fi
 
 # --- Configuration ------------------------------------------
@@ -249,9 +279,28 @@ systemctl --user daemon-reload
 # desk, so that call belongs to whoever installed it. System units
 # rather than user ones, since rebooting needs root.
 echo "--- Installing (not enabling) scheduled reboot units ---"
-sudo cp ~/lynx/lynx-scheduled-reboot.service /etc/systemd/system/
-sudo cp ~/lynx/lynx-scheduled-reboot.timer /etc/systemd/system/
-sudo systemctl daemon-reload
+# Guarded rather than a bare cp. With `set -e` at the top of this
+# script, a missing unit file aborts the whole install here - leaving a
+# half-configured system, and an error message ("cannot stat
+# lynx-scheduled-reboot.service") that points at the symptom rather than
+# the cause. That happened for real when the clone above took the wrong
+# branch: these units exist only on beta, so a main checkout got most of
+# the way through an install and then died. The branch bug is fixed
+# above; this makes the failure non-fatal and self-explaining anyway,
+# because a scheduled reboot is an optional extra and is not worth
+# losing an otherwise good install over.
+if [ -f ~/lynx/lynx-scheduled-reboot.service ] && [ -f ~/lynx/lynx-scheduled-reboot.timer ]; then
+  sudo cp ~/lynx/lynx-scheduled-reboot.service /etc/systemd/system/
+  sudo cp ~/lynx/lynx-scheduled-reboot.timer /etc/systemd/system/
+  sudo systemctl daemon-reload
+else
+  echo ""
+  echo ">>> Scheduled reboot units not found in ~/lynx - skipping."
+  echo ">>> Everything else is installed and usable. This usually means"
+  echo ">>> ~/lynx is on a branch that does not carry these files;"
+  echo ">>> check with:  git -C ~/lynx rev-parse --abbrev-ref HEAD"
+  echo ""
+fi
 
 # --- Cursor-hide keybind (labwc rc.xml) ------------------------
 # Only created if rc.xml doesn't exist at all - same reasoning as
