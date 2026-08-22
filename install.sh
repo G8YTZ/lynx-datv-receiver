@@ -37,6 +37,7 @@ sudo apt install -y \
   librsvg2-bin \
   wtype \
   iw \
+  chrony \
   git
 
 # --- Python dependencies -------------------------------------
@@ -49,13 +50,111 @@ sudo apt install -y \
 # (the end-of-contact station map). 74KB, pure Python - deliberately
 # chosen over geopandas, which would drag in GEOS, PROJ, pandas and
 # NumPy for what amounts to reading a few polygons.
+# `pyserial` reads the optional GNSS HAT (lynx_gnss.py) over
+# /dev/ttyAMA0 - harmless to install even on a receiver with no HAT
+# fitted at all, since lynx_gnss.py already fails quietly with
+# nothing on the port. Often already present via Raspberry Pi OS's
+# own python3-serial package (confirmed: `pip install` reports
+# "Requirement already satisfied" in that case rather than
+# reinstalling) - listed explicitly regardless rather than assumed,
+# same reasoning this section already gives for requests/gpiozero.
 echo "--- Installing Python dependencies ---"
-pip install --break-system-packages fastapi uvicorn pyyaml requests gpiozero pyshp
+pip install --break-system-packages fastapi uvicorn pyyaml requests gpiozero pyshp pyserial
+
+# --- GPS time sync (chrony) -------------------------------------
+# Only relevant to a receiver with the optional GNSS HAT fitted
+# (lynx_gnss.py) - harmless either way on one without, since chrony
+# simply never sees a source that never sends it anything. Feeds
+# GPS time directly to chrony's own SOCK refclock driver rather than
+# via gpsd, since gpsd would need exclusive ownership of the same
+# serial port GnssReader already owns - see lynx_gnss.py's own
+# module comment for the full rationale. Genuinely useful even
+# without a HAT fitted yet: chrony is a better NTP client than
+# systemd-timesyncd regardless, and this leaves the receiver ready
+# for a HAT to be fitted later with no further setup needed.
+#
+# Deliberately placed BEFORE the --deps-only exit below, unlike the
+# repo/config/autostart steps further down: this needs to happen
+# automatically on every "Update Now" for an EXISTING install, not
+# only on a from-scratch one, since a HAT can be fitted to a receiver
+# that's already been running for months (exactly this session's own
+# case). Safe to put here specifically because it's fully idempotent
+# and side-effect-free on a re-run: unlike lynx_config.yaml (holds an
+# operator's own site-specific settings that must never be silently
+# reset) or the autostart entry (duplicating it would run two
+# competing Lynx instances), disabling an already-disabled
+# systemd-timesyncd or re-checking an already-present chrony.conf
+# line does nothing on the second and every subsequent run.
+#
+# Raspberry Pi OS runs systemd-timesyncd by default - the two
+# shouldn't both be actively managing the clock at once, so this
+# disables it in favour of chrony.
+echo "--- Setting up GPS time sync (chrony) ---"
+if systemctl is-enabled systemd-timesyncd >/dev/null 2>&1 || systemctl is-active systemd-timesyncd >/dev/null 2>&1; then
+  echo "Disabling systemd-timesyncd in favour of chrony..."
+  sudo systemctl disable --now systemd-timesyncd
+fi
+CHRONY_CONF="/etc/chrony/chrony.conf"
+if [ -f "$CHRONY_CONF" ]; then
+  if sudo grep -q "refclock SOCK /var/run/chrony.gnss.sock" "$CHRONY_CONF"; then
+    echo "chrony.conf already has the GNSS refclock line - leaving it untouched."
+  else
+    echo "refclock SOCK /var/run/chrony.gnss.sock refid GPS precision 1e-1" | sudo tee -a "$CHRONY_CONF" >/dev/null
+    echo "Added GNSS refclock line to $CHRONY_CONF."
+    sudo systemctl restart chrony
+  fi
+else
+  echo "$CHRONY_CONF not found - skipping (unexpected chrony packaging on this OS;"
+  echo "add 'refclock SOCK /var/run/chrony.gnss.sock refid GPS precision 1e-1' to"
+  echo "chrony's own config file by hand, then 'sudo systemctl restart chrony')."
+fi
+
+# Socket permissions. chrony creates the SOCK refclock owned by
+# root:root, mode 0755 - readable by everyone but writable only by
+# root. Lynx runs as the desktop user and has to WRITE samples into
+# it, so without this it connects and immediately fails with
+# "[Errno 13] Permission denied", leaving GPS time sync silently
+# non-functional even though chrony itself is installed and correctly
+# configured. Confirmed live: this was the second of two separate
+# reasons GPS time sync had never actually worked on an existing
+# install.
+#
+# Handled with a shared group plus a systemd drop-in rather than a
+# one-off chmod, because chrony recreates the socket from scratch on
+# every start - a manual chmod is undone by the next restart or
+# reboot. The drop-in re-applies it each time chrony starts.
+#
+# The '+' prefix on ExecStartPost runs that command as full root
+# regardless of the unit's own User=_chrony - without it the chgrp
+# fails with "Operation not permitted" AND takes the whole chrony
+# service down with it, which is considerably worse than not having
+# GPS time sync. The trailing 'exit 0' is the same insurance:
+# timekeeping must never fail because a GPS extra didn't work.
+echo "--- Setting up GNSS socket permissions ---"
+sudo groupadd -f gpsshare
+if id -nG "$USER" | tr ' ' '\n' | grep -qx gpsshare; then
+  echo "$USER is already in the gpsshare group."
+else
+  sudo usermod -aG gpsshare "$USER"
+  echo "Added $USER to the gpsshare group (takes effect at next login/reboot)."
+fi
+CHRONY_DROPIN_DIR="/etc/systemd/system/chrony.service.d"
+CHRONY_DROPIN="$CHRONY_DROPIN_DIR/gnss-sock-perms.conf"
+sudo mkdir -p "$CHRONY_DROPIN_DIR"
+sudo tee "$CHRONY_DROPIN" >/dev/null <<'DROPIN'
+[Service]
+ExecStartPost=
+ExecStartPost=+/bin/sh -c 'for i in $(seq 1 50); do [ -S /var/run/chrony.gnss.sock ] && break; sleep 0.1; done; if [ -S /var/run/chrony.gnss.sock ]; then chgrp gpsshare /var/run/chrony.gnss.sock && chmod g+w /var/run/chrony.gnss.sock; fi; exit 0'
+DROPIN
+sudo systemctl daemon-reload
+sudo systemctl restart chrony 2>/dev/null || true
+echo "GNSS socket permissions configured."
 
 # --deps-only stops here - used by "Update Now" (lynx_app.py) to
-# re-confirm every OS/apt/pip dependency above is genuinely present
-# on an existing install, without touching the repo clone, config, or
-# anything else below that would be unsafe to redo on an
+# re-confirm every OS/apt/pip dependency above, AND the GPS time-sync
+# setup just above (equally safe to redo), is genuinely present on an
+# existing install - without touching the repo clone, config, or
+# anything else below that would be genuinely unsafe to redo on an
 # already-configured system. See this section's own comment further
 # up (near the apt install list) for the full rationale.
 if [ "$1" = "--deps-only" ]; then
@@ -202,6 +301,31 @@ echo ""
 echo "  Enable auto-login to the desktop (one-time GUI setting):"
 echo "    Preferences -> Raspberry Pi Configuration -> System -> Auto login -> on"
 echo "    Then reboot to confirm Lynx starts automatically."
+echo ""
+echo "If a GNSS HAT is fitted (optional - portable operation only), two more"
+echo "one-time hardware/raspi-config steps, deliberately left manual for the"
+echo "same reason auto-login is above - getting a boot-config or raspi-config"
+echo "flag wrong via an unverified script is a worse outcome than asking:"
+echo ""
+echo "  1. Enable the GPIO header UART, then reboot:"
+echo "       sudo raspi-config"
+echo "       -> Interface Options -> Serial Port"
+echo "       -> 'login shell over serial' = No"
+echo "       -> 'enable serial port hardware' = Yes"
+echo "     Confirm /boot/firmware/config.txt has 'dtparam=uart0=on'"
+echo "     (add it by hand if raspi-config didn't) - reboot to apply."
+echo ""
+echo "  2. Confirm the HAT itself: UART jumper at position B (not A, which"
+echo "     routes to onboard USB instead), STANDBY switch OFF."
+echo ""
+echo "  Then enable it on the Config page's GNSS Portable Locator card"
+echo "  (Automatic by default), and if GPS time sync is wanted too, confirm"
+echo "  chrony sees it once a fix is confirmed:  chronyc sources -v"
+echo ""
+echo "  Note: GPS time sync needs this user to be in the 'gpsshare' group,"
+echo "  which only takes effect after a reboot (or a full log out and back"
+echo "  in). Until then the locator works normally but time sync will still"
+echo "  report as unavailable."
 echo ""
 echo "To test right now without rebooting:"
 echo "  cd ~/lynx && ./lynx_start.sh"

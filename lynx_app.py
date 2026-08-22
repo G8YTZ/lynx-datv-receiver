@@ -54,6 +54,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import lynx_notifications
+import lynx_gnss
 import lynx_map
 import lynx_rtmp_probe
 
@@ -99,6 +100,24 @@ CONFIG_PATH = Path(__file__).parent / "config" / "lynx_config.yaml"
 STATE_PATH = Path(__file__).parent / "lynx_state.json"
 DRIFT_SCRIPT_PATH = Path(__file__).parent / "lynx_drift_correction.lua"
 
+# Every writer of lynx_config.yaml (the /api/config POST handler, the
+# update-channel switcher, and the GNSS confirmed-fix callback) reads
+# the file fresh, modifies it, writes to the SAME "<config>.tmp" path,
+# then os.replace()s it into place - and none of that was ever guarded
+# by a lock, even before GNSS existed. Two human-triggered saves
+# genuinely landing in the same instant was rare enough not to matter
+# in practice. GNSS changes that: its callback is an AUTOMATIC,
+# high-frequency writer that can fire every time a fix is confirmed,
+# which meaningfully raises the odds of colliding with someone editing
+# Config in a browser tab at the same time - two processes opening the
+# same tmp path concurrently can truncate each other's write, and
+# whichever os.replace() lands second wins outright, silently
+# discarding the other save in full (not just the fields it touched).
+# One shared lock around the read-modify-write-replace cycle, used by
+# every writer, closes this for GNSS and for the two pre-existing
+# paths at the same time.
+_config_write_lock = threading.Lock()
+
 def load_config():
     with open(CONFIG_PATH) as f:
         return yaml.safe_load(f)
@@ -128,6 +147,120 @@ def load_last_state():
         return None
 
 config = load_config()
+
+# ── GNSS (portable locator) ─────────────────────────────────────
+# Waveshare L76K HAT, GPIO header UART - see lynx_gnss.py's own
+# docstring for why /dev/ttyAMA0 rather than the /dev/serial0 symlink,
+# and why 9600 baud. Fixed here rather than exposed in config: a
+# repeater site simply doesn't have the HAT fitted, and GnssReader
+# already fails quietly and keeps retrying when there's nothing on
+# the port - so there is nothing here for a fixed site to configure
+# wrong. What IS configurable is gnss.mode (see GnssConfigUpdate) -
+# whether a fix, once confirmed, is trusted to drive the locator at
+# all.
+
+def _on_gnss_locator_change(locator: str):
+    """Called by GnssReader only once a fix has held the same 6-char
+    square for the full stability window (30s by default) - i.e. on a
+    genuinely confirmed fix, not on every NMEA sentence.
+
+    Writes straight into notifications.qrz.portable_locator, the same
+    field an operator would otherwise type by hand into the Config
+    page's QRZ card. This is not a new field: lynx_notifications.
+    submit_qrz_logbook's own docstring already anticipated exactly
+    this - "a future, automated source - an onboard GPS module ...
+    could populate the same underlying config value on its own, and
+    this function would need no changes at all to use it." GPS is
+    just that automated source now.
+
+    Only actually writes in "automatic" mode. "GPS always wins when
+    there's a fix" is a decision about automatic mode specifically -
+    manual mode's entire point is a fixed, operator-chosen value that
+    GPS must never silently overwrite, even with a HAT fitted and
+    locked. Any mode value other than "automatic" (which today just
+    means "manual", but also covers a legacy "off" from a config
+    written before that mode was removed) is treated the same way:
+    don't write.
+
+    Uses the shared _config_write_lock (see its own comment by
+    CONFIG_PATH) - this fires from GnssReader's own background thread,
+    completely independent of and concurrent with any /api/config POST
+    a browser tab might be doing at the same moment, and both write the
+    same file via the same tmp path. Distinct from tune_lock, which
+    serializes an unrelated pair of operations (tune/start_stream)."""
+    global config
+    with _config_write_lock:
+        mode = config.get('gnss', {}).get('mode', 'automatic')
+        if mode != 'automatic':
+            return
+        on_disk = load_config()
+        on_disk.setdefault('notifications', {}).setdefault('qrz', {})['portable_locator'] = locator
+        tmp_path = str(CONFIG_PATH) + ".tmp"
+        with open(tmp_path, 'w') as f:
+            yaml.safe_dump(on_disk, f, default_flow_style=False, sort_keys=False)
+        os.replace(tmp_path, CONFIG_PATH)
+        config = on_disk
+        print(f"[gnss] confirmed fix - portable_locator set to {locator}")
+
+gnss_reader = lynx_gnss.GnssReader(
+    port="/dev/ttyAMA0", baud=9600, stable_secs=30.0, length=6,
+    on_change=_on_gnss_locator_change,
+    # Mode 7 = GPS + BeiDou + GLONASS, all three the L76K can actually
+    # be told to use - QZSS is always on regardless and can't be
+    # configured, so this is every constellation available. Sent once
+    # via $PCAS04 on each serial connect; the module keeps the setting
+    # in its own memory afterwards. The board ships as GPS + GLONASS
+    # only - this was discussed and settled on, but never actually
+    # passed through until now.
+    constellations=7,
+)
+
+# Fixed, like the port/baud above - matched by a chrony.conf refclock
+# entry install.sh sets up automatically. Not user-configurable:
+# there's nothing about this path that varies per installation, only
+# whether it's used at all (gnss.time_sync).
+GNSS_CHRONY_SOCK_PATH = "/var/run/chrony.gnss.sock"
+
+def _apply_gnss_mode():
+    """Applies gnss.time_sync live. Called once at startup and again
+    after every /api/config save that touches the gnss section.
+
+    The reader itself is started once, unconditionally, at startup
+    (see the bottom of this file) and stays running for the life of
+    the process - there is deliberately no mode that stops it. A site
+    with no HAT fitted costs nothing either way: GnssReader already
+    fails quietly and keeps retrying forever with nothing on the port.
+    A site WITH a HAT fitted should almost always want at least GPS
+    time sync active regardless of whether GPS is trusted to drive the
+    locator - an earlier "Off" mode that stopped the whole reader,
+    time sync included, defeated that for no benefit: Manual mode
+    already gives an operator everything Off was for (GPS never
+    touches portable_locator) without also losing the clock
+    correction. Removed rather than kept as a third option nobody had
+    a real use for.
+
+    time_sync's own on/off is still separate from locator mode -
+    useful even while Manual is driving the locator. Setting
+    chrony_sock_path to None when disabled means _run()'s next
+    reconnect simply won't attempt a chrony connection at all. Like
+    constellations, this is only re-read once per serial reconnect,
+    not instantaneously mid-connection - toggling it off takes effect
+    on the next reconnect cycle, same limitation this module already
+    has for constellation changes."""
+    gnss_reader.chrony_sock_path = (
+        GNSS_CHRONY_SOCK_PATH if config.get('gnss', {}).get('time_sync', True) else None
+    )
+
+def _gnss_provenance() -> str:
+    """'gnss' if the value currently in portable_locator is live,
+    GPS-derived data; 'config' if it's the operator's own configured
+    value - because mode is manual, or because mode is automatic but
+    there's no confirmed fix yet (cold start, indoors, or simply no
+    HAT - a fixed repeater site, exactly as expected)."""
+    mode = config.get('gnss', {}).get('mode', 'automatic')
+    if mode == 'automatic' and gnss_reader.tracker.locator:
+        return 'gnss'
+    return 'config'
 
 # ── App ───────────────────────────────────────────────────────
 app = FastAPI(
@@ -2462,6 +2595,24 @@ def picotuner_table_monitor_b():
     FREQUENCY/SR/MODULATION/FPRO/CODECS/ANT/PACKETS/%NUL/NIMTYPE/
     TS DESTINATION.
 
+    SHARED-STATE WARNING: this is the ONLY function that writes fields
+    picotuner_quality_monitor() also owns - specifically
+    picotuner_state["mer"] and ["margin"] for tuner A. Every other
+    field in picotuner_state / picotuner_state_b has exactly one
+    writing function (verified by a full audit of both dicts). That
+    shared ownership caused a real, confirmed bug: this function reads
+    fixed whitespace COLUMN POSITIONS, whereas the 9901 monitor reads
+    explicitly TAGGED fields ($12 = MER, $30 = margin). Column
+    positions are not stable across firmware revisions, so on
+    ptwh0v3k-w5100s this wrote non-numeric junk over values that had
+    arrived correctly moments earlier, roughly twice a second - the
+    Web UI showed MER and Margin permanently blank while tcpdump
+    proved the correct values were being received. The writes below
+    are now guarded so a column mismatch leaves the tagged values
+    alone. If any further field is ever added here, check first
+    whether the 9901 monitor already owns it, and guard it the same
+    way - tagged data should always win over positional data.
+
     Primarily extracts the RX=2 row for tuner B's rich stats (rcv=1's
     own equivalent monitor already exists separately, reading the
     $-field format on port 9901 — left untouched since it's confirmed
@@ -2521,8 +2672,56 @@ def picotuner_table_monitor_b():
                 if parts[0] == '1' and len(parts) >= 16:
                     # Supplement tuner A's mer/margin only - see
                     # docstring above for why this specific gap exists.
-                    picotuner_state["mer"] = parts[3]
-                    picotuner_state["margin"] = parts[4]
+                    #
+                    # Guarded because this is the SECOND writer of these
+                    # two fields: picotuner_quality_monitor() already
+                    # sets them from the $-tagged broadcast on 9901,
+                    # where they arrive correctly tagged ($12 = MER,
+                    # $30 = margin). This function instead reads fixed
+                    # whitespace column positions from the table-format
+                    # broadcast, and those positions are not stable
+                    # across firmware revisions. Confirmed live on
+                    # ptwh0v3k-w5100s: the $-tagged packets carried
+                    # $12,25.0 and $30,14.3 while the Web UI showed
+                    # both fields blank, because this ran afterwards
+                    # and overwrote them with non-numeric junk from the
+                    # wrong columns. MER and Margin were exactly - and
+                    # only - the two fields affected, which is exactly
+                    # the pair written here.
+                    #
+                    # Now only supplements when the columns genuinely
+                    # hold numbers, so a column-layout mismatch quietly
+                    # leaves the already-correct tagged values alone
+                    # instead of destroying them.
+                    def _numeric(tok):
+                        try:
+                            float(tok)
+                            return True
+                        except ValueError:
+                            return False
+                    # Only supplement when the TAGGED source hasn't
+                    # provided a value yet - i.e. exactly the
+                    # unlocked/searching case this branch exists for
+                    # (see docstring). Once port 9901 is reporting,
+                    # its tagged values are authoritative and are
+                    # never overwritten from column positions here.
+                    #
+                    # A numeric-only guard is NOT sufficient on its
+                    # own: this table's rows are variable-width (the
+                    # docstring above documents that for Rx2, and the
+                    # same acquisition-stage variation applies to
+                    # Rx1), so a shifted layout can put a genuine but
+                    # WRONG number in parts[3]/parts[4] - which would
+                    # pass a numeric check and silently corrupt a good
+                    # reading rather than blanking it. That is the
+                    # intermittent, hard-to-reproduce form of this same
+                    # bug: values that look plausible but are wrong,
+                    # appearing and clearing at random depending on
+                    # what the tuner happened to include in the row.
+                    if not picotuner_state.get("mer"):
+                        if _numeric(parts[3]) and _numeric(parts[4]):
+                            picotuner_state["mer"] = parts[3]
+                            picotuner_state["margin"] = parts[4]
                     continue
                 if parts[0] == '2' and len(parts) < 16:
                     # Shorter row - see docstring above. Still worth
@@ -2750,6 +2949,36 @@ class DiversityConfigUpdate(BaseModel):
     hard_freeze_breaker_required_clean_secs: Optional[float] = None
     hard_freeze_breaker_min_retry_interval_secs: Optional[float] = None
 
+class GnssConfigUpdate(BaseModel):
+    # automatic (default): GPS always wins once it has a confirmed,
+    # stable fix (see lynx_gnss.LocatorTracker) - it overwrites
+    # portable_locator itself, live, no restart. Until then - cold
+    # start, indoors, or simply no HAT - portable_locator is untouched,
+    # so it quietly falls back to whatever is already configured there.
+    # manual: the operator's own typed value in the QRZ card is
+    # authoritative and GPS, even if a HAT is fitted and locked, is
+    # never allowed to overwrite it.
+    #
+    # No "off": an earlier version had one, stopping the whole reader.
+    # Removed - a site with no HAT costs nothing either way (the
+    # reader fails quietly and keeps retrying), and a site WITH a HAT
+    # fitted should almost always want at least GPS time sync (see
+    # time_sync below) even while keeping GPS out of the locator,
+    # which Manual mode already gives with no downside. If an older
+    # config still has "off" saved, it's treated the same as "manual"
+    # (see _on_gnss_locator_change) - it just never gets cleaned up to
+    # "manual" automatically.
+    mode: str = "automatic"
+    # Independent of mode above (deliberately - a fixed value entered
+    # for Manual locator mode is still worth correcting the system
+    # clock from, and the two questions "should GPS drive the
+    # portable locator" and "should GPS feed chrony" are genuinely
+    # separate ones). Default on: it fails quietly if chrony isn't
+    # configured for it (see lynx_gnss._connect_chrony_sock), so
+    # there's no downside to leaving it on for an install that hasn't
+    # set up the chrony side yet.
+    time_sync: bool = True
+
 class QrzConfigUpdate(BaseModel):
     enabled: bool
     api_key: str
@@ -2858,6 +3087,7 @@ class ConfigUpdateRequest(BaseModel):
     display: Optional[DisplayConfigUpdate] = None
     tri_watch: Optional[TriWatchSourcesUpdate] = None
     pathfinder: Optional[PathfinderConfigUpdate] = None
+    gnss: Optional[GnssConfigUpdate] = None
 
 # ── Helpers ───────────────────────────────────────────────────
 def stop_current():
@@ -3690,7 +3920,7 @@ pathfinder_tracker = lynx_map.PathfinderTracker(
     max_distance_km=_pathfinder_cfg.get('max_distance_km', 1200),
     enabled=_pathfinder_cfg.get('enabled', True))
 
-_pathfinder_prev = {"receiving": False, "callsign": "", "rcv": 1}
+_pathfinder_prev = {"receiving": False, "callsign": "", "rcv": 1, "telemetry": {}}
 
 
 def _pathfinder_current_source():
@@ -3763,30 +3993,98 @@ def pathfinder_watcher():
                     prev['rcv'] = rcv
                 if not prev['receiving']:
                     # Something is on air again - cancel any card that
-                    # is pending or currently showing.
+                    # is pending or currently showing, and drop the
+                    # previous contact's telemetry. Done BEFORE caching
+                    # below, so this poll's own readings survive.
                     pathfinder_tracker.station_locked()
+                    prev['telemetry'] = {}
                 prev['receiving'] = True
+                # Cache quality telemetry WHILE the signal is live.
+                # picotuner_quality_monitor() rebuilds these fields from
+                # each broadcast with fields.get('$12', '') /
+                # fields.get('$18', '') - so the moment the signal drops
+                # and the Picotuner stops sending those fields, mer and
+                # modcod are overwritten with empty strings, typically
+                # within ~500ms. Reading them at unlock is therefore a
+                # race that is essentially always lost: confirmed live,
+                # with a diagnostic print showing mer='10.8' one line
+                # before the snapshot that captured ''. symbol_rate and
+                # frequency survive that transition (they're not blanked
+                # the same way), which is exactly why those two kept
+                # appearing on the card while MER/MODCOD did not.
+                # Only overwrite with non-empty values, so a single
+                # broadcast missing a field can't wipe a good reading.
+                for k in ('modcod', 'symbol_rate', 'frequency'):
+                    v = st.get(k, '')
+                    if v:
+                        prev['telemetry'][k] = v
+                # MER is kept at its BEST value for the contact, not its
+                # most recent. Caching the latest reading on every poll
+                # sounds right but isn't: the final poll before unlock
+                # catches the signal already collapsing as the operator
+                # unkeys, so the card reported a far worse figure than
+                # the contact actually achieved (25.0 dB live on the
+                # tuner, 3.7 dB on the card, dropping further on repeat
+                # transmissions). The best reading is the honest
+                # summary of how the path actually performed, and it's
+                # what an operator means by "what was my MER".
+                # Margin is captured alongside whichever poll produced
+                # that best MER, so the two always come from the same
+                # instant rather than being mixed from different ones.
+                mer_now = st.get('mer', '')
+                if mer_now:
+                    try:
+                        if float(mer_now) > float(prev['telemetry'].get('mer') or '-inf'):
+                            prev['telemetry']['mer'] = mer_now
+                            margin_now = st.get('margin', '')
+                            if margin_now:
+                                prev['telemetry']['margin'] = margin_now
+                    except ValueError:
+                        pass
                 continue
 
             if prev['receiving']:
                 prev['receiving'] = False
                 if prev['callsign']:
-                    _pathfinder_arm(prev['callsign'], prev['rcv'])
+                    _pathfinder_arm(prev['callsign'], prev['rcv'],
+                                     dict(prev['telemetry']))
         except Exception as e:
             print(f"[map] watcher: {e}")
 
 
-def _pathfinder_arm(callsign, rcv):
+def _pathfinder_arm(callsign, rcv, telemetry):
     """Looks the station up and arms the card if it has a usable
     locator. The QRZ lookup runs on its own thread - never inline, for
     the same reason tri_watch's name lookup doesn't: a slow or
-    unreachable QRZ must not stall anything."""
-    st = picotuner_state_b if rcv == 2 else picotuner_state
+    unreachable QRZ must not stall anything.
+
+    telemetry (mer/modcod/symbol_rate/frequency) is passed in by
+    pathfinder_watcher(), which caches it continuously while the
+    signal is still LIVE. It is deliberately NOT read from
+    picotuner_state here, and this is the whole fix for a
+    long-standing bug where the card showed no MER or MODCOD:
+    picotuner_quality_monitor() rebuilds those fields from every
+    broadcast via fields.get('$12', '') / fields.get('$18', ''), so
+    the instant a signal drops and the Picotuner stops sending them,
+    both are overwritten with empty strings - typically within about
+    500ms, and always before this function gets to run. Confirmed
+    live: a diagnostic print here read mer='10.8' and modcod='QPSK
+    8/9', and the snapshot taken on the very next line captured ''
+    for both. symbol_rate and frequency aren't blanked on that
+    transition, which is exactly why they kept appearing on the card
+    while MER and MODCOD didn't - the one clue that separated a lost
+    race from a rendering problem.
+
+    Two earlier attempts at this misdiagnosed it as a startup race and
+    added a bounded wait for MER to *arrive*; both were wrong, because
+    the data was already there and about to be destroyed rather than
+    still on its way. Waiting made it strictly worse.
+    """
     snapshot = {
-        'mer': st.get('mer', ''),
-        'modcod': st.get('modcod', ''),
-        'symbol_rate': st.get('symbol_rate', ''),
-        'frequency': st.get('frequency', ''),
+        'mer': telemetry.get('mer', ''),
+        'modcod': telemetry.get('modcod', ''),
+        'symbol_rate': telemetry.get('symbol_rate', ''),
+        'frequency': telemetry.get('frequency', ''),
     }
 
     def _lookup():
@@ -4365,6 +4663,9 @@ def get_status():
             "mpv_restarts_total": diagnostics["mpv_restarts_total"],
             "mpv_drift": get_mpv_drift_status(),
             "portable_locator": config.get('notifications', {}).get('qrz', {}).get('portable_locator', ''),
+            "portable_locator_provenance": _gnss_provenance(),
+            "gnss": {"mode": config.get('gnss', {}).get('mode', 'automatic'),
+                      "running": gnss_reader.running, **gnss_reader.status()},
             "ppm_style": config.get('display', {}).get('ppm_style', 'full_fat'),
             "quicklynx_enabled": bool(config.get('quicklynx', {}).get('enabled', False)),
             "site_locator": config.get('site', {}).get('locator', ''),
@@ -4852,10 +5153,39 @@ def config_page():
         label { color: #a8b5c7; font-size: 0.85em; margin-bottom: 2px; }
         .form-control { background: #0f3460; border: 1px solid #1e4a7a; color: #e0e0e0; }
         .form-control:focus { background: #0f3460; border-color: #00d4aa; color: #e0e0e0; box-shadow: none; }
+        /* .form-select is a genuinely different Bootstrap 5 class from
+           .form-control (used for <select> specifically) - every select
+           on this page already deliberately uses form-control instead,
+           which is why they've always matched; audio-device-select is
+           the one exception that used the more "correct" Bootstrap
+           class, which meant it fell through to Bootstrap's own default
+           (light) select styling with nothing here overriding it. Styled
+           to match form-control exactly rather than changing that
+           input's own class, in case anything future uses form-select
+           deliberately. */
+        .form-select { background: #0f3460; border: 1px solid #1e4a7a; color: #e0e0e0; }
+        .form-select:focus { background: #0f3460; border-color: #00d4aa; color: #e0e0e0; box-shadow: none; }
+        /* Disabled inputs (e.g. the QRZ card's portable-locator field
+           while GNSS Automatic mode is driving it) had no override at
+           all, so they fell back to the browser's own default disabled
+           styling - a light, out-of-place box against this dark theme.
+           Keeps the same dark background, dims the text to signal
+           "not editable right now" without breaking the theme. */
+        .form-control:disabled, .form-select:disabled { background: #0f3460; opacity: 0.55; color: #a8b5c7; }
+        /* Tells the browser to render native form-control chrome - the
+           time-picker spinner/icon on <input type="time"> (GPIO Tx's
+           schedule fields), and any date/datetime-local input - using
+           its own built-in dark variant. background/color on the outer
+           input don't reach into that native widget chrome at all,
+           which is why those specific fields were still showing white
+           despite already having the same form-control styling as
+           every other input on the page. */
+        input[type="time"], input[type="date"], input[type="datetime-local"] { color-scheme: dark; }
         .btn-save { background: #e94560; border-color: #e94560; }
         .btn-save:hover { background: #c73652; border-color: #c73652; }
         .save-status { font-size: 0.85em; min-height: 1.2em; }
         .placeholder-card { opacity: 0.6; }
+        .gnss-unavailable { opacity: 0.5; }
         /* Visually masks sensitive fields (API keys, passwords) the same
            way type="password" would, without actually using that type -
            deliberately avoids browsers treating these as login
@@ -4887,8 +5217,22 @@ def config_page():
 
         <div class="col-md-4">
                 <div class="card mb-3">
-                    <div class="card-header">&#x1F3AC; Bitfocus Companion</div>
+                    <div class="card-header">&#x1F3AC; Video Switching (Bitfocus Companion / GPIO)</div>
                     <div class="card-body">
+                        <p class="text-muted small">
+                            Switches your video source to this receiver when it has
+                            something to show, and away again when it hasn't. Fires a
+                            webhook, a GPIO pin, or both. Bitfocus Companion is the
+                            usual thing on the other end, but anything that accepts an
+                            HTTP request or a contact closure will do - you don't need
+                            Companion to use this.
+                        </p>
+                        <p class="text-muted small">
+                            Follows RF <em>and</em> streams: a relayed stream switches
+                            the source just as an off-air signal does. To key a
+                            transmitter rather than switch a source, see GPIO Tx On/Off
+                            below.
+                        </p>
                         <div class="form-check form-switch mb-3">
                             <input class="form-check-input" type="checkbox" id="companion-enabled-input">
                             <label class="form-check-label" for="companion-enabled">Enabled</label>
@@ -4936,6 +5280,16 @@ def config_page():
                 <div class="card mb-3">
                     <div class="card-header">&#x1F50C; GPIO Tx On/Off</div>
                     <div class="card-body">
+                        <p class="text-muted small">
+                            Keys a transmitter when there is something to send, with
+                            long settle times so it isn't cycled by brief gaps, and
+                            optional scheduled on-air windows.
+                        </p>
+                        <p class="text-muted small">
+                            This is <em>not</em> the pin for switching a video source -
+                            for that use Video Switching above, which has its own pin
+                            and much shorter timings.
+                        </p>
                         <div class="form-check form-switch mb-3">
                             <input class="form-check-input" type="checkbox" id="gpio-enabled-input">
                             <label class="form-check-label" for="gpio-enabled">Enabled</label>
@@ -5038,28 +5392,30 @@ def config_page():
                 </div>
 
                 <div class="card mb-3">
-                    <div class="card-header">&#x1F4E1; QuickLynx Spectrum Tuner</div>
+                    <div class="card-header">&#x1F4AC; Slack</div>
                     <div class="card-body">
-                        <p class="text-muted small">
-                            Serves QuickLynx from this receiver: the QO-100 wideband
-                            spectrum, with click-to-tune straight into Lynx. Served
-                            from here it needs no address configuring and can be
-                            opened from any device on your network.
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="slack-enabled-input">
+                            <label class="form-check-label" for="slack-enabled">Enabled</label>
+                        </div>
+                        <label for="slack-webhook-url">Webhook URL</label>
+                        <input type="text" class="form-control mb-2" id="slack-webhook-url-input"
+                               placeholder="https://hooks.slack.com/services/...">
+                        <label for="slack-settle">Settle time (seconds)</label>
+                        <input type="number" step="1" min="0" class="form-control mb-2" id="slack-settle-input">
+                        <label for="slack-template">Message template</label>
+                        <textarea class="form-control" id="slack-template-input" rows="5"></textarea>
+                        <p class="text-muted small mt-2 mb-0">
+                            Placeholders: <code>{site_callsign}</code> <code>{site_callsign_lower}</code>
+                            <code>{rx_callsign}</code> <code>{mer}</code> <code>{margin}</code>
+                            <code>{modcod}</code> <code>{frequency}</code>
                         </p>
-                        <div class="form-check form-switch mb-2">
-                            <input class="form-check-input" type="checkbox" id="quicklynx-enabled">
-                            <label class="form-check-label" for="quicklynx-enabled">Enabled</label>
+                        <div class="mt-3 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveSlack()">Save Slack settings</button>
+                            <span class="save-status" id="slack-save-status"></span>
                         </div>
-                        <div class="small text-muted mb-2">
-                            Off by default. Needs internet access for the spectrum feed
-                            and the chat pane, so it is opt-in rather than something a
-                            repeater carries unasked.
-                        </div>
-                        <button class="btn btn-save" onclick="saveQuickLynx()">Save QuickLynx settings</button>
-                        <span id="quicklynx-status" class="save-status ms-2"></span>
                     </div>
                 </div>
-
         </div>
 
         <div class="col-md-4">
@@ -5166,17 +5522,20 @@ def config_page():
                                 <input type="number" step="1" min="0" class="form-control" id="qrz-suppress-input">
                             </div>
                         </div>
-                        <label for="qrz-portable-locator" class="mt-2">Portable locator override</label>
+                        <label for="qrz-portable-locator" class="mt-2">Portable locator (this receiver's own position)</label>
                         <input type="text" class="form-control" id="qrz-portable-locator-input"
                                placeholder="e.g. IO91VG - leave blank for normal operation">
                         <p class="text-muted small mt-2 mb-0">
                             Settle time: delay after lock before logging, so the callsign has time to
                             decode. Suppress: don't log the same callsign again within this many minutes.
-                            Portable locator override: when a contacted station is operating portable and
-                            hasn't updated their QRZ profile, QRZ's own distance/bearing calculation uses
-                            their stale, registered locator. Set this to override it with their actual,
-                            current one for every contact logged while it's set - clear it (empty + save)
-                            once the portable session ends.
+                            Portable locator: set this when Lynx itself is operating away from its
+                            normal, registered site - it's attached to every logged contact as Lynx's
+                            own current position (ADIF MY_GRIDSQUARE), so QRZ's distance/bearing figures
+                            are correct for wherever Lynx actually is right now, not its usual fixed
+                            site. It does not touch the worked station's own locator, which QRZ
+                            continues to derive from their profile as normal. Clear it (empty + save)
+                            once the portable session ends. See GNSS Portable Locator below to populate
+                            this automatically from a GPS receiver instead of typing it by hand.
                         </p>
                         <hr class="my-3">
                         <p class="text-muted small mb-2">
@@ -5217,27 +5576,63 @@ def config_page():
                     </div>
                 </div>
                 <div class="card mb-3">
-                    <div class="card-header">&#x1F4AC; Slack</div>
+                    <div class="card-header">&#x1F6F0;&#xFE0F; GNSS Portable Locator</div>
                     <div class="card-body">
-                        <div class="form-check form-switch mb-3">
-                            <input class="form-check-input" type="checkbox" id="slack-enabled-input">
-                            <label class="form-check-label" for="slack-enabled">Enabled</label>
-                        </div>
-                        <label for="slack-webhook-url">Webhook URL</label>
-                        <input type="text" class="form-control mb-2" id="slack-webhook-url-input"
-                               placeholder="https://hooks.slack.com/services/...">
-                        <label for="slack-settle">Settle time (seconds)</label>
-                        <input type="number" step="1" min="0" class="form-control mb-2" id="slack-settle-input">
-                        <label for="slack-template">Message template</label>
-                        <textarea class="form-control" id="slack-template-input" rows="5"></textarea>
-                        <p class="text-muted small mt-2 mb-0">
-                            Placeholders: <code>{site_callsign}</code> <code>{site_callsign_lower}</code>
-                            <code>{rx_callsign}</code> <code>{mer}</code> <code>{margin}</code>
-                            <code>{modcod}</code> <code>{frequency}</code>
+                        <p class="text-muted small">
+                            Reads a Waveshare L76K HAT on /dev/ttyAMA0 and, once a fix has held
+                            steady in the same 6-character square for 30 seconds, writes it straight
+                            into the "Portable locator" field above - the same field an operator
+                            would otherwise type by hand, attached to every logged contact as this
+                            receiver's own current position. A fixed repeater site simply doesn't
+                            have the HAT fitted, so this fails quietly and does nothing there.
+                            Configures the module for GPS + BeiDou + GLONASS (plus QZSS, always on
+                            regardless) on each connect - every constellation the L76K can actually
+                            use, for the widest satellite visibility.
                         </p>
-                        <div class="mt-3 d-flex align-items-center gap-2">
-                            <button class="btn btn-save" onclick="saveSlack()">Save Slack settings</button>
-                            <span class="save-status" id="slack-save-status"></span>
+                        <div class="form-check">
+                            <input class="form-check-input" type="radio" name="gnss-mode"
+                                   id="gnss-mode-manual" value="manual" onchange="onGnssModeChange()">
+                            <label class="form-check-label" for="gnss-mode-manual">
+                                <strong>Manual</strong>
+                                <span class="text-muted small">- the typed value above is authoritative; GPS is only shown</span>
+                            </label>
+                        </div>
+                        <div id="gnss-no-module-warning" class="alert alert-warning py-1 px-2 small mb-2" style="display:none;">
+                            &#x26A0;&#xFE0F; No GNSS module detected on /dev/ttyAMA0. Automatic is greyed
+                            out below until one responds - Manual above is unaffected either way, and
+                            un-greys live, no reload, the moment a fitted HAT starts answering.
+                        </div>
+                        <div id="gnss-hw-dependent">
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="radio" name="gnss-mode"
+                                   id="gnss-mode-automatic" value="automatic" onchange="onGnssModeChange()">
+                            <label class="form-check-label" for="gnss-mode-automatic">
+                                <strong>Automatic</strong>
+                                <span class="text-muted small">- GPS drives the locator on every confirmed fix (default)</span>
+                            </label>
+                        </div>
+                        <hr class="my-2">
+                        <div class="form-check form-switch mb-2">
+                            <input class="form-check-input" type="checkbox" id="gnss-time-sync-input">
+                            <label class="form-check-label" for="gnss-time-sync">
+                                Set the clock from GPS when there's no internet
+                            </label>
+                            <p class="text-muted small mt-1 mb-0">
+                                Keeps logged contacts correctly timestamped at a site with no
+                                network. Uses the internet as usual whenever it's available.
+                            </p>
+                        </div>
+                        </div>
+                        <div id="gnss-status-box" class="small p-2 mb-2" style="background:#0f3460; border-radius:4px;">
+                            <div class="d-flex justify-content-between"><span>Receiver</span><span class="status-value" id="gnss-connected">—</span></div>
+                            <div class="d-flex justify-content-between"><span>Locator (8-char)</span><span class="status-value" id="gnss-locator-display">—</span></div>
+                            <div class="d-flex justify-content-between"><span>Satellites / HDOP</span><span class="status-value" id="gnss-quality">—</span></div>
+                            <div class="d-flex justify-content-between"><span>Time sync</span><span class="status-value" id="gnss-time-sync-status">—</span></div>
+                            <div class="d-flex justify-content-between"><span>Status</span><span class="status-value" id="gnss-detail">—</span></div>
+                        </div>
+                        <div class="mt-2 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveGnssMode()">Save GNSS mode</button>
+                            <span class="save-status" id="gnss-save-status"></span>
                         </div>
                     </div>
                 </div>
@@ -5424,6 +5819,29 @@ def config_page():
                             <button class="btn btn-outline-light btn-sm" onclick="restoreWifi()">Re-enable WiFi</button>
                             <span class="save-status" id="wifi-status"></span>
                         </div>
+                    </div>
+                </div>
+
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F4E1; QuickLynx Spectrum Tuner</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            Serves QuickLynx from this receiver: the QO-100 wideband
+                            spectrum, with click-to-tune straight into Lynx. Served
+                            from here it needs no address configuring and can be
+                            opened from any device on your network.
+                        </p>
+                        <div class="form-check form-switch mb-2">
+                            <input class="form-check-input" type="checkbox" id="quicklynx-enabled">
+                            <label class="form-check-label" for="quicklynx-enabled">Enabled</label>
+                        </div>
+                        <div class="small text-muted mb-2">
+                            Off by default. Needs internet access for the spectrum feed
+                            and the chat pane, so it is opt-in rather than something a
+                            repeater carries unasked.
+                        </div>
+                        <button class="btn btn-save" onclick="saveQuickLynx()">Save QuickLynx settings</button>
+                        <span id="quicklynx-status" class="save-status ms-2"></span>
                     </div>
                 </div>
         </div>
@@ -5633,6 +6051,18 @@ async function loadCurrentConfig() {
         document.getElementById('qrz-settle-input').value = qrz.settle_secs ?? 15;
         document.getElementById('qrz-suppress-input').value = qrz.suppress_mins ?? 60;
         document.getElementById('qrz-portable-locator-input').value = qrz.portable_locator || '';
+
+        const rawGnssMode = cfg.gnss?.mode;
+        // Anything other than exactly 'automatic' displays as Manual -
+        // covers a genuinely unset config (defaults to automatic,
+        // matching the backend) as well as a legacy 'off' value from
+        // before that mode was removed, which the backend already
+        // treats the same as manual (see _on_gnss_locator_change).
+        const gnssMode = (rawGnssMode === undefined || rawGnssMode === 'automatic')
+            ? 'automatic' : 'manual';
+        document.getElementById('gnss-mode-' + gnssMode).checked = true;
+        document.getElementById('gnss-time-sync-input').checked = cfg.gnss?.time_sync ?? true;
+        onGnssModeChange();
         document.getElementById('qrz-lookup-username-input').value = qrz.lookup_username || '';
         document.getElementById('qrz-lookup-password-input').value = qrz.lookup_password || '';
         document.getElementById('qrz-lookup-notif-input').checked = qrz.lookup_for_notifications || false;
@@ -6173,6 +6603,165 @@ async function saveQrz() {
     }
 }
 
+function onGnssModeChange() {
+    // In Automatic mode GPS is authoritative and will overwrite the
+    // QRZ field on its own next confirmed fix, so it's disabled here
+    // to avoid a typed edit that looks saved but is about to be
+    // silently overwritten - and, while disabled, loadGnssStatus()
+    // keeps its value live-updated to whatever GPS actually currently
+    // reports, rather than leaving it showing a stale config snapshot
+    // from page load. Manual leaves it a normal, editable field - the
+    // operator's typed value is the whole point.
+    const mode = document.querySelector('input[name="gnss-mode"]:checked')?.value || 'automatic';
+    const qrzInput = document.getElementById('qrz-portable-locator-input');
+    qrzInput.disabled = (mode === 'automatic');
+    qrzInput.placeholder = mode === 'automatic'
+        ? 'Driven by GPS - see GNSS card below'
+        : 'e.g. IO91VG - leave blank for normal operation';
+}
+
+async function saveGnssMode() {
+    const statusEl = document.getElementById('gnss-save-status');
+    statusEl.textContent = 'Saving...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const mode = document.querySelector('input[name="gnss-mode"]:checked')?.value || 'automatic';
+        const timeSync = document.getElementById('gnss-time-sync-input').checked;
+        // Also submits the QRZ card's current field values, portable_locator
+        // included - not just gnss.mode/time_sync. Without this, switching
+        // to Manual and clearing the locator field looked saved (the field
+        // itself went blank) but wasn't: this button only ever wrote the
+        // gnss section, so GPS's last-written value stayed sitting in
+        // notifications.qrz.portable_locator until "Save QRZ settings" was
+        // ALSO clicked separately - confirmed as the actual cause of a
+        // reported bug (a stale GPS locator kept appearing in the logbook
+        // after switching to Manual, since nothing had told the backend
+        // the field was now meant to be empty). One save now covers both.
+        const body = {
+            gnss: {mode: mode, time_sync: timeSync},
+            notifications_qrz: {
+                enabled: document.getElementById('qrz-enabled-input').checked,
+                api_key: document.getElementById('qrz-api-key-input').value,
+                settle_secs: parseFloat(document.getElementById('qrz-settle-input').value),
+                suppress_mins: parseFloat(document.getElementById('qrz-suppress-input').value),
+                portable_locator: document.getElementById('qrz-portable-locator-input').value.trim(),
+                lookup_username: document.getElementById('qrz-lookup-username-input').value.trim(),
+                lookup_password: document.getElementById('qrz-lookup-password-input').value,
+                lookup_for_notifications: document.getElementById('qrz-lookup-notif-input').checked,
+            }
+        };
+        const r = await fetch('/api/config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body)
+        });
+        if (!r.ok) throw new Error(await r.text());
+        statusEl.textContent = 'Saved - applied immediately.';
+        statusEl.className = 'save-status text-success';
+        onGnssModeChange();
+    } catch (e) {
+        statusEl.textContent = 'Save failed - see console.';
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
+function setGnssHardwareAvailable(available) {
+    // No module fitted (a repeater site, or the HAT not wired up yet)
+    // gets the same treatment as the PicoTuner's own LNB-plug-absent
+    // buttons: disabled and dimmed rather than left looking live, with
+    // the reason moved onto a hover tooltip. pointerEvents is forced
+    // back to 'auto' because a disabled control's own title attribute
+    // doesn't reliably show on hover in every browser otherwise - the
+    // same fix already proven there.
+    //
+    // Manual (gnss-mode-manual) is deliberately outside
+    // #gnss-hw-dependent and never touched here - unlike Automatic
+    // (which does nothing at all without a HAT actually answering),
+    // Manual's whole behaviour is hardware-independent by definition:
+    // it just means GPS doesn't touch the typed value, which is true
+    // and useful whether or not a HAT exists. It stays the always-
+    // selectable option, including to back out of Automatic if a HAT
+    // stops answering.
+    const why = 'No GNSS module detected on /dev/ttyAMA0 - fit the HAT ' +
+                '(or check the serial connection) to use this mode.';
+    document.getElementById('gnss-no-module-warning').style.display = available ? 'none' : 'block';
+
+    const wrap = document.getElementById('gnss-hw-dependent');
+    wrap.classList.toggle('gnss-unavailable', !available);
+
+    for (const id of ['gnss-mode-automatic']) {
+        const input = document.getElementById(id);
+        input.disabled = !available;
+        for (const el of [input, input.closest('.form-check')]) {
+            if (!el) continue;
+            if (!available) {
+                if (!el.dataset.titleOrig) el.dataset.titleOrig = el.title || '';
+                el.title = why;
+                el.style.cursor = 'not-allowed';
+                el.style.pointerEvents = 'auto';
+            } else if (el.dataset.titleOrig !== undefined) {
+                el.title = el.dataset.titleOrig;
+                el.style.cursor = '';
+            }
+        }
+    }
+}
+
+async function loadGnssStatus() {
+    // Polls regardless of which mode is currently selected - the
+    // no-module warning/greying needs to track real hardware state
+    // continuously, not just while Automatic happens to be selected.
+    try {
+        const s = await fetch('/api/status').then(r => r.json());
+        const g = s.lynx?.gnss || {};
+        const noModule = g.running && !g.connected;
+        setGnssHardwareAvailable(!noModule);
+
+        document.getElementById('gnss-connected').textContent =
+            noModule ? 'No GNSS Module' : (g.connected ? 'Connected' : 'Not connected');
+        document.getElementById('gnss-locator-display').textContent = g.locator_display || g.locator || '—';
+        const sats = g.satellites != null ? g.satellites : '—';
+        const hdop = g.hdop != null ? g.hdop : '—';
+        document.getElementById('gnss-quality').textContent = sats + ' / ' + hdop;
+        const tsEl = document.getElementById('gnss-time-sync-status');
+        if (!document.getElementById('gnss-time-sync-input').checked) {
+            tsEl.textContent = 'Off';
+        } else if (g.time_synced) {
+            tsEl.textContent = 'Active';
+        } else if (g.time_quality_ok) {
+            tsEl.textContent = 'Unavailable on this receiver';
+        } else {
+            tsEl.textContent = 'Waiting for a fix';
+        }
+        let detail;
+        if (noModule) {
+            detail = 'No GNSS Module';
+        } else if (!g.connected) {
+            detail = g.last_error || 'Not yet connected';
+        } else if (g.pending_secs != null) {
+            detail = 'New square settling, ' + Math.ceil(g.pending_secs) + 's to confirm';
+        } else if (g.locator) {
+            detail = 'Confirmed fix';
+        } else {
+            detail = 'Waiting for a fix';
+        }
+        document.getElementById('gnss-detail').textContent = detail;
+
+        // In Automatic mode the QRZ field is disabled (see
+        // onGnssModeChange) and shows the live GPS value rather than
+        // a stale config snapshot from whenever the page happened to
+        // load - keeps it visibly in sync with whatever's actually
+        // about to be logged, not just at load time.
+        const currentMode = document.querySelector('input[name="gnss-mode"]:checked')?.value;
+        if (currentMode === 'automatic') {
+            document.getElementById('qrz-portable-locator-input').value = g.locator || '';
+        }
+    } catch (e) {
+        console.error(e);
+    }
+}
+setInterval(loadGnssStatus, 3000);
+
 async function saveSlack() {
     const statusEl = document.getElementById('slack-save-status');
     statusEl.textContent = 'Saving...';
@@ -6336,6 +6925,7 @@ async function loadDiscoveredPicotuners() {
 }
 
 loadCurrentConfig();
+loadGnssStatus();
 loadDiscoveredPicotuners();
 setInterval(loadDiscoveredPicotuners, 5000);
 
@@ -7480,15 +8070,18 @@ def post_update_channel(req: UpdateChannelRequest):
             detail=f"Could not switch to the '{target_branch}' branch: {err}")
 
     # Persist the choice - same read-fresh-from-disk, write-via-tmp-
-    # then-replace pattern as every other config write in this file.
-    with open(CONFIG_PATH) as f:
-        on_disk = yaml.safe_load(f)
-    on_disk.setdefault('update', {})['channel'] = req.channel
-    tmp_path = str(CONFIG_PATH) + ".tmp"
-    with open(tmp_path, 'w') as f:
-        yaml.safe_dump(on_disk, f, default_flow_style=False, sort_keys=False)
-    os.replace(tmp_path, CONFIG_PATH)
-    config = on_disk
+    # then-replace pattern as every other config write in this file,
+    # now under the same shared lock as all of them (see
+    # _config_write_lock's own comment by CONFIG_PATH).
+    with _config_write_lock:
+        with open(CONFIG_PATH) as f:
+            on_disk = yaml.safe_load(f)
+        on_disk.setdefault('update', {})['channel'] = req.channel
+        tmp_path = str(CONFIG_PATH) + ".tmp"
+        with open(tmp_path, 'w') as f:
+            yaml.safe_dump(on_disk, f, default_flow_style=False, sort_keys=False)
+        os.replace(tmp_path, CONFIG_PATH)
+        config = on_disk
 
     # Refresh state immediately, same reasoning as post_update_apply()
     # above - a client that doesn't reload fast enough after the
@@ -7600,139 +8193,158 @@ def get_config():
                       "(presets, streams, and all other settings) completely untouched.")
 def update_config(req: ConfigUpdateRequest):
     global config
-    # Read the actual on-disk file fresh, not the in-memory config -
-    # avoids clobbering anything changed directly on disk since the
-    # last reload, and guarantees every other section (presets,
-    # streams, ryde, relay, dial, web, diversity,
-    # default_boot_preset) is preserved byte-for-byte.
-    with open(CONFIG_PATH) as f:
-        on_disk = yaml.safe_load(f)
+    # Everything below is one atomic read-modify-write-replace cycle,
+    # held under the shared _config_write_lock (see its own comment by
+    # CONFIG_PATH) - without this, a GNSS confirmed-fix write landing
+    # mid-way through this handler could either corrupt the shared tmp
+    # file both writers use, or silently discard whichever save
+    # completed second. Confirmed as a real, reported failure: QRZ
+    # logging stopped entirely after GNSS and a Config page save
+    # happened to land close together during testing.
+    with _config_write_lock:
+        # Read the actual on-disk file fresh, not the in-memory config -
+        # avoids clobbering anything changed directly on disk since the
+        # last reload, and guarantees every other section (presets,
+        # streams, ryde, relay, dial, web, diversity,
+        # default_boot_preset) is preserved byte-for-byte.
+        with open(CONFIG_PATH) as f:
+            on_disk = yaml.safe_load(f)
 
-    picotuner_changed = False
-    if req.site is not None:
-        on_disk.setdefault('site', {}).update(req.site.model_dump())
-    if req.picotuner is not None:
-        new_pt = req.picotuner.model_dump()
-        picotuner_changed = on_disk.get('picotuner', {}) != {**on_disk.get('picotuner', {}), **new_pt}
-        on_disk.setdefault('picotuner', {}).update(new_pt)
+        picotuner_changed = False
+        if req.site is not None:
+            on_disk.setdefault('site', {}).update(req.site.model_dump())
+        if req.picotuner is not None:
+            new_pt = req.picotuner.model_dump()
+            picotuner_changed = on_disk.get('picotuner', {}) != {**on_disk.get('picotuner', {}), **new_pt}
+            on_disk.setdefault('picotuner', {}).update(new_pt)
 
-    diversity_changed = False
-    if req.diversity is not None:
-        new_div = req.diversity.model_dump(exclude_none=True)
-        # update() merges these in without disturbing enabled/
-        # combiner_out_port/rcv1_plug/rcv2_plug, which this endpoint
-        # never sees or sends. exclude_none above means a save from
-        # either the MER-hysteresis card or the hard-freeze-recovery
-        # card only touches its own fields, leaving the other
-        # untouched, rather than requiring every field from both on
-        # every single save.
-        current_div = on_disk.get('diversity', {})
-        # Only the MER-hysteresis fields actually require a restart -
-        # they're passed as combiner CLI args, read once at process
-        # launch. The hard_freeze_breaker_* fields are read fresh from
-        # config on every check (mpv_drift_monitor's own loop) and take
-        # effect immediately. Checked only against keys THIS request
-        # actually included - otherwise a breaker-only save would
-        # compare its own absent MER keys (None) against their real,
-        # unrelated saved values and wrongly report a restart needed.
-        RESTART_NEEDED_KEYS = ('mer_switch_dwell_secs', 'mer_switch_margin_db')
-        diversity_changed = any(
-            k in new_div and current_div.get(k) != new_div.get(k) for k in RESTART_NEEDED_KEYS
-        )
-        on_disk.setdefault('diversity', {}).update(new_div)
+        diversity_changed = False
+        if req.diversity is not None:
+            new_div = req.diversity.model_dump(exclude_none=True)
+            # update() merges these in without disturbing enabled/
+            # combiner_out_port/rcv1_plug/rcv2_plug, which this endpoint
+            # never sees or sends. exclude_none above means a save from
+            # either the MER-hysteresis card or the hard-freeze-recovery
+            # card only touches its own fields, leaving the other
+            # untouched, rather than requiring every field from both on
+            # every single save.
+            current_div = on_disk.get('diversity', {})
+            # Only the MER-hysteresis fields actually require a restart -
+            # they're passed as combiner CLI args, read once at process
+            # launch. The hard_freeze_breaker_* fields are read fresh from
+            # config on every check (mpv_drift_monitor's own loop) and take
+            # effect immediately. Checked only against keys THIS request
+            # actually included - otherwise a breaker-only save would
+            # compare its own absent MER keys (None) against their real,
+            # unrelated saved values and wrongly report a restart needed.
+            RESTART_NEEDED_KEYS = ('mer_switch_dwell_secs', 'mer_switch_margin_db')
+            diversity_changed = any(
+                k in new_div and current_div.get(k) != new_div.get(k) for k in RESTART_NEEDED_KEYS
+            )
+            on_disk.setdefault('diversity', {}).update(new_div)
 
-    # Notifications: none of these ever require a restart. QRZ/Slack/
-    # Companion settings are re-read fresh on every poll (NotificationManager
-    # holds a getter, not a captured config reference). The GPIO pin object
-    # itself is also rebuilt automatically the moment its pin/polarity
-    # config changes (see NotificationManager._poll_tx_pin's cfg_key check) -
-    # so even that takes effect live, no restart needed.
-    if req.notifications_qrz is not None:
-        on_disk.setdefault('notifications', {}).setdefault('qrz', {}).update(
-            req.notifications_qrz.model_dump())
-    if req.notifications_slack is not None:
-        on_disk.setdefault('notifications', {}).setdefault('slack', {}).update(
-            req.notifications_slack.model_dump())
-    if req.notifications_companion is not None:
-        on_disk.setdefault('notifications', {}).setdefault('companion', {}).update(
-            req.notifications_companion.model_dump())
-    if req.notifications_gpio_tx is not None:
-        on_disk.setdefault('notifications', {}).setdefault('gpio_tx', {}).update(
-            req.notifications_gpio_tx.model_dump())
+        # Notifications: none of these ever require a restart. QRZ/Slack/
+        # Companion settings are re-read fresh on every poll (NotificationManager
+        # holds a getter, not a captured config reference). The GPIO pin object
+        # itself is also rebuilt automatically the moment its pin/polarity
+        # config changes (see NotificationManager._poll_tx_pin's cfg_key check) -
+        # so even that takes effect live, no restart needed.
+        if req.notifications_qrz is not None:
+            on_disk.setdefault('notifications', {}).setdefault('qrz', {}).update(
+                req.notifications_qrz.model_dump())
+        if req.notifications_slack is not None:
+            on_disk.setdefault('notifications', {}).setdefault('slack', {}).update(
+                req.notifications_slack.model_dump())
+        if req.notifications_companion is not None:
+            on_disk.setdefault('notifications', {}).setdefault('companion', {}).update(
+                req.notifications_companion.model_dump())
+        if req.notifications_gpio_tx is not None:
+            on_disk.setdefault('notifications', {}).setdefault('gpio_tx', {}).update(
+                req.notifications_gpio_tx.model_dump())
 
-    # Display: takes effect live, no restart - the overlay picks this
-    # up on its own next /api/status poll (a few seconds), same as
-    # portable_locator and the notification settings above.
-    if req.quicklynx is not None:
-        on_disk.setdefault('quicklynx', {}).update(req.quicklynx.model_dump())
+        # Display: takes effect live, no restart - the overlay picks this
+        # up on its own next /api/status poll (a few seconds), same as
+        # portable_locator and the notification settings above.
+        if req.quicklynx is not None:
+            on_disk.setdefault('quicklynx', {}).update(req.quicklynx.model_dump())
 
-    if req.display is not None:
-        on_disk.setdefault('display', {}).update(req.display.model_dump())
+        if req.display is not None:
+            on_disk.setdefault('display', {}).update(req.display.model_dump())
 
-    # pathfinder: merges only the three fields the form sends, leaving
-    # min_span_km/max_span_km/max_distance_km untouched - the form never
-    # sees them, and a blind update() would wipe them.
-    if req.pathfinder is not None:
-        on_disk.setdefault('pathfinder', {}).update(req.pathfinder.model_dump())
+        # pathfinder: merges only the three fields the form sends, leaving
+        # min_span_km/max_span_km/max_distance_km untouched - the form never
+        # sees them, and a blind update() would wipe them.
+        if req.pathfinder is not None:
+            on_disk.setdefault('pathfinder', {}).update(req.pathfinder.model_dump())
 
-    # tri_watch: rebuilds just the `sources` list and top-level
-    # `enabled` flag from whichever of Rx1/Rx2/stream are actually
-    # enabled in the submitted form - every other tri_watch field
-    # (settling_seconds, lock_confirm_seconds, notification_duration_secs,
-    # rf_notification_template) is left completely untouched, since
-    # this form never sees or sends them. Always needs a restart to
-    # take effect - tri_watch's own probes/arbitrator are set up once
-    # at process start from this exact list, unlike most other
-    # sections here which are re-read live.
-    tri_watch_changed = req.tri_watch is not None
-    if req.tri_watch is not None:
-        new_sources = []
-        # Every existing tri_watch reader (get_tri_watch_status, the
-        # arbitrator loop, startup tune, the port drainer sync) checks
-        # src_cfg.get('enabled', False) on each individual source dict
-        # - defaulting to False if that key is absent entirely. This
-        # form only ever appends a source here when its own "Include"
-        # checkbox was on, so it's always enabled - but that must be
-        # written explicitly as its own field, not left implied by
-        # presence in the list, or every single saved source would
-        # silently fail that check and disappear, not just an
-        # intentionally-excluded one. Confirmed as a real, reported bug
-        # otherwise: a save that only meant to drop Rx2 dropped Rx1 and
-        # the stream too, since neither carried this field either.
-        if req.tri_watch.rx1.enabled:
-            r = req.tri_watch.rx1
-            new_sources.append({
-                "type": "rf", "rcv": 1, "fplug": r.fplug, "freq": r.freq, "sr": r.sr,
-                "lnb_lo_khz": r.lnb_lo_khz, "label": r.label, "callsign": r.callsign,
-                "enabled": True,
-            })
-        if req.tri_watch.rx2.enabled:
-            r = req.tri_watch.rx2
-            new_sources.append({
-                "type": "rf", "rcv": 2, "fplug": r.fplug, "freq": r.freq, "sr": r.sr,
-                "lnb_lo_khz": r.lnb_lo_khz, "label": r.label, "callsign": r.callsign,
-                "enabled": True,
-            })
-        if req.tri_watch.stream.enabled:
-            s = req.tri_watch.stream
-            new_sources.append({
-                "type": "stream", "domain": s.domain, "app": s.app,
-                "streamname": s.streamname, "port": s.port, "label": s.label,
-                "waiting_message": s.waiting_message, "enabled": True,
-            })
-        on_disk.setdefault('tri_watch', {})['enabled'] = req.tri_watch.enabled
-        on_disk.setdefault('tri_watch', {})['sources'] = new_sources
+        # tri_watch: rebuilds just the `sources` list and top-level
+        # `enabled` flag from whichever of Rx1/Rx2/stream are actually
+        # enabled in the submitted form - every other tri_watch field
+        # (settling_seconds, lock_confirm_seconds, notification_duration_secs,
+        # rf_notification_template) is left completely untouched, since
+        # this form never sees or sends them. Always needs a restart to
+        # take effect - tri_watch's own probes/arbitrator are set up once
+        # at process start from this exact list, unlike most other
+        # sections here which are re-read live.
+        tri_watch_changed = req.tri_watch is not None
+        if req.tri_watch is not None:
+            new_sources = []
+            # Every existing tri_watch reader (get_tri_watch_status, the
+            # arbitrator loop, startup tune, the port drainer sync) checks
+            # src_cfg.get('enabled', False) on each individual source dict
+            # - defaulting to False if that key is absent entirely. This
+            # form only ever appends a source here when its own "Include"
+            # checkbox was on, so it's always enabled - but that must be
+            # written explicitly as its own field, not left implied by
+            # presence in the list, or every single saved source would
+            # silently fail that check and disappear, not just an
+            # intentionally-excluded one. Confirmed as a real, reported bug
+            # otherwise: a save that only meant to drop Rx2 dropped Rx1 and
+            # the stream too, since neither carried this field either.
+            if req.tri_watch.rx1.enabled:
+                r = req.tri_watch.rx1
+                new_sources.append({
+                    "type": "rf", "rcv": 1, "fplug": r.fplug, "freq": r.freq, "sr": r.sr,
+                    "lnb_lo_khz": r.lnb_lo_khz, "label": r.label, "callsign": r.callsign,
+                    "enabled": True,
+                })
+            if req.tri_watch.rx2.enabled:
+                r = req.tri_watch.rx2
+                new_sources.append({
+                    "type": "rf", "rcv": 2, "fplug": r.fplug, "freq": r.freq, "sr": r.sr,
+                    "lnb_lo_khz": r.lnb_lo_khz, "label": r.label, "callsign": r.callsign,
+                    "enabled": True,
+                })
+            if req.tri_watch.stream.enabled:
+                s = req.tri_watch.stream
+                new_sources.append({
+                    "type": "stream", "domain": s.domain, "app": s.app,
+                    "streamname": s.streamname, "port": s.port, "label": s.label,
+                    "waiting_message": s.waiting_message, "enabled": True,
+                })
+            on_disk.setdefault('tri_watch', {})['enabled'] = req.tri_watch.enabled
+            on_disk.setdefault('tri_watch', {})['sources'] = new_sources
 
-    tmp_path = str(CONFIG_PATH) + ".tmp"
-    with open(tmp_path, 'w') as f:
-        yaml.safe_dump(on_disk, f, default_flow_style=False, sort_keys=False)
-    os.replace(tmp_path, CONFIG_PATH)
+        # GNSS: no restart needed either - _apply_gnss_mode() below
+        # applies time_sync live, immediately after config is
+        # reassigned, the same "takes effect right away" pattern as
+        # site. Mode itself needs no live-apply step at all: it only
+        # gates whether _on_gnss_locator_change writes on the next
+        # confirmed fix, which reads config fresh every time anyway.
+        if req.gnss is not None:
+            on_disk.setdefault('gnss', {}).update(req.gnss.model_dump())
 
-    config = on_disk  # reload in-memory immediately - site fields take effect right away
-    return {
-        "success": True,
-        "restart_required": picotuner_changed or diversity_changed or tri_watch_changed,
-    }
+        tmp_path = str(CONFIG_PATH) + ".tmp"
+        with open(tmp_path, 'w') as f:
+            yaml.safe_dump(on_disk, f, default_flow_style=False, sort_keys=False)
+        os.replace(tmp_path, CONFIG_PATH)
+
+        config = on_disk  # reload in-memory immediately - site fields take effect right away
+        _apply_gnss_mode()
+        return {
+            "success": True,
+            "restart_required": picotuner_changed or diversity_changed or tri_watch_changed,
+        }
 
 @app.post("/api/config/reload", tags=["Configuration"],
           summary="Reload configuration from disk")
@@ -7819,7 +8431,7 @@ def web_ui():
             <!-- Tri-watch (Stage 1): shows status for every currently-enabled source (any mix of RF-A/RF-B/stream), only when enabled in config. Element id kept as "dual-watch-line" from the earlier, narrower design - purely cosmetic, no need to rename it -->
             <div id="dual-watch-line" style="display:none; background:#3a2a5c; color:#ffffff; font-weight:500; padding: 4px 10px; border-radius: 4px; font-size: 1rem;"></div>
         </div>
-        <div class="col-auto d-flex align-items-start gap-2 pt-1">
+        <div class="col-auto d-flex flex-wrap align-items-start gap-2 pt-1">
             <span><span class="led led-grey" id="picotuner-led"></span><small id="picotuner-status" class="text-muted">Picotuner</small></span>
             <span class="d-flex align-items-center gap-1" title="LNB PSU, Plug A - press the active button again to turn off. Amateur TV is always Horizontal (18V), labelled by voltage since some LNBs are physically mounted rotated 90 degrees.">
                 <small class="text-muted">LNB&nbsp;A</small>
@@ -7834,6 +8446,7 @@ def web_ui():
                 <button class="btn btn-sm" id="lnb-psu-b-tone" onclick="onLnbToneClick('b')" title="Hi-Band LO (22kHz tone) - almost never needed for Amateur TV, default is Lo-Band">Tone</button>
             </span>
             <span class="btn btn-sm" id="mode-badge" style="background:#3a4a63; color:#fff; cursor:default;">IDLE</span>
+            <a href="/config" class="btn btn-sm" id="locator-badge" style="background:#3a4a63; color:#fff;" title="Portable locator">&#x1F4CD; —</a>
             <a href="/diagnostics" class="btn btn-sm btn-outline-light" title="mpv restart/stop diagnostics" id="diagnostics-link">mpv: <span id="mpv-restart-count">0</span></a>
             <span class="btn btn-sm" id="version-badge" style="background:#3a4a63; color:#fff; cursor:default;" title="Current version">v?</span>
             <button class="btn btn-sm btn-outline-light" onclick="checkForUpdates()" id="update-check-btn" title="Check for updates now">&#x1F504; Check Updates</button>
@@ -7899,6 +8512,7 @@ def web_ui():
                                     id="lnb-select" onchange="onLnbSelectChange()" title="LNB local oscillator — freq above is the real downlink frequency when set">
                                 <option value="0">No LNB (direct)</option>
                                 <option value="9750000">Ku 9750 MHz (QO-100 std.)</option>
+                                <option value="9000000">Ku 9000 MHz (QO-100, 9-10GHz mod. LNB)</option>
                                 <option value="10600000">Ku 10600 MHz</option>
                                 <option value="10750000">Ku 10750 MHz</option>
                                 <option value="5150000">C-band 5150 MHz (3.4 GHz)</option>
@@ -8144,6 +8758,50 @@ async function updateStatus() {
         const badge = document.getElementById('mode-badge');
         badge.textContent = mode.toUpperCase();
         badge.style.background = mode === 'idle' ? '#3a4a63' : mode === 'rf' ? '#1a9850' : '#3b82c4';
+
+        // Locator badge - value AND provenance (GPS vs configured),
+        // per the task: the two must always be shown together, since
+        // a GPS-driven value and an operator-typed one carry very
+        // different confidence for anyone reading the display.
+        const loc = s.lynx?.portable_locator || '';
+        const provenance = s.lynx?.portable_locator_provenance || 'config';
+        const gnss = s.lynx?.gnss || {};
+        const locBadge = document.getElementById('locator-badge');
+        if (gnss.running && !gnss.connected) {
+            // Reader is meant to be talking to the HAT (mode isn't
+            // Off) but isn't - either no HAT is physically fitted (a
+            // fixed repeater site, exactly as expected) or the serial
+            // port isn't answering. Takes priority over the value/
+            // provenance display below: whatever locator is in use
+            // right now is necessarily the configured one, and that's
+            // secondary information to "there's no GPS talking to
+            // this receiver at all".
+            locBadge.textContent = '\U0001F4CD No GNSS Module';
+            locBadge.style.background = '#3a4a63';
+            locBadge.title = (gnss.last_error ? gnss.last_error + ' \u2014 ' : '') +
+                              (loc ? 'using configured locator ' + loc : 'no locator configured');
+        } else if (!loc) {
+            locBadge.textContent = '\U0001F4CD \u2014';
+            locBadge.style.background = '#3a4a63';
+            locBadge.title = 'Portable locator: not set';
+        } else if (provenance === 'gnss') {
+            locBadge.textContent = '\U0001F4CD ' + (gnss.locator_display || loc) + ' (GPS)';
+            locBadge.style.background = '#1a9850';
+            const sats = gnss.satellites != null ? gnss.satellites + ' sats' : 'sats \u2014';
+            const hdop = gnss.hdop != null ? 'HDOP ' + gnss.hdop : '';
+            locBadge.title = 'Confirmed GNSS fix - ' + sats + (hdop ? ', ' + hdop : '');
+        } else {
+            locBadge.textContent = '\U0001F4CD ' + loc + ' (config)';
+            locBadge.style.background = '#3a4a63';
+            if (gnss.mode === 'automatic' && gnss.pending_secs != null) {
+                locBadge.title = 'Configured value - GPS fix settling, ' +
+                                  Math.ceil(gnss.pending_secs) + 's to confirm';
+            } else if (gnss.mode === 'automatic') {
+                locBadge.title = 'Configured value - no GNSS fix (no HAT, or indoors)';
+            } else {
+                locBadge.title = 'Configured value - GNSS mode is Manual';
+            }
+        }
 
         // Tri-watch (Stage 1) - status of every currently-enabled source
         // (any mix of RF-A, RF-B, a stream) shown side by side. No
@@ -8850,6 +9508,14 @@ if __name__ == "__main__":
     # are reliably online, sometimes running RF-only with no internet
     # at all, and this must never touch the network unless a user
     # explicitly asks it to.
+    # GNSS (portable locator) - started unconditionally, like the
+    # Picotuner monitor threads just below. There is no mode that
+    # stops the reader itself anymore (see _apply_gnss_mode's own
+    # docstring) - a site with no HAT fails quietly regardless, and a
+    # site with one fitted should keep the option of GPS time sync
+    # even while Manual mode keeps GPS out of the locator.
+    gnss_reader.start()
+    _apply_gnss_mode()
     # Start Picotuner monitor background threads
     monitor = threading.Thread(target=picotuner_monitor, daemon=True)
     monitor.start()

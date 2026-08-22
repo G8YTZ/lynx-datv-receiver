@@ -699,8 +699,8 @@ class MapRenderer:
             cols.append(('MODCOD', str(modcod)))
         if symbol_rate:
             cols.append(('SR', f'{symbol_rate} kS'))
-        elif frequency:
-            cols.append(('FREQ', str(frequency)))
+        if frequency:
+            cols.append(('FREQ', f'{frequency} MHz'))
 
         usable = W - 2 * m
         step = usable / max(len(cols), 1)

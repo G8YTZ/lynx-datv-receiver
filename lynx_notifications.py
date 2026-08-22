@@ -208,15 +208,15 @@ class GpioPin:
 # the original field set (band/mode/call/qso_date/time_on/station_callsign/
 # freq/comment/rst_sent) - is carried over unchanged from the reference
 # code (confirmed tested, working in production for over a year), and
-# deliberately preserved exactly as proven, not redesigned. gridsquare is
-# a genuinely new, additive field (portable-locator override, see
+# deliberately preserved exactly as proven, not redesigned. my_gridsquare
+# is a genuinely new, additive field (portable-locator override, see
 # submit_qrz_logbook) - it's optional and only appears in the payload
 # when actually set, so it can't affect the proven, original behaviour.
 
 QRZ_LOGBOOK_URL = "https://logbook.qrz.com/api"
 
 def _build_qrz_adif(api_key, action, call, band, mode, qso_date, time_on,
-                     station_callsign, freq, comment, rst_sent, gridsquare=""):
+                     station_callsign, freq, comment, rst_sent, my_gridsquare=""):
     ps = ""
     ps += "KEY=" + api_key + "&"
     ps += "ACTION=" + action + "&"
@@ -230,11 +230,22 @@ def _build_qrz_adif(api_key, action, call, band, mode, qso_date, time_on,
     ps += "<freq:" + str(len(str(freq))) + ">" + str(freq)
     ps += "<comment:" + str(len(str(comment))) + ">" + str(comment)
     ps += "<rst_sent:" + str(len(str(rst_sent))) + ">" + str(rst_sent)
-    if gridsquare:
-        # Portable locator override (see submit_qrz_logbook) - only added
-        # when actually set, so normal operation produces byte-identical
+    if my_gridsquare:
+        # Portable locator override (see submit_qrz_logbook) - MY_GRIDSQUARE,
+        # not GRIDSQUARE. In ADIF, GRIDSQUARE is the WORKED/contacted
+        # station's own grid - QRZ already derives that correctly from
+        # that station's own profile, and nothing here has any business
+        # overriding it. MY_GRIDSQUARE is the logging station's grid at
+        # time of QSO, which is what "Lynx is operating portable, correct
+        # every contact logged during this session" actually means. Using
+        # plain GRIDSQUARE previously meant a GNSS-confirmed fix wrote
+        # Lynx's own coordinates onto whichever callsign happened to be
+        # logged at that moment - confirmed as a genuine, reported bug,
+        # not a corner case: 100% of logged contacts carried the wrong
+        # station's position. Only added when actually set, so normal
+        # operation with no override configured produces byte-identical
         # ADIF to before this field existed.
-        ps += "<gridsquare:" + str(len(gridsquare)) + ">" + str(gridsquare)
+        ps += "<my_gridsquare:" + str(len(my_gridsquare)) + ">" + str(my_gridsquare)
     ps += "<eor>"
     return ps
 
@@ -437,21 +448,27 @@ def submit_qrz_logbook(api_key, station_callsign, rx_callsign, freq_khz,
     dB) is used in its place for the comment/rst_sent fields as the
     closest available, meaningful signal-quality figure Lynx actually has.
 
-    portable_locator: an operator-supplied override for the contacted
-    station's grid square, for the case where they're operating portable
-    and haven't updated their QRZ profile - without this, QRZ calculates
-    distance/bearing from the contacted callsign's stale, registered
-    locator rather than where they actually are. Empty by default, in
-    which case no gridsquare is sent at all and QRZ's own lookup behaves
-    exactly as it always has.
+    portable_locator: an operator-supplied (or GNSS-confirmed) locator
+    for LYNX'S OWN current position - the logging station, not the
+    contacted one - for the case where Lynx itself is operating away
+    from its normal, registered site. Sent as ADIF's MY_GRIDSQUARE, not
+    GRIDSQUARE: the latter is the worked station's own grid, which QRZ
+    already derives correctly from that station's own profile and has
+    no reason to be overridden by anything Lynx knows. Without this,
+    QRZ calculates distance/bearing using the logged-in QRZ account's
+    stale, registered locator rather than wherever Lynx actually is
+    right now. Empty by default, in which case no gridsquare of any
+    kind is sent and QRZ's own lookup behaves exactly as it always has.
 
     Deliberately just a plain string, sourced from wherever the caller
-    gets it - today that's a manually-entered config value (see
-    NotificationManager._fire_qrz), but nothing here assumes a human
-    typed it. A future, automated source - an onboard GPS module, or a
-    phone's GPS relayed over Bluetooth, with the lat/long converted to a
-    Maidenhead locator - could populate the same underlying config value
-    on its own, and this function would need no changes at all to use it.
+    gets it - today that's a manually-entered config value or a
+    confirmed GNSS fix (see NotificationManager._fire_qrz and
+    lynx_app.py's _on_gnss_locator_change), but nothing here assumes a
+    human typed it. Applies uniformly to every contact logged while
+    set, which is exactly right for "Lynx itself is portable for this
+    session" - it would be wrong for trying to correct one specific
+    worked station's stale profile instead, which is a different thing
+    this field does not attempt.
 
     comment_override: replaces the normal, auto-built comment entirely
     when set - used by the /diagnostics test feature to mark its entries
@@ -478,10 +495,22 @@ def submit_qrz_logbook(api_key, station_callsign, rx_callsign, freq_khz,
     payload = _build_qrz_adif(api_key, "INSERT", call_trunc, band, str(mode),
                                qso_date, time_on, station_callsign,
                                str(freq_mhz), comment, str(rst_sent),
-                               gridsquare=portable_locator.strip())
+                               my_gridsquare=portable_locator.strip())
+
+    # Logged unconditionally (not just when portable_locator is set) -
+    # this is ground truth for exactly what left this machine, with no
+    # room for QRZ's own handling of it to be mistaken for something
+    # Lynx did or didn't send. API key redacted (everything up to and
+    # including "ADIF=" is dropped) since it's a credential, not
+    # diagnostic data - the ADIF body itself is the whole point of
+    # this line and contains every field actually being submitted,
+    # MY_GRIDSQUARE included when it's set.
+    adif_body = payload.split("ADIF=", 1)[-1]
+    print(f"[notifications] QRZ: submitting for {call_trunc} - {adif_body}")
 
     r = requests.post(QRZ_LOGBOOK_URL, data=payload,
                        headers={"User-agent": "lynx-notifications/1.0"}, timeout=10)
+    print(f"[notifications] QRZ: raw response - {r.status_code} {r.text}")
     result, logid, count, reason = "none", "none", "none", "none"
     if r.status_code == 200:
         for pair in r.text.split("&"):
@@ -671,6 +700,15 @@ class NotificationManager:
         self._tw_confirmed_locked = {1: False, 2: False}
 
         self._qrz_last_logged = {}   # {callsign: unix_timestamp} - suppression window
+        # {callsign: retry_count} - see _fire_qrz's own MER-not-ready
+        # handling. Right after a restart, the lock/callsign broadcast
+        # (port 9997) and the quality broadcast carrying MER/modcod
+        # (port 9901, picotuner_quality_monitor - a genuinely separate
+        # background thread) can arrive at different times; if the
+        # settle timer fires in that gap, MER/modcod were being logged
+        # as literally "None" and blank rather than the real values a
+        # few seconds later would have given.
+        self._qrz_mer_retries = {}
 
         self._actions = {}   # {name: SettlingAction} - persistent, keyed store so a
                               # later event (e.g. unlock) can find and cancel an earlier
@@ -1182,6 +1220,51 @@ class NotificationManager:
                                count_as_mpv_restart=False)
             return
 
+        # MER (and modcod, set in the same picotuner_quality_monitor()
+        # pass - see that function's own field list) can genuinely still
+        # be unset here, most often the very first contact right after a
+        # restart: the lock/callsign broadcast (port 9997) and the
+        # quality broadcast (port 9901) are read by two separate
+        # background threads that don't start in lockstep, so the settle
+        # timer can fire in the gap before quality data has arrived at
+        # all. Confirmed as a real, reported case: a logged entry
+        # carrying the literal text "None" for MER and no modcod at all.
+        # Deferred a few seconds rather than logged incomplete - bounded
+        # so a genuine, sustained absence (not just a startup race)
+        # still logs eventually rather than being silently dropped.
+        # Only for the non-tri_watch path: source_override, when given,
+        # is a fixed snapshot from tri_watch's own separate per-receiver
+        # tracking, and re-arming with that same stale snapshot would
+        # never actually pick up fresher data.
+        #
+        # Checks BOTH mer and modcod, not mer alone - confirmed as a
+        # real gap in the first version of this fix: mer can arrive
+        # from picotuner_table_monitor_b() (a THIRD background thread,
+        # which explicitly only backfills tuner A's mer/margin, never
+        # modcod) independently of and potentially earlier than modcod,
+        # which only ever comes from picotuner_quality_monitor()'s own,
+        # separate parsing. A logged entry with a real MER but still
+        # missing "QPSK 8/9" confirmed this was happening in practice.
+        if source_override is None and (src["mer"] is None or not src["modcod"]):
+            MAX_QRZ_MER_RETRIES = 3
+            QRZ_MER_RETRY_DELAY_SECS = 3.0
+            retries = self._qrz_mer_retries.get(call, 0)
+            if retries < MAX_QRZ_MER_RETRIES:
+                self._qrz_mer_retries[call] = retries + 1
+                missing = ", ".join(
+                    n for n, v in (("MER", src["mer"] is None), ("modcod", not src["modcod"])) if v)
+                print(f"[notifications] QRZ: {missing} not yet available for {call} "
+                      f"(most likely the first contact after a restart) - "
+                      f"deferring {QRZ_MER_RETRY_DELAY_SECS:.0f}s "
+                      f"(retry {retries + 1}/{MAX_QRZ_MER_RETRIES})")
+                self._arm_action('qrz', QRZ_MER_RETRY_DELAY_SECS,
+                                  lambda: self._fire_qrz(qrz_cfg, site_callsign), "QRZ")
+                return
+            print(f"[notifications] QRZ: MER/modcod still not fully available for {call} "
+                  f"after {MAX_QRZ_MER_RETRIES} retries - logging anyway rather than "
+                  f"losing the contact entirely")
+        self._qrz_mer_retries.pop(call, None)
+
         suppress_secs = float(qrz_cfg.get('suppress_mins', 60)) * 60.0
         now = time.time()
         last = self._qrz_last_logged.get(call, 0)
@@ -1196,10 +1279,28 @@ class NotificationManager:
 
         try:
             portable_locator = qrz_cfg.get('portable_locator', '').strip()
+            # Off must be a hard guarantee that no portable locator is
+            # ever submitted - not merely "GNSS stops writing new
+            # values" (which _on_gnss_locator_change already handles in
+            # lynx_app.py). Without this check, switching Automatic -> Off
+            # left whatever GPS last confirmed still sitting in this
+            # field, and every contact logged afterwards - at a fixed
+            # site, GNSS genuinely off - kept carrying a stale portable
+            # position with nothing having actually asked for it.
+            # Confirmed as a real, reported case: logged at home, GNSS
+            # off, no value manually typed, yet a portable locator was
+            # still attached to the entry. gnss.mode is read fresh from
+            # the live config (self.get_config(), same getter qrz_cfg
+            # itself came from) rather than cached, so this reacts to a
+            # mode change on the very next contact, no restart needed.
+            gnss_mode = self.get_config().get('gnss', {}).get('mode', 'automatic')
+            if gnss_mode == 'off':
+                portable_locator = ''
             if portable_locator:
-                print(f"[notifications] QRZ: logging {call} with portable "
-                      f"locator override ({portable_locator}) instead of "
-                      f"their registered QRZ locator")
+                print(f"[notifications] QRZ: logging {call} with Lynx's own "
+                      f"current locator ({portable_locator}) attached as "
+                      f"MY_GRIDSQUARE - {call}'s own registered locator is "
+                      f"untouched")
             # ADIF's MODE field wants the standard name alongside the
             # modcod (confirmed against a genuine, correct QRZ Logbook
             # entry: "DVB-S2 QPSK 2/3") - src["modcod"] alone is just the
