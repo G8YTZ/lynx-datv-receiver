@@ -911,7 +911,8 @@ class LynxOverlay(Gtk.Window):
                     modcod=card.get('modcod'),
                     symbol_rate=card.get('symbol_rate'),
                     frequency=card.get('frequency'),
-                    site_name=state.get("site_location") or "")
+                    site_name=state.get("site_location") or "",
+                    via_qo100=bool(card.get('via_qo100')))
             except Exception as e:
                 # A map that will not draw must never take the OSD down -
                 # fall back silently to the normal idle screen.

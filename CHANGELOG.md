@@ -2,6 +2,19 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-08-23
+
+**Added**
+- Pathfinder now draws a globe rather than a terrestrial map when the contact came via QO-100. A great-circle line between the two stations is actively misleading for a satellite contact - the signal went up 36,000 km and back down, not across the ground - so the card shows an orthographic globe with both ends marked and the satellite drawn where it really is. The view is tilted 12 degrees, which is what lets the bird sit at its true geostationary distance of 6.6 Earth radii and still land just clear of the limb, to scale, with no compression. Centred on the sub-satellite longitude, so the visible disc is very nearly the satellite's own footprint. Both ends are labelled by country, since the bundled town data is clipped to the UK and a country is the honest granularity at globe scale anyway.
+- The BEARING column becomes DELAY on a QO-100 card. A bearing is meaningless when both stations point at the same satellite, whereas the propagation delay - around 253 ms for a European contact, computed per contact from the two slant ranges rather than quoted as a constant - is the thing everyone remarks on.
+- Natural Earth 110m world land and country outlines added to `geo/` (about 800 KB). The existing 10m set is deliberately clipped to 1200 km around the UK, so it contains no Africa or Middle East to draw; 110m is also the correct resolution at globe scale, where 10m would be invisible detail that merely costs time.
+- `pathfinder.qo100_test` in the config file forces the globe view on for any contact, so the card can be developed and demonstrated at a site with no 3cm satellite installation. Honoured by `/api/pathfinder/test` as well as real contacts. Deliberately not on the Config page: it makes every card wrong and is only ever wanted by someone editing the file by hand.
+
+**Fixed**
+- QO-100 detection tests the DOWNLINK, not the LNB local oscillator, so a 9750 Universal LNB, a 9000 QO-100 PLL LNB or anything else all give the same answer with no list of LOs to maintain. The Picotuner reports the IF and has no idea an LNB sits in front of it, so the LO is added back first - which is also why the decision is made in `lynx_app.py` and passed through rather than worked out in `lynx_map.py`, which never sees the LO. The test itself uses the IARU Region 1 / RSGB bandplan boundary (10475-10500 MHz, Amateur Satellite Service only) rather than the transponder edges: terrestrial 10 GHz ATV repeaters sit far below at 10065, 10240 and 10425 MHz, so nothing terrestrial can legitimately appear in that window and a frequency test is sufficient on its own rather than a heuristic.
+- `max_distance_km` no longer rejects QO-100 contacts. That limit exists to catch a stale or default QRZ locator on a terrestrial contact, where several thousand km means bad data rather than an extraordinary contact - but via the satellite the reasoning inverts, since the footprint is most of a hemisphere and a South African or Brazilian station is entirely ordinary. Found in testing: ZR6TG at 9,000 km drew no card at all while nearer European stations worked.
+- Missing globe map data now says so in the log instead of failing silently. A shapefile is three files (.shp, .shx and .dbf) and pyshp needs all of them; copying only the .shp left `_read_shp` catching the error and returning nothing, which drew a bare disc with two correct markers on it and read as a rendering bug rather than a missing file.
+
 ## 2026-08-21
 
 **Added**

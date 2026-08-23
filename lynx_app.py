@@ -4052,6 +4052,61 @@ def pathfinder_watcher():
             print(f"[map] watcher: {e}")
 
 
+def _pathfinder_lnb_lo_khz(rcv):
+    """The LNB local oscillator currently in front of a receiver, in kHz.
+
+    Needed because the frequency the Picotuner reports is the IF, not
+    the downlink - the tuner has no idea an LNB sits in front of it.
+    With a 9750 LNB a QO-100 contact reports as roughly 743 MHz, and
+    with a 9000 LNB as roughly 1493 MHz; neither is the frequency being
+    received, and testing either against the 3cm bandplan would simply
+    return False for a contact that plainly did come via the satellite.
+    Adding the LO back reconstructs the real downlink, which is the
+    only number worth testing.
+
+    Mirrors _picotuner_expected_tuning()'s own source-of-truth rules
+    deliberately: tri_watch's per-source config when it is driving,
+    otherwise the saved tuning state."""
+    try:
+        if _tri_watch_present():
+            for src in globals().get('tri_watch_sources_cfg', []):
+                if src.get('enabled') and src.get('type') == 'rf' \
+                        and src.get('rcv') == rcv:
+                    return int(src.get('lnb_lo_khz', 0) or 0)
+            return 0
+        state = load_last_state() or {}
+        return int(state.get('lnb_lo_khz', 0) or 0)
+    except Exception as e:
+        print(f"[map] could not determine LNB LO: {e}")
+        return 0
+
+
+def _pathfinder_via_qo100(rcv, telemetry):
+    """Did this contact come via QO-100?
+
+    Config switch first: pathfinder.qo100_test forces the globe view on
+    for any contact, so the card can be developed and demonstrated at a
+    site with no 3cm satellite installation at all. Deliberately not
+    exposed on the Config page - it makes every card wrong, and is only
+    ever wanted by someone editing the file by hand.
+
+    Otherwise the downlink is reconstructed from the reported IF plus
+    the LNB LO and tested against the bandplan's satellite-only
+    segment. See lynx_map.is_qo100()."""
+    try:
+        if config.get('pathfinder', {}).get('qo100_test', False):
+            print("[map] pathfinder.qo100_test is set - forcing QO-100 globe view")
+            return True
+        raw = str(telemetry.get('frequency', '') or '').strip()
+        if not raw:
+            return False
+        if_khz = float(raw) * 1000.0     # Picotuner reports MHz
+        return lynx_map.is_qo100(if_khz + _pathfinder_lnb_lo_khz(rcv))
+    except Exception as e:
+        print(f"[map] QO-100 check failed, assuming terrestrial: {e}")
+        return False
+
+
 def _pathfinder_arm(callsign, rcv, telemetry):
     """Looks the station up and arms the card if it has a usable
     locator. The QRZ lookup runs on its own thread - never inline, for
@@ -4100,7 +4155,18 @@ def _pathfinder_arm(callsign, rcv, telemetry):
             home = config.get('site', {}).get('locator', '')
             pos_h = lynx_map.locator_to_latlon(home)
             pos_s = lynx_map.locator_to_latlon(grid)
-            if pos_h and pos_s:
+            via_qo100 = _pathfinder_via_qo100(rcv, telemetry)
+            # max_distance_km exists to catch a stale or default QRZ
+            # locator on a terrestrial contact, where a few thousand km
+            # really does mean the data is wrong rather than the contact
+            # extraordinary. Via QO-100 that reasoning inverts: the
+            # satellite's footprint is most of a hemisphere, so a South
+            # African or Brazilian station is entirely ordinary and
+            # rejecting it is the bug. The sanity check the globe view
+            # relies on instead is the bandplan test that got us here -
+            # a contact in the satellite-only part of 3cm genuinely did
+            # come via the bird, whatever the distance.
+            if pos_h and pos_s and not via_qo100:
                 d = lynx_map.haversine_km(*pos_h, *pos_s)
                 if d > pathfinder_tracker.max_distance_km:
                     # Almost always a stale or default QRZ locator rather
@@ -4111,7 +4177,8 @@ def _pathfinder_arm(callsign, rcv, telemetry):
                           f"- treating locator {grid} as unreliable, no card")
                     return
             pathfinder_tracker.station_unlocked(
-                callsign, grid, name=name, **snapshot)
+                callsign, grid, name=name, via_qo100=via_qo100,
+                **snapshot)
         except Exception as e:
             print(f"[map] lookup for {callsign} failed: {e}")
 
@@ -4814,9 +4881,15 @@ def pathfinder_test(req: PathfinderTestRequest):
     if pos is None:
         raise HTTPException(status_code=400,
                             detail=f"'{req.locator}' is not a usable Maidenhead locator")
+    # Honours pathfinder.qo100_test, so this endpoint is the way to
+    # exercise the QO-100 globe at a site with no 3cm satellite
+    # installation: set the switch, POST a distant locator, watch the
+    # card. Without that the globe could only ever be seen by someone
+    # who already had the hardware working.
     pathfinder_tracker.station_unlocked(
         req.callsign, req.locator, name=req.name or None, mer=req.mer,
-        modcod=req.modcod, symbol_rate=req.symbol_rate)
+        modcod=req.modcod, symbol_rate=req.symbol_rate,
+        via_qo100=bool(config.get('pathfinder', {}).get('qo100_test', False)))
     home = config.get('site', {}).get('locator', '')
     pos_h = lynx_map.locator_to_latlon(home)
     dist = lynx_map.haversine_km(*pos_h, *pos) if pos_h else None

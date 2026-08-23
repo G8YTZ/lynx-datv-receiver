@@ -92,6 +92,137 @@ BAND_TOP = 0.155
 BAND_BOTTOM = 0.135
 
 
+# ---------------------------------------------------------------- QO-100
+#
+# QO-100 / Es'hail-2 sits at 25.9 degrees East on the geostationary
+# belt. A contact through it did not travel the great-circle path
+# between the two stations, so drawing one is actively misleading - it
+# went up 36,000 km and back down. The globe view draws what actually
+# happened.
+SAT_LON = 25.9
+SAT_LAT = 0.0
+
+RE_KM   = 6378.137            # Earth equatorial radius
+RGEO_KM = 42164.0             # geostationary orbit radius, from Earth's centre
+C_KMS   = 299792.458
+GEO_R   = RGEO_KM / RE_KM     # 6.61 Earth radii
+
+# Viewing tilt for the globe. Looking from 12 degrees south of the
+# equator puts the sub-satellite point slightly above the disc centre,
+# and GEO_R times that offset lands the satellite about 1.38 R above
+# centre - just clear of the limb. That means the bird can be drawn at
+# its TRUE distance, to scale against the Earth below it, with no
+# compression or fudging. Centred exactly on the sub-satellite point
+# it would sit dead in front of the planet and be undrawable.
+VIEW_LAT = -12.0
+
+# The satellite-only segment of 3cm, from the IARU Region 1 / RSGB
+# bandplan. Deliberately the bandplan boundary rather than the
+# transponder edges, because that is what makes a frequency test
+# sufficient on its own rather than a heuristic: 10475-10500 MHz is
+# Amateur Satellite Service ONLY, while terrestrial 10 GHz ATV
+# repeaters sit far below at 10065, 10240 and 10425 MHz. Nothing
+# terrestrial can legitimately appear in this window. It also covers
+# both QO-100 transponders - narrowband at 10489.5-10490.0 and
+# wideband (DATV) at 10490.5-10499.5 - without needing to tell them
+# apart.
+SAT_ONLY_MIN_KHZ = 10_475_000
+SAT_ONLY_MAX_KHZ = 10_500_000
+
+
+def is_qo100(downlink_khz):
+    """True if this DOWNLINK frequency is in the satellite-only part of
+    3cm, i.e. the contact came via QO-100.
+
+    Tested on the downlink, never on the LNB local oscillator, so a
+    9750 Universal LNB, a 9000 QO-100 PLL LNB or anything else all give
+    the same answer and there is no list of known LOs to maintain.
+
+    Note the caller must pass the DOWNLINK, not the frequency the
+    Picotuner reports - those differ by the LO, and the Picotuner has
+    no idea an LNB is in front of it."""
+    try:
+        f = float(downlink_khz)
+    except (TypeError, ValueError):
+        return False
+    return SAT_ONLY_MIN_KHZ <= f <= SAT_ONLY_MAX_KHZ
+
+
+def slant_range_km(lat, lon):
+    """Straight-line distance from a ground station up to QO-100.
+
+    Cosine rule on the triangle Earth-centre / station / satellite,
+    where the central angle is the angle subtended at Earth's centre
+    between the station and the sub-satellite point."""
+    g = math.acos(max(-1.0, min(1.0,
+        math.cos(math.radians(lat)) * math.cos(math.radians(lon - SAT_LON)))))
+    return math.sqrt(RGEO_KM ** 2 + RE_KM ** 2
+                     - 2 * RGEO_KM * RE_KM * math.cos(g))
+
+
+def sat_path_delay_ms(lat_h, lon_h, lat_s, lon_s):
+    """Propagation delay for the whole path: one station up to the
+    satellite and back down to the other. Around 253 ms for a European
+    contact - the quarter second everyone notices on QO-100. Computed
+    per contact rather than quoted as a constant, because a station in
+    South Africa or Brazil is meaningfully different."""
+    total = slant_range_km(lat_h, lon_h) + slant_range_km(lat_s, lon_s)
+    return total, total / C_KMS * 1000.0
+
+
+def ortho(lat, lon):
+    """Orthographic projection, unit Earth radius, centred on the
+    sub-satellite longitude and tilted by VIEW_LAT. Returns
+    (x, y, visible) with y already flipped for screen use.
+
+    Far-side points are pushed out onto the limb rather than dropped.
+    Breaking the path instead fragments any polygon that spans the
+    horizon and loses whole continents - Africa disappeared entirely in
+    the first version of this."""
+    la, lo = math.radians(lat), math.radians(lon)
+    cla, clo = math.radians(VIEW_LAT), math.radians(SAT_LON)
+    cosc = (math.sin(cla) * math.sin(la)
+            + math.cos(cla) * math.cos(la) * math.cos(lo - clo))
+    x = math.cos(la) * math.sin(lo - clo)
+    y = (math.cos(cla) * math.sin(la)
+         - math.sin(cla) * math.cos(la) * math.cos(lo - clo))
+    if cosc < 0.0:
+        m = math.hypot(x, y) or 1.0
+        return x / m, -y / m, False
+    return x, -y, True
+
+
+def country_of(lat, lon):
+    """Country name for a position, or ''.
+
+    Used to label the two ends of a QO-100 path. The bundled towns.csv
+    and populated-places layer are both clipped to a 1200 km window
+    around the UK, so a station in Brazil or Thailand has no city to
+    name - and at globe scale a country is the honest granularity
+    anyway."""
+    parts_list = _read_shp('ne_110m_admin_0_countries', want_fields=('NAME',))
+    for parts, rec in parts_list:
+        for ring in parts:
+            if not ring:
+                continue
+            xs = [p[0] for p in ring]
+            ys = [p[1] for p in ring]
+            if not (min(xs) <= lon <= max(xs) and min(ys) <= lat <= max(ys)):
+                continue
+            inside = False
+            j = len(ring) - 1
+            for k in range(len(ring)):
+                xi, yi = ring[k]
+                xj, yj = ring[j]
+                if ((yi > lat) != (yj > lat)) and \
+                   (lon < (xj - xi) * (lat - yi) / ((yj - yi) or 1e-12) + xi):
+                    inside = not inside
+                j = k
+            if inside:
+                return str(rec.get('NAME', '') if isinstance(rec, dict) else '')
+    return ''
+
+
 def _hex_rgb(h):
     h = h.lstrip('#')
     return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
@@ -364,13 +495,23 @@ class MapRenderer:
 
     def render(self, W, H, callsign, locator, name=None, mer=None,
                modcod=None, symbol_rate=None, frequency=None,
-               site_name=None):
+               site_name=None, via_qo100=False):
         """Returns a cairo.ImageSurface, or None if the card cannot be
         drawn (no home locator, unparseable station locator, missing
         data files). Callers must handle None — a missing map should
-        simply mean the normal idle screen stays up."""
+        simply mean the normal idle screen stays up.
+
+        via_qo100 switches to the globe view. It is passed in rather
+        than worked out here because the decision needs the LNB local
+        oscillator, and the only frequency this module ever sees is the
+        one the Picotuner reports - which is the IF, several GHz below
+        the actual downlink. lynx_app.py knows the LO; this does not."""
         if not self.home:
             return None
+        if via_qo100:
+            return self._render_globe(W, H, callsign, locator, name, mer,
+                                      modcod, symbol_rate, frequency,
+                                      site_name)
         pos = locator_to_latlon(locator)
         if not pos:
             return None
@@ -643,10 +784,229 @@ class MapRenderer:
             if try_place(tlon, tlat, town_name, False):
                 n += 1
 
+    # -- QO-100 globe -----------------------------------------------------
+
+    def _render_globe(self, W, H, callsign, locator, name, mer, modcod,
+                      symbol_rate, frequency, site_name):
+        """The end-of-contact card for a QO-100 contact.
+
+        Deliberately a different picture rather than the terrestrial map
+        with a different line on it: the signal genuinely did not travel
+        between the two stations, and a great-circle path would be a
+        confident lie. Orthographic globe, both ends marked, and the
+        satellite drawn where it really is.
+
+        Uses the 110m Natural Earth data rather than the 10m set the
+        terrestrial card uses. That is not a compromise - at this scale
+        10m is invisible detail that merely costs time to draw, and the
+        bundled 10m set is clipped to 1200 km around the UK anyway, so
+        it contains no Africa or Middle East to draw."""
+        pos = locator_to_latlon(locator)
+        if not pos or not self.home:
+            return None
+        lat_s, lon_s = pos
+        lat_h, lon_h = self.home
+
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, W, H)
+        cr = cairo.Context(surf)
+        cr.set_source_rgb(*_hex_rgb('#0B0D14'))
+        cr.paint()
+
+        top = H * BAND_TOP
+        bot = H * (1 - BAND_BOTTOM)
+
+        # Size the globe so the satellite AND its label clear the header
+        # band. sat_off is how far above the disc centre the bird lands,
+        # in globe radii - see VIEW_LAT for why this works out.
+        _, sat_unit_y, _ = ortho(SAT_LAT, SAT_LON)
+        sat_off = abs(sat_unit_y) * GEO_R
+        R = (bot - top - H * 0.10) / (sat_off + 1.0)
+        cx = W * 0.5
+        cy = top + H * 0.081 + sat_off * R
+
+        def P(lat, lon, r=1.0):
+            x, y, vis = ortho(lat, lon)
+            return cx + x * R * r, cy + y * R * r, vis
+
+        cr.arc(cx, cy, R, 0, 2 * math.pi)
+        cr.set_source_rgb(*_hex_rgb('#212B3B'))
+        cr.fill()
+
+        cr.save()
+        cr.arc(cx, cy, R, 0, 2 * math.pi)
+        cr.clip()
+
+        land = _read_shp('ne_110m_land')
+        if not land:
+            # Loud, because the alternative is a bare blue disc with two
+            # correct markers on it, which reads as a drawing bug rather
+            # than a missing file. A shapefile is three files - .shp,
+            # .shx and .dbf - and pyshp needs all of them; copying only
+            # the .shp leaves _read_shp catching the error and returning
+            # nothing at all.
+            print("[map] ne_110m_land not readable - the QO-100 globe will "
+                  "have no land. Check geo/ contains ne_110m_land.shp, .shx "
+                  "AND .dbf (all three are required).")
+        for parts, _rec in land:
+            for ring in parts:
+                for i, (lon, lat) in enumerate(ring):
+                    x, y, _ = P(lat, lon)
+                    cr.move_to(x, y) if i == 0 else cr.line_to(x, y)
+                cr.close_path()
+        cr.set_source_rgb(*_hex_rgb('#313D51'))
+        cr.fill()
+
+        # Graticule - without it the disc reads as a flat circle
+        cr.set_source_rgba(*COAST, 0.22)
+        cr.set_line_width(max(0.8, H * 0.0009))
+        for lat in range(-60, 61, 30):
+            first = True
+            for lon in range(-180, 181, 2):
+                x, y, vis = P(lat, lon)
+                if not vis:
+                    first = True
+                    continue
+                cr.move_to(x, y) if first else cr.line_to(x, y)
+                first = False
+            cr.stroke()
+        for lon in range(-180, 181, 30):
+            first = True
+            for lat in range(-88, 89, 2):
+                x, y, vis = P(lat, lon)
+                if not vis:
+                    first = True
+                    continue
+                cr.move_to(x, y) if first else cr.line_to(x, y)
+                first = False
+            cr.stroke()
+
+        # The equator, picked out - it is the line the satellite sits above
+        cr.set_source_rgba(*COAST, 0.55)
+        cr.set_line_width(max(1.2, H * 0.0013))
+        first = True
+        for lon in range(-180, 181, 2):
+            x, y, vis = P(0, lon)
+            if not vis:
+                first = True
+                continue
+            cr.move_to(x, y) if first else cr.line_to(x, y)
+            first = False
+        cr.stroke()
+
+        for parts, _rec in land:
+            for ring in parts:
+                first = True
+                for (lon, lat) in ring:
+                    x, y, vis = P(lat, lon)
+                    if not vis:
+                        first = True
+                        continue
+                    cr.move_to(x, y) if first else cr.line_to(x, y)
+                    first = False
+                cr.set_source_rgb(*COAST)
+                cr.set_line_width(max(0.9, H * 0.001))
+                cr.stroke()
+        cr.restore()
+
+        cr.arc(cx, cy, R, 0, 2 * math.pi)
+        cr.set_source_rgba(*COAST, 0.75)
+        cr.set_line_width(max(1.4, H * 0.0016))
+        cr.stroke()
+
+        # -- the satellite, at its true distance ---------------------------
+        sub_x, sub_y, _ = P(SAT_LAT, SAT_LON)
+        sx, sy, _ = P(SAT_LAT, SAT_LON, r=GEO_R)
+
+        cr.set_source_rgba(*COAST, 0.5)
+        cr.set_line_width(1.0)
+        cr.set_dash([4, 6])
+        cr.move_to(sub_x, sub_y)
+        cr.line_to(sx, sy)
+        cr.stroke()
+        cr.set_dash([])
+        cr.set_source_rgba(*COAST, 0.9)
+        cr.arc(sub_x, sub_y, max(2.5, H * 0.003), 0, 2 * math.pi)
+        cr.fill()
+
+        hx, hy, _ = P(lat_h, lon_h)
+        rx, ry, _ = P(lat_s, lon_s)
+
+        cr.set_line_width(max(2.0, H * 0.0024))
+        cr.set_source_rgb(*PATH)
+        for (px, py) in ((hx, hy), (rx, ry)):
+            cr.move_to(px, py)
+            cr.line_to(sx, sy)
+            cr.stroke()
+
+        wing_w, wing_h = W * 0.0167, H * 0.013
+        body = H * 0.024
+        cr.set_source_rgb(*_hex_rgb('#8CB8F2'))
+        cr.rectangle(sx - body / 2 - wing_w - 3, sy - wing_h / 2, wing_w, wing_h)
+        cr.fill()
+        cr.rectangle(sx + body / 2 + 3, sy - wing_h / 2, wing_w, wing_h)
+        cr.fill()
+        cr.set_source_rgb(*AMBER)
+        cr.rectangle(sx - body / 2, sy - body / 2, body, body)
+        cr.fill()
+
+        def gtext(x, y, t, size, colour, bold=False, centre=False):
+            cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL,
+                                cairo.FONT_WEIGHT_BOLD if bold
+                                else cairo.FONT_WEIGHT_NORMAL)
+            cr.set_font_size(size)
+            if centre:
+                x -= cr.text_extents(t).width / 2
+            cr.set_source_rgb(*colour)
+            cr.move_to(x, y)
+            cr.show_text(t)
+            cr.new_path()
+
+        gtext(sx, sy - body / 2 - H * 0.030, 'QO-100', H * 0.021,
+              TEXT_BRIGHT, bold=True, centre=True)
+        gtext(sx, sy - body / 2 - H * 0.012, '25.9\u00b0E  GEO', H * 0.014,
+              TEXT_LABEL, centre=True)
+
+        # -- the two ends --------------------------------------------------
+        for (px, py, col, lat_p, lon_p) in ((hx, hy, CYAN, lat_h, lon_h),
+                                            (rx, ry, AMBER, lat_s, lon_s)):
+            cr.set_source_rgba(*col, 0.28)
+            cr.arc(px, py, max(10, H * 0.014), 0, 2 * math.pi)
+            cr.fill()
+            cr.set_source_rgb(*col)
+            cr.arc(px, py, max(4.5, H * 0.006), 0, 2 * math.pi)
+            cr.fill()
+            lbl = country_of(lat_p, lon_p)
+            if lbl:
+                cr.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL,
+                                    cairo.FONT_WEIGHT_BOLD)
+                cr.set_font_size(H * 0.0195)
+                cr.set_source_rgb(*TEXT_BRIGHT)
+                cr.move_to(px + H * 0.018, py + H * 0.007)
+                cr.show_text(lbl)
+                cr.new_path()
+
+        dist = haversine_km(lat_h, lon_h, lat_s, lon_s)
+        _total, delay_ms = sat_path_delay_ms(lat_h, lon_h, lat_s, lon_s)
+        self._draw_text(cr, W, H, callsign, locator, name, dist, None,
+                        mer, modcod, symbol_rate, frequency, site_name,
+                        delay_ms=delay_ms)
+        return surf
+
     # -- text card --------------------------------------------------------
 
     def _draw_text(self, cr, W, H, callsign, locator, name, dist, brg,
-                   mer, modcod, symbol_rate, frequency, site_name):
+                   mer, modcod, symbol_rate, frequency, site_name,
+                   delay_ms=None):
+        """Shared between the terrestrial card and the QO-100 globe, so
+        the two always agree on layout - same bands, same column slots,
+        same attribution. A viewer should never feel they are looking at
+        two different products.
+
+        delay_ms, when given, replaces the BEARING column with DELAY.
+        A bearing is meaningless for a satellite contact - both stations
+        are pointing at the same bird, so it would be near enough the
+        same number every time - whereas the quarter-second delay is the
+        thing everyone remarks on."""
         top_h = int(H * BAND_TOP)
         bot_h = int(H * BAND_BOTTOM)
 
@@ -691,8 +1051,11 @@ class MapRenderer:
 
         # bottom data strip
         cols = [('LOCATOR', (locator or '').upper()),
-                ('DISTANCE', f'{dist:,.0f} km'),
-                ('BEARING', f'{brg:.0f}\u00b0 {compass_point(brg)}')]
+                ('DISTANCE', f'{dist:,.0f} km')]
+        if delay_ms is not None:
+            cols.append(('DELAY', f'{delay_ms:.0f} ms'))
+        elif brg is not None:
+            cols.append(('BEARING', f'{brg:.0f}\u00b0 {compass_point(brg)}'))
         if mer:
             cols.append(('MER', f'{mer} dB'))
         if modcod:
@@ -743,7 +1106,8 @@ class PathfinderTracker:
         self.pending = None
 
     def station_unlocked(self, callsign, locator, name=None, mer=None,
-                         modcod=None, symbol_rate=None, frequency=None):
+                         modcod=None, symbol_rate=None, frequency=None,
+                         via_qo100=False):
         """A station has stopped. Arms the card if we have enough to draw
         one; otherwise does nothing at all, which leaves the normal idle
         screen in place."""
@@ -760,6 +1124,7 @@ class PathfinderTracker:
             'modcod': modcod,
             'symbol_rate': symbol_rate,
             'frequency': frequency,
+            'via_qo100': via_qo100,
             'unlocked_at': time.time(),
         }
 
