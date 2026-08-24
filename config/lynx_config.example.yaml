@@ -326,6 +326,37 @@ ryde:
 # with the defaults below), or shorten the card to fit the hang time
 # you already have. Lynx's own gpio_tx keying needs no change - its
 # power_down_settle_secs is far longer than this window.
+# ---------------------------------------------------------------------
+#  Auto-Squeak - audio path measurement from a Lindos test sequence
+# ---------------------------------------------------------------------
+# Listens for a Lindos sequence on the received audio and puts a
+# measurement card on screen after each pass: level against alignment,
+# channel balance, frequency response, noise, separation and THD.
+#
+# On by default. It is idle until a sequence actually arrives, and it
+# reads the same audio monitor the PPM meter already uses, so the cost
+# of leaving it on is negligible.
+#
+# Unlike Pathfinder, the card is drawn OVER live video. That is
+# deliberate: the results are wanted during the transmission, in the
+# gap between passes, so an adjustment can be made and the next pass
+# seen. It also takes priority over a Pathfinder card where both fall
+# due at once.
+squeak:
+  enabled: true
+  # Which monitor to listen on. Leave BLANK and it follows whatever
+  # output mpv is actually playing to - the same rule the PPM meter
+  # uses, and for the same reason: watching the system default instead
+  # means that selecting a different output leaves the measurement
+  # reading silence, which looks like a broken detector rather than a
+  # misdirected one. Only set a name here to override that.
+  source: ''
+  # How long a card stays up. Worth setting close to the gap between
+  # passes in your test file, so the previous result is still visible
+  # while an adjustment is being made rather than clearing too early.
+  hold_secs: 45
+  label: 'off-air'
+
 pathfinder:
   enabled: true
   delay_secs: 2           # quiet gap after a station stops, before the card appears

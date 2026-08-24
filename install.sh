@@ -78,7 +78,7 @@ sudo apt install -y \
 # reinstalling) - listed explicitly regardless rather than assumed,
 # same reasoning this section already gives for requests/gpiozero.
 echo "--- Installing Python dependencies ---"
-pip install --break-system-packages fastapi uvicorn pyyaml requests gpiozero pyshp pyserial
+pip install --break-system-packages fastapi uvicorn pyyaml requests gpiozero pyshp pyserial numpy
 
 # --- GPS time sync (chrony) -------------------------------------
 # Only relevant to a receiver with the optional GNSS HAT fitted

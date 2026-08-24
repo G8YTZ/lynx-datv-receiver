@@ -56,6 +56,21 @@ from pydantic import BaseModel
 import lynx_notifications
 import lynx_gnss
 import lynx_map
+
+# Auto-Squeak needs numpy, which older installs may not have - it was
+# added to install.sh at the same time as this feature, and anyone who
+# updates by copying files rather than running the installer will not
+# have picked it up. A missing optional feature must never stop the
+# receiver starting, so this degrades to "Auto-Squeak unavailable"
+# rather than taking Lynx down on an import error.
+try:
+    import lynx_squeak
+    SQUEAK_AVAILABLE = True
+except Exception as _e:
+    lynx_squeak = None
+    SQUEAK_AVAILABLE = False
+    print(f"[squeak] unavailable ({_e}) - install numpy to enable "
+          f"audio measurement: pip install --break-system-packages numpy")
 import lynx_rtmp_probe
 
 # Diagnostic: dump every thread's current stack trace to a log file on
@@ -2949,6 +2964,19 @@ class DiversityConfigUpdate(BaseModel):
     hard_freeze_breaker_required_clean_secs: Optional[float] = None
     hard_freeze_breaker_min_retry_interval_secs: Optional[float] = None
 
+class SqueakConfigUpdate(BaseModel):
+    # On by default - it is idle until a sequence arrives, and a
+    # receiver that measures itself when someone sends a test is more
+    # useful than one that must be configured first.
+    enabled: bool = True
+    # Blank means "monitor of the default output", which is what almost
+    # everyone wants and needs no maintenance if the output changes.
+    source: str = ""
+    # Worth matching to the gap between passes in the test file, so the
+    # previous result is still on screen while an adjustment is made.
+    hold_secs: float = 45.0
+
+
 class GnssConfigUpdate(BaseModel):
     # automatic (default): GPS always wins once it has a confirmed,
     # stable fix (see lynx_gnss.LocatorTracker) - it overwrites
@@ -3088,6 +3116,7 @@ class ConfigUpdateRequest(BaseModel):
     tri_watch: Optional[TriWatchSourcesUpdate] = None
     pathfinder: Optional[PathfinderConfigUpdate] = None
     gnss: Optional[GnssConfigUpdate] = None
+    squeak: Optional[SqueakConfigUpdate] = None
 
 # ── Helpers ───────────────────────────────────────────────────
 def stop_current():
@@ -3922,6 +3951,135 @@ pathfinder_tracker = lynx_map.PathfinderTracker(
 
 _pathfinder_prev = {"receiving": False, "callsign": "", "rcv": 1, "telemetry": {}}
 
+# ---------------------------------------------------------------------
+#  Auto-Squeak - Lindos sequence measurement
+# ---------------------------------------------------------------------
+# Listens continuously for a Lindos test sequence and measures the
+# audio path. On by default: it costs one more reader on an audio
+# monitor that is already being read for the PPM, does nothing at all
+# until a sequence actually arrives, and a receiver that quietly
+# measures itself when someone sends a test is more useful than one
+# that has to be configured first.
+_squeak_cfg = config.get('squeak', {}) or {}
+squeak_tracker = (lynx_squeak.SqueakTracker(
+    hold_secs=_squeak_cfg.get('hold_secs', 45),
+    enabled=_squeak_cfg.get('enabled', True))
+    if SQUEAK_AVAILABLE else None)
+squeak_listener = None
+
+# Longest Pathfinder will wait for an Auto-Squeak card to clear.
+SQUEAK_DEFER_MAX_S = 120.0
+
+
+def _squeak_monitor_target():
+    """Which monitor Auto-Squeak should listen on.
+
+    Follows mpv's output device, exactly as the PPM meter does, and for
+    the same reason it had to: the meter originally watched the default
+    sink, so with mpv sent to HDMI while a USB dongle was the system
+    default it sat reading silence with no indication why. Auto-Squeak
+    would fail the same way and look like a broken detector rather than
+    a misdirected one.
+
+    On PipeWire this is exact rather than inferred: mpv's device name
+    is "pipewire/<node>", so the monitor is "<node>.monitor". Falling
+    back to the default sink's monitor otherwise, which is right for a
+    single-output receiver and no worse than guessing on any other.
+    """
+    fallback = '@DEFAULT_SINK@.monitor'
+    try:
+        dev = str(config.get('display', {}).get('audio_device', 'hdmi')).strip()
+        if not dev or dev.lower() == 'auto':
+            return fallback
+        resolved = _cached_audio_device_resolved() or dev
+        if resolved.startswith('pipewire/'):
+            return resolved.split('/', 1)[1] + '.monitor'
+        m = re.search(r'CARD=([A-Za-z0-9_\-]+)', resolved)
+        if m:
+            for mon in list_audio_monitors():
+                if m.group(1).lower() in mon['name'].lower():
+                    return mon['name']
+        return fallback
+    except Exception as e:
+        print(f"[squeak] could not resolve the audio monitor ({e}) - "
+              f"using the default sink")
+        return fallback
+
+
+def list_audio_monitors():
+    """Monitor sources available for Auto-Squeak to listen on.
+
+    Uses pw-cli rather than pactl: pactl belongs to the PulseAudio
+    utilities package, which is not installed on a stock Raspberry Pi
+    OS running PipeWire, whereas pw-cli comes with PipeWire itself.
+    Confirmed the hard way on a receiver where pactl simply did not
+    exist."""
+    out = [{'name': '', 'description': 'Automatic (default output)'}]
+    try:
+        r = subprocess.run(['pw-cli', 'list-objects', 'Node'],
+                           capture_output=True, text=True, timeout=5)
+        name = None
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line.startswith('node.name'):
+                name = line.split('=', 1)[1].strip().strip('"')
+            elif line.startswith('media.class') and name:
+                cls = line.split('=', 1)[1].strip().strip('"')
+                if cls == 'Audio/Sink':
+                    out.append({'name': name + '.monitor',
+                                'description': name + ' (monitor)'})
+                name = None
+    except Exception as e:
+        print(f"[squeak] could not list audio monitors: {e}")
+    return out
+
+
+def _squeak_status():
+    if squeak_tracker is None:
+        return None
+    """The card, trimmed for JSON. The response curves are numpy arrays
+    of a couple of hundred points each and are not JSON-serialisable,
+    so they are converted to plain lists here rather than anywhere that
+    would have to know about numpy."""
+    c = squeak_tracker.get_card()
+    if not c:
+        return None
+    out = {}
+    for k, v in c.items():
+        if k in ('resp_l', 'resp_r'):
+            out[k] = [list(map(float, v[0])), list(map(float, v[1]))]
+        elif k == 'segments':
+            continue
+        elif isinstance(v, (int, float, str, bool)) or v is None:
+            out[k] = v
+    return out
+
+
+def _squeak_result(res):
+    """Called by the listener when a pass completes."""
+    res['measured_at'] = time.time()
+    res['seq_name'] = _squeak_cfg.get('label', 'off-air')
+    if squeak_tracker is not None:
+        squeak_tracker.on_result(res)
+
+
+def _start_squeak():
+    """Started unconditionally like the other background threads, but
+    returns immediately unless enabled - the audio source is only
+    opened when the feature is actually wanted."""
+    global squeak_listener
+    if not SQUEAK_AVAILABLE or not _squeak_cfg.get('enabled', True):
+        return
+    # Blank means "follow whatever mpv is playing to" - see
+    # _squeak_monitor_target. An explicit name overrides it.
+    src = (_squeak_cfg.get('source') or '').strip() or _squeak_monitor_target()
+    print(f"[squeak] listening on {src}")
+    squeak_listener = lynx_squeak.SqueakListener(src, on_result=_squeak_result)
+    squeak_tracker.listener = squeak_listener
+    squeak_listener.start()
+
+
+
 
 def _pathfinder_current_source():
     """Which tuner, if any, is currently supplying the displayed picture.
@@ -4176,6 +4334,27 @@ def _pathfinder_arm(callsign, rcv, telemetry):
                     print(f"[map] {callsign}: {d:.0f}km exceeds max_distance_km "
                           f"- treating locator {grid} as unreliable, no card")
                     return
+            # Queue behind Auto-Squeak rather than fighting it. A test
+            # transmission ends like any other, so Pathfinder arms as
+            # normal - but the squeak measurement is still running and
+            # its card is the one wanted first. Waiting here rather
+            # than suppressing means Pathfinder still gets its full
+            # display window afterwards instead of being lost.
+            #
+            # This runs on the QRZ lookup thread, so blocking is free.
+            # Bounded, because a card several minutes after the contact
+            # would be worse than none: if Auto-Squeak somehow never
+            # finishes, Pathfinder goes ahead anyway.
+            waited = 0.0
+            while squeak_tracker is not None and squeak_tracker.busy() \
+                    and waited < SQUEAK_DEFER_MAX_S:
+                if waited == 0.0:
+                    print(f"[map] {callsign}: holding card while Auto-Squeak finishes")
+                time.sleep(0.5)
+                waited += 0.5
+            if waited:
+                print(f"[map] {callsign}: resuming after {waited:.0f}s")
+
             pathfinder_tracker.station_unlocked(
                 callsign, grid, name=name, via_qo100=via_qo100,
                 **snapshot)
@@ -4747,6 +4926,7 @@ def get_status():
             # screen right now. The overlay only has to check presence -
             # all the timing is worked out here, from a timestamp.
             "pathfinder": pathfinder_tracker.get_card(),
+            "squeak": _squeak_status(),
             "timestamp": utc_now_iso()
         },
         "picotuner": {
@@ -4848,6 +5028,16 @@ class PathfinderTestRequest(BaseModel):
     mer: str = "9.4"
     modcod: str = "QPSK 2/3"
     symbol_rate: str = "333"
+
+
+@app.get("/api/audio/monitors", tags=["Control"],
+         summary="List audio monitor sources for Auto-Squeak",
+         description="Monitor sources Auto-Squeak can listen on. The blank "
+                     "entry means the monitor of whatever output is current, "
+                     "which is the sensible default.")
+def api_audio_monitors():
+    return {"current": (config.get('squeak', {}) or {}).get('source', ''),
+            "monitors": list_audio_monitors()}
 
 
 @app.get("/api/audio/devices", tags=["Control"],
@@ -5649,6 +5839,46 @@ def config_page():
                     </div>
                 </div>
                 <div class="card mb-3">
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F4C8; Auto-Squeak &mdash; audio measurement</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            Listens for a Lindos test sequence on the received audio and puts a
+                            measurement card on screen after each pass: level against alignment,
+                            channel balance, frequency response, noise, separation and distortion.
+                            Nothing to send from here &mdash; whoever transmits the sequence provides
+                            the signal, and Lindos publish the standard sequences as WAV files, so
+                            no test equipment is needed at either end. On by default: it stays idle
+                            until a sequence actually arrives.
+                        </p>
+                        <div class="form-check form-switch mb-2">
+                            <input class="form-check-input" type="checkbox" id="squeak-enabled-input">
+                            <label class="form-check-label" for="squeak-enabled-input">
+                                Measure the audio path when a test sequence is received
+                            </label>
+                        </div>
+                        <label class="small text-muted mb-1" for="squeak-source-select">Listen on</label>
+                        <select class="form-select form-select-sm mb-2" id="squeak-source-select"></select>
+                        <p class="text-muted small mb-2">
+                            Automatic follows whatever output is selected above, so it keeps working
+                            if that is changed. Only pick a specific monitor to override this.
+                        </p>
+                        <label class="small text-muted mb-1" for="squeak-hold-input">Card on screen for (seconds)</label>
+                        <input type="number" min="10" max="300" step="5"
+                               class="form-control mb-2" id="squeak-hold-input">
+                        <p class="text-muted small mb-2">
+                            Worth matching to the gap between passes in the test file, so the previous
+                            result is still visible while an adjustment is being made. The card is drawn
+                            over the picture, and takes precedence over a Pathfinder map &mdash; the map
+                            waits its turn rather than being lost.
+                        </p>
+                        <div class="mt-2 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveSqueak()">Save Auto-Squeak settings</button>
+                            <span class="save-status" id="squeak-save-status"></span>
+                        </div>
+                    </div>
+                </div>
+
                     <div class="card-header">&#x1F6F0;&#xFE0F; GNSS Portable Locator</div>
                     <div class="card-body">
                         <p class="text-muted small">
@@ -6124,6 +6354,10 @@ async function loadCurrentConfig() {
         document.getElementById('qrz-settle-input').value = qrz.settle_secs ?? 15;
         document.getElementById('qrz-suppress-input').value = qrz.suppress_mins ?? 60;
         document.getElementById('qrz-portable-locator-input').value = qrz.portable_locator || '';
+
+        document.getElementById('squeak-enabled-input').checked = (cfg.squeak?.enabled !== false);
+        document.getElementById('squeak-hold-input').value = cfg.squeak?.hold_secs ?? 45;
+        loadSqueakSources();
 
         const rawGnssMode = cfg.gnss?.mode;
         // Anything other than exactly 'automatic' displays as Manual -
@@ -6691,6 +6925,44 @@ function onGnssModeChange() {
     qrzInput.placeholder = mode === 'automatic'
         ? 'Driven by GPS - see GNSS card below'
         : 'e.g. IO91VG - leave blank for normal operation';
+}
+
+async function loadSqueakSources() {
+    try {
+        const r = await fetch('/api/audio/monitors').then(r => r.json());
+        const sel = document.getElementById('squeak-source-select');
+        sel.innerHTML = '';
+        (r.monitors || []).forEach(m => {
+            const o = document.createElement('option');
+            o.value = m.name; o.textContent = m.description;
+            sel.appendChild(o);
+        });
+        sel.value = r.current || '';
+    } catch (e) { console.error(e); }
+}
+
+async function saveSqueak() {
+    const el = document.getElementById('squeak-save-status');
+    el.textContent = 'Saving...'; el.className = 'save-status text-muted';
+    try {
+        const body = {squeak: {
+            enabled: document.getElementById('squeak-enabled-input').checked,
+            source: document.getElementById('squeak-source-select').value,
+            hold_secs: parseFloat(document.getElementById('squeak-hold-input').value) || 45
+        }};
+        const r = await fetch('/api/config', {method: 'POST',
+            headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+        if (!r.ok) throw new Error(await r.text());
+        // Enabling or changing the source needs a restart: the listener
+        // holds an open reader on the audio monitor for the life of the
+        // process. The display time alone applies to the next card.
+        el.textContent = 'Saved - restart Lynx to start or stop listening.';
+        el.className = 'save-status text-success';
+    } catch (e) {
+        el.textContent = 'Save failed - see console.';
+        el.className = 'save-status text-danger';
+        console.error(e);
+    }
 }
 
 async function saveGnssMode() {
@@ -8406,6 +8678,12 @@ def update_config(req: ConfigUpdateRequest):
         # confirmed fix, which reads config fresh every time anyway.
         if req.gnss is not None:
             on_disk.setdefault('gnss', {}).update(req.gnss.model_dump())
+        # Auto-Squeak: enabling or changing the source needs a restart,
+        # because the listener holds an open ffmpeg reader on the audio
+        # monitor for the life of the process. hold_secs alone is read
+        # live and takes effect on the next card.
+        if req.squeak is not None:
+            on_disk.setdefault('squeak', {}).update(req.squeak.model_dump())
 
         tmp_path = str(CONFIG_PATH) + ".tmp"
         with open(tmp_path, 'w') as f:
@@ -9665,6 +9943,9 @@ if __name__ == "__main__":
     # whether plain RF, diversity or tri_watch rules apply.
     pathfinder_thread = threading.Thread(target=pathfinder_watcher, daemon=True)
     pathfinder_thread.start()
+    # Auto-Squeak - see _start_squeak for why this is safe to call
+    # unconditionally even when the feature is off.
+    _start_squeak()
     # Picotuner tuning watchdog - catches the tuner losing its tuning
     # for ANY reason (its own reboot, a lost command, static), which
     # otherwise leaves a repeater deaf and reporting itself healthy.

@@ -2,6 +2,15 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-08-24
+
+**Added**
+- Auto-Squeak: measures the receiver's audio chain from a Lindos test sequence and puts the results on screen - level against alignment in PPM, level error, channel balance, frequency response plotted 20 Hz to 20 kHz for both channels, noise, stereo separation and distortion. Runs in the background and is triggered by the frequency-shift keying that precedes each Lindos segment rather than by a level threshold, so programme audio cannot start it by accident. On by default; idle until a sequence arrives. Where a repeater runs Lynx this means any user can measure the transmission chain from their own shack simply by sending the sequence, with no test equipment at either end.
+- Auto-Squeak follows whichever audio output is selected, using the same resolution the PPM meter uses rather than the system default sink - the meter originally watched the default, and with mpv sent to HDMI while a USB dongle was the default it sat reading silence with no indication why. The measurement would have failed the same way and looked like a broken detector rather than a misdirected one.
+- Auto-Squeak and Pathfinder are queued rather than competing. At the end of a test transmission both fall due, since the station sending the sequence has transmitted like any other - so this is the normal case, not a rare clash. Auto-Squeak shows first and Pathfinder waits, keeping its full display window. Ordering matters because the measurement completes about twelve seconds after the last segment while Pathfinder arms within a few seconds of the drop, so without the queue the map would appear first and be pushed aside exactly as the figures arrived. Auto-Squeak also draws over live video, where Pathfinder deliberately never does: its results are wanted during the transmission, and what it covers is a test card.
+- numpy added to install.sh, and `import lynx_squeak` in lynx_app.py made non-fatal. Auto-Squeak needs numpy, which was not previously a dependency, and anyone updating by copying files rather than running the installer would not pick it up - a missing optional feature must never stop the receiver starting, so it degrades to "Auto-Squeak unavailable" with a note in the log.
+- Web UI manual: new section 3.12 covering Auto-Squeak, what each reading means, the settings, and how it interacts with Pathfinder.
+
 ## 2026-08-23
 
 **Added**

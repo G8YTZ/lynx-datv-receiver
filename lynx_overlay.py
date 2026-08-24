@@ -267,6 +267,7 @@ state = {
     "portable_locator": "",
     "tri_watch_notification": None,   # the current "someone else wants in" message text, or None
     "pathfinder": None,              # end-of-contact card dict, or None if none is due
+    "squeak": None,                  # Auto-Squeak results card, or None
     "site_locator": "",
     "site_location": "",
     # Diversity mode — which tuner is actually the one supplying the
@@ -655,6 +656,7 @@ def poll_status():
             # backend has already decided whether a card is due - this
             # side only ever checks presence.
             state["pathfinder"] = lynx.get('pathfinder')
+            state["squeak"] = lynx.get('squeak')
             # tri_watch's "someone else wants in" notification - the
             # backend already handles its own expiry (get_notification()
             # returns None once past the configured display window), so
@@ -758,7 +760,31 @@ class LynxOverlay(Gtk.Window):
         genuinely_locked = (state["locked"] and state["mpv_running_for_rf"]) or state["mode"] == "stream"
         showing_picture = genuinely_locked and not mpv_transitioning
 
-        if not showing_picture:
+        # Auto-Squeak is drawn BEFORE the showing_picture branch and
+        # over the top of live video, which is the one place it differs
+        # from Pathfinder.
+        #
+        # Pathfinder deliberately never covers a picture: it appears
+        # only once a station has stopped, so there is nothing
+        # underneath worth protecting. Auto-Squeak is the opposite - the
+        # results are wanted DURING the transmission, in the gap between
+        # passes, precisely so an adjustment can be made and the next
+        # pass seen. Waiting for the signal to drop would defeat the
+        # purpose, and what it covers is a test card rather than
+        # anything anyone wants to watch.
+        #
+        # Where both fall due, Auto-Squeak goes first and Pathfinder
+        # QUEUES behind it rather than being suppressed - the waiting
+        # is done in lynx_app.py, which holds the Pathfinder card back
+        # until the squeak measurement has finished and its card has
+        # cleared, so the map still gets its full display window
+        # afterwards. This priority is only the last line of defence
+        # for the case where the two somehow overlap anyway; it decides
+        # which is drawn, never whether the other happens at all.
+        showing_squeak = self.draw_squeak(cr, width, height)
+        if showing_squeak:
+            showing_map = True          # suppress the corner OSD zones too
+        elif not showing_picture:
             if mpv_transitioning and genuinely_locked:
                 # mpv is being restarted (decoder/freeze recovery)
                 # while the tuner itself remains genuinely locked - a
@@ -871,6 +897,43 @@ class LynxOverlay(Gtk.Window):
         cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
         cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
         cr.close_path()
+
+    def draw_squeak(self, cr, width, height):
+        """Auto-Squeak results card - full screen, drawn over whatever
+        is on air.
+
+        Cached on the measurement timestamp like Pathfinder's, because
+        rendering the response plot takes long enough that repeating it
+        every frame would be wasteful on a Pi that may also be encoding
+        a stream."""
+        card = state.get("squeak")
+        if not card:
+            self._sq_surface = None
+            self._sq_key = None
+            return False
+        key = (card.get('measured_at'), int(width), int(height))
+        if key != getattr(self, '_sq_key', None):
+            try:
+                import lynx_squeak
+                self._sq_surface = lynx_squeak.render_card(
+                    card, int(width), int(height),
+                    seq_name=card.get('seq_name', ''),
+                    duration_s=card.get('duration_s'))
+            except Exception as e:
+                print(f"[overlay] Auto-Squeak render failed: {e}")
+                self._sq_surface = None
+            self._sq_key = key
+        if not self._sq_surface:
+            return False
+        # SOURCE rather than OVER: this replaces the frame outright,
+        # including where live video would otherwise show through the
+        # transparent overlay. With OVER, anything left in the surface
+        # from the previous frame could remain visible around the card.
+        cr.set_source_surface(self._sq_surface, 0, 0)
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        return True
 
     def draw_pathfinder(self, cr, width, height):
         """End-of-contact card - full screen, drawn INSTEAD of the idle
