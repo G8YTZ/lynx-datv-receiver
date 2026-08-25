@@ -284,9 +284,32 @@ def analyse(L, R, sr):
         res['notes'].append('No Lindos header found')
         return res
 
+    # A segment's content is the audio between its own header and the
+    # NEXT header. The final header has no successor to bound it, and
+    # running it to the end of the buffer is wrong in a way that is hard
+    # to spot: capture deliberately continues for END_GAP_S after the
+    # last header, so the tail is a dozen seconds of dead air. Measured
+    # as a segment it lands under -60 dBFS, is classified 'noise', and
+    # then wins the min() in the noise calculation - so the S/N figure
+    # ends up describing the silence after the sequence rather than the
+    # sequence's own noise segments. A lone header with nothing after it
+    # produces a card reading PASS off the back of it.
+    #
+    # Bound the last segment by how long the other segments actually ran
+    # instead, and if there are no others to learn that from, there is no
+    # trustworthy content and it is dropped.
     bounds = []
+    spans = [hdrs[i + 1][0] - hdrs[i][1] for i in range(len(hdrs) - 1)]
+    typical = float(np.median(spans)) if spans else None
     for i, (a, b) in enumerate(hdrs):
-        nxt = hdrs[i + 1][0] if i + 1 < len(hdrs) else len(mono) / sr
+        if i + 1 < len(hdrs):
+            nxt = hdrs[i + 1][0]
+        elif typical is not None:
+            nxt = min(b + typical, len(mono) / sr)
+        else:
+            continue
+        if nxt - b < 0.10:
+            continue
         bounds.append((a, b, b + 0.03, nxt - 0.03))
 
     # ---- classify each segment from the audio that follows it -------
@@ -528,7 +551,12 @@ def render_card(res, W=1920, H=1080, seq_name='', duration_s=None, tol=None):
          TEXT_BRIGHT, bold=True, mono=False)
     sub = seq_name or 'Lindos sequence'
     if duration_s:
-        sub += f'  \u00b7  {duration_s:.0f} s  \u00b7  {res.get("headers", 0)} segments'
+        # Segments MEASURED, not headers seen. These differ - the final
+        # header is dropped when nothing trustworthy follows it - and
+        # this figure is what tells the viewer whether the card saw the
+        # whole run, so it has to be the honest one.
+        nseg = len(res.get('segments') or []) or res.get('headers', 0)
+        sub += f'  \u00b7  {duration_s:.0f} s  \u00b7  {nseg} segments'
     _txt(cr, W * 0.031, H * 0.100, sub, H * 0.021, TEXT_DIM, mono=False)
 
     fails = _failures(res, t)
@@ -801,7 +829,9 @@ class SqueakListener(threading.Thread):
         # programme audio that happened to trip the opening detector.
         # Publishing it puts up an empty card, and an empty card reads
         # PASS, because _failures() finds no measurement to fault.
-        nseg = res.get('headers', 0)
+        # Count segments that were actually measured, not headers that
+        # were detected. A header on its own yields no usable content.
+        nseg = len(res.get('segments') or [])
         if nseg < MIN_SEGMENTS:
             print(f"[squeak] {nseg} segments, need {MIN_SEGMENTS} - "
                   f"not a Lindos pass, ignoring")
