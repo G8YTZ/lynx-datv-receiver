@@ -2749,6 +2749,7 @@ def _picotuner_restore_tuning():
     """Re-applies LNB supply then tuning, in the same order and with the
     same settling delays startup uses - so there is one behaviour to
     reason about rather than two."""
+    global _tune_lock_handed_off
     try:
         time.sleep(PICOTUNER_RETUNE_SETTLE_SECS)
 
@@ -2831,7 +2832,50 @@ def _picotuner_restore_tuning():
                           lnb_lo_khz=state.get("lnb_lo_khz", 0))
         print(f"[picotuner] restore: re-tuning to {state['freq']} kHz / "
               f"{state['sr']} kS/s on plug {req.plug}")
-        _tune_impl(req)
+
+        # Acquire tune_lock exactly as tune() does, rather than calling
+        # _tune_impl() bare.
+        #
+        # _tune_impl() is written on the assumption that its caller
+        # already holds the lock: it hands ownership to its own
+        # _kick_mpv() thread, which releases it unconditionally in a
+        # finally. Calling it without the lock therefore has that thread
+        # release a lock nobody ever acquired - "RuntimeError: release
+        # unlocked lock", confirmed in the field on a receiver whose
+        # tuning had stopped responding entirely.
+        #
+        # The traceback is the mild part. The real damage is that the
+        # stray release frees the lock REGARDLESS of who is holding it:
+        # if an operator tune held it when the watchdog fired, it is
+        # handed away mid-sequence and two tune sequences then run against
+        # the Picotuner at once, interleaving their commands. A tuner that
+        # ignores the frequency it is given is exactly what that looks
+        # like from the outside.
+        #
+        # (It does NOT strand the lock - tune() resets
+        # _tune_lock_handed_off immediately after acquiring, so a stale
+        # True from this path is always cleared. Verified rather than
+        # assumed; the failure here is theft, not deadlock.)
+        #
+        # Backing off when the lock is busy does not lose the restore:
+        # the watchdog keeps polling, still sees the mismatch, and fires
+        # again after its cooldown.
+        #
+        # Safe to block here: this runs on its own daemon thread, spawned
+        # by the watchdog loop, holding nothing.
+        if not tune_lock.acquire(timeout=15):
+            print("[picotuner] restore: another tune is already in progress "
+                  "- leaving it to finish, will retry on the next check")
+            return
+        _tune_lock_handed_off = False
+        try:
+            _tune_impl(req)
+        except Exception:
+            if not _tune_lock_handed_off:
+                tune_lock.release()
+            raise
+        # On success the lock is deliberately still held - _tune_impl()'s
+        # own async thread releases it once the tune is genuinely complete.
 
     except Exception as e:
         print(f"[picotuner] restore failed: {e}")
@@ -4766,6 +4810,76 @@ def refresh_live_streams():
         raise HTTPException(status_code=503, detail=f"BATC API unavailable: {e}")
 
 # ── API: Control ──────────────────────────────────────────────
+
+# Privileged actions below are fire-and-forget by necessity - the server
+# cannot wait around to report on its own reboot - so each checks its
+# permissions first rather than returning a hopeful "ok" for something
+# that never happens.
+#
+# The check asks about the COMMAND ABOUT TO RUN. It used to run
+# 'sudo -n true', which asks whether /usr/bin/true may run without a
+# password - a different question entirely. A drop-in granting only
+# /sbin/reboot fails that test, so the fix these errors recommended did
+# not satisfy the check that produced it, and the advice sent operators
+# in a circle. 'sudo -n -l <cmd>' resolves the real command against the
+# sudoers rules and reports whether it is permitted, without running it.
+SUDO_CMDS = ("/sbin/reboot", "/usr/sbin/reboot",
+             "/sbin/shutdown", "/usr/sbin/shutdown",
+             "/sbin/poweroff", "/usr/sbin/poweroff",
+             "/usr/sbin/rfkill", "/usr/bin/rfkill")
+
+# ONE line, deliberately. The previous advice was three commands joined
+# by newlines inside a JSON error detail; browsers collapse that to a
+# single line, operators paste the lot, and 'tee' swallows the rest as
+# filenames and reports "-c invalid argument" - confirmed in the field.
+# A single &&-chained line survives being collapsed, and validates the
+# rule with visudo before installing it, so a typo cannot lock anyone
+# out of sudo.
+SUDO_FIX = (
+    "printf '%s ALL=(ALL) NOPASSWD: " + ", ".join(SUDO_CMDS) + "\\n' \"$USER\""
+    " > /tmp/lynx.sudo && sudo visudo -c -f /tmp/lynx.sudo"
+    " && sudo install -m 0440 -o root -g root /tmp/lynx.sudo /etc/sudoers.d/lynx"
+    " && rm -f /tmp/lynx.sudo"
+)
+
+
+def sudo_ready(command):
+    """True if `command` can be run under sudo without a password.
+
+    'sudo -l <cmd>' resolves the command against the sudoers rules and
+    exits 0 if it is permitted. It never executes it, so this is safe to
+    call on 'reboot'.
+
+    If that says no, fall back to the blanket 'sudo -n true' check this
+    replaced. 'sudo -l <cmd>' has to resolve the command against the
+    caller's PATH and is also subject to the sudoers 'listpw' policy, so
+    it can report failure for reasons that have nothing to do with
+    whether the command itself is permitted - confirmed in the field on a
+    Pi where Reboot worked and Shutdown did not, despite both being
+    runnable. Keeping the old check as a fallback means this function can
+    only ever be MORE permissive than the behaviour it replaced, so a
+    stricter resolver can never take away a button that used to work.
+    The precision is a bonus, not something worth a regression for."""
+    for probe in (["sudo", "-n", "-l", command], ["sudo", "-n", "true"]):
+        try:
+            if subprocess.run(probe, capture_output=True,
+                              timeout=5).returncode == 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def sudo_error(problem):
+    """A 500 that says what failed, what still stands, and how to fix it
+    permanently - in a form that survives being rendered as one line."""
+    return HTTPException(
+        status_code=500,
+        detail=(f"{problem} Passwordless sudo isn't configured for this user. "
+                f"Re-running install.sh sets this up, or paste this single "
+                f"command on the Pi over SSH:\n\n{SUDO_FIX}"))
+
+
 @app.post("/api/stop", tags=["Control"],
           summary="Stop current reception/stream")
 def stop():
@@ -4791,17 +4905,8 @@ def restart_lynx():
     # so without this check, a missing passwordless-sudo setup would
     # return a false "success" that never actually reboots anything,
     # with no way for the operator to know why.
-    check = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=5)
-    if check.returncode != 0:
-        raise HTTPException(status_code=500,
-            detail="'sudo reboot' requires passwordless sudo for this user, which "
-                   "isn't currently configured - the Pi was NOT rebooted. Fix (run "
-                   "on the Pi over SSH):\n\n"
-                   'echo "$USER ALL=(ALL) NOPASSWD: /sbin/reboot, /usr/sbin/reboot" '
-                   "| sudo tee /etc/sudoers.d/lynx-reboot\n"
-                   "sudo chmod 0440 /etc/sudoers.d/lynx-reboot\n"
-                   "sudo visudo -c\n\n"
-                   "Or reboot manually over SSH instead.")
+    if not sudo_ready("reboot"):
+        raise sudo_error("The Pi was NOT rebooted.")
 
     def _do_reboot():
         time.sleep(1.0)  # let this HTTP response actually reach the browser first
@@ -4821,17 +4926,8 @@ def restart_lynx():
                       "reason: a fire-and-forget shutdown can't report back "
                       "if it's actually going to work.")
 def shutdown_pi():
-    check = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=5)
-    if check.returncode != 0:
-        raise HTTPException(status_code=500,
-            detail="'sudo shutdown' requires passwordless sudo for this user, which "
-                   "isn't currently configured - the Pi was NOT shut down. Fix (run "
-                   "on the Pi over SSH):\n\n"
-                   'echo "$USER ALL=(ALL) NOPASSWD: /sbin/shutdown, /sbin/poweroff" '
-                   "| sudo tee /etc/sudoers.d/lynx-shutdown\n"
-                   "sudo chmod 0440 /etc/sudoers.d/lynx-shutdown\n"
-                   "sudo visudo -c\n\n"
-                   "Or shut down manually over SSH instead.")
+    if not sudo_ready("shutdown"):
+        raise sudo_error("The Pi was NOT shut down.")
 
     stop_current()  # graceful cover-up + mpv stop first, same as the Stop button
 
@@ -5061,17 +5157,10 @@ def post_update_apply():
     # point though, so a failed check here still leaves the code
     # genuinely updated - just not yet running - which the error
     # message below says explicitly, rather than leaving that unclear.
-    check = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=5)
-    if check.returncode != 0:
-        raise HTTPException(status_code=500,
-            detail="Code pulled successfully, but couldn't reboot automatically - "
-                   "passwordless sudo isn't configured for this user. The update "
-                   "IS applied; reboot the Pi manually now, or fix this permanently "
-                   "(run on the Pi over SSH):\n\n"
-                   'echo "$USER ALL=(ALL) NOPASSWD: /sbin/reboot, /usr/sbin/reboot" '
-                   "| sudo tee /etc/sudoers.d/lynx-reboot\n"
-                   "sudo chmod 0440 /etc/sudoers.d/lynx-reboot\n"
-                   "sudo visudo -c")
+    if not sudo_ready("reboot"):
+        raise sudo_error("Code pulled successfully, but the Pi could not be "
+                         "rebooted automatically. The update IS applied - "
+                         "reboot manually to run it.")
 
     def _do_reboot():
         time.sleep(1.0)  # let this HTTP response actually reach the browser first
@@ -5146,12 +5235,10 @@ def post_update_channel(req: UpdateChannelRequest):
     update_state["commits_behind"] = 0
     update_state["new_commits"] = []
 
-    check = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=5)
-    if check.returncode != 0:
-        raise HTTPException(status_code=500,
-            detail=f"Switched to the '{req.channel}' channel successfully, but couldn't "
-                   "reboot automatically - passwordless sudo isn't configured for this "
-                   "user. The switch IS applied; reboot the Pi manually now.")
+    if not sudo_ready("reboot"):
+        raise sudo_error(f"Switched to the '{req.channel}' channel successfully, "
+                         "but the Pi could not be rebooted automatically. The "
+                         "switch IS applied - reboot manually to run it.")
 
     def _do_reboot():
         time.sleep(1.0)
@@ -5173,10 +5260,8 @@ def post_update_channel(req: UpdateChannelRequest):
                       "over WiFi, this will cut off Web UI access "
                       "until WiFi is re-enabled locally or via SSH.")
 def kill_wifi():
-    check = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=5)
-    if check.returncode != 0:
-        raise HTTPException(status_code=500,
-            detail="Couldn't disable WiFi - passwordless sudo isn't configured for this user.")
+    if not sudo_ready("rfkill"):
+        raise sudo_error("WiFi was NOT disabled.")
     result = subprocess.run(["sudo", "rfkill", "block", "wifi"],
                              capture_output=True, text=True, timeout=5)
     if result.returncode != 0:
@@ -5187,10 +5272,8 @@ def kill_wifi():
           summary="Re-enable WiFi (rfkill unblock)",
           description="Reverses Kill WiFi.")
 def restore_wifi():
-    check = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=5)
-    if check.returncode != 0:
-        raise HTTPException(status_code=500,
-            detail="Couldn't re-enable WiFi - passwordless sudo isn't configured for this user.")
+    if not sudo_ready("rfkill"):
+        raise sudo_error("WiFi was NOT re-enabled.")
     result = subprocess.run(["sudo", "rfkill", "unblock", "wifi"],
                              capture_output=True, text=True, timeout=5)
     if result.returncode != 0:
