@@ -8180,7 +8180,21 @@ def shutdown_pi():
 
     def _do_shutdown():
         time.sleep(1.5)  # let this HTTP response actually reach the browser first
-        subprocess.Popen(["sudo", "shutdown", "-h", "now"])
+        # run() with captured output, not a bare Popen. On success this
+        # process is killed mid-call and nothing below runs, so the only
+        # way execution continues past here is failure - which under
+        # Popen was discarded entirely, leaving a Shutdown button that
+        # stopped playback, reported success, and left the Pi running,
+        # with nothing anywhere to say why. Confirmed in the field.
+        # sudo's own stderr says exactly what is wrong; print it.
+        r = subprocess.run(["sudo", "shutdown", "-h", "now"],
+                           capture_output=True, text=True)
+        msg = (r.stderr or r.stdout or "").strip() or "no output"
+        print(f"[shutdown] 'sudo shutdown -h now' did not shut the Pi down "
+              f"(exit {r.returncode}): {msg}")
+        record_diagnostic_event("shutdown_failed",
+                                f"exit {r.returncode}: {msg}",
+                                count_as_mpv_restart=False)
     threading.Thread(target=_do_shutdown, daemon=True).start()
     return {"success": True, "message": "Shutting down - the Pi will power off shortly and will NOT restart on its own."}
 
