@@ -8416,23 +8416,44 @@ def post_update_apply():
     update_state["commits_behind"] = 0
     update_state["new_commits"] = []
 
-    # Deliberately NOT gated on sudo_ready() here, unlike the Reboot and
-    # Shutdown buttons.
+    # Whether the dependency step can run at all is decided HERE, not
+    # inside the thread, and on the BLANKET check rather than a specific
+    # command.
     #
-    # The dependency step below runs install.sh, and install.sh is what
-    # CONFIGURES passwordless sudo. Refusing to proceed because sudo is
-    # not yet configured would therefore block the very step that
-    # configures it: the fix could never bootstrap itself on precisely
-    # the receivers that need it. Confirmed in the field - an update on a
-    # Pi without the rule refused to reboot AND skipped the dependency
-    # run, leaving it exactly as broken as before, with the fix sitting
-    # on disk unused.
+    # install.sh needs sudo for apt, for writing to /etc, for everything.
+    # A receiver without passwordless sudo cannot run it non-interactively
+    # at all - and an earlier attempt to let it try anyway, on the theory
+    # that install.sh is what configures passwordless sudo, was simply
+    # wrong: install.sh needs sudo to write the sudoers file, so it can
+    # never bootstrap the permission it depends on. That attempt made
+    # things worse rather than better. `sudo apt update` inside the
+    # script asked for a password, found no terminal to ask on because it
+    # was running inside this process, and sat there until the 1200s
+    # timeout - a twenty-minute silent hang in place of an immediate,
+    # honest refusal. Confirmed in the field.
     #
-    # So: proceed, let install.sh do its work, then attempt the reboot
-    # and report honestly if it still will not go. The pull has already
-    # succeeded either way, so the worst case is an update that is
-    # applied but needs a manual reboot - which is what the old check
-    # produced anyway, minus the chance of fixing itself.
+    # So: if sudo is unavailable, skip the dependency step rather than
+    # hang on it. The pull has already succeeded, so the code IS updated
+    # either way; what is lost is only the OS/dependency refresh.
+    #
+    # The BLANKET check, deliberately - not sudo_ready(), and not any
+    # single command. install.sh runs apt, writes to /etc and more, so
+    # "may I run one specific command" answers the wrong question. A
+    # receiver carrying only a narrow rule - the /etc/sudoers.d/lynx-reboot
+    # left by the old manual instructions, which grants reboot and
+    # nothing else - passes sudo_ready("reboot") happily and then hangs
+    # in apt, which is exactly the case this is here to catch.
+    #
+    # The reboot below is judged separately and always attempted, because
+    # on that same narrow-rule receiver rebooting is permitted even
+    # though the installer is not. Skipping the refresh should not cost
+    # the restart as well.
+    try:
+        can_run_installer = subprocess.run(
+            ["sudo", "-n", "true"], capture_output=True,
+            timeout=5).returncode == 0
+    except Exception:
+        can_run_installer = False
 
     def _do_reboot():
         time.sleep(1.0)  # let this HTTP response actually reach the browser first
@@ -8444,28 +8465,45 @@ def post_update_apply():
         # install.sh is itself pulled fresh as part of this same
         # update, so this always runs whatever the current, correct
         # list actually is, with only one place that list is ever
-        # maintained. Non-interactive under the hood (install.sh's
-        # own apt calls), so this can never hang on a prompt that
-        # will never come; a bounded timeout so even something going
-        # wrong here still lets the reboot below proceed rather than
-        # hanging indefinitely.
-        try:
-            install_script = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "install.sh")
-            env = os.environ.copy()
-            env["DEBIAN_FRONTEND"] = "noninteractive"
-            subprocess.run(["bash", install_script, "--deps-only"],
-                            env=env, timeout=1200)
-        except Exception as e:
-            print(f"[update] Dependency check failed or timed out ({e}) - "
-                  "rebooting anyway with whatever succeeded so far.")
-        # Captured, not a bare Popen. install.sh has just had its chance
-        # to configure passwordless sudo, so this usually succeeds and
-        # kills the process mid-call - meaning anything reached below is
-        # a genuine failure, and worth saying out loud rather than
-        # discarding. An update that quietly declines to reboot looks
-        # identical to one that worked until you notice the version
-        # hasn't changed.
+        # maintained. A bounded timeout so even something going wrong
+        # here still lets the reboot below proceed rather than hanging
+        # indefinitely.
+        if not can_run_installer:
+            print("[update] passwordless sudo is not configured for this "
+                  "user - skipping the dependency refresh, which needs "
+                  "sudo throughout and would stop at a password prompt "
+                  "with no terminal to answer it. The code IS updated. "
+                  "Run ~/lynx/install.sh by hand once, from a terminal "
+                  "where you can type your password, to sort this "
+                  "permanently. Still attempting the reboot below.")
+            record_diagnostic_event("update_deps_skipped_no_sudo",
+                                    "dependency refresh skipped - no "
+                                    "passwordless sudo",
+                                    count_as_mpv_restart=False)
+        else:
+            try:
+                install_script = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "install.sh")
+                env = os.environ.copy()
+                env["DEBIAN_FRONTEND"] = "noninteractive"
+                # stdin closed, belt and braces. The blanket check above
+                # says this user has sudo, but it does not promise every
+                # command install.sh runs is covered by the same rule -
+                # and a sudo that decides to prompt with an inherited
+                # stdin waits for an answer that cannot come. With no
+                # stdin it fails immediately instead, which the timeout
+                # then does not have to catch twenty minutes later.
+                subprocess.run(["bash", install_script, "--deps-only"],
+                               env=env, timeout=1200,
+                               stdin=subprocess.DEVNULL)
+            except Exception as e:
+                print(f"[update] Dependency check failed or timed out ({e}) "
+                      "- rebooting anyway with whatever succeeded so far.")
+        # Captured, not a bare Popen. This usually succeeds and kills the
+        # process mid-call - meaning anything reached below is a genuine
+        # failure, and worth saying out loud rather than discarding. An
+        # update that quietly declines to reboot looks identical to one
+        # that worked until you notice the version hasn't changed.
         r = subprocess.run(["sudo", "reboot"], capture_output=True, text=True)
         msg = (r.stderr or r.stdout or "").strip() or "no output"
         print(f"[update] code is updated, but the automatic reboot did not "
