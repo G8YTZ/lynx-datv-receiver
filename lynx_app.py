@@ -8121,6 +8121,37 @@ def sudo_ready(command):
     return False
 
 
+def power_action(argv, what):
+    """Reboot or power off, and say so if it doesn't happen.
+
+    On success this process is killed mid-call, so anything reached
+    afterwards is by definition a failure. Under a bare Popen that
+    failure was discarded, which is what made a refusing Reboot button
+    indistinguishable from a working one and turned a one-line error into
+    a two-day hunt. sudo and systemd both explain themselves perfectly
+    well on stderr; the only bug was nobody listening.
+
+    Always passes -i. Power actions go through logind, which can refuse
+    while a user is logged in on seat0 - permanently true on a receiver,
+    where pi is auto-logged-in running the desktop - and being root does
+    not override it. Observed once in the field, refusing with exactly
+    that message and recommending -i itself; not reproducible on demand
+    afterwards, so the trigger is not fully understood. -i costs nothing
+    when it is unnecessary and is decisive when it is not, which is the
+    right trade for something that has to work unattended on a hilltop.
+
+    poweroff rather than `shutdown -h now`: same systemd action, but
+    shutdown has no -i. Both are already granted with any arguments by
+    /etc/sudoers.d/lynx, so this needs no rule change."""
+    r = subprocess.run(["sudo", *argv], capture_output=True, text=True)
+    msg = (r.stderr or r.stdout or "").strip() or "no output"
+    print(f"[power] {what} did not happen (exit {r.returncode}): {msg}")
+    record_diagnostic_event("power_action_failed",
+                            f"{what}: exit {r.returncode}: {msg}",
+                            count_as_mpv_restart=False)
+    return False
+
+
 def sudo_error(problem):
     """A 500 that says what failed, what still stands, and how to fix it
     permanently - in a form that survives being rendered as one line."""
@@ -8157,14 +8188,14 @@ def restart_lynx():
 
     def _do_reboot():
         time.sleep(1.0)  # let this HTTP response actually reach the browser first
-        subprocess.Popen(["sudo", "reboot"])
+        power_action(["reboot", "-i"], "reboot")
     threading.Thread(target=_do_reboot, daemon=True).start()
     return {"success": True, "message": "Rebooting the Pi - back in about a minute"}
 
 @app.post("/api/shutdown", tags=["Control"],
           summary="Shut down (power off) the Pi",
           description="Gracefully stops current reception, then powers off "
-                      "the entire Raspberry Pi via 'sudo shutdown -h now'. "
+                      "the entire Raspberry Pi via 'sudo poweroff -i'. "
                       "Unlike Reboot, the Pi does NOT come back up on its "
                       "own afterwards - it needs power physically cycled "
                       "(or a remote power switch) to bring the receiver "
@@ -8185,16 +8216,7 @@ def shutdown_pi():
         # way execution continues past here is failure - which under
         # Popen was discarded entirely, leaving a Shutdown button that
         # stopped playback, reported success, and left the Pi running,
-        # with nothing anywhere to say why. Confirmed in the field.
-        # sudo's own stderr says exactly what is wrong; print it.
-        r = subprocess.run(["sudo", "shutdown", "-h", "now"],
-                           capture_output=True, text=True)
-        msg = (r.stderr or r.stdout or "").strip() or "no output"
-        print(f"[shutdown] 'sudo shutdown -h now' did not shut the Pi down "
-              f"(exit {r.returncode}): {msg}")
-        record_diagnostic_event("shutdown_failed",
-                                f"exit {r.returncode}: {msg}",
-                                count_as_mpv_restart=False)
+        power_action(["poweroff", "-i"], "shutdown")
     threading.Thread(target=_do_shutdown, daemon=True).start()
     return {"success": True, "message": "Shutting down - the Pi will power off shortly and will NOT restart on its own."}
 
@@ -8502,16 +8524,12 @@ def post_update_apply():
         # Captured, not a bare Popen. This usually succeeds and kills the
         # process mid-call - meaning anything reached below is a genuine
         # failure, and worth saying out loud rather than discarding. An
-        # update that quietly declines to reboot looks identical to one
-        # that worked until you notice the version hasn't changed.
-        r = subprocess.run(["sudo", "reboot"], capture_output=True, text=True)
-        msg = (r.stderr or r.stdout or "").strip() or "no output"
-        print(f"[update] code is updated, but the automatic reboot did not "
-              f"happen (exit {r.returncode}): {msg} - reboot manually to run "
-              f"the new version")
-        record_diagnostic_event("update_reboot_failed",
-                                f"exit {r.returncode}: {msg}",
-                                count_as_mpv_restart=False)
+        # The code is already updated at this point, so a refusal here
+        # costs only the restart - which the log line says, so nobody
+        # concludes the update itself failed.
+        if not power_action(["reboot", "-i"], "post-update reboot"):
+            print("[update] the code IS updated - reboot manually to run "
+                  "the new version")
     threading.Thread(target=_do_reboot, daemon=True).start()
 
     return {"result": "ok",
@@ -8603,7 +8621,7 @@ def post_update_channel(req: UpdateChannelRequest):
 
     def _do_reboot():
         time.sleep(1.0)  # let this HTTP response actually reach the browser first
-        subprocess.Popen(["sudo", "reboot"])
+        power_action(["reboot", "-i"], "channel-switch reboot")
     threading.Thread(target=_do_reboot, daemon=True).start()
 
     return {"result": "ok", "channel": req.channel,
