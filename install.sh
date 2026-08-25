@@ -270,6 +270,41 @@ mkdir -p ~/.config/systemd/user
 cp ~/lynx/lynx.service ~/.config/systemd/user/lynx.service
 systemctl --user daemon-reload
 
+# --- Passwordless sudo for the privileged buttons ---------------
+# Reboot, Shutdown, Update and Kill WiFi in the Web UI all shell out to
+# sudo. They are fire-and-forget by necessity - the server cannot report
+# on the success of its own reboot - so the app checks permission first
+# and refuses rather than claiming a success that never happens.
+#
+# Stock Raspberry Pi OS gives the first user NOPASSWD: ALL, so this is
+# usually already satisfied and this step changes nothing. It is not
+# guaranteed though: it depends on how the user was created, and when it
+# is absent the buttons fail in a way that reads like a broken install
+# rather than a missing permission. Cheaper to make it explicit.
+#
+# visudo -c validates the file BEFORE it is installed. A syntax error in
+# /etc/sudoers.d/ locks the user out of sudo entirely, which on a remote
+# receiver means a site visit, so this is not a corner worth cutting.
+# Guarded and non-fatal under `set -e` for the same reason the scheduled
+# reboot units are: a failure here should not take down an otherwise
+# good install.
+echo "--- Configuring passwordless sudo for reboot/shutdown/rfkill ---"
+LYNX_SUDO_TMP="$(mktemp)"
+printf '%s ALL=(ALL) NOPASSWD: /sbin/reboot, /usr/sbin/reboot, /sbin/shutdown, /usr/sbin/shutdown, /sbin/poweroff, /usr/sbin/poweroff, /usr/sbin/rfkill, /usr/bin/rfkill\n' \
+  "$USER" > "$LYNX_SUDO_TMP"
+if sudo visudo -c -f "$LYNX_SUDO_TMP" >/dev/null 2>&1; then
+  sudo install -m 0440 -o root -g root "$LYNX_SUDO_TMP" /etc/sudoers.d/lynx
+  echo "Installed /etc/sudoers.d/lynx"
+else
+  echo ""
+  echo ">>> Could not validate the sudoers rule - NOT installing it."
+  echo ">>> Everything else is installed and usable. The Reboot, Shutdown"
+  echo ">>> and Kill WiFi buttons may refuse to act until this is sorted;"
+  echo ">>> rebooting over SSH always works regardless."
+  echo ""
+fi
+rm -f "$LYNX_SUDO_TMP"
+
 # --- Scheduled reboot (installed, NOT enabled) ------------------
 # A twice-daily reboot as a blunt backstop: it recovers from states
 # nobody has specifically thought of yet, which is exactly the sort of
