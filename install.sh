@@ -48,6 +48,66 @@ sudo apt install -y \
 echo "--- Installing Python dependencies ---"
 pip install --break-system-packages fastapi uvicorn pyyaml requests gpiozero
 
+# --- Passwordless sudo for the privileged buttons ---------------
+# ABOVE the --deps-only exit deliberately. Reboot, Shutdown, Update and
+# Kill WiFi all shell out to sudo, and they are fire-and-forget by
+# necessity - the server cannot report on the success of its own reboot.
+# If this only ran on a fresh install, every EXISTING receiver updating
+# through "Update Now" would keep the broken buttons forever, which is
+# the opposite of what a fix is for. It qualifies on the --deps-only
+# test's own terms: it is a dependency of those buttons working, it is
+# idempotent, and redoing it on an already-configured system is safe -
+# the file has fixed contents and is validated before replacing anything.
+#
+# Stock Raspberry Pi OS gives the first user NOPASSWD: ALL, so this
+# usually changes nothing. It is not guaranteed though - it depends on
+# how the user was created - and a receiver carrying an older, narrower
+# rule (a /etc/sudoers.d/lynx-reboot granting reboot but not shutdown,
+# say) gets a Shutdown button that stops playback, reports success and
+# leaves the Pi running. Confirmed in the field.
+#
+# visudo -c validates BEFORE installing. A syntax error in
+# /etc/sudoers.d/ locks the user out of sudo entirely, which on a remote
+# receiver means a site visit, so this is not a corner worth cutting.
+# Non-fatal under `set -e`: a failure here should not take down an
+# otherwise good install or update.
+echo "--- Configuring passwordless sudo for reboot/shutdown/rfkill ---"
+# id -un, not $USER. Everything below the --deps-only exit runs in an
+# interactive shell where $USER is always set, but this block also runs
+# from "Update Now", which invokes this script from inside the Lynx
+# process with a COPY of that process's environment. $USER survives an
+# lxterminal-started Lynx and would not survive a systemd-started one -
+# and an empty $USER produces a malformed rule that visudo rejects, so
+# the guard below would quietly skip the fix on exactly the receivers
+# that need it. id -un asks the kernel and cannot be unset.
+LYNX_USER="$(id -un)"
+LYNX_SUDO_TMP="$(mktemp)"
+printf '%s ALL=(ALL) NOPASSWD: /sbin/reboot, /usr/sbin/reboot, /sbin/shutdown, /usr/sbin/shutdown, /sbin/poweroff, /usr/sbin/poweroff, /usr/sbin/rfkill, /usr/bin/rfkill\n' \
+  "$LYNX_USER" > "$LYNX_SUDO_TMP"
+if sudo visudo -c -f "$LYNX_SUDO_TMP" >/dev/null 2>&1; then
+  sudo install -m 0440 -o root -g root "$LYNX_SUDO_TMP" /etc/sudoers.d/lynx
+  echo "Installed /etc/sudoers.d/lynx"
+  # An older install may have left a narrower rule behind. Harmless to
+  # keep, but it is the thing that made Reboot work while Shutdown did
+  # not, so removing it stops anyone chasing that ghost twice.
+  if [ -f /etc/sudoers.d/lynx-reboot ]; then
+    sudo rm -f /etc/sudoers.d/lynx-reboot
+    echo "Removed superseded /etc/sudoers.d/lynx-reboot"
+  fi
+  if [ -f /etc/sudoers.d/lynx-shutdown ]; then
+    sudo rm -f /etc/sudoers.d/lynx-shutdown
+    echo "Removed superseded /etc/sudoers.d/lynx-shutdown"
+  fi
+else
+  echo ""
+  echo ">>> Could not validate the sudoers rule - NOT installing it."
+  echo ">>> Everything else is installed and usable. The Reboot, Shutdown"
+  echo ">>> and Kill WiFi buttons may refuse to act until this is sorted;"
+  echo ">>> rebooting over SSH always works regardless."
+  echo ""
+fi
+rm -f "$LYNX_SUDO_TMP"
+
 # --deps-only stops here - used by "Update Now" (lynx_app.py) to
 # re-confirm every OS/apt/pip dependency above is genuinely present
 # on an existing install, without touching the repo clone, config, or
@@ -136,41 +196,6 @@ echo "--- Installing (not enabling) systemd user service ---"
 mkdir -p ~/.config/systemd/user
 cp ~/lynx/lynx.service ~/.config/systemd/user/lynx.service
 systemctl --user daemon-reload
-
-# --- Passwordless sudo for the privileged buttons ---------------
-# Reboot, Shutdown, Update and Kill WiFi in the Web UI all shell out to
-# sudo. They are fire-and-forget by necessity - the server cannot report
-# on the success of its own reboot - so the app checks permission first
-# and refuses rather than claiming a success that never happens.
-#
-# Stock Raspberry Pi OS gives the first user NOPASSWD: ALL, so this is
-# usually already satisfied and this step changes nothing. It is not
-# guaranteed though: it depends on how the user was created, and when it
-# is absent the buttons fail in a way that reads like a broken install
-# rather than a missing permission. Cheaper to make it explicit.
-#
-# visudo -c validates the file BEFORE it is installed. A syntax error in
-# /etc/sudoers.d/ locks the user out of sudo entirely, which on a remote
-# receiver means a site visit, so this is not a corner worth cutting.
-# Guarded and non-fatal under `set -e` for the same reason the scheduled
-# reboot units are: a failure here should not take down an otherwise
-# good install.
-echo "--- Configuring passwordless sudo for reboot/shutdown/rfkill ---"
-LYNX_SUDO_TMP="$(mktemp)"
-printf '%s ALL=(ALL) NOPASSWD: /sbin/reboot, /usr/sbin/reboot, /sbin/shutdown, /usr/sbin/shutdown, /sbin/poweroff, /usr/sbin/poweroff, /usr/sbin/rfkill, /usr/bin/rfkill\n' \
-  "$USER" > "$LYNX_SUDO_TMP"
-if sudo visudo -c -f "$LYNX_SUDO_TMP" >/dev/null 2>&1; then
-  sudo install -m 0440 -o root -g root "$LYNX_SUDO_TMP" /etc/sudoers.d/lynx
-  echo "Installed /etc/sudoers.d/lynx"
-else
-  echo ""
-  echo ">>> Could not validate the sudoers rule - NOT installing it."
-  echo ">>> Everything else is installed and usable. The Reboot, Shutdown"
-  echo ">>> and Kill WiFi buttons may refuse to act until this is sorted;"
-  echo ">>> rebooting over SSH always works regardless."
-  echo ""
-fi
-rm -f "$LYNX_SUDO_TMP"
 
 # --- Cursor-hide keybind (labwc rc.xml) ------------------------
 # Only created if rc.xml doesn't exist at all - same reasoning as
