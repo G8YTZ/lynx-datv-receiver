@@ -108,6 +108,25 @@ else
 fi
 rm -f "$LYNX_SUDO_TMP"
 
+# --- Persistent log directory -----------------------------------
+# ABOVE the --deps-only exit, for the same reason as the sudoers block:
+# an existing receiver that has only ever been updated never runs
+# anything below that line, so this directory would never appear on
+# exactly the installs that have been running longest.
+#
+# /tmp is RAM-backed on Raspberry Pi OS and loses its contents on every
+# reboot - confirmed as a real problem (2026-08-01) when a stack-trace
+# dump meant to diagnose an intermittent freeze was lost to exactly
+# that, and again on 2026-08-25 when a refusing Reboot button destroyed
+# its own evidence every time it was tried. lynx_start.sh and
+# lynx_app.py both prefer /var/log/lynx and fall back to /tmp when it is
+# missing - a silent fallback, so its absence shows up as "the
+# persistent log doesn't work" rather than as a missing directory.
+# Idempotent and safe to redo on every update.
+echo "--- Setting up persistent log directory ---"
+sudo mkdir -p /var/log/lynx
+sudo chown "$(id -un)":"$(id -gn)" /var/log/lynx
+
 # --deps-only stops here - used by "Update Now" (lynx_app.py) to
 # re-confirm every OS/apt/pip dependency above is genuinely present
 # on an existing install, without touching the repo clone, config, or
@@ -148,19 +167,6 @@ fi
 # does preserve it correctly, but set it explicitly regardless
 # so this script is safe to re-run.
 chmod +x ~/lynx/lynx_start.sh
-
-# --- Persistent log directory ----------------------------------
-# /tmp is typically RAM-backed on Raspberry Pi OS, losing its
-# contents on every reboot - genuinely confirmed as a real problem
-# (2026-08-01) when a stack-trace dump meant to help diagnose an
-# intermittent freeze was lost to exactly this, right when it would
-# have mattered most. lynx_app.py's own diagnostic logging prefers
-# this location when it's writable, falling back to /tmp otherwise -
-# this just makes sure it's actually there and owned correctly from
-# the start.
-echo "--- Setting up persistent log directory ---"
-sudo mkdir -p /var/log/lynx
-sudo chown "$USER":"$USER" /var/log/lynx
 
 # --- Autostart file (labwc) -----------------------------------
 # This is the one part of Section 8 that's safe to script -

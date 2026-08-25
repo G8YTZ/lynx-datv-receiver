@@ -173,8 +173,30 @@ sleep 1
 # the cleanup trap and watchdog checks further down this script
 # that rely on APP_PID genuinely being the Python process itself —
 # confirmed directly before deploying this.
+#
+# Also written to /var/log/lynx when that directory is writable. /tmp
+# alone is erased by a reboot - which is precisely the event most worth
+# having a log of, and the reason a refusing Reboot button took two days
+# to diagnose: every attempt destroyed its own evidence.
+#
+# Appended, not truncated, so it survives across boots; rotated on size
+# here rather than via logrotate, so an install needs no extra package
+# and no root-owned config to keep it bounded. Still process
+# substitution, so $! remains lynx_app.py's own PID - see above.
 echo -ne "Starting Lynx web app... "
-python3 ${LYNX_DIR}/lynx_app.py > >(tee /tmp/lynx_app.log) 2>&1 &
+APP_LOG_TARGETS=(/tmp/lynx_app.log)
+rm -f /tmp/lynx_app.log
+if [ -w /var/log/lynx ] 2>/dev/null; then
+    PERSIST_LOG=/var/log/lynx/lynx_app.log
+    if [ -f "$PERSIST_LOG" ] && \
+       [ "$(stat -c %s "$PERSIST_LOG" 2>/dev/null || echo 0)" -gt 20000000 ]; then
+        mv -f "$PERSIST_LOG" "${PERSIST_LOG}.1" 2>/dev/null || true
+    fi
+    printf '\n=== %s  Lynx starting ===\n' \
+        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$PERSIST_LOG" 2>/dev/null || true
+    APP_LOG_TARGETS+=("$PERSIST_LOG")
+fi
+python3 ${LYNX_DIR}/lynx_app.py > >(tee -a "${APP_LOG_TARGETS[@]}") 2>&1 &
 APP_PID=$!
 for i in $(seq 1 10); do
     sleep 1

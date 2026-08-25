@@ -4870,6 +4870,37 @@ def sudo_ready(command):
     return False
 
 
+def power_action(argv, what):
+    """Reboot or power off, and say so if it doesn't happen.
+
+    On success this process is killed mid-call, so anything reached
+    afterwards is by definition a failure. Under a bare Popen that
+    failure was discarded, which is what made a refusing Reboot button
+    indistinguishable from a working one and turned a one-line error into
+    a two-day hunt. sudo and systemd both explain themselves perfectly
+    well on stderr; the only bug was nobody listening.
+
+    Always passes -i. Power actions go through logind, which can refuse
+    while a user is logged in on seat0 - permanently true on a receiver,
+    where pi is auto-logged-in running the desktop - and being root does
+    not override it. Observed once in the field, refusing with exactly
+    that message and recommending -i itself; not reproducible on demand
+    afterwards, so the trigger is not fully understood. -i costs nothing
+    when it is unnecessary and is decisive when it is not, which is the
+    right trade for something that has to work unattended on a hilltop.
+
+    poweroff rather than `shutdown -h now`: same systemd action, but
+    shutdown has no -i. Both are already granted with any arguments by
+    /etc/sudoers.d/lynx, so this needs no rule change."""
+    r = subprocess.run(["sudo", *argv], capture_output=True, text=True)
+    msg = (r.stderr or r.stdout or "").strip() or "no output"
+    print(f"[power] {what} did not happen (exit {r.returncode}): {msg}")
+    record_diagnostic_event("power_action_failed",
+                            f"{what}: exit {r.returncode}: {msg}",
+                            count_as_mpv_restart=False)
+    return False
+
+
 def sudo_error(problem):
     """A 500 that says what failed, what still stands, and how to fix it
     permanently - in a form that survives being rendered as one line."""
@@ -4910,14 +4941,14 @@ def restart_lynx():
 
     def _do_reboot():
         time.sleep(1.0)  # let this HTTP response actually reach the browser first
-        subprocess.Popen(["sudo", "reboot"])
+        power_action(["reboot", "-i"], "reboot")
     threading.Thread(target=_do_reboot, daemon=True).start()
     return {"success": True, "message": "Rebooting the Pi - back in about a minute"}
 
 @app.post("/api/shutdown", tags=["Control"],
           summary="Shut down (power off) the Pi",
           description="Gracefully stops current reception, then powers off "
-                      "the entire Raspberry Pi via 'sudo shutdown -h now'. "
+                      "the entire Raspberry Pi via 'sudo poweroff -i'. "
                       "Unlike Reboot, the Pi does NOT come back up on its "
                       "own afterwards - it needs power physically cycled "
                       "(or a remote power switch) to bring the receiver "
@@ -4937,17 +4968,7 @@ def shutdown_pi():
         # process is killed mid-call and nothing below runs, so the only
         # way execution continues past here is failure - which under
         # Popen was discarded entirely, leaving a Shutdown button that
-        # stopped playback, reported success, and left the Pi running,
-        # with nothing anywhere to say why. Confirmed in the field.
-        # sudo's own stderr says exactly what is wrong; print it.
-        r = subprocess.run(["sudo", "shutdown", "-h", "now"],
-                           capture_output=True, text=True)
-        msg = (r.stderr or r.stdout or "").strip() or "no output"
-        print(f"[shutdown] 'sudo shutdown -h now' did not shut the Pi down "
-              f"(exit {r.returncode}): {msg}")
-        record_diagnostic_event("shutdown_failed",
-                                f"exit {r.returncode}: {msg}",
-                                count_as_mpv_restart=False)
+        power_action(["poweroff", "-i"], "shutdown")
     threading.Thread(target=_do_shutdown, daemon=True).start()
     return {"success": True, "message": "Shutting down - the Pi will power off shortly and will NOT restart on its own."}
 
@@ -5164,17 +5185,33 @@ def post_update_apply():
     update_state["commits_behind"] = 0
     update_state["new_commits"] = []
 
-    # Same passwordless-sudo check as the Reboot button, and for the
-    # same reason: a fire-and-forget reboot can't report back if it
-    # silently fails to actually happen, so check first rather than
-    # claim success either way. The pull has already succeeded by this
-    # point though, so a failed check here still leaves the code
-    # genuinely updated - just not yet running - which the error
-    # message below says explicitly, rather than leaving that unclear.
-    if not sudo_ready("reboot"):
-        raise sudo_error("Code pulled successfully, but the Pi could not be "
-                         "rebooted automatically. The update IS applied - "
-                         "reboot manually to run it.")
+    # Whether the dependency step can run at all is decided HERE, and on
+    # the BLANKET check rather than a specific command.
+    #
+    # install.sh needs sudo for apt, for writing to /etc, for everything.
+    # A receiver without passwordless sudo cannot run it non-interactively
+    # at all: `sudo apt update` inside the script asks for a password,
+    # finds no terminal to ask on because it is running inside this
+    # process, and sits there until the 1200s timeout - a twenty-minute
+    # silent hang. Confirmed in the field.
+    #
+    # sudo_ready() is the wrong test here precisely because it is
+    # permissive: a receiver carrying only a narrow rule - the
+    # /etc/sudoers.d/lynx-reboot left by the old manual instructions,
+    # which grants reboot and nothing else - passes it happily and then
+    # hangs in apt. That is the exact case this exists to catch.
+    #
+    # The reboot is judged separately and always attempted, because on
+    # that same narrow-rule receiver rebooting IS permitted even though
+    # the installer is not. Skipping the refresh must not cost the
+    # restart as well. The pull has already succeeded regardless, so the
+    # code is updated either way.
+    try:
+        can_run_installer = subprocess.run(
+            ["sudo", "-n", "true"], capture_output=True,
+            timeout=5).returncode == 0
+    except Exception:
+        can_run_installer = False
 
     def _do_reboot():
         time.sleep(1.0)  # let this HTTP response actually reach the browser first
@@ -5186,26 +5223,50 @@ def post_update_apply():
         # install.sh is itself pulled fresh as part of this same
         # update, so this always runs whatever the current, correct
         # list actually is, with only one place that list is ever
-        # maintained. Non-interactive under the hood (install.sh's
-        # own apt calls), so this can never hang on a prompt that
-        # will never come; a bounded timeout so even something going
-        # wrong here still lets the reboot below proceed rather than
-        # hanging indefinitely.
-        try:
-            install_script = os.path.join(
-                os.path.dirname(os.path.abspath(__file__)), "install.sh")
-            env = os.environ.copy()
-            env["DEBIAN_FRONTEND"] = "noninteractive"
-            subprocess.run(["bash", install_script, "--deps-only"],
-                            env=env, timeout=1200)
-        except Exception as e:
-            print(f"[update] Dependency check failed or timed out ({e}) - "
-                  "rebooting anyway with whatever succeeded so far.")
-        subprocess.Popen(["sudo", "reboot"])
+        # maintained. A bounded timeout so even something going wrong
+        # here still lets the reboot below proceed rather than hanging
+        # indefinitely.
+        if not can_run_installer:
+            print("[update] passwordless sudo is not configured for this "
+                  "user - skipping the dependency refresh, which needs "
+                  "sudo throughout and would stop at a password prompt "
+                  "with no terminal to answer it. The code IS updated. "
+                  "Run ~/lynx/install.sh by hand once, from a terminal "
+                  "where you can type your password, to sort this "
+                  "permanently. Still attempting the reboot below.")
+            record_diagnostic_event("update_deps_skipped_no_sudo",
+                                    "dependency refresh skipped - no "
+                                    "passwordless sudo",
+                                    count_as_mpv_restart=False)
+        else:
+            try:
+                install_script = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "install.sh")
+                env = os.environ.copy()
+                env["DEBIAN_FRONTEND"] = "noninteractive"
+                # stdin closed, belt and braces. The blanket check above
+                # says this user has sudo, but it does not promise every
+                # command install.sh runs is covered by the same rule -
+                # and a sudo that decides to prompt with an inherited
+                # stdin waits for an answer that cannot come. With no
+                # stdin it fails immediately instead, which the timeout
+                # then does not have to catch twenty minutes later.
+                subprocess.run(["bash", install_script, "--deps-only"],
+                               env=env, timeout=1200,
+                               stdin=subprocess.DEVNULL)
+            except Exception as e:
+                print(f"[update] Dependency check failed or timed out ({e}) "
+                      "- rebooting anyway with whatever succeeded so far.")
+        # The code is already updated at this point, so a refusal here
+        # costs only the restart - which the log line says, so nobody
+        # concludes the update itself failed.
+        if not power_action(["reboot", "-i"], "post-update reboot"):
+            print("[update] the code IS updated - reboot manually to run "
+                  "the new version")
     threading.Thread(target=_do_reboot, daemon=True).start()
 
     return {"result": "ok",
-            "message": "Update pulled successfully - now updating OS packages and rebooting (this can take a few minutes).",
+            "message": "Update pulled successfully - now updating OS packages and rebooting (this can take a few minutes). If the Pi has not restarted after a few minutes, the update is still applied - reboot it manually to run the new version.",
             "pull_output": pull_output}
 
 class UpdateChannelRequest(BaseModel):
@@ -5256,7 +5317,7 @@ def post_update_channel(req: UpdateChannelRequest):
 
     def _do_reboot():
         time.sleep(1.0)
-        subprocess.Popen(["sudo", "reboot"])
+        power_action(["reboot", "-i"], "channel-switch reboot")
     threading.Thread(target=_do_reboot, daemon=True).start()
 
     return {"result": "ok", "channel": req.channel,
