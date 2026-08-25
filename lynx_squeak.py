@@ -562,6 +562,15 @@ def render_card(res, W=1920, H=1080, seq_name='', duration_s=None, tol=None):
 
 
 def _failures(res, t):
+    # An absence of faults is only a PASS if something was actually
+    # measured. Every test below is conditional on its measurement being
+    # present, so a result carrying none at all falls through the lot and
+    # renders as PASS - confidently, over a blank card. Say so instead.
+    measured = ('level_err_l', 'resp_l', 'resp_r', 'noise_l',
+                'separation', 'thd_l')
+    if not any(res.get(k) is not None for k in measured):
+        return ['no measurements']
+
     f = []
     if 'level_err_l' in res and max(abs(res['level_err_l']),
                                     abs(res['level_err_r'])) > t['level_db']:
@@ -629,7 +638,21 @@ import subprocess, threading, time as _time, shutil
 # the only reliable end marker.
 END_GAP_S = 12.0
 MAX_PASS_S = 200.0
-MIN_HEADERS = 4          # fewer than this is a stray tone, not a run
+
+# Two separate gates, because they answer different questions.
+#
+# MIN_HEADER_CHUNKS decides whether to OPEN a capture, and is measured in
+# 100 ms frames of FSK-band energy - so four frames is 400 ms, not four
+# headers. It is deliberately loose: it runs continuously and only has to
+# be cheap, and being wrong here costs nothing but a discarded buffer.
+#
+# MIN_SEGMENTS decides whether to PUBLISH a result, and is measured in
+# complete segments found by find_headers(). This is the gate that
+# matters. Programme audio can easily hold enough energy in the FSK band
+# to open a capture - music does it regularly - but it never survives
+# find_headers(), so it arrives here with zero segments.
+MIN_HEADER_CHUNKS = 4
+MIN_SEGMENTS = 1
 
 # A header should arrive at alignment (PPM4). Much below that and the
 # path is broken or the sender is badly misaligned - worth saying so
@@ -762,7 +785,7 @@ class SqueakListener(threading.Thread):
                     self.state = 'idle'
 
     def _finish(self, chunks, hdr_count, truncated):
-        if hdr_count < MIN_HEADERS:
+        if hdr_count < MIN_HEADER_CHUNKS:
             print(f"[squeak] only {hdr_count} header frames - ignoring")
             return
         x = np.concatenate(chunks).astype(np.float64) / 32768.0
@@ -773,6 +796,17 @@ class SqueakListener(threading.Thread):
         except Exception as e:
             print(f"[squeak] measurement failed: {e}")
             return
+
+        # A capture that yields no segments is not a short run - it is
+        # programme audio that happened to trip the opening detector.
+        # Publishing it puts up an empty card, and an empty card reads
+        # PASS, because _failures() finds no measurement to fault.
+        nseg = res.get('headers', 0)
+        if nseg < MIN_SEGMENTS:
+            print(f"[squeak] {nseg} segments, need {MIN_SEGMENTS} - "
+                  f"not a Lindos pass, ignoring")
+            return
+
         res['duration_s'] = dur
         res['truncated'] = truncated
         self.headers_seen = res.get('headers', 0)
