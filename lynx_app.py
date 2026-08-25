@@ -8099,12 +8099,26 @@ def sudo_ready(command):
 
     'sudo -l <cmd>' resolves the command against the sudoers rules and
     exits 0 if it is permitted. It never executes it, so this is safe to
-    call on 'reboot'."""
-    try:
-        return subprocess.run(["sudo", "-n", "-l", command],
-                              capture_output=True, timeout=5).returncode == 0
-    except Exception:
-        return False
+    call on 'reboot'.
+
+    If that says no, fall back to the blanket 'sudo -n true' check this
+    replaced. 'sudo -l <cmd>' has to resolve the command against the
+    caller's PATH and is also subject to the sudoers 'listpw' policy, so
+    it can report failure for reasons that have nothing to do with
+    whether the command itself is permitted - confirmed in the field on a
+    Pi where Reboot worked and Shutdown did not, despite both being
+    runnable. Keeping the old check as a fallback means this function can
+    only ever be MORE permissive than the behaviour it replaced, so a
+    stricter resolver can never take away a button that used to work.
+    The precision is a bonus, not something worth a regression for."""
+    for probe in (["sudo", "-n", "-l", command], ["sudo", "-n", "true"]):
+        try:
+            if subprocess.run(probe, capture_output=True,
+                              timeout=5).returncode == 0:
+                return True
+        except Exception:
+            continue
+    return False
 
 
 def sudo_error(problem):
