@@ -229,6 +229,19 @@ else
 fi
 rm -f "$LYNX_SUDO_TMP"
 
+# --- Persistent log directory -----------------------------------
+# ABOVE the --deps-only exit, for the same reason as the sudoers block:
+# an existing receiver that has only ever been updated never runs
+# anything below that line, so this directory would never appear on
+# exactly the installs that have been running longest. lynx_start.sh and
+# lynx_app.py both prefer /var/log/lynx and fall back to /tmp when it is
+# missing - a silent fallback, so the absence shows up as "the
+# persistent log doesn't work" rather than as a missing directory.
+# Idempotent and safe to redo on every update.
+echo "--- Setting up persistent log directory ---"
+sudo mkdir -p /var/log/lynx
+sudo chown "$(id -un)":"$(id -gn)" /var/log/lynx
+
 # --deps-only stops here - used by "Update Now" (lynx_app.py) to
 # re-confirm every OS/apt/pip dependency above, AND the GPS time-sync
 # setup just above (equally safe to redo), is genuinely present on an
@@ -291,10 +304,6 @@ chmod +x ~/lynx/lynx_start.sh
 # this location when it's writable, falling back to /tmp otherwise -
 # this just makes sure it's actually there and owned correctly from
 # the start.
-echo "--- Setting up persistent log directory ---"
-sudo mkdir -p /var/log/lynx
-sudo chown "$USER":"$USER" /var/log/lynx
-
 # --- Autostart file (labwc) -----------------------------------
 # This is the one part of Section 8 that's safe to script -
 # creating the file itself is unambiguous. Enabling auto-login
