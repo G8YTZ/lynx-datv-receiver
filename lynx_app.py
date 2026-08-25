@@ -2498,6 +2498,11 @@ PICOTUNER_CHECK_SECS = 2.0          # how often to compare
 PICOTUNER_MISMATCH_SECS = 20.0      # sustained disagreement before acting
 PICOTUNER_RETUNE_SETTLE_SECS = 8.0  # let its firmware finish booting first
 PICOTUNER_RETUNE_COOLDOWN_SECS = 90.0   # don't hammer a tuner that won't take
+PICOTUNER_FUTILE_FIXES_WARN = 3     # restores in a row achieving nothing before
+                                    # suggesting the commands aren't arriving.
+                                    # Three rather than one: a genuine power
+                                    # cycle mid-restore, or a Pico still booting,
+                                    # can legitimately waste one or two.
 
 
 def _tri_watch_present():
@@ -2646,6 +2651,7 @@ def picotuner_tuning_watchdog():
     tuning, whatever the cause."""
     bad_since = None
     last_fix = 0.0
+    futile_fixes = 0     # consecutive restores that changed nothing
     while True:
         time.sleep(PICOTUNER_CHECK_SECS)
         try:
@@ -2720,6 +2726,7 @@ def picotuner_tuning_watchdog():
 
             if not wrong:
                 bad_since = None
+                futile_fixes = 0       # a restore worked - start counting again
                 continue
 
             now = time.time()
@@ -2736,6 +2743,42 @@ def picotuner_tuning_watchdog():
                   "power cycle, so restoring:")
             for why in wrong:
                 print(f"[picotuner]     {why}")
+
+            # Restores that never take are worth saying out loud.
+            #
+            # Status and commands travel in opposite directions and only
+            # one of them needs to be configured correctly. Status is
+            # RECEIVED by binding a local port and listening to the
+            # Picotuner's broadcasts - which needs no knowledge of its
+            # address at all. Commands are SENT to picotuner.host on
+            # picotuner.cmd_port, fire-and-forget UDP that deliberately
+            # never raises, so a wrong-but-valid address or port produces
+            # no error and no log line anywhere.
+            #
+            # The result is a receiver showing perfect, live status from
+            # a Picotuner it cannot actually command: every tune returns
+            # 200 OK, nothing ever changes, and this watchdog restores
+            # forever without once remarking that its restores achieve
+            # nothing. Reported from the field and diagnosed the long way
+            # round; this is the line that would have shortened it.
+            futile_fixes += 1
+            if futile_fixes == PICOTUNER_FUTILE_FIXES_WARN:
+                cfg_pt = config['picotuner']
+                print(f"[picotuner] WARNING: {futile_fixes} restores in a row "
+                      f"have not changed anything. Commands may not be "
+                      f"reaching the Picotuner at all - status is received by "
+                      f"listening, so it stays correct even when commands go "
+                      f"nowhere. Check that host={cfg_pt.get('host')} and "
+                      f"cmd_port={cfg_pt.get('cmd_port')} are really this "
+                      f"Picotuner's. Its actual address is the source of the "
+                      f"status broadcasts: "
+                      f"sudo tcpdump -n -i any udp port "
+                      f"{cfg_pt.get('status_port', 9997) - 96} -c 5")
+                record_diagnostic_event("picotuner_restores_futile",
+                                        f"{futile_fixes} consecutive restores "
+                                        f"with no change - check host/cmd_port",
+                                        count_as_mpv_restart=False)
+
             last_fix = now
             bad_since = None
             threading.Thread(target=_picotuner_restore_tuning,
