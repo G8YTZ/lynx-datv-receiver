@@ -8416,17 +8416,23 @@ def post_update_apply():
     update_state["commits_behind"] = 0
     update_state["new_commits"] = []
 
-    # Same passwordless-sudo check as the Reboot button, and for the
-    # same reason: a fire-and-forget reboot can't report back if it
-    # silently fails to actually happen, so check first rather than
-    # claim success either way. The pull has already succeeded by this
-    # point though, so a failed check here still leaves the code
-    # genuinely updated - just not yet running - which the error
-    # message below says explicitly, rather than leaving that unclear.
-    if not sudo_ready("reboot"):
-        raise sudo_error("Code pulled successfully, but the Pi could not be "
-                         "rebooted automatically. The update IS applied - "
-                         "reboot manually to run it.")
+    # Deliberately NOT gated on sudo_ready() here, unlike the Reboot and
+    # Shutdown buttons.
+    #
+    # The dependency step below runs install.sh, and install.sh is what
+    # CONFIGURES passwordless sudo. Refusing to proceed because sudo is
+    # not yet configured would therefore block the very step that
+    # configures it: the fix could never bootstrap itself on precisely
+    # the receivers that need it. Confirmed in the field - an update on a
+    # Pi without the rule refused to reboot AND skipped the dependency
+    # run, leaving it exactly as broken as before, with the fix sitting
+    # on disk unused.
+    #
+    # So: proceed, let install.sh do its work, then attempt the reboot
+    # and report honestly if it still will not go. The pull has already
+    # succeeded either way, so the worst case is an update that is
+    # applied but needs a manual reboot - which is what the old check
+    # produced anyway, minus the chance of fixing itself.
 
     def _do_reboot():
         time.sleep(1.0)  # let this HTTP response actually reach the browser first
@@ -8453,11 +8459,25 @@ def post_update_apply():
         except Exception as e:
             print(f"[update] Dependency check failed or timed out ({e}) - "
                   "rebooting anyway with whatever succeeded so far.")
-        subprocess.Popen(["sudo", "reboot"])
+        # Captured, not a bare Popen. install.sh has just had its chance
+        # to configure passwordless sudo, so this usually succeeds and
+        # kills the process mid-call - meaning anything reached below is
+        # a genuine failure, and worth saying out loud rather than
+        # discarding. An update that quietly declines to reboot looks
+        # identical to one that worked until you notice the version
+        # hasn't changed.
+        r = subprocess.run(["sudo", "reboot"], capture_output=True, text=True)
+        msg = (r.stderr or r.stdout or "").strip() or "no output"
+        print(f"[update] code is updated, but the automatic reboot did not "
+              f"happen (exit {r.returncode}): {msg} - reboot manually to run "
+              f"the new version")
+        record_diagnostic_event("update_reboot_failed",
+                                f"exit {r.returncode}: {msg}",
+                                count_as_mpv_restart=False)
     threading.Thread(target=_do_reboot, daemon=True).start()
 
     return {"result": "ok",
-            "message": "Update pulled successfully - now updating OS packages and rebooting (this can take a few minutes).",
+            "message": "Update pulled successfully - now updating OS packages and rebooting (this can take a few minutes). If the Pi has not restarted after a few minutes, the update is still applied - reboot it manually to run the new version.",
             "pull_output": pull_output}
 
 class UpdateChannelRequest(BaseModel):
