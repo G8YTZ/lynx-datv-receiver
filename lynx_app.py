@@ -3955,15 +3955,23 @@ _pathfinder_prev = {"receiving": False, "callsign": "", "rcv": 1, "telemetry": {
 #  Auto-Squeak - Lindos sequence measurement
 # ---------------------------------------------------------------------
 # Listens continuously for a Lindos test sequence and measures the
-# audio path. On by default: it costs one more reader on an audio
-# monitor that is already being read for the PPM, does nothing at all
-# until a sequence actually arrives, and a receiver that quietly
-# measures itself when someone sends a test is more useful than one
-# that has to be configured first.
+# audio path.
+#
+# OFF by default. It was on, on the reasoning that it costs only one
+# more reader on a monitor already being read for the PPM and does
+# nothing until a sequence arrives. That reasoning was wrong in a way
+# that only showed up on real hardware: a capture client influences how
+# PipeWire schedules the WHOLE audio graph, so an idle capture is not
+# free at all. Two receivers stuttered for days - audio breaking up,
+# video stalling - with provably perfect RF, and both were cured by
+# turning this off. The capture is now asked to be served in large lazy
+# chunks (see lynx_squeak.py), which should remove the cost, but a
+# feature most owners will never use should not be running on their
+# receiver by default while that is still a "should".
 _squeak_cfg = config.get('squeak', {}) or {}
 squeak_tracker = (lynx_squeak.SqueakTracker(
     hold_secs=_squeak_cfg.get('hold_secs', 45),
-    enabled=_squeak_cfg.get('enabled', True))
+    enabled=_squeak_cfg.get('enabled', False))
     if SQUEAK_AVAILABLE else None)
 squeak_listener = None
 
@@ -4068,7 +4076,7 @@ def _start_squeak():
     returns immediately unless enabled - the audio source is only
     opened when the feature is actually wanted."""
     global squeak_listener
-    if not SQUEAK_AVAILABLE or not _squeak_cfg.get('enabled', True):
+    if not SQUEAK_AVAILABLE or not _squeak_cfg.get('enabled', False):
         return
     # Blank means "follow whatever mpv is playing to" - see
     # _squeak_monitor_target. An explicit name overrides it.
@@ -6395,7 +6403,11 @@ async function loadCurrentConfig() {
         document.getElementById('qrz-suppress-input').value = qrz.suppress_mins ?? 60;
         document.getElementById('qrz-portable-locator-input').value = qrz.portable_locator || '';
 
-        document.getElementById('squeak-enabled-input').checked = (cfg.squeak?.enabled !== false);
+        // Off unless explicitly on, matching the server-side default.
+        // Was "!== false", which showed the box ticked on any config
+        // with no squeak section at all - i.e. claiming a feature was
+        // running that the server had not started.
+        document.getElementById('squeak-enabled-input').checked = (cfg.squeak?.enabled === true);
         document.getElementById('squeak-hold-input').value = cfg.squeak?.hold_secs ?? 45;
         loadSqueakSources();
 

@@ -343,7 +343,16 @@ ryde:
 # seen. It also takes priority over a Pathfinder card where both fall
 # due at once.
 squeak:
-  enabled: true
+  # OFF by default, deliberately. Enabling this starts a permanent
+  # capture of the audio output, which has to run continuously because a
+  # Lindos sequence can arrive at any moment - so it is a real, ongoing
+  # cost on a receiver whose owner may never send one. A capture client
+  # also influences how PipeWire schedules the whole audio graph, and on
+  # a Pi already decoding video that has been enough to produce
+  # stuttering audio and stalled video. Mitigated (see lynx_squeak.py's
+  # own capture command) but not worth imposing on people who did not
+  # ask for it. Turn it on from the Config page when you want it.
+  enabled: false
   # Which monitor to listen on. Leave BLANK and it follows whatever
   # output mpv is actually playing to - the same rule the PPM meter
   # uses, and for the same reason: watching the system default instead

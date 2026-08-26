@@ -657,7 +657,7 @@ def _cells(res, t):
 
 # ------------------------------------------------------------ listener
 
-import subprocess, threading, time as _time, shutil
+import os, subprocess, threading, time as _time, shutil
 
 # Gap after the last header before a pass is considered finished.
 # MUST exceed the longest silence WITHIN a sequence: the noise segments
@@ -747,6 +747,33 @@ class SqueakListener(threading.Thread):
             except Exception:
                 pass
 
+    def _reap(self):
+        """Make sure the previous ffmpeg is genuinely gone.
+
+        run() below restarts _capture() on ANY exception, and
+        'audio stream ended' is one this class raises itself - a normal
+        path, not an edge case. Without this, each restart simply
+        overwrote self._proc and abandoned the old process: zombies at
+        best, and at worst a second live capture competing for the same
+        audio device every three seconds."""
+        p, self._proc = self._proc, None
+        if p is None:
+            return
+        try:
+            p.kill()
+        except Exception:
+            pass
+        try:
+            p.wait(timeout=2)
+        except Exception:
+            pass
+        for stream in (p.stdout, p.stderr):
+            try:
+                if stream:
+                    stream.close()
+            except Exception:
+                pass
+
     def run(self):
         self.running = True
         while self.running:
@@ -755,18 +782,39 @@ class SqueakListener(threading.Thread):
             except Exception as e:
                 self.last_error = str(e)
                 print(f"[squeak] listener error: {e}")
+            finally:
+                self._reap()
             if self.running:
                 _time.sleep(3.0)
 
     def _capture(self):
         if not shutil.which(self.ffmpeg):
             raise RuntimeError(f'{self.ffmpeg} not found')
+        # -fragment_size and PIPEWIRE_LATENCY both ask for a RELAXED
+        # capture, and they are the point of this whole block.
+        #
+        # A capture client's latency request drives the entire PipeWire
+        # graph, not just its own stream: ask for small periods and the
+        # server speeds everything up to serve them, mpv's playback
+        # included. On a Pi already decoding video that is enough to
+        # produce under-runs, which is heard as stuttering audio and
+        # stalled video - confirmed in the field, where disabling
+        # Auto-Squeak cured a receiver that had been stuttering for days
+        # while its RF was provably perfect.
+        #
+        # Nothing here needs low latency. The sequence is measured after
+        # the fact, from a buffer, and a card appears seconds later
+        # regardless. Asking to be served in large lazy chunks costs
+        # nothing and takes the capture out of the critical path.
         cmd = [self.ffmpeg, '-hide_banner', '-loglevel', 'error',
-               '-f', 'pulse', '-i', self.source,
+               '-f', 'pulse', '-fragment_size', '65536', '-i', self.source,
                '-ar', str(self.sr), '-ac', '2',
                '-f', 's16le', '-']
+        env = dict(os.environ)
+        env.setdefault('PIPEWIRE_LATENCY', '8192/48000')
         self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                       stderr=subprocess.DEVNULL,
+                                      env=env,
                                       bufsize=self.chunk * 8)
         print(f"[squeak] listening on {self.source}")
         nbytes = self.chunk * 2 * 2
