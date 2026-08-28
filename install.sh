@@ -295,7 +295,13 @@ fi
 # SFTP transfers never preserved this bit; a fresh git clone
 # does preserve it correctly, but set it explicitly regardless
 # so this script is safe to re-run.
-chmod +x ~/lynx/lynx_start.sh
+#
+# The autostart entry no longer DEPENDS on this - it invokes the
+# script through bash, so a missing execute bit can never again
+# leave a receiver silently sitting at the desktop - but someone
+# typing ./lynx_start.sh by hand still needs it, and so does
+# install.sh itself on the next run.
+chmod +x ~/lynx/lynx_start.sh ~/lynx/install.sh 2>/dev/null || true
 
 # --- Persistent log directory ----------------------------------
 # /tmp is typically RAM-backed on Raspberry Pi OS, losing its
@@ -315,10 +321,29 @@ chmod +x ~/lynx/lynx_start.sh
 # a worse outcome than just asking for one manual step.
 echo "--- Setting up labwc autostart ---"
 mkdir -p ~/.config/labwc
+# Repair an autostart written by an older installer, which invoked the
+# script directly and so depended on its execute bit. Done on every run,
+# including Update Now, so existing receivers are fixed without anyone
+# having to know this was ever a problem.
+if [ -f ~/.config/labwc/autostart ] \
+   && grep -q "lynx_start.sh" ~/.config/labwc/autostart \
+   && ! grep -q "bash .*lynx_start.sh" ~/.config/labwc/autostart; then
+  sed -i "s|lxterminal -e \(.*\)lynx_start.sh|lxterminal -e bash \1lynx_start.sh|" \
+      ~/.config/labwc/autostart
+  echo "Updated the autostart entry to invoke the script via bash."
+fi
+
 if [ -f ~/.config/labwc/autostart ] && grep -q "lynx_start.sh" ~/.config/labwc/autostart; then
   echo "Autostart already configured - leaving it untouched."
 else
-  echo "lxterminal -e $HOME/lynx/lynx_start.sh &" >> ~/.config/labwc/autostart
+  # Invoked as "bash <script>", NOT "./script". The execute bit is not
+  # preserved by every way a file reaches a receiver - SFTP drops it,
+  # and a file copied by hand rather than pulled arrives without it -
+  # and when that happens labwc's autostart fails SILENTLY: no picture,
+  # no overlay, no error anywhere, just the bare desktop. Passing the
+  # script to bash explicitly removes the dependency entirely, so a
+  # missing execute bit can no longer stop a receiver starting.
+  echo "lxterminal -e bash $HOME/lynx/lynx_start.sh &" >> ~/.config/labwc/autostart
   chmod +x ~/.config/labwc/autostart
 fi
 
