@@ -389,6 +389,30 @@ site:
   name: My Lynx Receiver
 
 display:
+  # Display refresh rate, in Hz. 50 or 60.
+  #
+  # 50 is right for the UK and Europe, where DATV is 25 fps: each frame
+  # then occupies exactly two refreshes. At 60 Hz a 25 fps source needs
+  # 3:2 pulldown - frames held alternately for two refreshes and three -
+  # which shows as judder on any horizontal pan. Set 60 in a 30/60 fps
+  # region.
+  #
+  # Only applied when the display has to be switched at all, i.e. when
+  # it is taller than max_height below. A screen offering no mode at
+  # this rate falls back to the highest it does offer, because being
+  # left at 4K is the fault this exists to avoid.
+  refresh_hz: 50
+
+  # Maximum display height in lines. A 4K framebuffer is more than this
+  # hardware can sustain alongside decoding a live stream - picture
+  # glitches, audio dropouts and no OSD at all, on a Pi 5 that was 88%
+  # idle at the time - while the same receiver is clean at 1080.
+  # Nothing is lost: DATV video is well below 1080 anyway, so a larger
+  # framebuffer only composites more pixels for an identical picture.
+  # An ultrawide at 2560x1080 is unaffected, its height already being
+  # within this.
+  max_height: 1080
+
   ppm_style: full_fat   # "skeleton" (needles/graduations only) or
                           # "full_fat" (adds the round meter housing) -
                           # also settable from the Web UI's Config page,

@@ -58,6 +58,7 @@ sudo apt install -y \
   iw \
   chrony \
   pipewire-utils \
+  wlr-randr \
   git
 
 # --- Python dependencies -------------------------------------

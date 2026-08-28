@@ -153,6 +153,90 @@ for i in $(seq 1 45); do
 done
 
 
+# ── Cap the display height ──────────────────────────────────────
+# A 4K output is more than this hardware can sustain alongside decoding
+# a live DATV stream. Confirmed directly on a Pi 5 with 16 GB free and
+# 88% idle CPU - so neither memory nor compute: at 3840x2160 the picture
+# glitches and the audio drops out, both markedly worse on fast-moving
+# pictures, and the OSD overlay stops appearing at all. The same
+# receiver on the same transmission is perfectly clean at 1080.
+#
+# Nothing is lost by capping. DATV video is far below 1080 anyway - a
+# typical stream here is 1024x576 - so a 3840x2160 framebuffer buys no
+# detail whatever, it only asks the display pipeline to composite four
+# times the pixels for an identical image. The monitor scales to its own
+# panel either way.
+#
+# Runtime only, via wlr-randr, never config.txt. Lynx deliberately does
+# not touch boot configuration - the same reasoning as leaving the UART
+# settings to raspi-config - because a wrong value there is recoverable
+# only with a card reader, whereas this is undone by a reboot.
+#
+# Applied BEFORE mpv and the overlay start, so they size themselves to
+# the final mode. Changing it underneath them is the very thing that
+# breaks them.
+#
+# Values come from display.refresh_hz / display.max_height in the config
+# file, read with python3 rather than by grepping the YAML: they are
+# nested, and a regex that works today would quietly return the wrong
+# thing the first time someone reorders or comments a line. python3 is
+# already a hard dependency, and a missing, malformed or nonsensical
+# config falls back to the defaults rather than failing to start.
+#
+# 50 Hz by default because Lynx is a European product and 25 fps is what
+# it will almost always be shown: each frame then occupies exactly two
+# refreshes. At 60 Hz a 25 fps source needs 3:2 pulldown - frames held
+# alternately for two refreshes and three - which shows as judder on any
+# horizontal pan.
+_cfg_display() {
+    python3 - "$1" "$2" <<'PYEOF' 2>/dev/null
+import sys, yaml, os
+key, default = sys.argv[1], sys.argv[2]
+try:
+    p = os.path.expanduser('~/lynx/config/lynx_config.yaml')
+    v = (yaml.safe_load(open(p)) or {}).get('display', {}).get(key)
+    print(int(v) if v is not None else default)
+except Exception:
+    print(default)
+PYEOF
+}
+LYNX_MAX_HEIGHT="${LYNX_MAX_HEIGHT:-$(_cfg_display max_height 1080)}"
+LYNX_REFRESH_HZ="${LYNX_REFRESH_HZ:-$(_cfg_display refresh_hz 50)}"
+[ -n "$LYNX_MAX_HEIGHT" ] || LYNX_MAX_HEIGHT=1080
+[ -n "$LYNX_REFRESH_HZ" ] || LYNX_REFRESH_HZ=50
+
+if command -v wlr-randr > /dev/null 2>&1; then
+    _out=$(wlr-randr 2>/dev/null | awk '/^[A-Za-z]/ {print $1; exit}')
+    _cur=$(wlr-randr 2>/dev/null | awk '/current/ {print $1; exit}')
+    _curh=${_cur##*x}
+    if [ -n "$_out" ] && [ -n "$_curh" ] && [ "$_curh" -gt "$LYNX_MAX_HEIGHT" ] 2>/dev/null; then
+        echo -ne "Display is ${_cur} - capping to ${LYNX_MAX_HEIGHT}p... "
+        # Prefer the configured rate; fall back to the highest the output
+        # actually offers at that height. A screen with no mode at the
+        # wanted rate must not be left stuck at 4K, which is the fault
+        # this exists to fix - some panels, and most in 60 Hz regions,
+        # list no 50 Hz mode at all.
+        _want=$(wlr-randr 2>/dev/null \
+            | awk -v h="$LYNX_MAX_HEIGHT" -v r="$LYNX_REFRESH_HZ" '
+                $2 == "px," {
+                    split($1, d, "x")
+                    if (d[2] != h) next
+                    hz = $3 + 0
+                    if (int(hz + 0.5) == r) exact = $1 "@" hz
+                    if (hz > best) { best = hz; bestmode = $1 "@" hz }
+                }
+                END { print (exact != "" ? exact : bestmode) }')
+        if [ -n "$_want" ] && wlr-randr --output "$_out" --mode "$_want" > /dev/null 2>&1; then
+            echo -e "${GREEN}${_want}${NC}"
+            sleep 2   # let the compositor settle before anything draws
+        else
+            echo -e "${AMBER}no usable ${LYNX_MAX_HEIGHT}p mode - leaving as-is${NC}"
+        fi
+    fi
+else
+    echo "wlr-randr not found - display height not capped."
+fi
+
 # ── Kill existing processes ───────────────────────────────────
 # Uses -9 and waits for confirmation — a previous lynx_app.py instance
 # still holding port 9901 when a new one starts (both using

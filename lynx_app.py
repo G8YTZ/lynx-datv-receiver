@@ -3061,6 +3061,16 @@ class QuickLynxConfigUpdate(BaseModel):
 
 class DisplayConfigUpdate(BaseModel):
     ppm_style: str = "full_fat"  # "skeleton" or "full_fat"
+    # Display refresh rate, 50 or 60. 50 by default: broadcast
+    # television here is 25 fps, so each frame occupies exactly two
+    # refreshes. At 60 Hz a 25 fps source needs 3:2 pulldown - frames
+    # held alternately for two refreshes and three - which shows as
+    # judder on any horizontal pan. Only applied when the display has
+    # to be switched at all, i.e. when it exceeds max_height.
+    refresh_hz: int = 50
+    # Cap on display height in lines. Read by lynx_start.sh at startup,
+    # so a change needs a restart to take effect.
+    max_height: int = 1080
     # "hdmi" (resolved to the first HDMI output at launch), "auto" to let
     # mpv choose, or an explicit mpv device name from /api/audio/devices.
     audio_device: str = "hdmi"
@@ -4961,6 +4971,8 @@ def get_status():
             "gnss": {"mode": config.get('gnss', {}).get('mode', 'automatic'),
                       "running": gnss_reader.running, **gnss_reader.status()},
             "ppm_style": config.get('display', {}).get('ppm_style', 'full_fat'),
+            "refresh_hz": config.get('display', {}).get('refresh_hz', 50),
+            "max_height": config.get('display', {}).get('max_height', 1080),
             "quicklynx_enabled": bool(config.get('quicklynx', {}).get('enabled', False)),
             "site_locator": config.get('site', {}).get('locator', ''),
             # Published so the overlay's PPM can follow mpv to whichever
@@ -5773,6 +5785,36 @@ def config_page():
                     </div>
                 </div>
                 <div class="card mb-3">
+                    <div class="card-header">&#x1F5A5;&#xFE0F; Screen</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            Lynx caps the screen at 1080 lines, switching a 4K monitor down when it
+                            starts. A 4K screen is more than a Raspberry Pi can drive while also
+                            decoding a live picture &mdash; it causes picture glitches, audio dropouts
+                            and a missing overlay. Nothing is lost: DATV video is well below 1080
+                            anyway, so a bigger screen buffer only draws more pixels for exactly the
+                            same picture. An ultrawide monitor is unaffected.
+                        </p>
+                        <input type="hidden" id="max-height-hidden" value="1080">
+                        <label class="small text-muted mb-1" for="refresh-hz-select">Refresh rate</label>
+                        <select class="form-select form-select-sm mb-2" id="refresh-hz-select">
+                            <option value="50">50 Hz &mdash; UK, Europe (25 fps)</option>
+                            <option value="60">60 Hz &mdash; North America, Japan (30 fps)</option>
+                        </select>
+                        <p class="text-muted small mb-2">
+                            Only used when the screen actually has to be switched. 50 Hz suits 25 fps
+                            television: each frame then lasts exactly two refreshes. At 60 Hz a 25 fps
+                            picture judders on pans, because frames are held alternately for two
+                            refreshes and three. A monitor with no mode at the chosen rate falls back
+                            to the highest it offers.
+                        </p>
+                        <div class="mt-2 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveScreen()">Save screen settings</button>
+                            <span class="save-status" id="screen-save-status"></span>
+                        </div>
+                    </div>
+                </div>
+                <div class="card mb-3">
                     <div class="card-header">&#x1F5FA;&#xFE0F; Pathfinder</div>
                     <div class="card-body">
                         <p class="text-muted small">
@@ -6373,6 +6415,9 @@ async function loadCurrentConfig() {
 
         loadAudioDevices(cfg.display?.audio_device || 'hdmi');
 
+        document.getElementById('refresh-hz-select').value = String(cfg.display?.refresh_hz ?? 50);
+        document.getElementById('max-height-hidden').value = String(cfg.display?.max_height ?? 1080);
+
         const ppmStyle = cfg.display?.ppm_style || 'full_fat';
         document.getElementById(ppmStyle === 'full_fat' ? 'ppm-style-full-fat' : 'ppm-style-skeleton').checked = true;
 
@@ -6815,6 +6860,38 @@ async function saveAudioDevice() {
     }
 }
 
+async function saveScreen() {
+    const el = document.getElementById('screen-save-status');
+    el.textContent = 'Saving...'; el.className = 'save-status text-muted';
+    try {
+        // Every display field must be sent, not just the ones this card
+        // owns. The API merges with update(model_dump()), and model_dump
+        // fills anything unsent with the model's DEFAULT - so omitting a
+        // field silently resets it on disk rather than leaving it alone.
+        // savePpmStyle() already sends audio_device for exactly this
+        // reason; refresh_hz and max_height now need the same treatment
+        // from both.
+        const body = {display: {
+            refresh_hz: parseInt(document.getElementById('refresh-hz-select').value, 10) || 50,
+            max_height: parseInt(document.getElementById('max-height-hidden').value, 10) || 1080,
+            ppm_style: document.querySelector('input[name="ppm-style"]:checked')?.value || 'full_fat',
+            audio_device: document.getElementById('audio-device-select')?.value || 'hdmi'
+        }};
+        const r = await fetch('/api/config', {method: 'POST',
+            headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+        if (!r.ok) throw new Error(await r.text());
+        // The screen mode is set once, by lynx_start.sh, before mpv and
+        // the overlay start - changing it underneath them is exactly
+        // what breaks them - so this cannot take effect live.
+        el.textContent = 'Saved - restart Lynx for this to take effect.';
+        el.className = 'save-status text-success';
+    } catch (e) {
+        el.textContent = 'Save failed - see console.';
+        el.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
 async function savePpmStyle() {
     const statusEl = document.getElementById('ppm-style-status');
     statusEl.textContent = 'Saving...';
@@ -6825,6 +6902,10 @@ async function savePpmStyle() {
         // whole display block, so sending only one would drop the other.
         const body = { display: {
             ppm_style: style,
+            // Carried through for the same reason this already carries
+            // audio_device - see saveScreen().
+            refresh_hz: parseInt(document.getElementById('refresh-hz-select')?.value, 10) || 50,
+            max_height: parseInt(document.getElementById('max-height-hidden')?.value, 10) || 1080,
             audio_device: document.getElementById('audio-device-select')?.value || 'hdmi'
         }};
         const r = await fetch('/api/config', {
