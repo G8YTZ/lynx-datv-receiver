@@ -5969,66 +5969,6 @@ def config_page():
                     </div>
                 </div>
 
-                    <div class="card-header">&#x1F6F0;&#xFE0F; GNSS Portable Locator</div>
-                    <div class="card-body">
-                        <p class="text-muted small">
-                            Reads a Waveshare L76K HAT on /dev/ttyAMA0 and, once a fix has held
-                            steady in the same 6-character square for 30 seconds, writes it straight
-                            into the "Portable locator" field above - the same field an operator
-                            would otherwise type by hand, attached to every logged contact as this
-                            receiver's own current position. A fixed repeater site simply doesn't
-                            have the HAT fitted, so this fails quietly and does nothing there.
-                            Configures the module for GPS + BeiDou + GLONASS (plus QZSS, always on
-                            regardless) on each connect - every constellation the L76K can actually
-                            use, for the widest satellite visibility.
-                        </p>
-                        <div class="form-check">
-                            <input class="form-check-input" type="radio" name="gnss-mode"
-                                   id="gnss-mode-manual" value="manual" onchange="onGnssModeChange()">
-                            <label class="form-check-label" for="gnss-mode-manual">
-                                <strong>Manual</strong>
-                                <span class="text-muted small">- the typed value above is authoritative; GPS is only shown</span>
-                            </label>
-                        </div>
-                        <div id="gnss-no-module-warning" class="alert alert-warning py-1 px-2 small mb-2" style="display:none;">
-                            &#x26A0;&#xFE0F; No GNSS module detected on /dev/ttyAMA0. Automatic is greyed
-                            out below until one responds - Manual above is unaffected either way, and
-                            un-greys live, no reload, the moment a fitted HAT starts answering.
-                        </div>
-                        <div id="gnss-hw-dependent">
-                        <div class="form-check mb-2">
-                            <input class="form-check-input" type="radio" name="gnss-mode"
-                                   id="gnss-mode-automatic" value="automatic" onchange="onGnssModeChange()">
-                            <label class="form-check-label" for="gnss-mode-automatic">
-                                <strong>Automatic</strong>
-                                <span class="text-muted small">- GPS drives the locator on every confirmed fix (default)</span>
-                            </label>
-                        </div>
-                        <hr class="my-2">
-                        <div class="form-check form-switch mb-2">
-                            <input class="form-check-input" type="checkbox" id="gnss-time-sync-input">
-                            <label class="form-check-label" for="gnss-time-sync">
-                                Set the clock from GPS when there's no internet
-                            </label>
-                            <p class="text-muted small mt-1 mb-0">
-                                Keeps logged contacts correctly timestamped at a site with no
-                                network. Uses the internet as usual whenever it's available.
-                            </p>
-                        </div>
-                        </div>
-                        <div id="gnss-status-box" class="small p-2 mb-2" style="background:#0f3460; border-radius:4px;">
-                            <div class="d-flex justify-content-between"><span>Receiver</span><span class="status-value" id="gnss-connected">—</span></div>
-                            <div class="d-flex justify-content-between"><span>Locator (8-char)</span><span class="status-value" id="gnss-locator-display">—</span></div>
-                            <div class="d-flex justify-content-between"><span>Satellites / HDOP</span><span class="status-value" id="gnss-quality">—</span></div>
-                            <div class="d-flex justify-content-between"><span>Time sync</span><span class="status-value" id="gnss-time-sync-status">—</span></div>
-                            <div class="d-flex justify-content-between"><span>Status</span><span class="status-value" id="gnss-detail">—</span></div>
-                        </div>
-                        <div class="mt-2 d-flex align-items-center gap-2">
-                            <button class="btn btn-save" onclick="saveGnssMode()">Save GNSS mode</button>
-                            <span class="save-status" id="gnss-save-status"></span>
-                        </div>
-                    </div>
-                </div>
         </div>
 
         <div class="col-md-4">
@@ -6237,6 +6177,67 @@ def config_page():
                         <span id="quicklynx-status" class="save-status ms-2"></span>
                     </div>
                 </div>
+                    <div class="card-header">&#x1F6F0;&#xFE0F; GNSS Portable Locator</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            Reads a Waveshare L76K HAT on /dev/ttyAMA0 and, once a fix has held
+                            steady in the same 6-character square for 30 seconds, writes it straight
+                            into the "Portable locator" field above - the same field an operator
+                            would otherwise type by hand, attached to every logged contact as this
+                            receiver's own current position. A fixed repeater site simply doesn't
+                            have the HAT fitted, so this fails quietly and does nothing there.
+                            Configures the module for GPS + BeiDou + GLONASS (plus QZSS, always on
+                            regardless) on each connect - every constellation the L76K can actually
+                            use, for the widest satellite visibility.
+                        </p>
+                        <div class="form-check">
+                            <input class="form-check-input" type="radio" name="gnss-mode"
+                                   id="gnss-mode-manual" value="manual" onchange="onGnssModeChange()">
+                            <label class="form-check-label" for="gnss-mode-manual">
+                                <strong>Manual</strong>
+                                <span class="text-muted small">- the typed value above is authoritative; GPS is only shown</span>
+                            </label>
+                        </div>
+                        <div id="gnss-no-module-warning" class="alert alert-warning py-1 px-2 small mb-2" style="display:none;">
+                            &#x26A0;&#xFE0F; No GNSS module detected on /dev/ttyAMA0. Automatic is greyed
+                            out below until one responds - Manual above is unaffected either way, and
+                            un-greys live, no reload, the moment a fitted HAT starts answering.
+                        </div>
+                        <div id="gnss-hw-dependent">
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="radio" name="gnss-mode"
+                                   id="gnss-mode-automatic" value="automatic" onchange="onGnssModeChange()">
+                            <label class="form-check-label" for="gnss-mode-automatic">
+                                <strong>Automatic</strong>
+                                <span class="text-muted small">- GPS drives the locator on every confirmed fix (default)</span>
+                            </label>
+                        </div>
+                        <hr class="my-2">
+                        <div class="form-check form-switch mb-2">
+                            <input class="form-check-input" type="checkbox" id="gnss-time-sync-input">
+                            <label class="form-check-label" for="gnss-time-sync">
+                                Set the clock from GPS when there's no internet
+                            </label>
+                            <p class="text-muted small mt-1 mb-0">
+                                Keeps logged contacts correctly timestamped at a site with no
+                                network. Uses the internet as usual whenever it's available.
+                            </p>
+                        </div>
+                        </div>
+                        <div id="gnss-status-box" class="small p-2 mb-2" style="background:#0f3460; border-radius:4px;">
+                            <div class="d-flex justify-content-between"><span>Receiver</span><span class="status-value" id="gnss-connected">—</span></div>
+                            <div class="d-flex justify-content-between"><span>Locator (8-char)</span><span class="status-value" id="gnss-locator-display">—</span></div>
+                            <div class="d-flex justify-content-between"><span>Satellites / HDOP</span><span class="status-value" id="gnss-quality">—</span></div>
+                            <div class="d-flex justify-content-between"><span>Time sync</span><span class="status-value" id="gnss-time-sync-status">—</span></div>
+                            <div class="d-flex justify-content-between"><span>Status</span><span class="status-value" id="gnss-detail">—</span></div>
+                        </div>
+                        <div class="mt-2 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveGnssMode()">Save GNSS mode</button>
+                            <span class="save-status" id="gnss-save-status"></span>
+                        </div>
+                    </div>
+                </div>
+
         </div>
 
     </div>

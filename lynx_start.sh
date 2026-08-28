@@ -70,6 +70,20 @@ save_log_tail() {
     fi
 }
 
+# ── systemd watchdog ────────────────────────────────────────────
+# Pinged during startup as well as from the health-check loop at the
+# bottom of this script. WatchdogSec counts from the moment the process
+# launches - there is no separate startup grace for Type=simple - and
+# the loop is not reached until the network wait, the clock wait, the
+# web app and the overlay have all completed. Feeding the clock from
+# the beginning means a slow cold start can never be mistaken for a
+# hang.
+#
+# Silent no-op when not running under systemd: systemd-notify simply
+# has no socket to talk to, and this script must run identically either
+# way.
+wd() { systemd-notify WATCHDOG=1 2>/dev/null || true; }
+
 echo -e "${BLUE}╔══════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║       Lynx DATV Receiver             ║${NC}"
 echo -e "${BLUE}║       G8YTZ / EI3IOB  2026           ║${NC}"
@@ -83,6 +97,7 @@ echo -e "${BLUE}╚════════════════════�
 # launch, but has been observed to NEVER succeed at all when this
 # script is launched via labwc's autostart. A genuine reachability
 # check (not just "interface has an IP") catches this properly.
+wd
 echo -ne "Waiting for network... "
 for i in $(seq 1 45); do
     GATEWAY=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
@@ -140,6 +155,7 @@ iw wlan0 set power_save off 2>/dev/null || true
 # NTP can never reach a server, the clock never jumps at all, which is
 # exactly the condition this wait exists to protect against in the
 # first place.
+wd
 echo -ne "Waiting for system time sync... "
 for i in $(seq 1 45); do
     if [ "$(timedatectl show --property=NTPSynchronized --value 2>/dev/null)" = "yes" ]; then
@@ -284,6 +300,7 @@ sleep 1
 # Appended, not truncated, so it survives across boots; rotated on size
 # here rather than via logrotate, so an install needs no extra package
 # and no root-owned config to keep it bounded.
+wd
 echo -ne "Starting Lynx web app... "
 APP_LOG_TARGETS=(/tmp/lynx_app.log)
 rm -f /tmp/lynx_app.log
@@ -351,6 +368,7 @@ wpctl set-volume @DEFAULT_AUDIO_SINK@ 1.0 2>/dev/null || true
 # Confirmed live as a real, intermittent failure - removed entirely.
 
 # ── Start OSD overlay — shows logo when unlocked, OSD always ──────
+wd
 echo -ne "Starting OSD overlay... "
 LD_PRELOAD=${LAYER_SHELL_LIB} python3 ${LYNX_DIR}/lynx_overlay.py > /tmp/lynx_overlay.log 2>&1 &
 OVERLAY_PID=$!

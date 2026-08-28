@@ -4,6 +4,17 @@ All notable changes to Lynx are documented here, in reverse chronological order.
 
 ## 2026-08-25
 
+**Changed**
+- GNSS Portable Locator moved to the bottom of the third column on the Config page, below QuickLynx Spectrum Tuner. Moved verbatim, so nothing about the card itself changed.
+
+
+**Fixed**
+- `NotifyAccess=all` added to lynx.service. Without it EVERY notification was silently discarded - including every watchdog ping - so systemd killed the service every 45 seconds however healthy it was: "Result: watchdog", "signal=ABRT", restarting on a loop while the picture was perfectly fine. NotifyAccess defaults to `none` and Type=notify sets it implicitly, so this was never needed until the switch to Type=simple in July, and nothing replaced it at the time. `all` rather than `main` because systemd-notify runs as a child of the start script rather than as the main process, so even `main` would reject it - which is also why the original Type=notify readiness signal never arrived and Type=notify appeared not to work. Same root cause, identified only now.
+- lynx.service is ordered against `default.target`, not `graphical-session.target`. That target is activated by a desktop session manager, and on a receiver with the desktop stripped out nothing pulls it in - confirmed directly, it sits "inactive (dead)" indefinitely while default.target is active, so the unit never started at all and never logged a word to explain why. The compositor is now waited for explicitly instead, by watching for its Wayland socket, which is better in any case: it waits for the thing Lynx actually needs rather than for a target that may or may not be activated.
+- WatchdogSec raised from 45s to 180s, and lynx_start.sh now pings during its startup waits rather than only from the health-check loop. The loop is not reached until the network wait, the clock wait, the web app and the overlay have all completed, and WatchdogSec counts from process launch with no startup grace for Type=simple - so 45s comfortably exceeded the ping interval but not a cold start.
+- lynx.service invokes the start script through bash rather than directly, so a missing execute bit cannot stop it - the same silent failure already fixed in the labwc autostart.
+
+
 **Fixed**
 - The PipeWire tools package is `pipewire-bin`, not `pipewire-utils`. The wrong name had been in the overlay's own "is pipewire-utils installed?" error message for some time, and adding it to install.sh's package list on the strength of that aborted the whole install with "Unable to locate package" - taking everything after it, including the autostart repair below, with it. Corrected in install.sh and in both error messages, which were the very things anyone would have read while trying to work out what to install.
 - The labwc autostart entry now invokes the start script through bash rather than running it directly, so a missing execute bit can no longer stop a receiver starting. The bit is not preserved by every route a file takes onto a Pi - SFTP drops it, and a file copied by hand rather than pulled arrives without it - and when that happened the autostart failed SILENTLY: no picture, no overlay, nothing in any log, just the bare desktop with no indication why. install.sh also repairs an autostart written the old way, on every run including Update Now, so existing receivers are fixed without anyone needing to know this was ever a problem. The explicit chmod remains, since someone typing ./lynx_start.sh by hand still needs it, and now covers install.sh as well.
