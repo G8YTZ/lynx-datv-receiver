@@ -57,7 +57,7 @@ sudo apt install -y \
   wtype \
   iw \
   chrony \
-  pipewire-utils \
+  pipewire-bin \
   wlr-randr \
   git
 

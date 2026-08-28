@@ -491,7 +491,7 @@ def audio_ppm_monitor():
             state["ppm_level_dbfs_r"] = meter_r.level_dbfs
 
         except FileNotFoundError:
-            print("[overlay] pw-cat not found - PPM meter unavailable (is pipewire-utils installed?)")
+            print("[overlay] pw-cat not found - PPM meter unavailable (is pipewire-bin installed?)")
             time.sleep(30)
         except Exception as e:
             print(f"[overlay] PPM audio tap error: {type(e).__name__}: {e}")

@@ -788,7 +788,7 @@ class SqueakListener(threading.Thread):
 
     def _capture(self):
         if not shutil.which('pw-cat'):
-            raise RuntimeError('pw-cat not found (is pipewire-utils installed?)')
+            raise RuntimeError('pw-cat not found (is pipewire-bin installed?)')
         # -fragment_size and PIPEWIRE_LATENCY both ask for a RELAXED
         # capture, and they are the point of this whole block.
         #
