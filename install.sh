@@ -57,6 +57,7 @@ sudo apt install -y \
   wtype \
   iw \
   chrony \
+  pipewire-utils \
   git
 
 # --- Python dependencies -------------------------------------

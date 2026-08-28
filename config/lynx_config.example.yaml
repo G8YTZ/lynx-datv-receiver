@@ -341,23 +341,14 @@ ryde:
 # deliberate: the results are wanted during the transmission, in the
 # gap between passes, so an adjustment can be made and the next pass
 # seen. It also takes priority over a Pathfinder card where both fall
-# due at once.
+# due at once - Pathfinder waits its turn rather than being lost.
 squeak:
-  # OFF by default, deliberately. Enabling this starts a permanent
-  # capture of the audio output, which has to run continuously because a
-  # Lindos sequence can arrive at any moment - so it is a real, ongoing
-  # cost on a receiver whose owner may never send one. A capture client
-  # also influences how PipeWire schedules the whole audio graph, and on
-  # a Pi already decoding video that has been enough to produce
-  # stuttering audio and stalled video. Mitigated (see lynx_squeak.py's
-  # own capture command) but not worth imposing on people who did not
-  # ask for it. Turn it on from the Config page when you want it.
-  enabled: false
+  enabled: true
   # Which monitor to listen on. Leave BLANK and it follows whatever
   # output mpv is actually playing to - the same rule the PPM meter
   # uses, and for the same reason: watching the system default instead
-  # means that selecting a different output leaves the measurement
-  # reading silence, which looks like a broken detector rather than a
+  # means selecting a different output leaves the measurement reading
+  # silence, which looks like a broken detector rather than a
   # misdirected one. Only set a name here to override that.
   source: ''
   # How long a card stays up. Worth setting close to the gap between
@@ -375,18 +366,6 @@ pathfinder:
   min_span_km: 15         # closest zoom, so a local contact still shows context
   max_span_km: 1000       # widest zoom - beyond this the frame stops growing
   max_distance_km: 1200   # further than this, the locator is assumed stale
-  qo100_test: false       # DEVELOPMENT/DEMO ONLY - forces every card to draw the
-                          # QO-100 globe view regardless of the real frequency.
-                          # A contact via QO-100 is normally detected on its own,
-                          # by adding the LNB LO back to the frequency the
-                          # Picotuner reports and testing the resulting downlink
-                          # against the satellite-only part of 3cm - so this
-                          # switch is never needed in normal operation. It exists
-                          # so the globe can be developed and demonstrated at a
-                          # site with no 3cm satellite installation, and is
-                          # deliberately not on the Config page: it makes every
-                          # card wrong, and is only ever wanted by someone
-                          # editing this file by hand. Leave false.
                           # rather than the contact genuinely extraordinary,
                           # and no card is drawn. Matches the extent of the
                           # map data shipped in geo/.

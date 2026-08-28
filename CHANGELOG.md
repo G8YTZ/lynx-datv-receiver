@@ -4,6 +4,12 @@ All notable changes to Lynx are documented here, in reverse chronological order.
 
 ## 2026-08-25
 
+**Fixed**
+- Auto-Squeak now captures with `pw-cat`, exactly as the PPM meter has read the same monitor all along - same program, same flags, no extra environment. Asking ffmpeg's `-f pulse` input for large fragments, and setting PIPEWIRE_LATENCY alongside it, was the obvious fix and did not work: `-f pulse` is not a PipeWire client at all, it connects through the PulseAudio compatibility layer, and the negotiation that sets the graph quantum happens there regardless of what is requested further up. Confirmed in the field on a Pi 5 sitting 86% idle - stuttering on every codec with Auto-Squeak on, perfect with it off, so nothing to do with decoding. Deliberately no PIPEWIRE_LATENCY on the pw-cat path either: a large-quantum request is plausible but is reasoning rather than evidence, and it would make this tap subtly different from the one already proven.
+- `pipewire-utils` added to install.sh. `pw-cat` was already required by the PPM meter - the overlay's own error message asks whether the package is installed - but it was never a stated dependency and worked only because Raspberry Pi OS happens to ship it. Two features now rely on it.
+- Auto-Squeak settings documented in lynx_config.example.yaml, which had no `squeak:` section at all.
+
+
 **Action required after updating**
 - **Reboot the Pi by hand once.** "Update Now" runs whatever is already loaded in memory, so the update that delivers these fixes is still carried out by the code they replace. Every update after this one restarts on its own.
 - **If Reboot, Shutdown or Kill WiFi still do nothing, run the installer once:** `cd ~/lynx && ./install.sh`. Those buttons need passwordless sudo. Raspberry Pi OS normally grants it to the first user, but not always - a user added later, or some headless setups, may not have it, and both receivers examined while fixing this turned out to lack it. `install.sh` configures it properly, but it needs sudo to do so, so it has to be run from a terminal where you can type your password once. It cannot be done from the Web UI, and no amount of updating will fix it on its own. After this release those buttons say so in the log rather than silently doing nothing, so you will know which situation you are in.

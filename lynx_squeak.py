@@ -705,7 +705,7 @@ class SqueakListener(threading.Thread):
     DEFAULT_SOURCE = '@DEFAULT_MONITOR@'
 
     def __init__(self, source=None, on_result=None, sr=48000,
-                 ffmpeg='ffmpeg', chunk_s=0.10):
+                 chunk_s=0.10):
         super().__init__(daemon=True)
         # PulseAudio's own alias for "the monitor of whatever sink is
         # currently the default", which PipeWire's compatibility layer
@@ -717,7 +717,6 @@ class SqueakListener(threading.Thread):
         self.source = source or self.DEFAULT_SOURCE
         self.sr = sr
         self.on_result = on_result
-        self.ffmpeg = ffmpeg
         self.chunk = int(sr * chunk_s)
         self.running = False
         self._proc = None
@@ -748,7 +747,7 @@ class SqueakListener(threading.Thread):
                 pass
 
     def _reap(self):
-        """Make sure the previous ffmpeg is genuinely gone.
+        """Make sure the previous pw-cat is genuinely gone.
 
         run() below restarts _capture() on ANY exception, and
         'audio stream ended' is one this class raises itself - a normal
@@ -788,8 +787,8 @@ class SqueakListener(threading.Thread):
                 _time.sleep(3.0)
 
     def _capture(self):
-        if not shutil.which(self.ffmpeg):
-            raise RuntimeError(f'{self.ffmpeg} not found')
+        if not shutil.which('pw-cat'):
+            raise RuntimeError('pw-cat not found (is pipewire-utils installed?)')
         # -fragment_size and PIPEWIRE_LATENCY both ask for a RELAXED
         # capture, and they are the point of this whole block.
         #
@@ -806,15 +805,31 @@ class SqueakListener(threading.Thread):
         # the fact, from a buffer, and a card appears seconds later
         # regardless. Asking to be served in large lazy chunks costs
         # nothing and takes the capture out of the critical path.
-        cmd = [self.ffmpeg, '-hide_banner', '-loglevel', 'error',
-               '-f', 'pulse', '-fragment_size', '65536', '-i', self.source,
-               '-ar', str(self.sr), '-ac', '2',
-               '-f', 's16le', '-']
-        env = dict(os.environ)
-        env.setdefault('PIPEWIRE_LATENCY', '8192/48000')
+        # Captured with pw-cat, IDENTICAL to how the PPM meter has read
+        # this same monitor all along - same program, same flags, no
+        # extra environment.
+        #
+        # Asking ffmpeg's "-f pulse" input for large fragments was the
+        # obvious fix for the above and did not work, because it treats
+        # the symptom from inside the problem: "-f pulse" is not a
+        # PipeWire client at all, it connects through the PulseAudio
+        # compatibility layer, and the negotiation that sets the graph
+        # quantum happens there regardless of what is asked for further
+        # up. pw-cat speaks to PipeWire natively and never enters that
+        # negotiation - which is precisely why the PPM, doing exactly
+        # this, has never disturbed anything.
+        #
+        # Deliberately no PIPEWIRE_LATENCY here either. Requesting a
+        # large quantum is plausible and probably harmless, but it is
+        # reasoning rather than evidence, and it would make this tap
+        # subtly different from the one already proven on this monitor.
+        # If a second capture ever does disturb the graph, that is worth
+        # finding out against the known-good method, not a variant.
+        cmd = ['pw-cat', '-r', f'--target={self.source}',
+               '--format=s16', '--rate', str(self.sr),
+               '--channels', '2', '-']
         self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                       stderr=subprocess.DEVNULL,
-                                      env=env,
                                       bufsize=self.chunk * 8)
         print(f"[squeak] listening on {self.source}")
         nbytes = self.chunk * 2 * 2
