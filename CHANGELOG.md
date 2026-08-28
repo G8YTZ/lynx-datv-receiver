@@ -4,6 +4,13 @@ All notable changes to Lynx are documented here, in reverse chronological order.
 
 ## 2026-08-25
 
+**Changed**
+- The scheduled reboot is now ENABLED by default and runs once a night at 03:00, rather than being installed-but-dormant and running twice daily at 04:00 and 16:00. A receiver is an appliance expected to run unattended for months, so a restart at a genuinely quiet hour costs nothing and clears anything that has slowly crept up which nobody has thought to look for. The afternoon slot was dropped because it fell in the middle of the day for anyone actually using the repeater, and nothing needs clearing that often. Still carries up to 5 minutes of jitter so several receivers on one site never drop together. Turn it off with `sudo systemctl disable --now lynx-scheduled-reboot.timer`.
+
+**Fixed**
+- The stack-trace logs now rotate at 2 MB. `/var/log/lynx/stacktrace.log` and `stacktrace_overlay.log` are opened for append by faulthandler and written to again by the watchdog, and unlike everything else in that directory they had no cap at all - so they grew across reboots indefinitely. About a kilobyte per incident, which is why it went unnoticed, but a fault recurring on an unattended site writes one every time: the HDMI hotplug case alone produced three inside a quarter of an hour.
+
+
 **Fixed**
 - Auto-Squeak now captures with `pw-cat`, exactly as the PPM meter has read the same monitor all along - same program, same flags, no extra environment. Asking ffmpeg's `-f pulse` input for large fragments, and setting PIPEWIRE_LATENCY alongside it, was the obvious fix and did not work: `-f pulse` is not a PipeWire client at all, it connects through the PulseAudio compatibility layer, and the negotiation that sets the graph quantum happens there regardless of what is requested further up. Confirmed in the field on a Pi 5 sitting 86% idle - stuttering on every codec with Auto-Squeak on, perfect with it off, so nothing to do with decoding. Deliberately no PIPEWIRE_LATENCY on the pw-cat path either: a large-quantum request is plausible but is reasoning rather than evidence, and it would make this tap subtly different from the one already proven.
 - `pipewire-utils` added to install.sh. `pw-cat` was already required by the PPM meter - the overlay's own error message asks whether the package is installed - but it was never a stated dependency and worked only because Raspberry Pi OS happens to ship it. Two features now rely on it.

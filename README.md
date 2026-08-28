@@ -18,7 +18,7 @@ A Raspberry Pi 5 based DATV receiver for the Picotuner (WinterHill firmware), wi
 
 See [`lynx_install_guide.docx`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/docs/lynx_install_guide.docx) for the full, step-by-step setup guide, from a blank SD card to a working receiver — or use the one-line installer described in that guide's Section 4.1.
 
-Copy [`lynx_config.example.yaml`](./lynx_config.example.yaml) to `config/lynx_config.yaml`, start Lynx, then set your Picotuner's IP address from the Web Control Portal's Configuration page (⚙️ Config → Picotuner Network Settings) — no need to hand-edit the config file for this.
+Copy [`config/lynx_config.example.yaml`](./config/lynx_config.example.yaml) to `config/lynx_config.yaml`, start Lynx, then set your Picotuner's IP address from the Web Control Portal's Configuration page (⚙️ Config → Picotuner Network Settings) — no need to hand-edit the config file for this.
 
 ## Documentation
 

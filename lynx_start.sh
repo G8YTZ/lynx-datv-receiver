@@ -204,6 +204,23 @@ echo -ne "Starting Lynx web app... "
 APP_LOG_TARGETS=(/tmp/lynx_app.log)
 rm -f /tmp/lynx_app.log
 if [ -w /var/log/lynx ] 2>/dev/null; then
+    # Rotate the stack-trace logs on the same principle as the app log
+    # below. These are opened for APPEND by faulthandler in both
+    # lynx_app.py and lynx_overlay.py, and written to again by this
+    # script's own watchdog - so unlike everything else in
+    # /var/log/lynx they had no cap at all and grew across reboots
+    # forever. Each incident is only about a kilobyte, which is why it
+    # went unnoticed, but a fault that recurs on an unattended site
+    # writes one every time it happens: the HDMI hotplug case alone
+    # produced three inside a quarter of an hour. Small threshold,
+    # because these are diagnostic breadcrumbs rather than a log
+    # anyone reads in bulk, and the recent ones are the useful ones.
+    for _st in /var/log/lynx/stacktrace.log /var/log/lynx/stacktrace_overlay.log; do
+        if [ -f "$_st" ] && \
+           [ "$(stat -c %s "$_st" 2>/dev/null || echo 0)" -gt 2000000 ]; then
+            mv -f "$_st" "${_st}.1" 2>/dev/null || true
+        fi
+    done
     PERSIST_LOG=/var/log/lynx/lynx_app.log
     if [ -f "$PERSIST_LOG" ] && \
        [ "$(stat -c %s "$PERSIST_LOG" 2>/dev/null || echo 0)" -gt 20000000 ]; then

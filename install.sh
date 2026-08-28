@@ -348,7 +348,7 @@ systemctl --user daemon-reload
 # rebooting itself twice a day is right for a hilltop and wrong for a
 # desk, so that call belongs to whoever installed it. System units
 # rather than user ones, since rebooting needs root.
-echo "--- Installing (not enabling) scheduled reboot units ---"
+echo "--- Installing and enabling the nightly reboot ---"
 # Guarded rather than a bare cp. With `set -e` at the top of this
 # script, a missing unit file aborts the whole install here - leaving a
 # half-configured system, and an error message ("cannot stat
@@ -363,6 +363,20 @@ if [ -f ~/lynx/lynx-scheduled-reboot.service ] && [ -f ~/lynx/lynx-scheduled-reb
   sudo cp ~/lynx/lynx-scheduled-reboot.service /etc/systemd/system/
   sudo cp ~/lynx/lynx-scheduled-reboot.timer /etc/systemd/system/
   sudo systemctl daemon-reload
+  # Enabled by default now, rather than merely installed and left for
+  # the operator to discover. A receiver is an appliance expected to run
+  # unattended for months, and a restart at a genuinely quiet hour costs
+  # nothing while clearing anything that has slowly crept up which
+  # nobody has thought to look for. 03:00, with up to 5 minutes of
+  # jitter so several receivers on one site never drop together.
+  #
+  # Turn it off with:
+  #   sudo systemctl disable --now lynx-scheduled-reboot.timer
+  if sudo systemctl enable --now lynx-scheduled-reboot.timer >/dev/null 2>&1; then
+    echo "Nightly reboot enabled (03:00)."
+  else
+    echo "Could not enable the nightly reboot timer - enable it by hand if wanted."
+  fi
 else
   echo ""
   echo ">>> Scheduled reboot units not found in ~/lynx - skipping."
@@ -406,14 +420,13 @@ fi
 echo ""
 echo "=== Install complete ==="
 echo ""
-echo "For a repeater or other unattended site, consider enabling the"
-echo "scheduled reboot - twice daily, at 04:00 and 16:00 with a few"
-echo "minutes of jitter so several receivers don't all drop at once:"
-echo ""
-echo "    sudo systemctl enable --now lynx-scheduled-reboot.timer"
+echo "This receiver will reboot itself nightly at 03:00, with a few minutes"
+echo "of jitter so several receivers on one site never drop together."
+echo "Enabled by default - it costs nothing at that hour and clears"
+echo "anything that has slowly crept up."
 echo ""
 echo "  Check when it will next fire:  systemctl list-timers lynx-scheduled-reboot.timer"
-echo "  Turn it off again:            sudo systemctl disable --now lynx-scheduled-reboot.timer"
+echo "  Turn it off:                  sudo systemctl disable --now lynx-scheduled-reboot.timer"
 echo ""
 echo "One thing still needs doing by hand:"
 echo ""

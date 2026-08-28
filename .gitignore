@@ -1,3 +1,34 @@
-.DS_Store
-.DS_Store
+# ---------------------------------------------------------------------
+#  Lynx - files that must never be committed
+# ---------------------------------------------------------------------
+
+# Runtime state, written by the running receiver. config/lynx_config.yaml
+# in particular holds the site's own settings - Picotuner address, site
+# locator, QRZ API key, Slack webhook - so committing it would publish
+# someone's credentials. Note the EXAMPLE config is deliberately not
+# ignored: that is the template and belongs in the repository.
+config/lynx_config.yaml
+lynx_state.json
+diversity_stats_pcr.jsonl
+tri_watch_notification.mp3
+
+# Logs and diagnostics
+*.log
+lynx_stacktrace*.log
+stacktrace*.log
+
+# Local backups made while testing on a receiver
+*.old
+*.bak
+*.orig
+*~
+
+# Python
 __pycache__/
+*.pyc
+*.pyo
+
+# Editors and operating systems
+.DS_Store
+.vscode/
+.idea/

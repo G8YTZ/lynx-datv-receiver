@@ -366,6 +366,18 @@ pathfinder:
   min_span_km: 15         # closest zoom, so a local contact still shows context
   max_span_km: 1000       # widest zoom - beyond this the frame stops growing
   max_distance_km: 1200   # further than this, the locator is assumed stale
+  qo100_test: false       # DEVELOPMENT/DEMO ONLY - forces every card to draw the
+                          # QO-100 globe view regardless of the real frequency.
+                          # A contact via QO-100 is normally detected on its own,
+                          # by adding the LNB LO back to the frequency the
+                          # Picotuner reports and testing the resulting downlink
+                          # against the satellite-only part of 3cm - so this
+                          # switch is never needed in normal operation. It exists
+                          # so the globe can be developed and demonstrated at a
+                          # site with no 3cm satellite installation, and is
+                          # deliberately not on the Config page: it makes every
+                          # card wrong, and is only ever wanted by someone
+                          # editing this file by hand. Leave false.
                           # rather than the contact genuinely extraordinary,
                           # and no card is drawn. Matches the extent of the
                           # map data shipped in geo/.
