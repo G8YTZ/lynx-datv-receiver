@@ -2486,7 +2486,19 @@ def picotuner_quality_monitor():
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
                 sock.settimeout(5)
                 sock.bind(('', cfg['status_port'] - 96))  # 9997-96 = 9901
-            data, _ = sock.recvfrom(4096)
+            data, addr = sock.recvfrom(4096)
+            # Only accept status from the PicoTuner we are actually using.
+            # Without this, ANY PicoTuner broadcasting on these ports is
+            # believed - and Brian G4EWJ confirms two boards sharing a base
+            # IP port both broadcast to the same place, so a second unit on
+            # the network would interleave its readings with ours at twice
+            # a second: MER from one, callsign from the other. That is the
+            # same shared-state corruption as the MER/modcod bug, except arriving
+            # from outside the process, where no amount of internal locking
+            # would help. The discovery listener has always filtered this
+            # way; these two monitors never did.
+            if addr[0] != cfg['host']:
+                continue
             fields = {}
             for line in data.decode(errors='replace').splitlines():
                 line = line.strip()
@@ -2674,7 +2686,19 @@ def picotuner_table_monitor_b():
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
                 sock.settimeout(5)
                 sock.bind(('', cfg['status_port'] - 93))  # 9997-93 = 9904
-            data, _ = sock.recvfrom(4096)
+            data, addr = sock.recvfrom(4096)
+            # Only accept status from the PicoTuner we are actually using.
+            # Without this, ANY PicoTuner broadcasting on these ports is
+            # believed - and Brian G4EWJ confirms two boards sharing a base
+            # IP port both broadcast to the same place, so a second unit on
+            # the network would interleave its readings with ours at twice
+            # a second: MER from one, callsign from the other. That is the
+            # same shared-state corruption as the MER/modcod bug, except arriving
+            # from outside the process, where no amount of internal locking
+            # would help. The discovery listener has always filtered this
+            # way; these two monitors never did.
+            if addr[0] != cfg['host']:
+                continue
             text = data.decode(errors='replace')
             for line in text.splitlines():
                 parts = line.split()
