@@ -5969,6 +5969,7 @@ def config_page():
                     </div>
                 </div>
 
+                </div>
         </div>
 
         <div class="col-md-4">
@@ -6177,6 +6178,7 @@ def config_page():
                         <span id="quicklynx-status" class="save-status ms-2"></span>
                     </div>
                 </div>
+                    <div class="card mb-3">
                     <div class="card-header">&#x1F6F0;&#xFE0F; GNSS Portable Locator</div>
                     <div class="card-body">
                         <p class="text-muted small">
@@ -6236,7 +6238,7 @@ def config_page():
                             <span class="save-status" id="gnss-save-status"></span>
                         </div>
                     </div>
-                </div>
+                    </div>
 
         </div>
 

@@ -5,7 +5,8 @@ All notable changes to Lynx are documented here, in reverse chronological order.
 ## 2026-08-25
 
 **Changed**
-- GNSS Portable Locator moved to the bottom of the third column on the Config page, below QuickLynx Spectrum Tuner. Moved verbatim, so nothing about the card itself changed.
+- GNSS Portable Locator moved to the bottom of the third column on the Config page, below QuickLynx Spectrum Tuner.
+- The GNSS card never had a `<div class="card mb-3">` wrapper of its own - it opened straight at `card-header`, and its trailing `</div>` was silently closing the COLUMN instead. That went unnoticed because the browser renders it anyway, and because a div COUNT stays balanced either way. Moving the card verbatim therefore took the column's closing tag with it, nesting column three inside column two and squashing it to a narrow strip. Now given the wrapper it always needed, with the column's own close left where it belongs. Verified by parsing the page and checking every col-md-4 sits at the same nesting depth, rather than by counting tags - the count was identical in both the working and the broken version, which is exactly why counting did not catch it.
 
 
 **Fixed**
