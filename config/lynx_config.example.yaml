@@ -220,6 +220,26 @@ relay:
 # live source-switching on real hardware end-to-end.
 tri_watch:
   enabled: false
+
+  # Keep reading the transport stream of whichever RF source is NOT
+  # currently being displayed, discarding it, so that no receiver's
+  # output goes entirely unread.
+  #
+  # OFF by default, and best left off. It was written to test an idea
+  # that was never confirmed on real hardware: every other working
+  # configuration has something reading both receivers' streams
+  # continuously (diversity has the combiner doing exactly that), and
+  # tri_watch was the only case where one receiver's output went into a
+  # port with nothing on the other end. Whether that actually troubles
+  # the Picotuner has never been demonstrated.
+  #
+  # What it definitely did was hold the port of a source that had since
+  # become the displayed one, so mpv could not bind it: the tuner locked,
+  # the stream arrived at full rate, and the screen stayed black. That
+  # looks exactly like a hardware fault and is not one.
+  #
+  # Only turn this on to investigate the original idea again.
+  port_drainers: false
   # How long a source must stay CONTINUOUSLY active before tri_watch
   # shows a NOTIFICATION about it - deliberately does NOT delay the
   # actual display switch itself, which always reacts immediately to

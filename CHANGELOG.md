@@ -2,6 +2,22 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-08-29
+
+**Added**
+- Picotuner ports and receiver numbers are now taken from the board's own broadcast instead of being assumed. A PicoTunerWH can be jumpered (GP28 to ground) to present as the SECOND WinterHill unit - receivers 5 and 6 on base port 9904 rather than 1 and 2 on 9900 - and Lynx assumed 1 and 2 unconditionally, so it addressed receivers that do not exist on ports nothing is listening to. Every command vanished while the status broadcasts, which need no addressing at all, kept arriving: right frequencies on screen, every tune accepted, nothing ever happening. The jumper exists so two boards can share one network and WinterHill users are told to fit it, so it is a configuration to live with rather than a mistake to correct.
+- All four derived ports now follow the announced base port, per Brian G4EWJ and confirmed live against a genuinely jumpered board: TS at base+41/+42, table at base+4, and `$` info at `(base & ~3) + 1`. That last one is the trap - all four receivers of a WinterHill send their `$` info to one port, so the base is masked down to a multiple of four first, meaning base 9912 and 9914 both give 9913. Lynx previously derived these by subtracting from the broadcast port (9997-96 and 9997-93), which is correct for base 9900 by coincidence and wrong for every other base.
+- Commands are addressed BOTH ways: to `9920 + receiver number`, and by the `rcv=` field inside the payload. Getting only the port right is not enough - confirmed live, with commands arriving correctly at 9925/9926 and the board ignoring every one because they said `rcv=1` and `rcv=2` while its receivers were 5 and 6.
+- Status sockets rebind when the base port changes. The base port is learned from a broadcast after the sockets are first created, and resets to the default on every start, so it is always learned late - without rebinding a jumpered board's status goes to 9905/9908 while Lynx listens on 9901/9904 and hears nothing, for ever.
+- Receiver numbers are also read from the discovery broadcast, not only the table format. The command ports derive from the receiver numbers, the numbers came only from the table, and the table is only sent once the tuner has been successfully tuned - which needs the command ports. A jumpered board sat in "search" for ever as a result. The discovery broadcast carries them as `RX5`/`RX6` labels and is sent continuously while the tuner is idle, which is exactly when they are needed.
+- Tested on real hardware in both directions - jumper in and out, live, without restarting Lynx - across single, diversity and Tri-Watch, including a cold start with a jumpered board.
+
+**Fixed**
+- The two Picotuner status monitors (`$` info and table format) now check who sent each packet and ignore anything not from the configured board. They bound the ports but discarded the sender's address, so any Picotuner broadcasting there was believed - and two boards sharing a base IP port both broadcast to the same place, so a second unit would have interleaved its readings with ours at twice a second. The discovery listener has always filtered this way; these two never did.
+- Tri-Watch port drainers are off by default, behind `tri_watch.port_drainers`. The drainer was built to test a hypothesis never confirmed on hardware, and it caused a definite failure: it held the TS port of a source that had since become the displayed one, so mpv could not bind it, failed instantly with "Address already in use", and the lifecycle logic retried for ever while the cover stayed up. Tuner locked, transport stream arriving at full rate, black screen - which looks like a hardware fault and is not. The reason its stop path does not release the socket is still not understood; an unproven mitigation for a hypothetical problem should not stay on while it is causing a proven one.
+- Tuner B's MER on a jumpered board. Everything about tuner B worked except its MER, because that is the one field which comes from the table format rather than the `$`-tagged report - rcv=2 never sends the richer report - and the table row was still matched against a literal `2` where a jumpered board sends `6`.
+- The settling gap between consecutive tuning commands raised from 0.3s to 0.8s as a precaution. Nothing depends on these being quick, since they run once at startup or on a deliberate tune.
+
 ## 2026-08-25
 
 **Changed**

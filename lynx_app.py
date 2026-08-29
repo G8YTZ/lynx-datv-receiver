@@ -1276,7 +1276,10 @@ def looks_like_callsign(token):
     # happen to share a valid callsign's shape. Secondary to the test
     # above, not a replacement for it - "K1A" is a real callsign and
     # "RX1" is not, and nothing about their form distinguishes them.
-    if t in {"RX1", "RX2", "RX3", "RX4"}:
+    # RX5-RX8 included because a board jumpered to be the second
+    # WinterHill unit uses those labels, and they would otherwise be
+    # mistaken for callsigns exactly as RX1-RX4 would.
+    if t in {"RX1", "RX2", "RX3", "RX4", "RX5", "RX6", "RX7", "RX8"}:
         return False
     return True
 
@@ -1326,6 +1329,12 @@ def picotuner_monitor():
                 if mac:
                     discovered_picotuners[mac] = {
                         "ip": fields.get("IP address", addr[0]),
+                        # Kept per tuner, not globally: selecting a different board
+                        # must bring its own base port with it, and one remembered
+                        # value would be stale the moment someone switched to a
+                        # differently-jumpered unit.
+                        "base_port": fields.get("Base IP port", ""),
+                        "mode": fields.get("Mode", ""),
                         "host_name": fields.get("Host name", ""),
                         "serial": fields.get("Pico serial", ""),
                         "software": fields.get("Software", ""),
@@ -1333,6 +1342,25 @@ def picotuner_monitor():
                         "mac": mac,
                         "last_seen": time.time(),
                     }
+                    # Follow the base port of the tuner actually in use - only
+                    # that one, since a broadcast arrives from every board on
+                    # the network and adopting someone else's would point Lynx
+                    # at ports nothing is sending to.
+                    if fields.get("IP address", addr[0]) == cfg['host']:
+                        adopt_picotuner_base_port(fields.get("Base IP port"))
+                        # The receiver numbers are in here too, as "RX5"/"RX6"
+                        # labels. Taken from this broadcast rather than only from
+                        # the table format, because of a deadlock: the command
+                        # ports derive from the receiver numbers, the numbers came
+                        # only from the table, and the table is only sent once the
+                        # tuner has been successfully tuned - which needs the
+                        # command ports. A jumpered board therefore sat in "search"
+                        # for ever, broadcasting discovery while being tuned on the
+                        # wrong ports. This broadcast is sent continuously WHILE the
+                        # tuner is idle, which is exactly when they are needed.
+                        learn_picotuner_rx_numbers(
+                            k[2:] for k in fields
+                            if k.startswith('RX') and k[2:].isdigit())
 
             # Everything below drives the actual status/OSD display, so -
             # unlike discovery above - it must only trust broadcasts from
@@ -1414,11 +1442,22 @@ def picotuner_monitor():
                                   f"overload indication, please report it so "
                                   f"it can be shown properly.")
 
-            # Parse RX1 line: "437.024 G8YTZ" or "437.000T search"
+            # Parse tuner A's RX line: "437.024 G8YTZ" or "437.000T
+            # search". The label carries the board's OWN receiver number,
+            # so it is "RX1" on a normal board and "RX5" on one jumpered
+            # to be the second WinterHill. Matched against the learned
+            # number rather than the literal - otherwise a jumpered board
+            # reports its lock, callsign and frequency and Lynx sees none
+            # of it, leaving the OSD stuck on the last frequency it knew
+            # and permanently SEARCHING while the tuner is locked and
+            # decoding perfectly. Confirmed exactly that way on real
+            # hardware.
+            rx_label_a = f"RX{picotuner_rx_numbers['a']}"
+            rx_label_b = f"RX{picotuner_rx_numbers['b']}"
             for line in text.splitlines():
                 line = line.strip()
-                if line.startswith("RX1"):
-                    rx1 = line.replace("RX1", "").strip()
+                if line.startswith(rx_label_a):
+                    rx1 = line.replace(rx_label_a, "").strip()
                     picotuner_state["rx1_raw"] = rx1
                     parts = rx1.split()
                     # Not-locked states. "header" is WinterHill's
@@ -1441,12 +1480,12 @@ def picotuner_monitor():
                         picotuner_state["callsign"] = ""
                         if parts:
                             picotuner_state["frequency"] = parts[0].rstrip("TB")
-                if line.startswith("RX2"):
+                if line.startswith(rx_label_b):
                     # Same format as RX1 — confirmed live: "437.024B G8YTZ".
                     # The trailing letter (T/B here) appears to indicate
                     # which physical plug that receiver is currently on,
                     # not something specific to RX1 vs RX2 — strip either.
-                    rx2 = line.replace("RX2", "").strip()
+                    rx2 = line.replace(rx_label_b, "").strip()
                     picotuner_state_b["online"] = True
                     picotuner_state_b["last_seen"] = time.time()
                     parts = rx2.split()
@@ -2324,7 +2363,7 @@ def rf_mpv_lifecycle_monitor():
                 cfg = config['picotuner']
                 target_rcv = tri_watch_target_rcv
                 target_state = picotuner_state_b if target_rcv == 2 else picotuner_state
-                target_port = cfg['ts_port_b'] if target_rcv == 2 else cfg['ts_port']
+                target_port = picotuner_ts_port('b' if target_rcv == 2 else 'a', cfg)
                 raw_locked = target_state.get("locked", False)
 
                 if raw_locked:
@@ -2395,7 +2434,7 @@ def rf_mpv_lifecycle_monitor():
                                 restart_mpv(f"udp://@:{div_cfg['combiner_out_port']}")
                             else:
                                 cfg = config['picotuner']
-                                restart_mpv(f"udp://@:{cfg['ts_port']}")
+                                restart_mpv(f"udp://@:{picotuner_ts_port('a', cfg)}")
                             rendering_confirmed = wait_for_mpv_rendering()  # real rendering, not a guess
                             if rendering_confirmed:
                                 # Same safety margin as the other two RF
@@ -2452,6 +2491,172 @@ def rf_mpv_lifecycle_monitor():
         except Exception as e:
             print(f"[rf_mpv_lifecycle] error: {e}")
 
+# ── Port arithmetic ──────────────────────────────────────────────
+# Every port a PicoTuner uses derives from its BASE IP PORT, which the
+# board announces in its own broadcast. Base is 9900 normally, or 9904
+# when jumpered to present as the SECOND WinterHill unit, and it can be
+# set to any even number from xx00 to xx14 by remote command.
+#
+# Rules from Brian G4EWJ, confirmed live against a genuinely jumpered
+# board (2026-08-29):
+#
+#     command   9920 + receiver number      (NOT base-relative)
+#     TS        base + 41, base + 42
+#     $ info    (base & ~3) + 1
+#     table     base + 4
+#
+# The $ info rule is the trap. All four receivers of a WinterHill send
+# their $ info to ONE port, so the base is masked down to a multiple of
+# four first - meaning base 9912 and base 9914 both give 9913, not 9913
+# and 9915. Deriving it as base+1 works for 9900 and quietly breaks
+# everywhere else.
+#
+# Lynx previously derived these by subtracting from status_port (9997):
+# 9997-96 = 9901 and 9997-93 = 9904. Correct for base 9900 by
+# coincidence, wrong for every other base. A jumpered board sends its
+# status to 9905 and 9908 while Lynx listens on 9901 and 9904, so it
+# hears nothing at all - the tuner sits in "search" broadcasting
+# discovery, present and doing nothing. Confirmed exactly that way on
+# real hardware before this was written.
+PICOTUNER_DEFAULT_BASE_PORT = 9900
+
+picotuner_base_port = PICOTUNER_DEFAULT_BASE_PORT
+
+
+def picotuner_info_port(base=None):
+    """Port the $-tagged status arrives on. Masked - see above."""
+    b = picotuner_base_port if base is None else base
+    return (b & ~3) + 1
+
+
+def picotuner_table_port(base=None):
+    """Port the table-format status arrives on."""
+    b = picotuner_base_port if base is None else base
+    return b + 4
+
+
+def picotuner_ts_port(slot, cfg):
+    """Transport stream port for tuner A or B: base + 41 / base + 42.
+
+    Falls back to the configured value while the base port is still the
+    default, so a manually-addressed tuner - one on another subnet,
+    whose broadcasts never reach us at all - keeps working exactly as
+    before.
+    """
+    if picotuner_base_port != PICOTUNER_DEFAULT_BASE_PORT:
+        return picotuner_base_port + (41 if slot == 'a' else 42)
+    return cfg['ts_port'] if slot == 'a' else cfg['ts_port_b']
+
+
+def adopt_picotuner_base_port(base):
+    """Adopt a base port announced by the CONFIGURED tuner.
+
+    Deliberately not from just any board: a broadcast arrives from every
+    PicoTuner on the network, and taking the base port from someone
+    else's would point Lynx at ports nothing is sending to.
+
+    Nothing is auto-selected here - the user chooses which tuner to use
+    and this only follows what the chosen one says about itself. That
+    matters because a tuner on another subnet never broadcasts to us, so
+    its address must remain enterable by hand.
+    """
+    global picotuner_base_port
+    try:
+        b = int(base)
+    except (TypeError, ValueError):
+        return
+    if b == picotuner_base_port or not (9000 <= b <= 9999):
+        return
+    print(f"[picotuner] base IP port is {b} - status on "
+          f"{picotuner_info_port(b)}/{picotuner_table_port(b)}, "
+          f"TS on {b + 41}/{b + 42}")
+    picotuner_base_port = b
+
+
+# ── Which receiver numbers this board actually uses ──────────────
+# A PicoTunerWH can be jumpered (GP28 to ground - see the BATC PicoTuner
+# Ethernet Interface wiki) to present itself as the SECOND WinterHill
+# unit: receivers 5 and 6 on base port 9904, rather than 1 and 2 on
+# 9900. The jumper exists so two boards can share one network, and
+# WinterHill users are told to fit it. It is a configuration to live
+# with, not a mistake to correct - telling someone to remove it fixes
+# Lynx and breaks their WinterHill setup, which they then have to
+# remember to undo.
+#
+# Lynx assumed 1 and 2 unconditionally. On a jumpered board that means
+# addressing receivers which do not exist, on ports nothing is
+# listening to - so every command vanishes, while the status broadcasts,
+# which need no addressing at all, keep arriving perfectly. Two
+# receivers unusable while looking entirely healthy: right frequencies
+# on screen, every tune accepted, nothing ever happening.
+#
+# The board announces its own numbering in the broadcast Lynx already
+# reads, so it is taken from there rather than added as a setting for
+# anyone to get wrong. Read from the RX column of the table format on
+# 9904 - which lists both receivers in one packet, so a single broadcast
+# establishes the pair - with "Base IP port" as corroboration.
+#
+# Defaults to 1 and 2 so an unjumpered board behaves exactly as before
+# and nothing depends on a broadcast having been seen yet.
+picotuner_rx_numbers = {"a": 1, "b": 2}
+
+
+def learn_picotuner_rx_numbers(seen):
+    """Adopt the receiver numbers a broadcast actually reported.
+
+    seen: every RX number in one table broadcast. The lower is tuner A,
+    the higher tuner B - the firmware always lists them in that order,
+    and the pair is always consecutive (1/2, 5/6).
+    """
+    global picotuner_rx_numbers
+    nums = sorted({int(n) for n in seen if str(n).isdigit()})
+    if len(nums) < 2:
+        return
+    a, b = nums[0], nums[1]
+    if (a, b) != (picotuner_rx_numbers["a"], picotuner_rx_numbers["b"]):
+        print(f"[picotuner] board reports receivers {a} and {b} "
+              f"(command ports {9920 + a} and {9920 + b})")
+        picotuner_rx_numbers = {"a": a, "b": b}
+
+
+def picotuner_rcv(slot):
+    """The receiver number to put in a command's rcv= field.
+
+    Not the same thing as choosing the right port. A command is
+    addressed BOTH ways - it goes to 9920 + receiver number, and it
+    names the receiver again inside the payload:
+
+        [to@wh] rcv=1 fplug=a offset=0 freq=1249000 srate=1000
+
+    Getting only the port right is not enough. Confirmed live on a
+    jumpered board: commands arrived correctly at 9925 and 9926, and the
+    board ignored every one of them because they said rcv=1 and rcv=2
+    while its receivers are 5 and 6. It sat in "search" looking
+    perfectly healthy - which is exactly the symptom that started all
+    this.
+    """
+    return picotuner_rx_numbers.get(slot, 1 if slot == 'a' else 2)
+
+
+def picotuner_cmd_port(slot, cfg):
+    """Command port for tuner A or B.
+
+    9920 + receiver number, per Brian G4EWJ: "Command port is 9920 +
+    receiver number." So a jumpered board answers on 9925/9926 rather
+    than 9921/9922.
+
+    Derived from what the board reports rather than from config, because
+    the board is authoritative about its own numbering and a stale
+    config value sends commands into silence. The configured value is
+    still used when nothing has been discovered yet - on the very first
+    tune after a cold start, before any broadcast has arrived.
+    """
+    n = picotuner_rx_numbers.get(slot)
+    if n:
+        return 9920 + n
+    return cfg['cmd_port'] if slot == 'a' else cfg['cmd_port_b']
+
+
 def picotuner_quality_monitor():
     """Background thread: reads rich status from Picotuner port 9901.
 
@@ -2478,15 +2683,41 @@ def picotuner_quality_monitor():
     global picotuner_state, picotuner_state_b
     cfg = config['picotuner']
     sock = None
+    bound_port = None
     while True:
         try:
-            if sock is None:
+            # Rebind when the derived port changes. The base port is
+            # learned from a broadcast by the discovery thread, which
+            # happens AFTER these sockets are first created - and
+            # picotuner_base_port resets to the default on every start, so
+            # it is always learned late. Without rebinding, a jumpered
+            # board's status goes to 9905/9908 while this stays bound to
+            # 9901/9904 and hears nothing, for ever. Confirmed exactly
+            # that way on real hardware: base port correctly adopted and
+            # logged, sockets still on the old ports, tuner stuck.
+            if sock is None or bound_port != picotuner_info_port():
+                if sock is not None:
+                    try: sock.close()
+                    except Exception: pass
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
                 sock.settimeout(5)
-                sock.bind(('', cfg['status_port'] - 96))  # 9997-96 = 9901
-            data, _ = sock.recvfrom(4096)
+                bound_port = picotuner_info_port()
+                sock.bind(('', bound_port))
+            data, addr = sock.recvfrom(4096)
+            # Only accept status from the PicoTuner we are actually using.
+            # Without this, ANY PicoTuner broadcasting on these ports is
+            # believed - and Brian G4EWJ confirms two boards sharing a base
+            # IP port both broadcast to the same place, so a second unit on
+            # the network would interleave its readings with ours at twice
+            # a second: MER from one, callsign from the other. That is the
+            # same shared-state corruption as the MER/modcod bug, except arriving
+            # from outside the process, where no amount of internal locking
+            # would help. The discovery listener has always filtered this
+            # way; these two monitors never did.
+            if addr[0] != cfg['host']:
+                continue
             fields = {}
             for line in data.decode(errors='replace').splitlines():
                 line = line.strip()
@@ -2497,9 +2728,17 @@ def picotuner_quality_monitor():
             if not fields:
                 continue
 
+            # $0 names which receiver this report is for, using the
+            # board's own numbering - so 5 and 6 on a jumpered board,
+            # not 1 and 2. Compared against what the board reports
+            # rather than against literals, or every packet from a
+            # jumpered board is silently discarded and the receiver
+            # looks entirely healthy while nothing works.
             rx_id = fields.get('$0')
+            rx_a = str(picotuner_rx_numbers["a"])
+            rx_b = str(picotuner_rx_numbers["b"])
 
-            if rx_id == '1':
+            if rx_id == rx_a:
                 picotuner_state["mer"]         = fields.get('$12', '')
                 picotuner_state["symbol_rate"] = fields.get('$9', '')
                 picotuner_state["margin"]      = fields.get('$30', '')
@@ -2512,7 +2751,7 @@ def picotuner_quality_monitor():
                 if '$26' in fields: picotuner_state["agc1"] = fields['$26']
                 if '$27' in fields: picotuner_state["agc2"] = fields['$27']
 
-            elif rx_id == '2':
+            elif rx_id == rx_b:
                 # Deliberately narrow, matching the same principle
                 # already established for tuner B elsewhere in this
                 # file: only fields genuinely new here, not
@@ -2530,8 +2769,10 @@ def picotuner_quality_monitor():
 
             elif rx_id == '0':
                 receiver_num = fields.get('$77')
-                target = (picotuner_state if receiver_num == '1' else
-                          picotuner_state_b if receiver_num == '2' else None)
+                # $77 names the receiver for the fast lock/AGC update,
+                # again in the board's own numbering.
+                target = (picotuner_state if receiver_num == rx_a else
+                          picotuner_state_b if receiver_num == rx_b else None)
                 if target is not None:
                     if '$85' in fields: target["dbm"]  = fields['$85']
                     if '$26' in fields: target["agc1"] = fields['$26']
@@ -2666,25 +2907,66 @@ def picotuner_table_monitor_b():
     global picotuner_state_b
     cfg = config['picotuner']
     sock = None
+    bound_port = None
     while True:
         try:
-            if sock is None:
+            # Rebind when the derived port changes. The base port is
+            # learned from a broadcast by the discovery thread, which
+            # happens AFTER these sockets are first created - and
+            # picotuner_base_port resets to the default on every start, so
+            # it is always learned late. Without rebinding, a jumpered
+            # board's status goes to 9905/9908 while this stays bound to
+            # 9901/9904 and hears nothing, for ever. Confirmed exactly
+            # that way on real hardware: base port correctly adopted and
+            # logged, sockets still on the old ports, tuner stuck.
+            if sock is None or bound_port != picotuner_table_port():
+                if sock is not None:
+                    try: sock.close()
+                    except Exception: pass
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
                 sock.settimeout(5)
-                sock.bind(('', cfg['status_port'] - 93))  # 9997-93 = 9904
-            data, _ = sock.recvfrom(4096)
+                bound_port = picotuner_table_port()
+                sock.bind(('', bound_port))
+            data, addr = sock.recvfrom(4096)
+            # Only accept status from the PicoTuner we are actually using.
+            # Without this, ANY PicoTuner broadcasting on these ports is
+            # believed - and Brian G4EWJ confirms two boards sharing a base
+            # IP port both broadcast to the same place, so a second unit on
+            # the network would interleave its readings with ours at twice
+            # a second: MER from one, callsign from the other. That is the
+            # same shared-state corruption as the MER/modcod bug, except arriving
+            # from outside the process, where no amount of internal locking
+            # would help. The discovery listener has always filtered this
+            # way; these two monitors never did.
+            if addr[0] != cfg['host']:
+                continue
             text = data.decode(errors='replace')
+            # Adopt the board's own receiver numbering. The table lists
+            # both receivers in a single packet, so one broadcast
+            # establishes the pair - see learn_picotuner_rx_numbers().
+            learn_picotuner_rx_numbers(
+                l.split()[0] for l in text.splitlines()
+                if l.split() and l.split()[0].isdigit())
+            rx_a = str(picotuner_rx_numbers["a"])
+            # Tuner B's rows too - the last hardcoded receiver numbers.
+            # Only reachable on a jumpered board, where B's row is 6
+            # rather than 2, which is why everything about tuner B
+            # worked EXCEPT its MER: that is the one field which comes
+            # from this table rather than from the $-tagged report, and
+            # rcv=2 never sends the richer report at all.
+            rx_b = str(picotuner_rx_numbers["b"])
             for line in text.splitlines():
                 parts = line.split()
-                # Data rows start with the RX number (1 or 2) — header
-                # and separator rows don't parse as a leading digit,
-                # so this alone is enough to skip them without needing
-                # to match the header text itself.
+                # Data rows start with the RX number - 1 and 2 on a normal
+                # board, 5 and 6 on a jumpered one, so compared against
+                # what the board reports rather than a literal. Header and
+                # separator rows don't parse as a leading digit, so this
+                # alone is enough to skip them.
                 if not parts or not parts[0].isdigit():
                     continue
-                if parts[0] == '1' and len(parts) >= 16:
+                if parts[0] == rx_a and len(parts) >= 16:
                     # Supplement tuner A's mer/margin only - see
                     # docstring above for why this specific gap exists.
                     #
@@ -2738,7 +3020,7 @@ def picotuner_table_monitor_b():
                             picotuner_state["mer"] = parts[3]
                             picotuner_state["margin"] = parts[4]
                     continue
-                if parts[0] == '2' and len(parts) < 16:
+                if parts[0] == rx_b and len(parts) < 16:
                     # Shorter row - see docstring above. Still worth
                     # checking for a usable symbol_rate even though it
                     # doesn't have the full field set for MER/margin/
@@ -2751,7 +3033,7 @@ def picotuner_table_monitor_b():
                         if freq_val >= 50 and i + 1 < len(parts) and parts[i + 1].isdigit():
                             picotuner_state_b["symbol_rate"] = parts[i + 1]
                             break
-                if parts[0] != '2' or len(parts) < 16:
+                if parts[0] != rx_b or len(parts) < 16:
                     continue
                 # Column indices confirmed directly against real
                 # captured output before deployment — see the
@@ -2840,7 +3122,8 @@ def start_diversity_combiner():
     script_path = Path(__file__).parent / "diversity_combiner_pcr.py"
     cmd = (
         f"python3 -u {script_path} "
-        f"--port-a {cfg['ts_port']} --port-b {cfg['ts_port_b']} "
+        f"--port-a {picotuner_ts_port('a', cfg)} "
+        f"--port-b {picotuner_ts_port('b', cfg)} "
         f"--out-ip 127.0.0.1 --out-port {div_cfg['combiner_out_port']} "
         f"--live-stats-file {DIVERSITY_STATS_PATH} --stats-interval 1.0 "
         f"--mer-switch-dwell-secs {div_cfg.get('mer_switch_dwell_secs', 10.0)} "
@@ -3220,7 +3503,7 @@ def get_batc_streams_cached() -> list:
     """Send a command to the Picotuner."""
     cfg = config['picotuner']
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.sendto(cmd.encode(), (cfg['host'], cfg['cmd_port']))
+    sock.sendto(cmd.encode(), (cfg['host'], picotuner_cmd_port('a', cfg)))
     sock.close()
 
 def ryde_cmd(request: dict) -> dict:
@@ -3369,13 +3652,14 @@ def tri_watch_startup_tune():
         try:
             tuner_freq = calc_tuner_freq(src['freq'], src.get('lnb_lo_khz', 0))
             fplug = src.get('fplug', 'a' if rcv == 1 else 'b')
-            cmd = f"[to@wh] rcv={rcv} fplug={fplug} offset=0 freq={tuner_freq} srate={src['sr']}"
+            cmd = (f"[to@wh] rcv={picotuner_rcv('a' if rcv == 1 else 'b')} "
+                   f"fplug={fplug} offset=0 freq={tuner_freq} srate={src['sr']}")
             if rcv == 1:
                 picotuner_cmd(cmd)
             else:
                 sock_b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 try:
-                    sock_b.sendto(cmd.encode(), (cfg['host'], cfg['cmd_port_b']))
+                    sock_b.sendto(cmd.encode(), (cfg['host'], picotuner_cmd_port('b', cfg)))
                 finally:
                     sock_b.close()
             print(f"[tri_watch] startup tune: Rx{rcv} -> {src['freq']} kHz / {src['sr']} kS/s")
@@ -3464,13 +3748,42 @@ def _tri_watch_sync_drainers(currently_displayed_rf_idx):
     # exact same index-mismatch risk as the arbitrator loop if it read
     # the live config instead - tri_watch_port_drainers is keyed by
     # the same startup indices as tri_watch_probes.
+    # Disabled by default. PortDrainer was built to test a hypothesis
+    # that was never confirmed on real hardware - see its own docstring -
+    # and it causes a definite, reproducible failure: the drainer holds
+    # the TS port of a source that has since become the displayed one,
+    # so mpv cannot bind it, fails instantly with "Address already in
+    # use", and the lifecycle logic retries for ever while the cover
+    # stays up. Tuner locked, stream arriving at full rate, and a black
+    # screen - which looks like a hardware fault and is not.
+    #
+    # Confirmed live: `ss -ulnp` showing python3 holding 9942 while mpv
+    # died on every attempt, surviving restarts because the drainer
+    # re-acquires the port during startup. The stop path evidently does
+    # not always release it, and the exact mechanism is not yet
+    # understood.
+    #
+    # An unproven mitigation for a hypothetical problem should not stay
+    # switched on when it is causing a proven one. Re-enable with
+    # tri_watch.port_drainers: true to investigate the original
+    # hypothesis again, once the release path is properly understood.
+    if not (config.get('tri_watch', {}) or {}).get('port_drainers', False):
+        # Release anything already running, so turning it off takes
+        # effect immediately rather than only after a restart.
+        for idx in list(tri_watch_port_drainers):
+            drainer = tri_watch_port_drainers.pop(idx, None)
+            if drainer is not None:
+                try: drainer.stop()
+                except Exception: pass
+        return
+
     sources = tri_watch_sources_cfg
     cfg = config['picotuner']
     for idx, src in enumerate(sources):
         if not src.get('enabled', False) or src.get('type') != 'rf':
             continue
         rcv = src.get('rcv', 1)
-        port = cfg['ts_port_b'] if rcv == 2 else cfg['ts_port']
+        port = picotuner_ts_port('b' if rcv == 2 else 'a', cfg)
         if idx == currently_displayed_rf_idx:
             drainer = tri_watch_port_drainers.pop(idx, None)
             if drainer is not None:
@@ -7483,7 +7796,7 @@ def picotuner_cmd(cmd: str):
         host = cfg.get('host', '')
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            sock.sendto(cmd.encode(), (host, cfg['cmd_port']))
+            sock.sendto(cmd.encode(), (host, picotuner_cmd_port('a', cfg)))
         finally:
             sock.close()
         return True
@@ -7503,7 +7816,7 @@ def picotuner_rcv2_cmd(cmd: str, cfg: dict):
         host = cfg.get('host', '')
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            sock.sendto(cmd.encode(), (host, cfg['cmd_port_b']))
+            sock.sendto(cmd.encode(), (host, picotuner_cmd_port('b', cfg)))
         finally:
             sock.close()
         return True
@@ -7644,7 +7957,7 @@ def _tune_impl(req: TuneRequest):
         # confirmed the hard way during tonight's standalone testing.
         div_cfg = config['diversity']
         picotuner_cmd(
-            f"[to@wh] rcv=1 fplug={div_cfg.get('rcv1_plug', 'a')} offset=0 freq={tuner_freq} srate={req.sr}"
+            f"[to@wh] rcv={picotuner_rcv('a')} fplug={div_cfg.get('rcv1_plug', 'a')} offset=0 freq={tuner_freq} srate={req.sr}"
         )
         # Give rcv=1's own tune command time to fully register on the
         # Picotuner's firmware before rcv=2's arrives - confirmed these
@@ -7658,8 +7971,8 @@ def _tune_impl(req: TuneRequest):
         time.sleep(0.3)
         sock_b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock_b.sendto(
-            f"[to@wh] rcv=2 fplug={div_cfg.get('rcv2_plug', 'b')} offset=0 freq={tuner_freq} srate={req.sr}".encode(),
-            (cfg['host'], cfg['cmd_port_b'])
+            f"[to@wh] rcv={picotuner_rcv('b')} fplug={div_cfg.get('rcv2_plug', 'b')} offset=0 freq={tuner_freq} srate={req.sr}".encode(),
+            (cfg['host'], picotuner_cmd_port('b', cfg))
         )
         sock_b.close()
         # Same settling delay as rcv=1 above, closing the one clear
@@ -7690,13 +8003,13 @@ def _tune_impl(req: TuneRequest):
             # via tri_watch's own startup-tuning and diversity mode's
             # own rcv=2 command - reused directly, not reimplemented.
             picotuner_rcv2_cmd(
-                f"[to@wh] rcv=2 fplug={req.plug} offset=0 "
+                f"[to@wh] rcv={picotuner_rcv('b')} fplug={req.plug} offset=0 "
                 f"freq={tuner_freq} srate={req.sr}",
                 cfg
             )
         else:
             picotuner_cmd(
-                f"[to@wh] rcv=1 fplug={req.plug} offset=0 "
+                f"[to@wh] rcv={picotuner_rcv('a')} fplug={req.plug} offset=0 "
                 f"freq={tuner_freq} srate={req.sr}"
             )
         if diversity_enabled:
@@ -8031,7 +8344,7 @@ def _start_stream_impl(req: StreamRequest):
     # RF/network bandwidth this normally frees up is a deliberate,
     # accepted trade-off for anyone who's turned this on.
     if not tri_watch_enabled:
-        picotuner_cmd("[to@wh] rcv=1 fplug=a offset=0 freq=0 srate=333")
+        picotuner_cmd(f"[to@wh] rcv={picotuner_rcv('a')} fplug=a offset=0 freq=0 srate=333")
 
     current_mode = "stream"
     # The friendly name is whatever the caller says it is — this is our
