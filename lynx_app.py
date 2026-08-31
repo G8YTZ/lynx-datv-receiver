@@ -2642,6 +2642,77 @@ def learn_picotuner_rx_numbers(seen):
         picotuner_rx_numbers = {"a": a, "b": b}
 
 
+# Callsigns whose name lookup is in flight or has already been tried
+# and found nothing. Without this, /api/status - polled about twice a
+# second - would fire a fresh QRZ lookup on EVERY poll for any station
+# not in the cache: dozens of requests during one contact, for a
+# station that may simply not be on QRZ.
+_osd_name_lookups = set()
+_osd_name_absent = set()
+# {callsign: when_it_failed} - a lookup that ERRORED, as distinct from
+# one that succeeded with no name. Errors are usually transient (QRZ
+# down, no internet), so they are retried - but not immediately, or a
+# persistent outage means a fresh failed request on every poll for the
+# whole contact. Measured at 12 attempts and 12 log lines in a single
+# 60-second contact before this.
+_osd_name_failed_at = {}
+OSD_NAME_RETRY_SECS = 300
+_osd_name_lock = threading.Lock()
+
+
+def _start_osd_name_lookup(callsign):
+    """Warm the name cache for a callsign, off the request thread.
+
+    Without this the name only appeared on the SECOND contact with a
+    station: the cache is otherwise populated as a side effect of the
+    notifications module or Pathfinder looking the callsign up, which
+    happens on a confirmed lock or at end of contact - so on a first
+    contact there was nothing cached and the OSD showed the bare
+    callsign throughout.
+
+    Fires once per callsign and never blocks: /api/status returns
+    immediately with no name, and the next poll a second or two later
+    picks it up from the cache.
+    """
+    qrz_cfg = config.get('notifications', {}).get('qrz', {})
+    username = qrz_cfg.get('lookup_username', '')
+    password = qrz_cfg.get('lookup_password', '')
+    if not username or not password:
+        return
+
+    with _osd_name_lock:
+        if callsign in _osd_name_lookups or callsign in _osd_name_absent:
+            return
+        failed_at = _osd_name_failed_at.get(callsign)
+        if failed_at and (time.time() - failed_at) < OSD_NAME_RETRY_SECS:
+            return
+        _osd_name_lookups.add(callsign)
+
+    def _lookup():
+        try:
+            name, _grid = lynx_notifications.qrz_callsign_details(
+                username, password, callsign)
+            with _osd_name_lock:
+                if not name:
+                    # Not on QRZ, or no name recorded there. Permanent
+                    # as far as we care, so never looked up again -
+                    # cleared only on restart.
+                    _osd_name_absent.add(callsign)
+                else:
+                    _osd_name_failed_at.pop(callsign, None)
+        except Exception as e:
+            # Transient - retried, but not before OSD_NAME_RETRY_SECS.
+            with _osd_name_lock:
+                _osd_name_failed_at[callsign] = time.time()
+            print(f"[osd] name lookup for {callsign} failed: {e}")
+        finally:
+            with _osd_name_lock:
+                _osd_name_lookups.discard(callsign)
+
+    threading.Thread(target=_lookup, daemon=True,
+                     name=f"osd-name-{callsign}").start()
+
+
 def qrz_first_name(callsign):
     """The operator's first name for the OSD, or "" if not known.
 
@@ -2668,6 +2739,9 @@ def qrz_first_name(callsign):
         # writes such an entry today, but a garbage name on screen is a
         # worse failure than no name at all.
         if not isinstance(cached, (tuple, list)) or len(cached) != 2:
+            # Nothing cached - warm it in the background so the name
+            # appears on the FIRST contact rather than the second.
+            _start_osd_name_lookup(callsign.strip().upper())
             return ""
         name = lynx_notifications._as_details(cached[0])[0]
         return name if isinstance(name, str) and name.strip() else ""
