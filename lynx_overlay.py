@@ -228,6 +228,7 @@ state = {
     "callsign": "",
     "callsign_name": "",
     "frequency": "",
+    "downlink_frequency": None,
     "mer": "",
     "margin": "",
     "locked_a": False,
@@ -628,6 +629,13 @@ def poll_status():
             # `source` the same way.
             state["callsign_name"] = source.get('callsign_name', '')
             state["frequency"] = source.get('frequency', '')
+            # The real on-air frequency where a converter is in use -
+            # what the station is actually transmitting on, rather than
+            # the IF the tuner happens to see it at. Ku, C-band and
+            # up-converters alike: with a SpyVerter on 6m the tuner is
+            # on 170 MHz, and 50 MHz is the number that means anything
+            # to anyone watching.
+            state["downlink_frequency"] = source.get('downlink_frequency')
             state["mer"]       = source.get('mer', '')
             state["margin"]    = source.get('margin', '')
             state["level"]     = source.get('level', '')
@@ -1191,7 +1199,14 @@ class LynxOverlay(Gtk.Window):
         margin = LEFT_MARGIN
         size = 30
         line_h = size * 1.3
-        freq = state["frequency"] or f"{state['freq_khz']/1000:.3f}"
+        # Prefer the real on-air frequency over the IF - see where this
+        # is populated. Falls back to the IF when no converter is in
+        # use, which is when the two are the same thing anyway.
+        dl = state.get("downlink_frequency")
+        if dl:
+            freq = f"{float(dl):.3f}"
+        else:
+            freq = state["frequency"] or f"{state['freq_khz']/1000:.3f}"
         lines = [f"{freq} MHz  {state['sr_ks']} kS/s"]
 
         # tri_watch, still "searching" (nothing selected/displayed yet):

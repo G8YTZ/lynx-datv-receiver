@@ -10006,7 +10006,7 @@ async function updateStatus() {
             ];
             if (pt.lnb_lo_khz && pt.downlink_frequency != null) {
                 rows.push(['Downlink', pt.downlink_frequency.toFixed(3) + ' MHz']);
-                rows.push(['IF (L-band)', pt.frequency ? pt.frequency + ' MHz' : '—']);
+                rows.push(['IF', pt.frequency ? pt.frequency + ' MHz' : '—']);
                 rows.push(['LNB LO', (pt.lnb_lo_khz/1000).toFixed(3) + ' MHz']);
             } else {
                 rows.push(['Frequency', pt.frequency ? pt.frequency + ' MHz' : '—']);
@@ -10320,13 +10320,33 @@ async function loadConfig() {
     } catch(e) {}
 }
 
+// Mirrors calc_tuner_freq() in the backend. This check previously did
+// a bare `freq - lnb_lo_khz`, which is only ever right for a low-side
+// Ku LNB: it made C-band look out of range, and it rejected every
+// up-converted frequency outright, since 71.5 MHz minus a 120 MHz LO
+// is negative. Nothing was sent to the tuner at all, so the entered
+// frequency simply appeared to be unusable.
+//
+// Kept deliberately identical to the Python, in the same order - the
+// up-conversion test first, because a frequency below what the tuner
+// can reach means something is up-converting however it compares to
+// the LO.
+const PICOTUNER_MIN_TUNE_KHZ_JS = 145000;
+
+function calcTunerFreqJs(freqKhz, loKhz) {
+    if (!loKhz) return freqKhz;
+    if (freqKhz < PICOTUNER_MIN_TUNE_KHZ_JS) return freqKhz + loKhz;  // up-converter
+    if (freqKhz >= loKhz) return freqKhz - loKhz;                     // low-side
+    return loKhz - freqKhz;                                            // high-side (C-band)
+}
+
 // ── Actions ───────────────────────────────────────────────────
 async function tuneTo() {
     const freq = parseInt(document.getElementById('freq-input').value);
     const sr = parseInt(document.getElementById('sr-input').value);
     const plug = document.getElementById('plug-select').value;
     const lnb_lo_khz = getLnbLoKhz();
-    const tunerFreq = freq - lnb_lo_khz;
+    const tunerFreq = calcTunerFreqJs(freq, lnb_lo_khz);
     if (tunerFreq < 50000 || tunerFreq > 2500000) {
         alert(`Calculated tuner frequency ${(tunerFreq/1000).toFixed(3)} MHz is out of range.\\n` +
               `Check the LNB LO selection matches the frequency entered — nothing was sent.`);
