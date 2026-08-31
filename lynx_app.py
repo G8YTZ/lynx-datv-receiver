@@ -375,7 +375,8 @@ current_lnb_lo_khz: int = 0    # LNB LO in use for the current tune, so
                                 # frequency the Picotuner is actually
                                 # locked on AND the real downlink
                                 # frequency for display.
-current_lnb_side: str = "low"  # "low" (Ku-band, IF=downlink-LO) or
+current_lnb_side: str = "low"  # "low" (Ku-band, IF=downlink-LO),
+                                # "up" (up-converter, IF=freq+LO) or
                                 # "high" (C-band, IF=LO-downlink) —
                                 # needed to correctly reverse the
                                 # calculation for display.
@@ -5278,6 +5279,11 @@ def _compute_downlink_frequency():
     try:
         ifreq_mhz = float(picotuner_state["frequency"])
         lo_mhz = current_lnb_lo_khz / 1000
+        if current_lnb_side == "up":
+            # Up-converter: IF = freq + LO, so freq = IF - LO. Without
+            # this the OSD would show an on-air frequency wrong by twice
+            # the LO for anything on 10m, 8m, 6m or 4m.
+            return round(ifreq_mhz - lo_mhz, 3)
         if current_lnb_side == "high":
             # High-side injection (C-band): IF = LO - downlink,
             # so downlink = LO - IF
@@ -8077,15 +8083,20 @@ def _tune_impl(req: TuneRequest):
     # LO from downlink regardless of which was larger, which produced
     # a nonsensical negative frequency for C-band — that was a genuine
     # calculation bug, not a case of that frequency being unreceivable.)
-    if req.lnb_lo_khz:
-        if req.freq >= req.lnb_lo_khz:
-            tuner_freq = req.freq - req.lnb_lo_khz       # low-side (Ku-band)
-            current_lnb_side = "low"
-        else:
-            tuner_freq = req.lnb_lo_khz - req.freq        # high-side (C-band)
-            current_lnb_side = "high"
+    # Uses the shared calc_tuner_freq() rather than repeating the
+    # arithmetic. This block had its own copy, which meant up-converter
+    # support reached Tri-Watch and the startup-resume check but NOT a
+    # manual tune - the path most people use. Two copies of one
+    # calculation is exactly how that happens.
+    tuner_freq = calc_tuner_freq(req.freq, req.lnb_lo_khz)
+    if not req.lnb_lo_khz:
+        current_lnb_side = "low"
+    elif req.freq < PICOTUNER_MIN_TUNE_KHZ:
+        current_lnb_side = "up"        # up-converter: IF = freq + LO
+    elif req.freq >= req.lnb_lo_khz:
+        current_lnb_side = "low"       # low-side (Ku LNB, or an IF output)
     else:
-        tuner_freq = req.freq
+        current_lnb_side = "high"      # high-side (C-band LNB)
 
     # CRITICAL SAFETY CHECK — a mismatched LNB selection can produce a
     # negative or nonsensical frequency (e.g. downlink 3404 MHz minus a
@@ -9609,8 +9620,8 @@ def web_ui():
                                 <option value="10600000">Ku 10600 MHz</option>
                                 <option value="10750000">Ku 10750 MHz</option>
                                 <option value="5150000">C-band 5150 MHz (3.4 GHz)</option>
-                                <option value="929000">Icom IC-9700 23cm IF (929 MHz)</option>
-                                <option value="120000">Airspy SpyVerter up-conv. (120 MHz)</option>
+                                <option value="929000" data-nodc="1">Icom IC-9700 23cm IF (929 MHz) - plug B only</option>
+                                <option value="120000" data-nodc="1">Airspy SpyVerter up-conv. (120 MHz) - plug B only</option>
                                 <option value="custom">Custom LO...</option>
                             </select>
                         </div>
@@ -9737,6 +9748,8 @@ async function api(method, path, body) {
 }
 
 // ── Status polling ────────────────────────────────────────────
+let lastLnbPsuState = null;
+
 function renderLnbPsuButtons(lnbPsu) {
     // Green = on, grey = off - reads the Picotuner's own last-reported
     // state from /api/status (parsed from its real status broadcast,
@@ -9747,6 +9760,11 @@ function renderLnbPsuButtons(lnbPsu) {
     // Picotuner configuration), not just within one session's own
     // in-memory state.
     const lnbPsuState = lnbPsu || {plug_a: 'off', plug_a_tone: false, plug_b: 'off', plug_b_tone: false};
+    // Kept where applyNoDcPlugRules() can see it. Leaving it local meant
+    // a reference from outside silently read `undefined` and fell back
+    // to "plug B is free", so the plug-B-only rule appeared to work
+    // while never actually checking anything.
+    lastLnbPsuState = lnbPsuState;
     for (const plug of ['a', 'b']) {
         const current = lnbPsuState['plug_' + plug] || 'off';
         const tone = lnbPsuState['plug_' + plug + '_tone'] || false;
@@ -9919,6 +9937,7 @@ async function updateStatus() {
         document.getElementById('mpv-restart-count').textContent = restartCount;
 
         renderLnbPsuButtons(s.picotuner?.lnb_psu);
+        applyNoDcPlugRules();
         
         // Picotuner LED — in diversity mode, "locked" should mean
         // EITHER tuner is locked, since the combiner can produce a
@@ -10134,9 +10153,59 @@ function getLnbLoKhz() {
     return parseInt(sel) || 0;
 }
 
+// Equipment that LNB supply voltage destroys: a SpyVerter expects
+// 4.2-5.5V on the pin an LNB gets 13 or 18V on, and an IC-9700's IF is
+// a receiver OUTPUT.
+//
+// The only real protection is that no voltage generator is fitted on
+// the plug it is connected to. Plug A always has one and is live from
+// the moment the board powers up - before Lynx runs - so nothing in
+// software can make plug A safe. Plug B has none as standard; one has
+// to be added by hand.
+//
+// So the rule is simply: these converters are plug B, and only when
+// plug B has no generator fitted. Anything else is not offered. That
+// is as far as software can honestly go.
+function applyNoDcPlugRules() {
+    const sel = document.getElementById('lnb-select');
+    const plugSel = document.getElementById('plug-select');
+    if (!sel || !plugSel) return;
+
+    // Only usable once the Picotuner has actually said plug B has no
+    // generator. Before the first status arrives the safe assumption is
+    // that it HAS one - offering the converter and withdrawing it a
+    // second later would be worse than a brief wait.
+    const bAbsent = !!(lastLnbPsuState && lastLnbPsuState['plug_b'] === 'absent');
+
+    for (const opt of sel.options) {
+        if (opt.dataset && opt.dataset.nodc === '1') {
+            opt.disabled = !bAbsent;
+            opt.title = bAbsent
+                ? 'Connect to plug B. Plug A carries LNB voltage from power-up and would destroy it.'
+                : 'Unavailable: a voltage generator is fitted on plug B. It has to be physically '
+                  + 'removed before this can be connected - LNB voltage destroys a SpyVerter or an '
+                  + "IC-9700's IF output, and plug A is live from power-up so it can never be used.";
+        }
+    }
+
+    const chosen = sel.options[sel.selectedIndex];
+    const noDc = !!(chosen && chosen.dataset && chosen.dataset.nodc === '1');
+    for (const opt of plugSel.options) {
+        if (opt.value === 'a' || opt.value === 'diversity') {
+            opt.disabled = noDc;
+            opt.title = noDc
+                ? 'Plug A carries LNB voltage from the moment the board powers up, before Lynx '
+                  + 'starts. The selected converter would be destroyed. Use plug B.'
+                : '';
+        }
+    }
+    if (noDc && plugSel.value !== 'b') plugSel.value = 'b';
+}
+
 function onLnbSelectChange() {
     const isCustom = document.getElementById('lnb-select').value === 'custom';
     document.getElementById('lnb-custom-col').style.display = isCustom ? '' : 'none';
+    applyNoDcPlugRules();
 }
 
 async function saveMemory() {
