@@ -226,6 +226,7 @@ state = {
     "locked": False,
     "mpv_running_for_rf": False,
     "callsign": "",
+    "callsign_name": "",
     "frequency": "",
     "mer": "",
     "margin": "",
@@ -620,6 +621,12 @@ def poll_status():
                         break
 
             state["callsign"]  = source.get('callsign', '')
+            # Picked up from the same source dict as the callsign, so it
+            # follows whichever receiver is being displayed without any
+            # per-mode handling: tri_watch's choice, diversity's A/B
+            # fallback and plain single-receiver operation all populate
+            # `source` the same way.
+            state["callsign_name"] = source.get('callsign_name', '')
             state["frequency"] = source.get('frequency', '')
             state["mer"]       = source.get('mer', '')
             state["margin"]    = source.get('margin', '')
@@ -1114,7 +1121,21 @@ class LynxOverlay(Gtk.Window):
             # less visual real estate than the MER/margin rows above it.
             if state["locked"]:
                 if state["callsign"]:
+                    # "Justin - G8YTZ" when QRZ has told us a name, the
+                    # bare callsign otherwise. A callsign is a licence;
+                    # a name is a person, and the whole point of the
+                    # display is that someone is on the air.
+                    #
+                    # Only ever from cache (see qrz_first_name), so it
+                    # appears a moment after the callsign rather than
+                    # with it, and simply never appears for anyone not
+                    # on QRZ - which must look deliberate rather than
+                    # broken, hence falling straight back to the
+                    # callsign alone.
                     label = state["callsign"]
+                    name = (state.get("callsign_name") or "").strip()
+                    if name:
+                        label = f"{name} - {label}"
                     if state["diversity_enabled"] and state["locked_via"] == "b":
                         label += " (B)"
                     lines.append(label)

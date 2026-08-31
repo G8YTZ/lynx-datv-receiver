@@ -2642,6 +2642,40 @@ def learn_picotuner_rx_numbers(seen):
         picotuner_rx_numbers = {"a": a, "b": b}
 
 
+def qrz_first_name(callsign):
+    """The operator's first name for the OSD, or "" if not known.
+
+    CACHE ONLY - never performs a lookup. This is called while building
+    /api/status, which the overlay polls about twice a second, and a QRZ
+    round trip there would stall every poll and the OSD with it.
+
+    The name arrives in the cache as a side effect of work already being
+    done: the notifications module looks it up on a confirmed lock, and
+    Pathfinder looks it up for the end-of-contact card. So it appears a
+    moment after the callsign does, and the OSD simply shows the
+    callsign alone until then - which is also what happens for anyone
+    not on QRZ, or when the lookup is not configured.
+    """
+    if not callsign or callsign in ("lost", "search", ""):
+        return ""
+    try:
+        cached = lynx_notifications._qrz_lookup_cache.get(
+            callsign.strip().upper())
+        # Entries are (details, cached_at). Checked rather than assumed:
+        # indexing blindly into an entry of some other shape - a bare
+        # string, say - yields its FIRST CHARACTER, which would put a
+        # single stray letter on the OSD instead of a name. Nothing
+        # writes such an entry today, but a garbage name on screen is a
+        # worse failure than no name at all.
+        if not isinstance(cached, (tuple, list)) or len(cached) != 2:
+            return ""
+        name = lynx_notifications._as_details(cached[0])[0]
+        return name if isinstance(name, str) and name.strip() else ""
+    except Exception:
+        # A missing name must never break the status endpoint.
+        return ""
+
+
 def picotuner_rcv(slot):
     """The receiver number to put in a command's rcv= field.
 
@@ -5329,6 +5363,7 @@ def get_status():
             "online": picotuner_state["online"],
             "locked": picotuner_state["locked"],
             "callsign": picotuner_state["callsign"],
+            "callsign_name": qrz_first_name(picotuner_state["callsign"]),
             "frequency": picotuner_state["frequency"],
             "downlink_frequency": _compute_downlink_frequency(),
             "lnb_lo_khz": current_lnb_lo_khz,
@@ -5368,6 +5403,7 @@ def get_status():
                 "online": picotuner_state_b["online"],
                 "locked": picotuner_state_b["locked"],
                 "callsign": picotuner_state_b["callsign"],
+                "callsign_name": qrz_first_name(picotuner_state_b["callsign"]),
                 "frequency": picotuner_state_b["frequency"],
                 "mer": picotuner_state_b["mer"],
                 "margin": picotuner_state_b["margin"],
