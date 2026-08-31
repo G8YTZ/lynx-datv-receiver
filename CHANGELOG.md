@@ -2,6 +2,20 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-08-31
+
+**Added**
+- Up-converter support, so 6m and 4m work through a transverter. `calc_tuner_freq` only ever subtracted a converter's local oscillator, so entering 50 MHz with a 1000 MHz transverter LO fell into the C-band branch and produced 950 MHz - a plausible-looking number on which nothing would ever be found. The three arrangements are now told apart from the numbers themselves rather than from a setting anyone has to get right: a Ku LNB has the wanted frequency at or above the LO, a C-band LNB has a GHz downlink below it, and an up-converter has a frequency below what the tuner can reach at all. That last case is unambiguous, since an up-converter is only ever used precisely because the frequency is otherwise unreachable. Requested by Martin G8LCE. The up-conversion test is applied FIRST, because a frequency below what the tuner can reach is unambiguous evidence of it however that frequency compares to the LO - testing `freq >= LO` first goes wrong whenever the LO is itself low, as with an Airspy SpyVerter's 120 MHz, where 130 MHz would have been subtracted down to 10 MHz.
+- Two converter presets on the tuning page: the Icom IC-9700's 23cm IF output (929 MHz LO, so 1249 MHz appears at 320 MHz) and the Airspy SpyVerter up-converter (120 MHz), which covers everything from LF to 6m and puts the whole of it between 121 and 180 MHz - matching that device's own 120-180 MHz IF filtering. That includes 10m: DATV on 29 MHz has been received and watched through one. The dropdown is relabelled from "LNB" to "Converter" throughout, since it now covers up-converters and IF outputs as well as satellite LNBs, and a transverter user would not have thought to look under "LNB".
+- The operator's first name beside the callsign on the OSD - "Justin - G8YTZ" rather than "G8YTZ" - in normal, diversity and Tri-Watch modes alike. A callsign is a licence; a name is a person, and the point of the display is that someone is on the air. Taken from the QRZ cache, which is warmed by a single background lookup per callsign so the name appears on the first contact rather than the second, without ever blocking the status endpoint. A station not on QRZ is looked up once and then left alone; a lookup that errors is retried, but not for five minutes, so a QRZ outage cannot produce a failed request on every poll.
+
+**Fixed**
+- Hard-freeze recovery now covers streams, not only RF. It was gated to `current_mode == "rf" and mpv_running_for_rf`, so a frozen STREAM was correctly detected by the drift script, which set the flag - and then nothing ever read it. Seen twice on a real receiver watching a BATC stream: five drop-buffers resyncs, the breaker tripping with "external restart monitor takes over if needed", and then silence for an hour and forty minutes. The restart monitor was the very thing that never took over.
+
+**Investigated, no change needed**
+- Clock drift on RF. Measured over several minutes on both a single receiver and diversity: estimated drift held at 0.01-0.06s with zero drop-buffers corrections, and the demuxer cache stayed at zero throughout. The 20% drift rate reported earlier was the QO-100 beacon, a known-faulty signal nobody watches, and no correction scheme survives that in any case. Diversity also switched cleanly from A to B under genuine corruption, losing one segment in 17,505 with no disturbance to timing.
+- Stream latency. The roughly 1.8s delay on a BATC stream is the server's, not Lynx's: it is set by where the RTMP burst lands on connect, and is the same from Australia (1.84s), the UK (1.84s) and California (1.60s) regardless of path. Seeking to the live edge removes it, but mpv rebuilds the same buffer within two minutes, and the 2-second keyframe interval means no finer position is available to seek to. Nothing at the receiver can change it.
+
 ## 2026-08-29
 
 **Added**

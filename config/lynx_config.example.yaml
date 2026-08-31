@@ -298,7 +298,16 @@ tri_watch:
                                 #     varies by site)
       freq: 437000              # <-- kHz
       sr: 333                   # <-- kS/s
-      lnb_lo_khz: 0
+      lnb_lo_khz: 0             # <-- converter local oscillator in kHz, 0 for none.
+                                #     Whether it is added or subtracted is worked out from
+                                #     the numbers, so there is nothing else to set:
+                                #       Ku LNB   freq at or above the LO -> subtracted
+                                #                (10491500, LO 9750000 -> 741500)
+                                #       C LNB    GHz downlink below the LO -> LO minus freq
+                                #                (3400000, LO 5150000 -> 1750000)
+                                #       up-conv  freq below the tuner's own range -> ADDED,
+                                #                so a 6m or 4m transverter works
+                                #                (50000, LO 1000000 -> 1050000)
       label: ''                  # <-- optional, shown in the Web UI - defaults to something sensible if left blank
       callsign: ''                # <-- optional - this input's own callsign (e.g. the
                                    #     repeater's), used as {configured_callsign} in the

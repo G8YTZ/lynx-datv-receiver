@@ -7957,18 +7957,58 @@ def picotuner_rcv2_cmd(cmd: str, cfg: dict):
         print(f"[picotuner_rcv2_cmd] could not send (Picotuner likely not configured/reachable): {e}")
         return False
 
+# Lowest frequency the Picotuner's own NIM can reach, in kHz.
+#
+# Used only to tell an UP-converter apart from a down-converting LNB,
+# and the distinction is unambiguous: an up-converter exists precisely
+# because its input is below what the tuner can reach, while a
+# satellite downlink is always GHz. Nothing here restricts what can be
+# tuned - it is a discriminator, not a limit.
+PICOTUNER_MIN_TUNE_KHZ = 145000   # 145 MHz - the NIM's own lower limit
+
+
 def calc_tuner_freq(freq_khz: int, lnb_lo_khz: int) -> int:
-    """Given a downlink frequency and an LNB LO (0 = no LNB), returns
+    """Given a wanted frequency and a converter LO (0 = none), returns
     the actual IF frequency the Picotuner needs to be tuned to.
-    Auto-detects low-side (Ku-band) vs high-side (C-band) injection —
-    see tune() for the full explanation. Shared so the startup resume
-    logic can check whether the Picotuner is already correctly tuned
-    without duplicating this calculation."""
+
+    Handles all three converter arrangements, distinguished from the
+    numbers themselves rather than from a setting anyone has to get
+    right:
+
+        Up-converter   freq below the        IF = freq + LO
+                       tuner's own range
+        Down-converter freq >= LO            IF = freq - LO
+        C-band LNB     GHz downlink < LO     IF = LO - freq
+
+    The up-converter case is what makes 6m and 4m possible: a
+    transverter takes 50 or 70 MHz up into the Picotuner's range, so
+    the LO is ADDED rather than subtracted. It is told apart safely
+    because an up-converter is only ever used when the wanted frequency
+    is below what the tuner can reach - if it were reachable directly,
+    nobody would need the converter. A satellite downlink, by contrast,
+    is always thousands of MHz, so the two can never be confused.
+
+    Without this, entering 50 MHz with a 1000 MHz transverter LO fell
+    into the C-band branch and produced 950 MHz - a plausible-looking
+    number, on which nothing would ever be found.
+
+    Shared so the startup resume logic can check whether the Picotuner
+    is already correctly tuned without duplicating this calculation.
+    """
     if not lnb_lo_khz:
         return freq_khz
+    # Up-conversion is tested FIRST, because a wanted frequency below
+    # what the tuner can reach is unambiguous evidence of it regardless
+    # of how that frequency compares to the LO. Testing freq >= LO
+    # first gets this wrong whenever the LO is itself low: an Airspy
+    # SpyVerter has a 120 MHz LO, so 130 MHz would satisfy freq >= LO
+    # and be subtracted down to 10 MHz - below the tuner's range, and
+    # nonsense.
+    if freq_khz < PICOTUNER_MIN_TUNE_KHZ:
+        return freq_khz + lnb_lo_khz          # up-converter (transverter)
     if freq_khz >= lnb_lo_khz:
-        return freq_khz - lnb_lo_khz   # low-side (Ku-band)
-    return lnb_lo_khz - freq_khz        # high-side (C-band)
+        return freq_khz - lnb_lo_khz          # low-side (Ku LNB, or an IF down-converter)
+    return lnb_lo_khz - freq_khz              # high-side (C-band LNB)
 
 _tune_lock_handed_off = False  # set by _tune_impl() once the async thread has taken over
                                 # responsibility for releasing tune_lock - protects against a
@@ -9562,19 +9602,21 @@ def web_ui():
                     <div class="row g-2 mt-1">
                         <div class="col">
                             <select class="form-select form-select-sm bg-dark text-light border-secondary"
-                                    id="lnb-select" onchange="onLnbSelectChange()" title="LNB local oscillator — freq above is the real downlink frequency when set">
-                                <option value="0">No LNB (direct)</option>
+                                    id="lnb-select" onchange="onLnbSelectChange()" title="Converter local oscillator — the frequency above is then the real on-air frequency, whether the converter works up or down">
+                                <option value="0">None (direct)</option>
                                 <option value="9750000">Ku 9750 MHz (QO-100 std.)</option>
                                 <option value="9000000">Ku 9000 MHz (QO-100, 9-10GHz mod. LNB)</option>
                                 <option value="10600000">Ku 10600 MHz</option>
                                 <option value="10750000">Ku 10750 MHz</option>
                                 <option value="5150000">C-band 5150 MHz (3.4 GHz)</option>
-                                <option value="custom">Custom...</option>
+                                <option value="929000">Icom IC-9700 23cm IF (929 MHz)</option>
+                                <option value="120000">Airspy SpyVerter up-conv. (120 MHz)</option>
+                                <option value="custom">Custom LO...</option>
                             </select>
                         </div>
                         <div class="col" id="lnb-custom-col" style="display:none">
                             <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary"
-                                   id="lnb-custom-input" placeholder="LNB LO (kHz)">
+                                   id="lnb-custom-input" placeholder="Converter LO (kHz)">
                         </div>
                     </div>
                     <div class="mt-2 d-flex gap-2">
