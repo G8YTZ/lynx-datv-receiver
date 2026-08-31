@@ -2031,9 +2031,30 @@ def mpv_drift_monitor():
                                          count_as_mpv_restart=False)
             last_breaker_active = breaker_active
 
+            # Streams count too, not just RF. This was gated to
+            # `current_mode == "rf" and mpv_running_for_rf`, so a frozen
+            # STREAM was detected by the Lua script, wrote
+            # hard_freeze_detected_at, and then nothing ever read it -
+            # the flag sat set while the picture stayed frozen. Confirmed
+            # twice on a real receiver watching a BATC stream: five
+            # drop-buffers resyncs, the breaker tripping with "external
+            # restart monitor takes over if needed", and then silence for
+            # an hour and forty minutes. The restart monitor was the very
+            # thing that never took over.
+            hard_freeze_target = None
+            hard_freeze_is_rf = True
+            if current_mode == "rf" and mpv_running_for_rf:
+                hard_freeze_target = f"udp://@:{current_rf_target_port()}"
+            elif current_mode == "stream" and current_stream_url:
+                hard_freeze_target = current_stream_url
+                # is_rf=False, exactly as the normal stream path calls
+                # it - the flag changes how mpv is set up for a remote
+                # source rather than a local Picotuner port.
+                hard_freeze_is_rf = False
+
             if (hard_freeze_detected_at > 0 and
                     hard_freeze_detected_at != last_handled_hard_freeze_at and
-                    current_mode == "rf" and mpv_running_for_rf):
+                    hard_freeze_target):
                 now2 = time.time()
                 div_cfg = config.get('diversity', {})
                 breaker_enabled = div_cfg.get('hard_freeze_breaker_enabled', True)
@@ -2091,7 +2112,9 @@ def mpv_drift_monitor():
                         # real, reproduced cause of "restart did not
                         # confirm rendering" specifically during
                         # tri_watch Rx2 sessions.
-                        restart_mpv(f"udp://@:{current_rf_target_port()}")
+                        # Whichever source is actually playing - an RF port or a
+                        # stream URL. See hard_freeze_target above.
+                        restart_mpv(hard_freeze_target, is_rf=hard_freeze_is_rf)
                         rendering_confirmed = wait_for_mpv_rendering()  # real rendering, not a guess
                         if rendering_confirmed:
                             # Same safety margin as the stream-mode restart
