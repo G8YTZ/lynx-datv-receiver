@@ -238,6 +238,7 @@ state = {
     "mer_b": "",
     "margin_b": "",
     "frequency_b": "",
+    "downlink_frequency_b": None,
     "sr_ks_b": "",
     "tri_watch_show_searching_rx2": False,
     "dbm_a": "",
@@ -574,6 +575,12 @@ def poll_status():
             state["mer_b"] = tuner_b.get('mer', '')
             state["margin_b"] = tuner_b.get('margin', '')
             state["frequency_b"] = tuner_b.get('frequency', '')
+            # Tuner B's real on-air frequency, the same as tuner A gets.
+            # Without this the second OSD line showed the IF - 170 MHz
+            # for a 6m source through a SpyVerter, where the first line
+            # was correctly showing 71 MHz for its own converter. Two
+            # lines, two different meanings, which is worse than either.
+            state["downlink_frequency_b"] = tuner_b.get('downlink_frequency')
             state["sr_ks_b"] = tuner_b.get('symbol_rate', '')
             # Independent per-tuner dBm (ptwh0v3k+) / level fallback,
             # for the split magic eye - top half driven by A, bottom by B.
@@ -1218,7 +1225,9 @@ class LynxOverlay(Gtk.Window):
         # False the moment tri_watch's own displayed_source_idx is set).
         if state["tri_watch_show_searching_rx2"] and state["frequency_b"]:
             sr_b = f"  {state['sr_ks_b']} kS/s" if state["sr_ks_b"] else ""
-            lines.append(f"{state['frequency_b']} MHz{sr_b}")
+            dl_b = state.get("downlink_frequency_b")
+            freq_b = f"{float(dl_b):.3f}" if dl_b else state['frequency_b']
+            lines.append(f"{freq_b} MHz{sr_b}")
 
         if state["modcod"]:
             modcod_line = state["modcod"]
