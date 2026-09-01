@@ -5,7 +5,7 @@ All notable changes to Lynx are documented here, in reverse chronological order.
 ## 2026-09-01
 
 **Added**
-- A Converter LO field on both Tri-Watch RF sources in the Web UI. The backend has always honoured `lnb_lo_khz` on a Tri-Watch source, but there was no field for it, so the only way to use a converter there was to edit `lynx_config.yaml` by hand. Spotted by Martin G8LCE.
+- A Converter LO selector on both Tri-Watch RF sources - the same dropdown as the manual tune page, with the same presets, a Custom LO option, and the same plug B restriction on the two converters that LNB voltage would destroy. The backend has always honoured `lnb_lo_khz` on a Tri-Watch source, but there was no field for it, so the only way to use a converter there was to edit `lynx_config.yaml` by hand. Spotted by Martin G8LCE.
 
 **Fixed**
 - A Tri-Watch source with a converter showed the IF rather than the real on-air frequency - or worse, a figure left over from an unrelated manual tune. The display reversal read globals that only a manual tune ever set, and tri_watch tunes the board itself. It now records the converter in use for whichever receiver it tuned, and the calculation takes that state as a parameter rather than reading one fixed pair of globals.

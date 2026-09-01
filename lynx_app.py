@@ -6752,9 +6752,21 @@ def config_page():
                             <input type="number" step="1" class="form-control mb-2" id="tw-rx1-freq-input" placeholder="e.g. 437000">
                             <label for="tw-rx1-sr" class="small">Symbol rate (kS/s)</label>
                             <input type="number" step="1" class="form-control mb-2" id="tw-rx1-sr-input" placeholder="e.g. 1000">
-                            <label for="tw-rx1-lnb" class="small">Converter LO (kHz)</label>
-                            <input type="number" step="1" class="form-control mb-2" id="tw-rx1-lnb-input"
-                                   placeholder="0 = none, e.g. 9750000 or 120000">
+                            <label for="tw-rx1-lnb" class="small">Converter LO</label>
+                            <select class="form-control mb-2" id="tw-rx1-lnb-input"
+                                    onchange="onTwLnbSelectChange('1')">
+                                <option value="0">None (direct)</option>
+                                <option value="9750000">Ku 9750 MHz (QO-100 std.)</option>
+                                <option value="9000000">Ku 9000 MHz (QO-100, 9-10GHz mod. LNB)</option>
+                                <option value="10600000">Ku 10600 MHz</option>
+                                <option value="10750000">Ku 10750 MHz</option>
+                                <option value="5150000">C-band 5150 MHz (3.4 GHz)</option>
+                                <option value="929000" data-nodc="1">Icom IC-9700 23cm IF (929 MHz) - plug B only</option>
+                                <option value="120000" data-nodc="1">Airspy SpyVerter up-conv. (120 MHz) - plug B only</option>
+                                <option value="custom">Custom LO...</option>
+                            </select>
+                            <input type="number" step="1" class="form-control mb-2" id="tw-rx1-lnb-custom"
+                                   placeholder="Converter LO (kHz)" style="display:none">
                             <label for="tw-rx1-plug" class="small">Plug</label>
                             <select class="form-control mb-2" id="tw-rx1-plug-input">
                                 <option value="a">A</option>
@@ -6775,9 +6787,21 @@ def config_page():
                             <input type="number" step="1" class="form-control mb-2" id="tw-rx2-freq-input" placeholder="e.g. 1249000">
                             <label for="tw-rx2-sr" class="small">Symbol rate (kS/s)</label>
                             <input type="number" step="1" class="form-control mb-2" id="tw-rx2-sr-input" placeholder="e.g. 1000">
-                            <label for="tw-rx2-lnb" class="small">Converter LO (kHz)</label>
-                            <input type="number" step="1" class="form-control mb-2" id="tw-rx2-lnb-input"
-                                   placeholder="0 = none, e.g. 9750000 or 120000">
+                            <label for="tw-rx2-lnb" class="small">Converter LO</label>
+                            <select class="form-control mb-2" id="tw-rx2-lnb-input"
+                                    onchange="onTwLnbSelectChange('2')">
+                                <option value="0">None (direct)</option>
+                                <option value="9750000">Ku 9750 MHz (QO-100 std.)</option>
+                                <option value="9000000">Ku 9000 MHz (QO-100, 9-10GHz mod. LNB)</option>
+                                <option value="10600000">Ku 10600 MHz</option>
+                                <option value="10750000">Ku 10750 MHz</option>
+                                <option value="5150000">C-band 5150 MHz (3.4 GHz)</option>
+                                <option value="929000" data-nodc="1">Icom IC-9700 23cm IF (929 MHz) - plug B only</option>
+                                <option value="120000" data-nodc="1">Airspy SpyVerter up-conv. (120 MHz) - plug B only</option>
+                                <option value="custom">Custom LO...</option>
+                            </select>
+                            <input type="number" step="1" class="form-control mb-2" id="tw-rx2-lnb-custom"
+                                   placeholder="Converter LO (kHz)" style="display:none">
                             <label for="tw-rx2-plug" class="small">Plug</label>
                             <select class="form-control mb-2" id="tw-rx2-plug-input">
                                 <option value="a">A</option>
@@ -7002,7 +7026,7 @@ async function loadCurrentConfig() {
         document.getElementById('tw-rx1-enabled-input').checked = !!twRx1;
         document.getElementById('tw-rx1-freq-input').value = twRx1?.freq ?? '';
         document.getElementById('tw-rx1-sr-input').value = twRx1?.sr ?? '';
-        document.getElementById('tw-rx1-lnb-input').value = twRx1?.lnb_lo_khz ?? '';
+        setTwLnbLo('1', twRx1?.lnb_lo_khz ?? 0);
         document.getElementById('tw-rx1-plug-input').value = twRx1?.fplug || 'a';
         document.getElementById('tw-rx1-label-input').value = twRx1?.label || '';
         document.getElementById('tw-rx1-callsign-input').value = twRx1?.callsign || '';
@@ -7010,7 +7034,7 @@ async function loadCurrentConfig() {
         document.getElementById('tw-rx2-enabled-input').checked = !!twRx2;
         document.getElementById('tw-rx2-freq-input').value = twRx2?.freq ?? '';
         document.getElementById('tw-rx2-sr-input').value = twRx2?.sr ?? '';
-        document.getElementById('tw-rx2-lnb-input').value = twRx2?.lnb_lo_khz ?? '';
+        setTwLnbLo('2', twRx2?.lnb_lo_khz ?? 0);
         document.getElementById('tw-rx2-plug-input').value = twRx2?.fplug || 'b';
         document.getElementById('tw-rx2-label-input').value = twRx2?.label || '';
         document.getElementById('tw-rx2-callsign-input').value = twRx2?.callsign || '';
@@ -7834,7 +7858,7 @@ async function saveTriWatch() {
                     fplug: document.getElementById('tw-rx1-plug-input').value,
                     freq: parseInt(document.getElementById('tw-rx1-freq-input').value) || 0,
                     sr: parseInt(document.getElementById('tw-rx1-sr-input').value) || 0,
-                    lnb_lo_khz: parseInt(document.getElementById('tw-rx1-lnb-input').value) || 0,
+                    lnb_lo_khz: twLnbLoKhz('1'),
                     label: document.getElementById('tw-rx1-label-input').value,
                     callsign: document.getElementById('tw-rx1-callsign-input').value,
                 },
@@ -7844,7 +7868,7 @@ async function saveTriWatch() {
                     fplug: document.getElementById('tw-rx2-plug-input').value,
                     freq: parseInt(document.getElementById('tw-rx2-freq-input').value) || 0,
                     sr: parseInt(document.getElementById('tw-rx2-sr-input').value) || 0,
-                    lnb_lo_khz: parseInt(document.getElementById('tw-rx2-lnb-input').value) || 0,
+                    lnb_lo_khz: twLnbLoKhz('2'),
                     label: document.getElementById('tw-rx2-label-input').value,
                     callsign: document.getElementById('tw-rx2-callsign-input').value,
                 },
@@ -10261,6 +10285,68 @@ function applyNoDcPlugRules() {
         }
     }
     if (noDc && plugSel.value !== 'b') plugSel.value = 'b';
+}
+
+// Tri-Watch's own converter selectors. Same options and the same plug
+// restriction as the manual tune card - a SpyVerter is no safer for
+// having been configured on the Config page instead.
+function twLnbLoKhz(rx) {
+    const sel = document.getElementById('tw-rx' + rx + '-lnb-input');
+    if (!sel) return 0;
+    if (sel.value === 'custom') {
+        return parseInt(document.getElementById('tw-rx' + rx + '-lnb-custom').value) || 0;
+    }
+    return parseInt(sel.value) || 0;
+}
+
+function onTwLnbSelectChange(rx) {
+    const sel = document.getElementById('tw-rx' + rx + '-lnb-input');
+    const custom = document.getElementById('tw-rx' + rx + '-lnb-custom');
+    const plugSel = document.getElementById('tw-rx' + rx + '-plug-input');
+    if (!sel) return;
+    if (custom) custom.style.display = (sel.value === 'custom') ? '' : 'none';
+
+    const bAbsent = !!(lastLnbPsuState && lastLnbPsuState['plug_b'] === 'absent');
+    for (const opt of sel.options) {
+        if (opt.dataset && opt.dataset.nodc === '1') {
+            opt.disabled = !bAbsent;
+            opt.title = bAbsent
+                ? 'Connect to plug B. Plug A carries LNB voltage from power-up and would destroy it.'
+                : 'Unavailable: a voltage generator is fitted on plug B. It has to be physically '
+                  + 'removed before this can be connected.';
+        }
+    }
+    const chosen = sel.options[sel.selectedIndex];
+    const noDc = !!(chosen && chosen.dataset && chosen.dataset.nodc === '1');
+    if (plugSel) {
+        for (const opt of plugSel.options) {
+            if (opt.value === 'a') {
+                opt.disabled = noDc;
+                opt.title = noDc
+                    ? 'Plug A carries LNB voltage from power-up, before Lynx starts. The '
+                      + 'selected converter would be destroyed. Use plug B.'
+                    : '';
+            }
+        }
+        if (noDc && plugSel.value !== 'b') plugSel.value = 'b';
+    }
+}
+
+// Put a stored LO back into the selector, choosing Custom for anything
+// that is not one of the presets.
+function setTwLnbLo(rx, lo) {
+    const sel = document.getElementById('tw-rx' + rx + '-lnb-input');
+    const custom = document.getElementById('tw-rx' + rx + '-lnb-custom');
+    if (!sel) return;
+    const v = String(lo || 0);
+    if (Array.from(sel.options).some(o => o.value === v)) {
+        sel.value = v;
+        if (custom) custom.value = '';
+    } else {
+        sel.value = 'custom';
+        if (custom) custom.value = lo;
+    }
+    onTwLnbSelectChange(rx);
 }
 
 function onLnbSelectChange() {
