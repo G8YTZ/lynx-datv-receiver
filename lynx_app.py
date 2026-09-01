@@ -4362,6 +4362,27 @@ def _tri_watch_display_source(idx, src_cfg):
         # immediately, synchronously, right here instead, so the very
         # next poll correctly sees nothing running yet for this target.
         mpv_running_for_rf = False
+        # Raised here, for BOTH paths below, rather than being left to
+        # fall out of tune() as a side effect.
+        #
+        # The cover belongs to the switch, not to the retune. It was
+        # only ever raised inside tune(), so when the retune-skip below
+        # was added - correctly, since re-tuning a receiver already on
+        # frequency just drops the lock and costs seconds - the cover
+        # silently went with it. Confirmed live: switching to an
+        # already-tuned Rx1 showed the bare acquisition screen, OSD and
+        # all, with no cover at all, while an Rx2 switch that happened
+        # to still need a retune covered correctly. The difference was
+        # never the receiver; it was whether that particular switch had
+        # a retune to hide behind.
+        #
+        # mpv is restarted either way - rf_mpv_lifecycle_monitor() owns
+        # that, and lowers this once it has confirmed real rendering -
+        # so either way there is a gap, and either way it wants
+        # covering. tune() calling start_transition_cover() again on the
+        # retune path is harmless: nested starts extend a cover rather
+        # than restarting its clock.
+        start_transition_cover()
         _fplug = src_cfg.get('fplug', 'a' if rcv == 1 else 'b')
         _lo = src_cfg.get('lnb_lo_khz', 0)
         # Skip the tuner command when it would change nothing. tri_watch
@@ -5529,6 +5550,15 @@ def get_status():
             # overlay carrying a second timer that could disagree with
             # this one.
             "pathfinder_delay_secs": pathfinder_tracker.delay_secs,
+            # The other half of the configured Pathfinder window. The
+            # overlay adds the two together for the longest it will hold
+            # a switch cover - the same total the config page already
+            # calls the Pathfinder window and warns against setting too
+            # high (see pathfinderWindow() there). A cover exists to
+            # carry the screen until something replaces it, and there is
+            # nothing left for it to carry once the card it was covering
+            # for would itself have finished.
+            "pathfinder_duration_secs": pathfinder_tracker.duration_secs,
             "squeak": _squeak_status(),
             "timestamp": utc_now_iso()
         },

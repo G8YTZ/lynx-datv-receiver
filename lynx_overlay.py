@@ -132,6 +132,32 @@ LYNX_API = "http://localhost:8080/api/status"
 MPV_TRANSITION_MARKER = "/tmp/lynx_mpv_transitioning"
 POLL_SECS = 2
 
+# Longest the cover may stay up before the overlay stops honouring it,
+# however long the marker file itself persists: the configured
+# Pathfinder window, delay_secs + duration_secs, which is the same
+# total the config page already calls the Pathfinder window and warns
+# against setting too high. Not a separate number - a cover exists to
+# carry the screen until something replaces it, and there is nothing
+# left for it to carry once the card it was covering for would itself
+# have finished.
+#
+# A cap is needed at all because the cover is not always lowered by
+# whoever raised it. The tri_watch loss-of-lock path raises it and
+# deliberately never lowers it, leaving that to whatever displays next -
+# which is right when something does display next, and leaves the
+# screen covered for ever when nothing does. A transmission that simply
+# ends, with no follow-on and no other source waiting, is exactly that
+# case.
+#
+# Enforced here rather than in lynx_app.py on purpose: this way a
+# marker leaked by any path at all, including one nobody has thought of
+# yet, still recovers. Past the cap the overlay behaves as though no
+# transition were in progress - picture if there genuinely is one,
+# otherwise the normal idle screen, which is opaque either way, so
+# nothing underneath is ever exposed by giving up.
+def _cover_max_secs():
+    return state["pathfinder_delay_secs"] + state["pathfinder_duration_secs"]
+
 # tri_watch's "someone else wants in" notification sound - place the
 # actual audio file here yourself (not fetched/bundled by Claude - see
 # chat). Any format mpv can play (mp3, wav, etc) works, since mpv
@@ -289,6 +315,10 @@ state = {
     # by lynx_app.py so there is only ever one timer. Defaults to 2 if
     # the API doesn't provide it (an older lynx_app.py).
     "pathfinder_delay_secs": 2.0,
+    # The other half of the configured Pathfinder window - see
+    # _cover_max_secs(). Defaults to 30 if the API doesn't provide it
+    # (an older lynx_app.py).
+    "pathfinder_duration_secs": 30.0,
     "squeak": None,                  # Auto-Squeak results card, or None
     "site_locator": "",
     "site_location": "",
@@ -698,6 +728,7 @@ def poll_status():
             # side only ever checks presence.
             state["pathfinder"] = lynx.get('pathfinder')
             state["pathfinder_delay_secs"] = lynx.get('pathfinder_delay_secs', 2.0)
+            state["pathfinder_duration_secs"] = lynx.get('pathfinder_duration_secs', 30.0)
             state["squeak"] = lynx.get('squeak')
             # tri_watch's "someone else wants in" notification - the
             # backend already handles its own expiry (get_notification()
@@ -820,7 +851,11 @@ class LynxOverlay(Gtk.Window):
         # gets the right age rather than starting its clock over.
         try:
             transition_age = time.time() - os.stat(MPV_TRANSITION_MARKER).st_mtime
-            mpv_transitioning = True
+            # Capped rather than merely present - see COVER_MAX_SECS. A
+            # cover nobody ever lowers stops being honoured here, so the
+            # screen recovers on its own instead of staying covered for
+            # ever after a transmission that had nothing following it.
+            mpv_transitioning = transition_age < _cover_max_secs()
         except OSError:
             transition_age = 0.0
             mpv_transitioning = False
