@@ -6897,6 +6897,92 @@ function setupRevealButtons() {
 }
 setupRevealButtons();
 
+// Tri-Watch's converter selectors. These live on THIS page because the
+// Tri-Watch fields do - the Config and Receiver pages are separate
+// documents with separate scripts, and a function defined on one is
+// simply not there on the other. Defining these alongside the manual
+// tune page's equivalents left the calls below throwing
+// "setTwLnbLo is not defined", which aborted the rest of the form load
+// and left every field after it - the whole stream section - blank.
+function twLnbLoKhz(rx) {
+    const sel = document.getElementById('tw-rx' + rx + '-lnb-input');
+    if (!sel) return 0;
+    if (sel.value === 'custom') {
+        return parseInt(document.getElementById('tw-rx' + rx + '-lnb-custom').value) || 0;
+    }
+    return parseInt(sel.value) || 0;
+}
+
+function onTwLnbSelectChange(rx) {
+    const sel = document.getElementById('tw-rx' + rx + '-lnb-input');
+    const custom = document.getElementById('tw-rx' + rx + '-lnb-custom');
+    const plugSel = document.getElementById('tw-rx' + rx + '-plug-input');
+    if (!sel) return;
+    if (custom) custom.style.display = (sel.value === 'custom') ? '' : 'none';
+
+    // Plug B's generator state comes from the API here rather than from
+    // a shared variable - the Receiver page's lastLnbPsuState does not
+    // exist on this page. Until it has been read, assume a generator IS
+    // fitted, which is the safe assumption.
+    const bAbsent = (twLnbPsuState && twLnbPsuState['plug_b'] === 'absent');
+    for (const opt of sel.options) {
+        if (opt.dataset && opt.dataset.nodc === '1') {
+            opt.disabled = !bAbsent;
+            opt.title = bAbsent
+                ? 'Connect to plug B. Plug A carries LNB voltage from power-up and would destroy it.'
+                : 'Unavailable: a voltage generator is fitted on plug B, or its state is not yet '
+                  + 'known. It has to be physically removed before this can be connected.';
+        }
+    }
+    const chosen = sel.options[sel.selectedIndex];
+    const noDc = !!(chosen && chosen.dataset && chosen.dataset.nodc === '1');
+    if (plugSel) {
+        for (const opt of plugSel.options) {
+            if (opt.value === 'a') {
+                opt.disabled = noDc;
+                opt.title = noDc
+                    ? 'Plug A carries LNB voltage from power-up, before Lynx starts. The '
+                      + 'selected converter would be destroyed. Use plug B.'
+                    : '';
+            }
+        }
+        if (noDc && plugSel.value !== 'b') plugSel.value = 'b';
+    }
+}
+
+// Put a stored LO back into the selector, choosing Custom LO for
+// anything that is not one of the presets.
+function setTwLnbLo(rx, lo) {
+    const sel = document.getElementById('tw-rx' + rx + '-lnb-input');
+    const custom = document.getElementById('tw-rx' + rx + '-lnb-custom');
+    if (!sel) return;
+    const v = String(lo || 0);
+    if (Array.from(sel.options).some(o => o.value === v)) {
+        sel.value = v;
+        if (custom) custom.value = '';
+    } else {
+        sel.value = 'custom';
+        if (custom) custom.value = lo;
+    }
+    onTwLnbSelectChange(rx);
+}
+
+let twLnbPsuState = null;
+
+// Read plug B's generator state once, so the no-DC presets can be
+// offered or withheld. Deliberately never throws: if this fails the
+// presets simply stay disabled, which is the safe way round.
+async function loadTwLnbPsuState() {
+    try {
+        const st = await api('GET', '/api/status');
+        twLnbPsuState = st?.picotuner?.lnb_psu || null;
+    } catch (e) {
+        twLnbPsuState = null;
+    }
+    onTwLnbSelectChange('1');
+    onTwLnbSelectChange('2');
+}
+
 async function loadCurrentConfig() {
     try {
         const cfg = await fetch('/api/config').then(r => r.json());
@@ -7920,6 +8006,9 @@ async function loadDiscoveredPicotuners() {
 }
 
 loadCurrentConfig();
+// Read plug B's generator state so the no-DC converter presets can be
+// offered. Runs after the form has loaded, and never blocks it.
+loadTwLnbPsuState();
 loadGnssStatus();
 loadDiscoveredPicotuners();
 setInterval(loadDiscoveredPicotuners, 5000);
@@ -10285,68 +10374,6 @@ function applyNoDcPlugRules() {
         }
     }
     if (noDc && plugSel.value !== 'b') plugSel.value = 'b';
-}
-
-// Tri-Watch's own converter selectors. Same options and the same plug
-// restriction as the manual tune card - a SpyVerter is no safer for
-// having been configured on the Config page instead.
-function twLnbLoKhz(rx) {
-    const sel = document.getElementById('tw-rx' + rx + '-lnb-input');
-    if (!sel) return 0;
-    if (sel.value === 'custom') {
-        return parseInt(document.getElementById('tw-rx' + rx + '-lnb-custom').value) || 0;
-    }
-    return parseInt(sel.value) || 0;
-}
-
-function onTwLnbSelectChange(rx) {
-    const sel = document.getElementById('tw-rx' + rx + '-lnb-input');
-    const custom = document.getElementById('tw-rx' + rx + '-lnb-custom');
-    const plugSel = document.getElementById('tw-rx' + rx + '-plug-input');
-    if (!sel) return;
-    if (custom) custom.style.display = (sel.value === 'custom') ? '' : 'none';
-
-    const bAbsent = !!(lastLnbPsuState && lastLnbPsuState['plug_b'] === 'absent');
-    for (const opt of sel.options) {
-        if (opt.dataset && opt.dataset.nodc === '1') {
-            opt.disabled = !bAbsent;
-            opt.title = bAbsent
-                ? 'Connect to plug B. Plug A carries LNB voltage from power-up and would destroy it.'
-                : 'Unavailable: a voltage generator is fitted on plug B. It has to be physically '
-                  + 'removed before this can be connected.';
-        }
-    }
-    const chosen = sel.options[sel.selectedIndex];
-    const noDc = !!(chosen && chosen.dataset && chosen.dataset.nodc === '1');
-    if (plugSel) {
-        for (const opt of plugSel.options) {
-            if (opt.value === 'a') {
-                opt.disabled = noDc;
-                opt.title = noDc
-                    ? 'Plug A carries LNB voltage from power-up, before Lynx starts. The '
-                      + 'selected converter would be destroyed. Use plug B.'
-                    : '';
-            }
-        }
-        if (noDc && plugSel.value !== 'b') plugSel.value = 'b';
-    }
-}
-
-// Put a stored LO back into the selector, choosing Custom for anything
-// that is not one of the presets.
-function setTwLnbLo(rx, lo) {
-    const sel = document.getElementById('tw-rx' + rx + '-lnb-input');
-    const custom = document.getElementById('tw-rx' + rx + '-lnb-custom');
-    if (!sel) return;
-    const v = String(lo || 0);
-    if (Array.from(sel.options).some(o => o.value === v)) {
-        sel.value = v;
-        if (custom) custom.value = '';
-    } else {
-        sel.value = 'custom';
-        if (custom) custom.value = lo;
-    }
-    onTwLnbSelectChange(rx);
 }
 
 function onLnbSelectChange() {
