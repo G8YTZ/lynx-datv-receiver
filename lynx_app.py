@@ -4319,7 +4319,7 @@ def _tri_watch_display_source(idx, src_cfg):
     start_stream() both acquire tune_lock internally, so this function
     must never also acquire it itself, or it would deadlock against
     itself."""
-    global tri_watch_target_rcv, mpv_running_for_rf
+    global tri_watch_target_rcv, mpv_running_for_rf, current_mode
     src_type = src_cfg.get('type')
     if src_type == 'rf':
         rcv = src_cfg.get('rcv', 1)
@@ -4343,14 +4343,57 @@ def _tri_watch_display_source(idx, src_cfg):
         # immediately, synchronously, right here instead, so the very
         # next poll correctly sees nothing running yet for this target.
         mpv_running_for_rf = False
-        tune(TuneRequest(
-            freq=src_cfg['freq'],
-            sr=src_cfg['sr'],
-            plug=src_cfg.get('fplug', 'a' if rcv == 1 else 'b'),
-            lnb_lo_khz=src_cfg.get('lnb_lo_khz', 0),
-            rcv=rcv,
-        ))
-        print(f"[tri_watch] now displaying source {idx}: RF Rx{rcv}")
+        # Skip the tuner command when this receiver is ALREADY on exactly
+        # this channel and locked - which, after tri_watch's startup tune,
+        # it almost always is. Switching which source is displayed is a
+        # display decision, not a tuning one, and retuning a locked
+        # receiver drops the lock and makes it reacquire from scratch:
+        # several seconds of black screen and a fresh confirmation cycle
+        # every single time the display changed.
+        #
+        # tune() is still called when anything differs, so the behaviour
+        # is unchanged wherever a retune is genuinely needed - and
+        # picotuner_already_tuned() returns False on anything it cannot
+        # be sure of.
+        already = picotuner_already_tuned(
+            rcv, src_cfg['freq'], src_cfg['sr'], src_cfg.get('lnb_lo_khz', 0))
+        if already:
+            # Set the state tune() would have set, and leave mpv to
+            # rf_mpv_lifecycle_monitor(): it already starts mpv for
+            # whatever tri_watch_target_rcv points at, confirms it is
+            # genuinely rendering before believing it, and retries if it
+            # is not. Calling restart_mpv() here instead would duplicate
+            # that and set mpv_running_for_rf before anything had been
+            # confirmed - tune() deliberately does not do that either,
+            # leaving it to the same monitor.
+            #
+            # So the saving is the retune and its reacquisition, not the
+            # mpv start, which still takes its normal moment.
+            current_mode = "rf"
+            _lo = src_cfg.get('lnb_lo_khz', 0)
+            _side = converter_side(src_cfg['freq'], _lo)
+            if rcv == 1:
+                globals()['current_lnb_lo_khz'] = _lo
+                globals()['current_lnb_side'] = _side
+            else:
+                globals()['current_lnb_lo_khz_b'] = _lo
+                globals()['current_lnb_side_b'] = _side
+            # Kept consistent with what tune() would have shown.
+            globals()['current_preset'] = (
+                f"{src_cfg['freq']/1000:.3f} MHz (LNB LO {_lo/1000:.3f} MHz) / {src_cfg['sr']} kS/s"
+                if _lo else
+                f"{src_cfg['freq']/1000:.3f} MHz / {src_cfg['sr']} kS/s")
+            print(f"[tri_watch] now displaying source {idx}: RF Rx{rcv} "
+                  f"(already tuned - no retune needed)")
+        else:
+            tune(TuneRequest(
+                freq=src_cfg['freq'],
+                sr=src_cfg['sr'],
+                plug=src_cfg.get('fplug', 'a' if rcv == 1 else 'b'),
+                lnb_lo_khz=src_cfg.get('lnb_lo_khz', 0),
+                rcv=rcv,
+            ))
+            print(f"[tri_watch] now displaying source {idx}: RF Rx{rcv}")
     elif src_type == 'stream':
         # No RF source is being displayed while a stream plays - every
         # enabled RF source should be drained, and tri_watch_target_rcv
@@ -4991,6 +5034,44 @@ def _picotuner_expected_lnb():
         'a': (str(cfg.get('plug_a', 'off')).lower(), bool(cfg.get('plug_a_tone', False))),
         'b': (str(cfg.get('plug_b', 'off')).lower(), bool(cfg.get('plug_b_tone', False))),
     }
+
+
+def picotuner_already_tuned(rcv: int, freq_khz: int, sr_ks: int,
+                            lnb_lo_khz: int = 0) -> bool:
+    """Is this receiver already sitting on exactly this channel?
+
+    Used to avoid retuning a receiver that needs no retuning. tri_watch
+    tunes every enabled RF source once at startup and leaves them there,
+    so switching which one is DISPLAYED does not require touching the
+    tuner at all - but the switch went through tune() regardless, which
+    dropped lock and made the receiver reacquire from scratch. Several
+    seconds of black screen and a fresh lock-confirmation cycle, every
+    time, for a receiver that was already locked on the right channel.
+
+    The tolerances match the config-drift monitor's, and for the same
+    reasons: a locked receiver reports the frequency it actually FOUND,
+    so a transmitter 23 kHz off its nominal is not a different channel.
+    Only a genuinely different one is worth a retune.
+
+    Deliberately conservative - anything uncertain returns False, which
+    means retuning as before. The cost of an unnecessary retune is a few
+    seconds; the cost of wrongly skipping one is a receiver left on the
+    wrong channel with no picture and no obvious reason.
+    """
+    st = picotuner_state_b if rcv == 2 else picotuner_state
+    if not st.get("locked"):
+        return False
+    got_khz = _picotuner_reported_khz(st)
+    if got_khz is None:
+        return False
+    want_khz = calc_tuner_freq(freq_khz, lnb_lo_khz)
+    if abs(got_khz - want_khz) > 1000.0:      # 1 MHz, as the drift monitor uses
+        return False
+    if sr_ks:
+        got_sr = _picotuner_reported_sr(st)
+        if got_sr is None or abs(got_sr - float(sr_ks)) > 2.0:
+            return False
+    return True
 
 
 def _picotuner_reported_khz(st):
