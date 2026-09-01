@@ -10,7 +10,6 @@
 config/lynx_config.yaml
 lynx_state.json
 diversity_stats_pcr.jsonl
-tri_watch_notification.mp3
 
 # Logs and diagnostics
 *.log
