@@ -5500,6 +5500,16 @@ def get_status():
             "pathfinder": pathfinder_tracker.get_card(
                 picture_ready=(current_mode != "rf" or mpv_running_for_rf)
             ),
+            # Published so the overlay can hold its own switch cover back
+            # by the same delay, for the same reason. The Pathfinder card
+            # waits this long before appearing so a brief fade doesn't
+            # throw a full-screen card up over a contact that hasn't
+            # actually ended; a placeholder shown instantly during a
+            # source change makes exactly that mistake in a different
+            # place. One configured value, one behaviour, rather than the
+            # overlay carrying a second timer that could disagree with
+            # this one.
+            "pathfinder_delay_secs": pathfinder_tracker.delay_secs,
             "squeak": _squeak_status(),
             "timestamp": utc_now_iso()
         },

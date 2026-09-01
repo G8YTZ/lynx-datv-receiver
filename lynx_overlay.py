@@ -284,6 +284,11 @@ state = {
     "portable_locator": "",
     "tri_watch_notification": None,   # the current "someone else wants in" message text, or None
     "pathfinder": None,              # end-of-contact card dict, or None if none is due
+    # How long the switch cover waits before drawing anything - the same
+    # configured value Pathfinder uses for its own appearance delay, sent
+    # by lynx_app.py so there is only ever one timer. Defaults to 2 if
+    # the API doesn't provide it (an older lynx_app.py).
+    "pathfinder_delay_secs": 2.0,
     "squeak": None,                  # Auto-Squeak results card, or None
     "site_locator": "",
     "site_location": "",
@@ -692,6 +697,7 @@ def poll_status():
             # backend has already decided whether a card is due - this
             # side only ever checks presence.
             state["pathfinder"] = lynx.get('pathfinder')
+            state["pathfinder_delay_secs"] = lynx.get('pathfinder_delay_secs', 2.0)
             state["squeak"] = lynx.get('squeak')
             # tri_watch's "someone else wants in" notification - the
             # backend already handles its own expiry (get_notification()
@@ -805,7 +811,19 @@ class LynxOverlay(Gtk.Window):
         _overlay_last_render_time[0] = time.time()
 
         showing_map = False
-        mpv_transitioning = os.path.exists(MPV_TRANSITION_MARKER)
+        # One stat rather than an exists() followed by a getmtime(): the
+        # marker's mtime IS the moment the switch began, because
+        # start_transition_cover() creates the file before anything else
+        # happens - before the old ffmpeg is killed, before the Picotuner
+        # is retuned. Nothing has to be remembered between frames, and a
+        # cover started mid-transition (overlay restarted, say) still
+        # gets the right age rather than starting its clock over.
+        try:
+            transition_age = time.time() - os.stat(MPV_TRANSITION_MARKER).st_mtime
+            mpv_transitioning = True
+        except OSError:
+            transition_age = 0.0
+            mpv_transitioning = False
         genuinely_locked = (state["locked"] and state["mpv_running_for_rf"]) or state["mode"] == "stream"
         showing_picture = genuinely_locked and not mpv_transitioning
 
@@ -864,34 +882,53 @@ class LynxOverlay(Gtk.Window):
             # through one does not change what should be on screen.
             if mpv_transitioning and state["tri_watch_enabled"]:
                 # Fill the gap with something to look at rather than a
-                # plain caption, where there's something valid to show.
-                # Pathfinder gets first refusal - if the outgoing station
-                # has a resolved QRZ result, its card is already exactly
-                # what belongs on screen for a few seconds, and drawing
-                # it here closes the visual gap rather than merely
-                # explaining it. draw_pathfinder() itself decides whether
-                # it has anything (state["pathfinder"] not None), so
-                # nothing else here needs to know about QRZ at all.
+                # plain caption, where there's something valid to show -
+                # but not instantly, and not unconditionally.
                 #
-                # Falls back to a fixed placeholder graphic when
-                # Pathfinder has nothing (a stream-only transition, or an
-                # RF station with no QRZ result), and only when even that
-                # is unavailable does the caption reappear - the original
-                # behaviour, never removed, just now the last resort.
-                showing_map = self.draw_pathfinder(cr, width, height)
-                if not showing_map:
-                    showing_map = self.draw_switching_graphic(cr, width, height)
+                # Nothing is drawn for the first pathfinder_delay_secs of
+                # the switch: plain black, exactly as before. That delay
+                # is Pathfinder's own configured one, reused rather than
+                # duplicated, and it is here for the same reason it
+                # exists there - a signal that drops for a moment may be
+                # a fade rather than an ending, and throwing a
+                # full-screen card up over it is a worse mistake than
+                # showing nothing for a second or two. The arbitrator's
+                # own lock_confirm_seconds already declines to switch on
+                # a brief drop; the cover has no business being quicker
+                # to draw a conclusion than the thing that decides.
+                #
+                # After that, Pathfinder gets first refusal - if the
+                # outgoing station has a resolved QRZ result, its card is
+                # already exactly what belongs on screen, and by this
+                # point the watcher has had time to arm it.
+                # draw_pathfinder() decides for itself whether it has
+                # anything, so nothing here needs to know about QRZ at
+                # all. The placeholder follows where it declines (a
+                # stream-only transition, or an RF station with no QRZ
+                # result), and the caption remains the last resort for
+                # when no placeholder image has been supplied.
+                if transition_age >= state["pathfinder_delay_secs"]:
+                    showing_map = self.draw_pathfinder(cr, width, height)
+                    if not showing_map:
+                        showing_map = self.draw_switching_graphic(cr, width, height)
                 if not showing_map:
                     cr.set_source_rgba(0, 0, 0, 1.0)
                     cr.set_operator(cairo.OPERATOR_SOURCE)
                     cr.paint()
                     cr.set_operator(cairo.OPERATOR_OVER)
+                    # Only once the delay has passed and nothing else
+                    # drew. During the delay the screen stays plain black
+                    # and says nothing, which is the point: a fade that
+                    # recovers should leave no trace of having been
+                    # noticed.
+                    #
                     # Smaller and quieter than RECONNECTING: this is a normal
                     # source change, not a fault, and the wording should not
                     # suggest otherwise. Sized so it reads as a caption rather
                     # than an alarm.
-                    self.draw_text(cr, width / 2, height / 2, "SWITCHING",
-                                   size=32, align="center")
+                    if transition_age >= state["pathfinder_delay_secs"]:
+                        self.draw_text(cr, width / 2, height / 2, "SWITCHING",
+                                       size=32, align="center")
             elif mpv_transitioning and genuinely_locked:
                 # mpv is being restarted (decoder/freeze recovery)
                 # while the tuner itself remains genuinely locked - a
