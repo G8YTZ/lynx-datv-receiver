@@ -2602,6 +2602,9 @@ def adopt_picotuner_base_port(base):
     print(f"[picotuner] base IP port is {b} - status on "
           f"{picotuner_info_port(b)}/{picotuner_table_port(b)}, "
           f"TS on {b + 41}/{b + 42}")
+    # The board has restarted or been rejumpered, so nothing it was
+    # previously told still holds.
+    forget_commanded_tune()
     picotuner_base_port = b
 
 
@@ -3809,6 +3812,8 @@ def tri_watch_startup_tune():
                     sock_b.sendto(cmd.encode(), (cfg['host'], picotuner_cmd_port('b', cfg)))
                 finally:
                     sock_b.close()
+            record_commanded_tune(rcv, src['freq'], src['sr'],
+                                  src.get('lnb_lo_khz', 0), fplug)
             print(f"[tri_watch] startup tune: Rx{rcv} -> {src['freq']} kHz / {src['sr']} kS/s")
         except Exception as e:
             print(f"[tri_watch] startup tune: source {idx} (Rx{rcv}) failed: {e}")
@@ -4338,14 +4343,41 @@ def _tri_watch_display_source(idx, src_cfg):
         # immediately, synchronously, right here instead, so the very
         # next poll correctly sees nothing running yet for this target.
         mpv_running_for_rf = False
-        tune(TuneRequest(
-            freq=src_cfg['freq'],
-            sr=src_cfg['sr'],
-            plug=src_cfg.get('fplug', 'a' if rcv == 1 else 'b'),
-            lnb_lo_khz=src_cfg.get('lnb_lo_khz', 0),
-            rcv=rcv,
-        ))
-        print(f"[tri_watch] now displaying source {idx}: RF Rx{rcv}")
+        _fplug = src_cfg.get('fplug', 'a' if rcv == 1 else 'b')
+        _lo = src_cfg.get('lnb_lo_khz', 0)
+        # Skip the tuner command when it would change nothing. tri_watch
+        # tunes every enabled RF source once at startup and leaves them
+        # there, so switching which one is DISPLAYED normally needs no
+        # tuning at all - but this went through tune() regardless, which
+        # dropped the lock and made the receiver reacquire from scratch:
+        # several seconds of black screen every time the display changed.
+        #
+        # The comparison is against what Lynx last COMMANDED this
+        # receiver, not against what the board reports. A reported
+        # frequency lags by a second or two and is briefly stale at
+        # exactly the moment of a switch, which is when it would be
+        # consulted; an earlier attempt compared against it and wrongly
+        # skipped retunes. What was commanded is exact and immediate.
+        #
+        # Anything unknown or different retunes as before, and the
+        # record is discarded whenever the board might have changed
+        # underneath - see forget_commanded_tune().
+        if commanded_tune_matches(rcv, src_cfg['freq'], src_cfg['sr'],
+                                  _lo, _fplug):
+            current_mode = "rf"
+            set_converter_state(rcv, src_cfg['freq'], _lo,
+                                'tri_watch display, already tuned')
+            print(f"[tri_watch] now displaying source {idx}: RF Rx{rcv} "
+                  f"(no retune - already commanded to this)")
+        else:
+            tune(TuneRequest(
+                freq=src_cfg['freq'],
+                sr=src_cfg['sr'],
+                plug=_fplug,
+                lnb_lo_khz=_lo,
+                rcv=rcv,
+            ))
+            print(f"[tri_watch] now displaying source {idx}: RF Rx{rcv}")
     elif src_type == 'stream':
         # No RF source is being displayed while a stream plays - every
         # enabled RF source should be drained, and tri_watch_target_rcv
@@ -8166,6 +8198,61 @@ def picotuner_rcv2_cmd(cmd: str, cfg: dict):
 PICOTUNER_MIN_TUNE_KHZ = 145000   # 145 MHz - the NIM's own lower limit
 
 
+# What Lynx last COMMANDED each receiver to, keyed by receiver number.
+#
+# Deliberately not what the board reports. A reported frequency lags the
+# command by a second or two and is briefly stale at exactly the moment
+# a switch happens - which is when it would be consulted. An earlier
+# attempt at this compared against the reported state and got it wrong,
+# skipping retunes it should have made. What was commanded is exact and
+# immediate, and it is the thing that actually determines whether a
+# retune would change anything.
+#
+# Cleared on anything that could invalidate it, so an empty entry always
+# means "retune", never "assume it is still there".
+picotuner_last_commanded = {}
+
+
+def record_commanded_tune(rcv: int, freq_khz: int, sr_ks: int, lnb_lo_khz: int,
+                          fplug: str):
+    """Remember exactly what this receiver was last told to do."""
+    picotuner_last_commanded[int(rcv)] = {
+        'freq': int(freq_khz), 'sr': int(sr_ks),
+        'lnb_lo_khz': int(lnb_lo_khz or 0), 'fplug': str(fplug or '').lower(),
+    }
+
+
+def forget_commanded_tune(rcv=None):
+    """Forget what a receiver was told - or all of them.
+
+    Called wherever the board might no longer be doing what it was last
+    asked: a power cycle, a base-port change, losing contact with it. The
+    cost of forgetting unnecessarily is one retune; the cost of
+    remembering wrongly is a receiver left on the wrong channel.
+    """
+    if rcv is None:
+        picotuner_last_commanded.clear()
+    else:
+        picotuner_last_commanded.pop(int(rcv), None)
+
+
+def commanded_tune_matches(rcv: int, freq_khz: int, sr_ks: int,
+                           lnb_lo_khz: int, fplug: str) -> bool:
+    """Would retuning this receiver change anything at all?
+
+    Exact comparison of every parameter that goes into the tune command.
+    Anything unknown or different returns False, meaning retune as
+    before.
+    """
+    last = picotuner_last_commanded.get(int(rcv))
+    if not last:
+        return False
+    return (last['freq'] == int(freq_khz)
+            and last['sr'] == int(sr_ks)
+            and last['lnb_lo_khz'] == int(lnb_lo_khz or 0)
+            and last['fplug'] == str(fplug or '').lower())
+
+
 def set_converter_state(rcv: int, freq_khz: int, lnb_lo_khz: int, why: str):
     """Record which converter is in use for a receiver, and log it.
 
@@ -8400,6 +8487,8 @@ def _tune_impl(req: TuneRequest):
         # different rcv= values in the command text does NOT work —
         # confirmed the hard way during tonight's standalone testing.
         div_cfg = config['diversity']
+        record_commanded_tune(1, req.freq, req.sr, req.lnb_lo_khz,
+                              div_cfg.get('rcv1_plug', 'a'))
         picotuner_cmd(
             f"[to@wh] rcv={picotuner_rcv('a')} fplug={div_cfg.get('rcv1_plug', 'a')} offset=0 freq={tuner_freq} srate={req.sr}"
         )
@@ -8416,6 +8505,7 @@ def _tune_impl(req: TuneRequest):
         sock_b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock_b.sendto(
             f"[to@wh] rcv={picotuner_rcv('b')} fplug={div_cfg.get('rcv2_plug', 'b')} offset=0 freq={tuner_freq} srate={req.sr}".encode(),
+            # (recorded below, once the send has been attempted)
             (cfg['host'], picotuner_cmd_port('b', cfg))
         )
         sock_b.close()
@@ -8438,10 +8528,14 @@ def _tune_impl(req: TuneRequest):
         # only kills the old process ~1s later via the async
         # _kick_mpv() thread below, which is too late for the
         # combiner's own startup.
+        record_commanded_tune(2, req.freq, req.sr, req.lnb_lo_khz,
+                              div_cfg.get('rcv2_plug', 'b'))
         kill_mpv()
         start_diversity_combiner()
         diversity_enabled = True
     else:
+        record_commanded_tune(int(getattr(req, 'rcv', 1) or 1), req.freq,
+                              req.sr, req.lnb_lo_khz, req.plug)
         if req.rcv == 2:
             # Same command format and port already confirmed working
             # via tri_watch's own startup-tuning and diversity mode's
