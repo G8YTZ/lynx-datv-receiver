@@ -6767,6 +6767,14 @@ def config_page():
                             </select>
                             <input type="number" step="1" class="form-control mb-2" id="tw-rx1-lnb-custom"
                                    placeholder="Converter LO (kHz)" style="display:none">
+                            <div class="text-muted small mb-2" style="color:#d98a1e !important">
+                                &#x26A0;&#xFE0F; <strong>Up-converters and IF outputs: never plug A.</strong>
+                                Plug A carries 13/18V LNB supply from the moment the PicoTuner
+                                powers up, before Lynx runs - it would destroy a SpyVerter
+                                (4.2-5.5V) or an IC-9700's IF output. Remove the PicoTuner's
+                                LNB supply jumpers, or fit a DC block. A Custom LO gets the
+                                right maths but none of that protection.
+                            </div>
                             <label for="tw-rx1-plug" class="small">Plug</label>
                             <select class="form-control mb-2" id="tw-rx1-plug-input">
                                 <option value="a">A</option>
@@ -6802,6 +6810,14 @@ def config_page():
                             </select>
                             <input type="number" step="1" class="form-control mb-2" id="tw-rx2-lnb-custom"
                                    placeholder="Converter LO (kHz)" style="display:none">
+                            <div class="text-muted small mb-2" style="color:#d98a1e !important">
+                                &#x26A0;&#xFE0F; <strong>Up-converters and IF outputs: never plug A.</strong>
+                                Plug A carries 13/18V LNB supply from the moment the PicoTuner
+                                powers up, before Lynx runs - it would destroy a SpyVerter
+                                (4.2-5.5V) or an IC-9700's IF output. Remove the PicoTuner's
+                                LNB supply jumpers, or fit a DC block. A Custom LO gets the
+                                right maths but none of that protection.
+                            </div>
                             <label for="tw-rx2-plug" class="small">Plug</label>
                             <select class="form-control mb-2" id="tw-rx2-plug-input">
                                 <option value="a">A</option>
@@ -6974,9 +6990,18 @@ let twLnbPsuState = null;
 // presets simply stay disabled, which is the safe way round.
 async function loadTwLnbPsuState() {
     try {
-        const st = await api('GET', '/api/status');
+        // Plain fetch, as the rest of this page uses. An earlier version
+        // called api(), which is defined on the Receiver page and not
+        // this one - so it threw, the catch below swallowed it, and the
+        // no-DC presets stayed permanently disabled with no clue why.
+        const r = await fetch('/api/status');
+        const st = await r.json();
         twLnbPsuState = st?.picotuner?.lnb_psu || null;
     } catch (e) {
+        // Logged rather than swallowed. A silent failure here disables
+        // the presets, which looks like a deliberate restriction and is
+        // very hard to tell apart from one.
+        console.error('could not read LNB PSU state:', e);
         twLnbPsuState = null;
     }
     onTwLnbSelectChange('1');
