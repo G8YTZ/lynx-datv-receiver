@@ -1101,9 +1101,28 @@ class PathfinderTracker:
         self.enabled = bool(enabled)
         self.pending = None
 
+    # How long the card may be held after a station locks, waiting for a
+    # picture that never comes. Without a cap, a source that locks but
+    # never renders would leave the map up indefinitely.
+    HOLD_AFTER_LOCK_MAX_SECS = 12.0
+
     def station_locked(self):
-        """A station is transmitting — cancel anything pending or showing."""
-        self.pending = None
+        """A station is transmitting.
+
+        Note this does NOT clear the card. A lock is not a picture: the
+        lock has to be confirmed, mpv has to start, and mpv has to
+        confirm it is rendering - several seconds during which the card
+        was previously already gone and the viewer saw the idle screen
+        instead. The map was covering that gap perfectly well.
+
+        So the card is held until a picture is genuinely up, which
+        get_card() is told about, or until HOLD_AFTER_LOCK_MAX_SECS has
+        passed in case no picture ever arrives. Audio is not held back
+        with it - sound arriving slightly before the picture is normal
+        for a vision cut and better than silence.
+        """
+        if self.pending is not None:
+            self.pending['locked_at'] = time.time()
 
     def station_unlocked(self, callsign, locator, name=None, mer=None,
                          modcod=None, symbol_rate=None, frequency=None,
@@ -1128,7 +1147,7 @@ class PathfinderTracker:
             'unlocked_at': time.time(),
         }
 
-    def get_card(self):
+    def get_card(self, picture_ready=False):
         """Returns the card to display now, or None. One comparison
         covers both the delay before it appears and the window it stays
         up for."""
@@ -1139,4 +1158,16 @@ class PathfinderTracker:
             return None
         if age > self.delay_secs + self.duration_secs:
             return None
+        # A station has locked since this card was armed: hold the card
+        # until there is actually a picture to cut to, rather than
+        # dropping straight to the idle screen while the new source
+        # acquires. See station_locked().
+        locked_at = self.pending.get('locked_at')
+        if locked_at is not None:
+            if picture_ready:
+                self.pending = None
+                return None
+            if time.time() - locked_at > self.HOLD_AFTER_LOCK_MAX_SECS:
+                self.pending = None
+                return None
         return self.pending

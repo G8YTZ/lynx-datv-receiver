@@ -5487,7 +5487,19 @@ def get_status():
             # End-of-contact map: None unless a card is due to be on
             # screen right now. The overlay only has to check presence -
             # all the timing is worked out here, from a timestamp.
-            "pathfinder": pathfinder_tracker.get_card(),
+            # Told whether there is genuinely a picture on screen, so the
+            # card is held across the gap between a station locking and
+            # its picture appearing, rather than vanishing on the lock and
+            # leaving the idle screen up while the source acquires.
+            # mpv_running_for_rf is set only once mpv has confirmed it is
+            # rendering, which is exactly when the picture arrives.
+            #
+            # Deliberately only applied to RF, the case this was reported
+            # for. Anything else reports ready immediately, so behaviour
+            # elsewhere is unchanged.
+            "pathfinder": pathfinder_tracker.get_card(
+                picture_ready=(current_mode != "rf" or mpv_running_for_rf)
+            ),
             "squeak": _squeak_status(),
             "timestamp": utc_now_iso()
         },
