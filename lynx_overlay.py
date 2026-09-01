@@ -917,35 +917,44 @@ class LynxOverlay(Gtk.Window):
             # through one does not change what should be on screen.
             if mpv_transitioning and state["tri_watch_enabled"]:
                 # Fill the gap with something to look at rather than a
-                # plain caption, where there's something valid to show -
-                # but not instantly, and not unconditionally.
+                # plain caption, where there's something valid to show.
                 #
-                # Nothing is drawn for the first pathfinder_delay_secs of
-                # the switch: plain black, exactly as before. That delay
-                # is Pathfinder's own configured one, reused rather than
-                # duplicated, and it is here for the same reason it
-                # exists there - a signal that drops for a moment may be
-                # a fade rather than an ending, and throwing a
+                # Pathfinder is tried IMMEDIATELY, with no delay applied
+                # here at all. It already has its own, measured from the
+                # moment the station stopped rather than from the moment
+                # the switch began, and enforced in get_card() before the
+                # card is ever sent. Gating it again on the cover's age
+                # applies the same wait twice, to a card that has already
+                # served it - and confirmed live as a real fault: the map
+                # appeared on the idle screen when the contact ended,
+                # then vanished into black the instant the cover went up,
+                # then came back a couple of seconds later. One cover
+                # throughout, one card, taken off the screen in the
+                # middle for no reason. If Pathfinder says a card is due,
+                # it is due, and a cover starting underneath it changes
+                # nothing about that.
+                #
+                # The placeholder is different: it has no timer of its
+                # own, so the delay is applied to it here. Same reason
+                # Pathfinder has one - a signal that drops for a moment
+                # may be a fade rather than an ending, and throwing a
                 # full-screen card up over it is a worse mistake than
                 # showing nothing for a second or two. The arbitrator's
                 # own lock_confirm_seconds already declines to switch on
-                # a brief drop; the cover has no business being quicker
-                # to draw a conclusion than the thing that decides.
+                # a brief drop; the placeholder has no business being
+                # quicker to draw a conclusion than the thing that
+                # decides.
                 #
-                # After that, Pathfinder gets first refusal - if the
-                # outgoing station has a resolved QRZ result, its card is
-                # already exactly what belongs on screen, and by this
-                # point the watcher has had time to arm it.
                 # draw_pathfinder() decides for itself whether it has
                 # anything, so nothing here needs to know about QRZ at
                 # all. The placeholder follows where it declines (a
                 # stream-only transition, or an RF station with no QRZ
                 # result), and the caption remains the last resort for
                 # when no placeholder image has been supplied.
-                if transition_age >= state["pathfinder_delay_secs"]:
-                    showing_map = self.draw_pathfinder(cr, width, height)
-                    if not showing_map:
-                        showing_map = self.draw_switching_graphic(cr, width, height)
+                showing_map = self.draw_pathfinder(cr, width, height)
+                if not showing_map and \
+                        transition_age >= state["pathfinder_delay_secs"]:
+                    showing_map = self.draw_switching_graphic(cr, width, height)
                 if not showing_map:
                     cr.set_source_rgba(0, 0, 0, 1.0)
                     cr.set_operator(cairo.OPERATOR_SOURCE)
