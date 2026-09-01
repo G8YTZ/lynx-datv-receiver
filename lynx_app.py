@@ -375,6 +375,14 @@ current_lnb_lo_khz: int = 0    # LNB LO in use for the current tune, so
                                 # frequency the Picotuner is actually
                                 # locked on AND the real downlink
                                 # frequency for display.
+current_lnb_lo_khz_b: int = 0   # the same pair for tuner B. There was
+current_lnb_side_b: str = "low" # no such pair, so tuner B's on-air
+                                # frequency could never be shown - and
+                                # tri_watch, which tunes both receivers
+                                # itself, never set even tuner A's, so a
+                                # tri_watch source with a converter
+                                # showed the IF or a figure left over
+                                # from an unrelated manual tune.
 current_lnb_side: str = "low"  # "low" (Ku-band, IF=downlink-LO),
                                 # "up" (up-converter, IF=freq+LO) or
                                 # "high" (C-band, IF=LO-downlink) —
@@ -3783,6 +3791,18 @@ def tri_watch_startup_tune():
             continue
         try:
             tuner_freq = calc_tuner_freq(src['freq'], src.get('lnb_lo_khz', 0))
+            # Record the converter in use for this receiver, so the OSD
+            # and Web UI can show the real on-air frequency rather than
+            # the IF. tri_watch tunes the board itself rather than going
+            # through tune(), so without this nothing ever set these and
+            # a tri_watch source with a converter displayed the IF.
+            _side = converter_side(src['freq'], src.get('lnb_lo_khz', 0))
+            if rcv == 1:
+                globals()['current_lnb_lo_khz'] = src.get('lnb_lo_khz', 0)
+                globals()['current_lnb_side'] = _side
+            else:
+                globals()['current_lnb_lo_khz_b'] = src.get('lnb_lo_khz', 0)
+                globals()['current_lnb_side_b'] = _side
             fplug = src.get('fplug', 'a' if rcv == 1 else 'b')
             cmd = (f"[to@wh] rcv={picotuner_rcv('a' if rcv == 1 else 'b')} "
                    f"fplug={fplug} offset=0 freq={tuner_freq} srate={src['sr']}")
@@ -5267,24 +5287,29 @@ def tri_watch_arbitrator_loop():
         except Exception as e:
             print(f"[tri_watch] arbitrator step failed: {e}")
 
-def _compute_downlink_frequency():
+def _compute_downlink_frequency(state=None, lo_khz=None, side=None):
     """When an LNB LO is in use, the Picotuner reports the L-band/IF
     frequency it's actually locked on (e.g. 739.500 MHz), not the real
     satellite downlink frequency. This reverses the LNB math to give
     the real-world figure for display (e.g. 10489.500 MHz for QO-100).
     Must match whichever injection side (low/high) was actually used
     at tune time — see current_lnb_side."""
-    if not current_lnb_lo_khz:
+    # Defaults to tuner A's state so existing callers are unchanged;
+    # tuner B passes its own.
+    state = picotuner_state if state is None else state
+    lo_khz = current_lnb_lo_khz if lo_khz is None else lo_khz
+    side = current_lnb_side if side is None else side
+    if not lo_khz:
         return None
     try:
-        ifreq_mhz = float(picotuner_state["frequency"])
-        lo_mhz = current_lnb_lo_khz / 1000
-        if current_lnb_side == "up":
+        ifreq_mhz = float(state["frequency"])
+        lo_mhz = lo_khz / 1000
+        if side == "up":
             # Up-converter: IF = freq + LO, so freq = IF - LO. Without
             # this the OSD would show an on-air frequency wrong by twice
             # the LO for anything on 10m, 8m, 6m or 4m.
             return round(ifreq_mhz - lo_mhz, 3)
-        if current_lnb_side == "high":
+        if side == "high":
             # High-side injection (C-band): IF = LO - downlink,
             # so downlink = LO - IF
             return round(lo_mhz - ifreq_mhz, 3)
@@ -5483,6 +5508,9 @@ def get_status():
                 "online": picotuner_state_b["online"],
                 "locked": picotuner_state_b["locked"],
                 "callsign": picotuner_state_b["callsign"],
+                "downlink_frequency": _compute_downlink_frequency(
+                    picotuner_state_b, current_lnb_lo_khz_b, current_lnb_side_b),
+                "lnb_lo_khz": current_lnb_lo_khz_b,
                 "callsign_name": qrz_first_name(picotuner_state_b["callsign"]),
                 "frequency": picotuner_state_b["frequency"],
                 "mer": picotuner_state_b["mer"],
@@ -6724,6 +6752,9 @@ def config_page():
                             <input type="number" step="1" class="form-control mb-2" id="tw-rx1-freq-input" placeholder="e.g. 437000">
                             <label for="tw-rx1-sr" class="small">Symbol rate (kS/s)</label>
                             <input type="number" step="1" class="form-control mb-2" id="tw-rx1-sr-input" placeholder="e.g. 1000">
+                            <label for="tw-rx1-lnb" class="small">Converter LO (kHz)</label>
+                            <input type="number" step="1" class="form-control mb-2" id="tw-rx1-lnb-input"
+                                   placeholder="0 = none, e.g. 9750000 or 120000">
                             <label for="tw-rx1-plug" class="small">Plug</label>
                             <select class="form-control mb-2" id="tw-rx1-plug-input">
                                 <option value="a">A</option>
@@ -6744,6 +6775,9 @@ def config_page():
                             <input type="number" step="1" class="form-control mb-2" id="tw-rx2-freq-input" placeholder="e.g. 1249000">
                             <label for="tw-rx2-sr" class="small">Symbol rate (kS/s)</label>
                             <input type="number" step="1" class="form-control mb-2" id="tw-rx2-sr-input" placeholder="e.g. 1000">
+                            <label for="tw-rx2-lnb" class="small">Converter LO (kHz)</label>
+                            <input type="number" step="1" class="form-control mb-2" id="tw-rx2-lnb-input"
+                                   placeholder="0 = none, e.g. 9750000 or 120000">
                             <label for="tw-rx2-plug" class="small">Plug</label>
                             <select class="form-control mb-2" id="tw-rx2-plug-input">
                                 <option value="a">A</option>
@@ -6968,6 +7002,7 @@ async function loadCurrentConfig() {
         document.getElementById('tw-rx1-enabled-input').checked = !!twRx1;
         document.getElementById('tw-rx1-freq-input').value = twRx1?.freq ?? '';
         document.getElementById('tw-rx1-sr-input').value = twRx1?.sr ?? '';
+        document.getElementById('tw-rx1-lnb-input').value = twRx1?.lnb_lo_khz ?? '';
         document.getElementById('tw-rx1-plug-input').value = twRx1?.fplug || 'a';
         document.getElementById('tw-rx1-label-input').value = twRx1?.label || '';
         document.getElementById('tw-rx1-callsign-input').value = twRx1?.callsign || '';
@@ -6975,6 +7010,7 @@ async function loadCurrentConfig() {
         document.getElementById('tw-rx2-enabled-input').checked = !!twRx2;
         document.getElementById('tw-rx2-freq-input').value = twRx2?.freq ?? '';
         document.getElementById('tw-rx2-sr-input').value = twRx2?.sr ?? '';
+        document.getElementById('tw-rx2-lnb-input').value = twRx2?.lnb_lo_khz ?? '';
         document.getElementById('tw-rx2-plug-input').value = twRx2?.fplug || 'b';
         document.getElementById('tw-rx2-label-input').value = twRx2?.label || '';
         document.getElementById('tw-rx2-callsign-input').value = twRx2?.callsign || '';
@@ -7798,6 +7834,7 @@ async function saveTriWatch() {
                     fplug: document.getElementById('tw-rx1-plug-input').value,
                     freq: parseInt(document.getElementById('tw-rx1-freq-input').value) || 0,
                     sr: parseInt(document.getElementById('tw-rx1-sr-input').value) || 0,
+                    lnb_lo_khz: parseInt(document.getElementById('tw-rx1-lnb-input').value) || 0,
                     label: document.getElementById('tw-rx1-label-input').value,
                     callsign: document.getElementById('tw-rx1-callsign-input').value,
                 },
@@ -7807,6 +7844,7 @@ async function saveTriWatch() {
                     fplug: document.getElementById('tw-rx2-plug-input').value,
                     freq: parseInt(document.getElementById('tw-rx2-freq-input').value) || 0,
                     sr: parseInt(document.getElementById('tw-rx2-sr-input').value) || 0,
+                    lnb_lo_khz: parseInt(document.getElementById('tw-rx2-lnb-input').value) || 0,
                     label: document.getElementById('tw-rx2-label-input').value,
                     callsign: document.getElementById('tw-rx2-callsign-input').value,
                 },
@@ -7973,6 +8011,26 @@ def picotuner_rcv2_cmd(cmd: str, cfg: dict):
 PICOTUNER_MIN_TUNE_KHZ = 145000   # 145 MHz - the NIM's own lower limit
 
 
+def converter_side(freq_khz: int, lnb_lo_khz: int) -> str:
+    """Which converter arrangement calc_tuner_freq() will use: "up",
+    "low" or "high".
+
+    Exists so the answer is computed in ONE place. The rule was already
+    duplicated between the tune path, the browser and the display
+    reversal, and they disagreed - which is how a frequency below the
+    tuner's range came to be rejected outright in the Web UI while the
+    backend handled it correctly. Anything needing to know the side asks
+    here.
+    """
+    if not lnb_lo_khz:
+        return "low"
+    if freq_khz < PICOTUNER_MIN_TUNE_KHZ:
+        return "up"
+    if freq_khz >= lnb_lo_khz:
+        return "low"
+    return "high"
+
+
 def calc_tuner_freq(freq_khz: int, lnb_lo_khz: int) -> int:
     """Given a wanted frequency and a converter LO (0 = none), returns
     the actual IF frequency the Picotuner needs to be tuned to.
@@ -8089,14 +8147,7 @@ def _tune_impl(req: TuneRequest):
     # manual tune - the path most people use. Two copies of one
     # calculation is exactly how that happens.
     tuner_freq = calc_tuner_freq(req.freq, req.lnb_lo_khz)
-    if not req.lnb_lo_khz:
-        current_lnb_side = "low"
-    elif req.freq < PICOTUNER_MIN_TUNE_KHZ:
-        current_lnb_side = "up"        # up-converter: IF = freq + LO
-    elif req.freq >= req.lnb_lo_khz:
-        current_lnb_side = "low"       # low-side (Ku LNB, or an IF output)
-    else:
-        current_lnb_side = "high"      # high-side (C-band LNB)
+    current_lnb_side = converter_side(req.freq, req.lnb_lo_khz)
 
     # CRITICAL SAFETY CHECK — a mismatched LNB selection can produce a
     # negative or nonsensical frequency (e.g. downlink 3404 MHz minus a

@@ -2,6 +2,16 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-09-01
+
+**Added**
+- A Converter LO field on both Tri-Watch RF sources in the Web UI. The backend has always honoured `lnb_lo_khz` on a Tri-Watch source, but there was no field for it, so the only way to use a converter there was to edit `lynx_config.yaml` by hand. Spotted by Martin G8LCE.
+
+**Fixed**
+- A Tri-Watch source with a converter showed the IF rather than the real on-air frequency - or worse, a figure left over from an unrelated manual tune. The display reversal read globals that only a manual tune ever set, and tri_watch tunes the board itself. It now records the converter in use for whichever receiver it tuned, and the calculation takes that state as a parameter rather than reading one fixed pair of globals.
+- Tuner B had no converter state at all, so its on-air frequency could never be shown whatever tuned it. It now has its own pair, and `downlink_frequency` and `lnb_lo_khz` appear alongside tuner B's other fields.
+- The rule deciding which converter arrangement applies - up, low-side or high-side - is now in one function, `converter_side()`. It had been written out separately in the tune path, the browser and the display reversal, and they disagreed: that is precisely how a frequency below the tuner's range came to be rejected outright in the Web UI while the backend handled it correctly. Anything needing the answer now asks one place.
+
 ## 2026-08-31
 
 **Added**
