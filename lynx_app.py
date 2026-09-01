@@ -607,7 +607,26 @@ def start_transition_cover():
     if the Pi is under load and scheduling is delayed."""
     global mpv_transitioning
     mpv_transitioning = True
-    open(MPV_TRANSITION_MARKER, 'w').close()
+    # Created only if it isn't already there, and atomically so.
+    # Re-touching an existing marker updates its mtime, and the overlay
+    # measures the age of the cover from exactly that - so a second
+    # start_transition_cover() during a cover that is already up would
+    # silently restart its clock. That is not hypothetical: the tri_watch
+    # loss-of-lock path in rf_mpv_lifecycle_monitor() raises the cover and
+    # deliberately never lowers it, leaving it up for whatever displays
+    # next; _start_stream_impl() then raises it again for its own switch.
+    # Confirmed live as a visible fault - the Pathfinder card appeared,
+    # vanished back to a black screen, and reappeared, because the second
+    # call sent the overlay back inside its own appearance delay.
+    #
+    # The cover has genuinely been up continuously the whole time, so the
+    # original timestamp is the honest one. Nesting starts is normal here
+    # and should extend a cover, never restart it.
+    try:
+        os.close(os.open(MPV_TRANSITION_MARKER,
+                         os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except FileExistsError:
+        pass
     # Mute the OLD process right away — launching the new one with
     # --mute=yes only silences audio from the new source, it does
     # nothing about the old source still being audible for however

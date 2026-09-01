@@ -929,6 +929,20 @@ class LynxOverlay(Gtk.Window):
                     if transition_age >= state["pathfinder_delay_secs"]:
                         self.draw_text(cr, width / 2, height / 2, "SWITCHING",
                                        size=32, align="center")
+                # Suppress the corner OSD zones for the WHOLE cover, not
+                # just the part of it where a card happens to be drawn.
+                # They were previously left on during the delay, and the
+                # result was reported as a distinct screen in its own
+                # right - "showing RF not locked" - when it was really
+                # this same cover with the frequency block, SEARCHING
+                # flag and magic eye still painted over the top of it.
+                #
+                # Nothing they report means anything mid-switch: the old
+                # source has gone and the new one has not arrived, so
+                # SEARCHING is true but irrelevant and the frequency is
+                # whatever is being left behind. The cover exists to say
+                # "wait", and the OSD contradicted it.
+                showing_map = True
             elif mpv_transitioning and genuinely_locked:
                 # mpv is being restarted (decoder/freeze recovery)
                 # while the tuner itself remains genuinely locked - a
