@@ -8176,6 +8176,26 @@ def set_converter_state(rcv: int, freq_khz: int, lnb_lo_khz: int, why: str):
     confusing symptom a long way from its cause.
     """
     side = converter_side(freq_khz, lnb_lo_khz)
+    # Drop the frequency the board last reported, at the same moment.
+    #
+    # The two are only meaningful together: the reported figure is an IF,
+    # and the converter state is what turns it back into an on-air
+    # frequency. The board takes a second or two to report a new tune, so
+    # keeping the old figure while the converter state has already
+    # changed pairs them wrongly and shows a number that is simply false.
+    #
+    # Confirmed as the cause of "the OSD shows the IF sometimes, then
+    # corrects itself": tune the IC-9700 (board reports 320, LO 929000,
+    # shown as 1249 - right), then tune something with no converter, and
+    # the LO becomes 0 while the board is still reporting 320. It shows
+    # 320 until the board catches up. The reverse gives a different
+    # nonsense - 1129 for a direct 1249 with a SpyVerter selected.
+    #
+    # Cleared rather than guessed at, so the OSD shows nothing for that
+    # moment instead of something wrong. A blank field for a second is
+    # honest; a confident wrong number is not.
+    st = picotuner_state_b if rcv == 2 else picotuner_state
+    st["frequency"] = ""
     if rcv == 2:
         globals()['current_lnb_lo_khz_b'] = lnb_lo_khz
         globals()['current_lnb_side_b'] = side
