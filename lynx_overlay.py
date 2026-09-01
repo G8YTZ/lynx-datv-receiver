@@ -139,6 +139,17 @@ POLL_SECS = 2
 NOTIFICATION_SOUND_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "tri_watch_notification.mp3")
 
+# tri_watch source-switch placeholder - shown full-frame in place of
+# the plain "SWITCHING" caption whenever Pathfinder has nothing to
+# draw for the switch (a stream-only transition, or an RF station
+# with no resolved QRZ result). Place the actual image here yourself
+# (not fetched/bundled by Claude - see chat); built to the video
+# frame size (1920x1080) so it can be drawn edge-to-edge with no
+# letterboxing. Entirely optional - if the file is missing, on_draw()
+# falls back to the original black slide with the "SWITCHING" caption.
+TRI_WATCH_SWITCHING_GRAPHIC_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "gb3oo_testcard.png")
+
 def play_notification_sound():
     """Fire-and-forget playback of the notification sound via a short-
     lived, audio-only mpv process - completely separate from the main,
@@ -758,6 +769,17 @@ class LynxOverlay(Gtk.Window):
             except Exception as e:
                 print(f"Could not load logo: {e}")
 
+        # See TRI_WATCH_SWITCHING_GRAPHIC_PATH's own comment - entirely
+        # optional, so a missing file here is not an error, just a
+        # fall-through to the plain "SWITCHING" caption.
+        self.switching_pixbuf = None
+        if os.path.exists(TRI_WATCH_SWITCHING_GRAPHIC_PATH):
+            try:
+                self.switching_pixbuf = GdkPixbuf.Pixbuf.new_from_file(
+                    TRI_WATCH_SWITCHING_GRAPHIC_PATH)
+            except Exception as e:
+                print(f"Could not load tri_watch switching graphic: {e}")
+
         GLib.timeout_add(100, self.tick)
 
         self._pf_surface = None
@@ -821,16 +843,35 @@ class LynxOverlay(Gtk.Window):
             # state does mean a decoder or freeze recovery is underway
             # and saying so is useful.
             if mpv_transitioning and genuinely_locked and state["tri_watch_enabled"]:
-                cr.set_source_rgba(0, 0, 0, 1.0)
-                cr.set_operator(cairo.OPERATOR_SOURCE)
-                cr.paint()
-                cr.set_operator(cairo.OPERATOR_OVER)
-                # Smaller and quieter than RECONNECTING: this is a normal
-                # source change, not a fault, and the wording should not
-                # suggest otherwise. Sized so it reads as a caption rather
-                # than an alarm.
-                self.draw_text(cr, width / 2, height / 2, "SWITCHING",
-                               size=32, align="center")
+                # Fill the gap with something to look at rather than a
+                # plain caption, where there's something valid to show.
+                # Pathfinder gets first refusal - if the outgoing station
+                # has a resolved QRZ result, its card is already exactly
+                # what belongs on screen for a few seconds, and drawing
+                # it here closes the visual gap rather than merely
+                # explaining it. draw_pathfinder() itself decides whether
+                # it has anything (state["pathfinder"] not None), so
+                # nothing else here needs to know about QRZ at all.
+                #
+                # Falls back to a fixed placeholder graphic when
+                # Pathfinder has nothing (a stream-only transition, or an
+                # RF station with no QRZ result), and only when even that
+                # is unavailable does the caption reappear - the original
+                # behaviour, never removed, just now the last resort.
+                showing_map = self.draw_pathfinder(cr, width, height)
+                if not showing_map:
+                    showing_map = self.draw_switching_graphic(cr, width, height)
+                if not showing_map:
+                    cr.set_source_rgba(0, 0, 0, 1.0)
+                    cr.set_operator(cairo.OPERATOR_SOURCE)
+                    cr.paint()
+                    cr.set_operator(cairo.OPERATOR_OVER)
+                    # Smaller and quieter than RECONNECTING: this is a normal
+                    # source change, not a fault, and the wording should not
+                    # suggest otherwise. Sized so it reads as a caption rather
+                    # than an alarm.
+                    self.draw_text(cr, width / 2, height / 2, "SWITCHING",
+                                   size=32, align="center")
             elif mpv_transitioning and genuinely_locked:
                 # mpv is being restarted (decoder/freeze recovery)
                 # while the tuner itself remains genuinely locked - a
@@ -1034,6 +1075,32 @@ class LynxOverlay(Gtk.Window):
 
         cr.set_source_surface(self._pf_surface, 0, 0)
         cr.paint()
+        return True
+
+    def draw_switching_graphic(self, cr, width, height):
+        """tri_watch source-switch placeholder - full-frame, drawn only
+        when draw_pathfinder() has already declined (nothing to show).
+        See TRI_WATCH_SWITCHING_GRAPHIC_PATH's own comment for what this
+        is and why it's optional.
+
+        Unlike draw_centered_logo() this scales to fill the frame
+        exactly rather than fitting within it - the asset is built to
+        the video frame size for precisely that reason, so there is no
+        letterboxing to avoid and no aspect ratio to preserve against a
+        differently-shaped source.
+        """
+        pb = self.switching_pixbuf
+        if pb is None:
+            return False
+        pw, ph = pb.get_width(), pb.get_height()
+        if not pw or not ph:
+            return False
+
+        cr.save()
+        cr.scale(width / pw, height / ph)
+        Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
+        cr.paint()
+        cr.restore()
         return True
 
     def draw_waiting_bubble(self, cr, width, height):
