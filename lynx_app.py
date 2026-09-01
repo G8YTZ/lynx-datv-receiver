@@ -3796,13 +3796,8 @@ def tri_watch_startup_tune():
             # the IF. tri_watch tunes the board itself rather than going
             # through tune(), so without this nothing ever set these and
             # a tri_watch source with a converter displayed the IF.
-            _side = converter_side(src['freq'], src.get('lnb_lo_khz', 0))
-            if rcv == 1:
-                globals()['current_lnb_lo_khz'] = src.get('lnb_lo_khz', 0)
-                globals()['current_lnb_side'] = _side
-            else:
-                globals()['current_lnb_lo_khz_b'] = src.get('lnb_lo_khz', 0)
-                globals()['current_lnb_side_b'] = _side
+            set_converter_state(rcv, src['freq'], src.get('lnb_lo_khz', 0),
+                                'tri_watch startup tune')
             fplug = src.get('fplug', 'a' if rcv == 1 else 'b')
             cmd = (f"[to@wh] rcv={picotuner_rcv('a' if rcv == 1 else 'b')} "
                    f"fplug={fplug} offset=0 freq={tuner_freq} srate={src['sr']}")
@@ -4343,57 +4338,14 @@ def _tri_watch_display_source(idx, src_cfg):
         # immediately, synchronously, right here instead, so the very
         # next poll correctly sees nothing running yet for this target.
         mpv_running_for_rf = False
-        # Skip the tuner command when this receiver is ALREADY on exactly
-        # this channel and locked - which, after tri_watch's startup tune,
-        # it almost always is. Switching which source is displayed is a
-        # display decision, not a tuning one, and retuning a locked
-        # receiver drops the lock and makes it reacquire from scratch:
-        # several seconds of black screen and a fresh confirmation cycle
-        # every single time the display changed.
-        #
-        # tune() is still called when anything differs, so the behaviour
-        # is unchanged wherever a retune is genuinely needed - and
-        # picotuner_already_tuned() returns False on anything it cannot
-        # be sure of.
-        already = picotuner_already_tuned(
-            rcv, src_cfg['freq'], src_cfg['sr'], src_cfg.get('lnb_lo_khz', 0))
-        if already:
-            # Set the state tune() would have set, and leave mpv to
-            # rf_mpv_lifecycle_monitor(): it already starts mpv for
-            # whatever tri_watch_target_rcv points at, confirms it is
-            # genuinely rendering before believing it, and retries if it
-            # is not. Calling restart_mpv() here instead would duplicate
-            # that and set mpv_running_for_rf before anything had been
-            # confirmed - tune() deliberately does not do that either,
-            # leaving it to the same monitor.
-            #
-            # So the saving is the retune and its reacquisition, not the
-            # mpv start, which still takes its normal moment.
-            current_mode = "rf"
-            _lo = src_cfg.get('lnb_lo_khz', 0)
-            _side = converter_side(src_cfg['freq'], _lo)
-            if rcv == 1:
-                globals()['current_lnb_lo_khz'] = _lo
-                globals()['current_lnb_side'] = _side
-            else:
-                globals()['current_lnb_lo_khz_b'] = _lo
-                globals()['current_lnb_side_b'] = _side
-            # Kept consistent with what tune() would have shown.
-            globals()['current_preset'] = (
-                f"{src_cfg['freq']/1000:.3f} MHz (LNB LO {_lo/1000:.3f} MHz) / {src_cfg['sr']} kS/s"
-                if _lo else
-                f"{src_cfg['freq']/1000:.3f} MHz / {src_cfg['sr']} kS/s")
-            print(f"[tri_watch] now displaying source {idx}: RF Rx{rcv} "
-                  f"(already tuned - no retune needed)")
-        else:
-            tune(TuneRequest(
-                freq=src_cfg['freq'],
-                sr=src_cfg['sr'],
-                plug=src_cfg.get('fplug', 'a' if rcv == 1 else 'b'),
-                lnb_lo_khz=src_cfg.get('lnb_lo_khz', 0),
-                rcv=rcv,
-            ))
-            print(f"[tri_watch] now displaying source {idx}: RF Rx{rcv}")
+        tune(TuneRequest(
+            freq=src_cfg['freq'],
+            sr=src_cfg['sr'],
+            plug=src_cfg.get('fplug', 'a' if rcv == 1 else 'b'),
+            lnb_lo_khz=src_cfg.get('lnb_lo_khz', 0),
+            rcv=rcv,
+        ))
+        print(f"[tri_watch] now displaying source {idx}: RF Rx{rcv}")
     elif src_type == 'stream':
         # No RF source is being displayed while a stream plays - every
         # enabled RF source should be drained, and tri_watch_target_rcv
@@ -5034,44 +4986,6 @@ def _picotuner_expected_lnb():
         'a': (str(cfg.get('plug_a', 'off')).lower(), bool(cfg.get('plug_a_tone', False))),
         'b': (str(cfg.get('plug_b', 'off')).lower(), bool(cfg.get('plug_b_tone', False))),
     }
-
-
-def picotuner_already_tuned(rcv: int, freq_khz: int, sr_ks: int,
-                            lnb_lo_khz: int = 0) -> bool:
-    """Is this receiver already sitting on exactly this channel?
-
-    Used to avoid retuning a receiver that needs no retuning. tri_watch
-    tunes every enabled RF source once at startup and leaves them there,
-    so switching which one is DISPLAYED does not require touching the
-    tuner at all - but the switch went through tune() regardless, which
-    dropped lock and made the receiver reacquire from scratch. Several
-    seconds of black screen and a fresh lock-confirmation cycle, every
-    time, for a receiver that was already locked on the right channel.
-
-    The tolerances match the config-drift monitor's, and for the same
-    reasons: a locked receiver reports the frequency it actually FOUND,
-    so a transmitter 23 kHz off its nominal is not a different channel.
-    Only a genuinely different one is worth a retune.
-
-    Deliberately conservative - anything uncertain returns False, which
-    means retuning as before. The cost of an unnecessary retune is a few
-    seconds; the cost of wrongly skipping one is a receiver left on the
-    wrong channel with no picture and no obvious reason.
-    """
-    st = picotuner_state_b if rcv == 2 else picotuner_state
-    if not st.get("locked"):
-        return False
-    got_khz = _picotuner_reported_khz(st)
-    if got_khz is None:
-        return False
-    want_khz = calc_tuner_freq(freq_khz, lnb_lo_khz)
-    if abs(got_khz - want_khz) > 1000.0:      # 1 MHz, as the drift monitor uses
-        return False
-    if sr_ks:
-        got_sr = _picotuner_reported_sr(st)
-        if got_sr is None or abs(got_sr - float(sr_ks)) > 2.0:
-            return False
-    return True
 
 
 def _picotuner_reported_khz(st):
@@ -8252,6 +8166,26 @@ def picotuner_rcv2_cmd(cmd: str, cfg: dict):
 PICOTUNER_MIN_TUNE_KHZ = 145000   # 145 MHz - the NIM's own lower limit
 
 
+def set_converter_state(rcv: int, freq_khz: int, lnb_lo_khz: int, why: str):
+    """Record which converter is in use for a receiver, and log it.
+
+    One function so there is one place to look, and one log line per
+    change so a fault can be read from the log rather than inferred.
+    The state feeds the on-air frequency shown on the OSD and in the Web
+    UI: get it wrong and the IF is displayed instead, which is a
+    confusing symptom a long way from its cause.
+    """
+    side = converter_side(freq_khz, lnb_lo_khz)
+    if rcv == 2:
+        globals()['current_lnb_lo_khz_b'] = lnb_lo_khz
+        globals()['current_lnb_side_b'] = side
+    else:
+        globals()['current_lnb_lo_khz'] = lnb_lo_khz
+        globals()['current_lnb_side'] = side
+    print(f"[converter] Rx{rcv}: freq={freq_khz} lo={lnb_lo_khz} "
+          f"side={side} ({why})")
+
+
 def converter_side(freq_khz: int, lnb_lo_khz: int) -> str:
     """Which converter arrangement calc_tuner_freq() will use: "up",
     "low" or "high".
@@ -8388,7 +8322,21 @@ def _tune_impl(req: TuneRequest):
     # manual tune - the path most people use. Two copies of one
     # calculation is exactly how that happens.
     tuner_freq = calc_tuner_freq(req.freq, req.lnb_lo_khz)
-    current_lnb_side = converter_side(req.freq, req.lnb_lo_khz)
+    # Recorded against the receiver actually being tuned. This used to
+    # write tuner A's state unconditionally, whatever req.rcv said - so
+    # displaying Rx2 overwrote Rx1's converter with Rx2's, and tuner B's
+    # was never set at all. The visible symptom was the OSD showing the
+    # IF instead of the on-air frequency for whichever receiver had been
+    # displaced, which is a long way from its cause.
+    #
+    # In diversity both receivers carry the same frequency and converter,
+    # so both are set.
+    _rcv = 1 if is_diversity else int(getattr(req, 'rcv', 1) or 1)
+    if is_diversity:
+        set_converter_state(1, req.freq, req.lnb_lo_khz, 'tune() diversity')
+        set_converter_state(2, req.freq, req.lnb_lo_khz, 'tune() diversity')
+    else:
+        set_converter_state(_rcv, req.freq, req.lnb_lo_khz, 'tune()')
 
     # CRITICAL SAFETY CHECK — a mismatched LNB selection can produce a
     # negative or nonsensical frequency (e.g. downlink 3404 MHz minus a
@@ -8407,7 +8355,7 @@ def _tune_impl(req: TuneRequest):
             )
         )
 
-    current_lnb_lo_khz = req.lnb_lo_khz
+    # (the converter state is recorded above, per receiver)
 
     # Cover the screen well before touching the source. This must come
     # AFTER the safety check above — if it started earlier and the
