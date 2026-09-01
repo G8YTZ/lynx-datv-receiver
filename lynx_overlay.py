@@ -825,6 +825,12 @@ class LynxOverlay(Gtk.Window):
                 cr.set_operator(cairo.OPERATOR_SOURCE)
                 cr.paint()
                 cr.set_operator(cairo.OPERATOR_OVER)
+                # Smaller and quieter than RECONNECTING: this is a normal
+                # source change, not a fault, and the wording should not
+                # suggest otherwise. Sized so it reads as a caption rather
+                # than an alarm.
+                self.draw_text(cr, width / 2, height / 2, "SWITCHING",
+                               size=32, align="center")
             elif mpv_transitioning and genuinely_locked:
                 # mpv is being restarted (decoder/freeze recovery)
                 # while the tuner itself remains genuinely locked - a
