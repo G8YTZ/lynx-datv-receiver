@@ -241,6 +241,7 @@ state = {
     "downlink_frequency_b": None,
     "sr_ks_b": "",
     "tri_watch_show_searching_rx2": False,
+    "tri_watch_enabled": False,
     "dbm_a": "",
     "level_a": "",
     "dbm_b": "",
@@ -686,6 +687,8 @@ def poll_status():
             tri_watch = data.get('tri_watch') or {}
             notification = tri_watch.get('notification') if tri_watch.get('enabled') else None
             state["tri_watch_notification"] = notification.get('message') if notification else None
+            state["tri_watch_enabled"] = bool(
+                (data.get('tri_watch') or {}).get('enabled', False))
             if notification:
                 triggered_at = notification.get('triggered_at')
                 if triggered_at is not None and triggered_at != _last_notification_sound_played_for:
@@ -807,7 +810,22 @@ class LynxOverlay(Gtk.Window):
         if showing_squeak:
             showing_map = True          # suppress the corner OSD zones too
         elif not showing_picture:
-            if mpv_transitioning and genuinely_locked:
+            # In tri_watch, a source switch produces exactly this state -
+            # tuner locked, mpv restarting, no picture yet - and it is
+            # entirely normal rather than a fault. Showing "RECONNECTING"
+            # for it implies something has gone wrong when nothing has,
+            # so tri_watch gets a plain black frame instead: a cut, which
+            # is what it actually is.
+            #
+            # The word is kept for the single-source case, where this
+            # state does mean a decoder or freeze recovery is underway
+            # and saying so is useful.
+            if mpv_transitioning and genuinely_locked and state["tri_watch_enabled"]:
+                cr.set_source_rgba(0, 0, 0, 1.0)
+                cr.set_operator(cairo.OPERATOR_SOURCE)
+                cr.paint()
+                cr.set_operator(cairo.OPERATOR_OVER)
+            elif mpv_transitioning and genuinely_locked:
                 # mpv is being restarted (decoder/freeze recovery)
                 # while the tuner itself remains genuinely locked - a
                 # plain black slide reads as a brief, minor interruption
