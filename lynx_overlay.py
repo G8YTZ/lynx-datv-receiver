@@ -838,13 +838,31 @@ class LynxOverlay(Gtk.Window):
             # tuner locked, mpv restarting, no picture yet - and it is
             # entirely normal rather than a fault. Showing "RECONNECTING"
             # for it implies something has gone wrong when nothing has,
-            # so tri_watch gets a plain black frame instead: a cut, which
-            # is what it actually is.
+            # so tri_watch gets a cover instead: a cut, which is what it
+            # actually is.
             #
             # The word is kept for the single-source case, where this
             # state does mean a decoder or freeze recovery is underway
             # and saying so is useful.
-            if mpv_transitioning and genuinely_locked and state["tri_watch_enabled"]:
+            #
+            # Deliberately NOT gated on genuinely_locked, which it was
+            # originally and which made this fire in one direction only.
+            # Switching TO a stream sets mode="stream" immediately, so
+            # genuinely_locked was true and the cover appeared. Switching
+            # TO RF sets mode="rf" while mpv_running_for_rf is still
+            # false (mpv is being restarted - that is the whole point of
+            # the transition), so genuinely_locked was false, this branch
+            # was skipped entirely, and the switch fell through to the
+            # idle screen below - logo, no cover, no caption. Confirmed
+            # live: stream-to-RF showed a blank page where RF-to-stream
+            # showed the cover correctly.
+            #
+            # The marker file alone is the right test. It exists only
+            # between start_transition_cover() and end_transition_cover(),
+            # so its presence already means a real, bounded transition is
+            # underway; what the tuner happens to be doing partway
+            # through one does not change what should be on screen.
+            if mpv_transitioning and state["tri_watch_enabled"]:
                 # Fill the gap with something to look at rather than a
                 # plain caption, where there's something valid to show.
                 # Pathfinder gets first refusal - if the outgoing station
