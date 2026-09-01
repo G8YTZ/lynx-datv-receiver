@@ -9630,6 +9630,16 @@ def web_ui():
                                    id="lnb-custom-input" placeholder="Converter LO (kHz)">
                         </div>
                     </div>
+                    <div class="text-muted small mt-1" style="color:#d98a1e !important">
+                        &#x26A0;&#xFE0F; <strong>Up-converters and IF outputs: never plug A.</strong>
+                        Plug A carries 13/18V LNB supply from the moment the PicoTuner powers
+                        up, before Lynx is running - it would destroy a SpyVerter (4.2-5.5V)
+                        or an IC-9700's IF output. Software cannot prevent this; remove the
+                        PicoTuner's LNB supply jumpers, or fit a DC block. The two presets
+                        above are offered only when plug B has no voltage generator fitted.
+                        A Custom LO gets the right maths but none of that protection - manage
+                        the supply yourself.
+                    </div>
                     <div class="mt-2 d-flex gap-2">
                         <select class="form-select form-select-sm bg-dark text-light border-secondary" id="plug-select">
                             <option value="a">Plug A (top)</option>
