@@ -142,13 +142,15 @@ NOTIFICATION_SOUND_PATH = os.path.join(
 # tri_watch source-switch placeholder - shown full-frame in place of
 # the plain "SWITCHING" caption whenever Pathfinder has nothing to
 # draw for the switch (a stream-only transition, or an RF station
-# with no resolved QRZ result). Place the actual image here yourself
-# (not fetched/bundled by Claude - see chat); built to the video
-# frame size (1920x1080) so it can be drawn edge-to-edge with no
-# letterboxing. Entirely optional - if the file is missing, on_draw()
-# falls back to the original black slide with the "SWITCHING" caption.
+# with no resolved QRZ result). Supply your own image here - a station
+# test card, a club logo, whatever suits; nothing is bundled, and the
+# filename is deliberately generic rather than named for any one
+# station. Built to the video frame size (1920x1080) so it can be
+# drawn edge-to-edge with no letterboxing. Entirely optional - if the
+# file is missing, on_draw() falls back to the original black slide
+# with the "SWITCHING" caption.
 TRI_WATCH_SWITCHING_GRAPHIC_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "gb3oo_testcard.png")
+    os.path.dirname(os.path.abspath(__file__)), "lynx_testcard.png")
 
 def play_notification_sound():
     """Fire-and-forget playback of the notification sound via a short-
