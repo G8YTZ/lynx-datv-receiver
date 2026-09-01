@@ -33,6 +33,7 @@ import asyncio
 import faulthandler
 import json
 import threading
+import base64
 import os
 import re
 import signal
@@ -5656,6 +5657,141 @@ def get_diagnostics():
         "events": list(reversed(diagnostics["events"])),  # newest first
     }
 
+class TestcardUploadRequest(BaseModel):
+    """The switch placeholder card, posted as base64 rather than as a
+    multipart file upload.
+
+    Multipart would be the obvious choice, but FastAPI needs
+    python-multipart for it and that isn't among Lynx's dependencies -
+    adding one means every existing receiver has to complete a
+    dependency refresh before the config page works at all, which is a
+    poor trade for a single small upload. Base64 in a JSON body needs
+    nothing that isn't already here, and a test card is a few hundred
+    kilobytes to a local server."""
+    filename: str = ""       # only used to pick the saved extension
+    data_base64: str
+
+
+# Where an uploaded card is written, and what it may be.
+#
+# config/ rather than the repo root, deliberately. lynx_testcard.png in
+# the root is a TRACKED file - writing an upload over it would leave the
+# receiver's working tree dirty and every later `git pull` would refuse
+# to fast-forward, breaking updates for exactly the people who used this
+# feature. config/ is gitignored (alongside lynx_config.yaml, for the
+# same reason), so an uploaded card survives updates and never collides
+# with the shipped one. The overlay looks here first and falls back to
+# the repo copy - see _find_switching_graphic() in lynx_overlay.py.
+TESTCARD_DIR = Path(__file__).parent / "config"
+TESTCARD_MAX_BYTES = 12 * 1024 * 1024
+
+# Checked against the file's own leading bytes, not its name. An
+# extension is a claim by whoever uploaded the file; the magic number is
+# what GdkPixbuf will actually act on when the overlay loads it, so that
+# is what gets validated. Every format here is one GdkPixbuf reads.
+TESTCARD_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"GIF87a", ".gif"),
+    (b"GIF89a", ".gif"),
+)
+
+def _testcard_existing():
+    """The uploaded card currently in place, or None."""
+    for p in sorted(TESTCARD_DIR.glob("lynx_testcard.*")):
+        return p
+    return None
+
+def _testcard_kind(raw: bytes):
+    """The extension implied by the data itself, or None if it isn't an
+    image format the overlay can draw."""
+    for magic, ext in TESTCARD_MAGIC:
+        if raw.startswith(magic):
+            return ext
+    # WebP is the one that needs more than a prefix: "RIFF" then a
+    # four-byte length then "WEBP".
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+@app.get("/api/testcard", tags=["Configuration"],
+         summary="Whether a switch placeholder card is in place",
+         description="Reports which card the overlay would draw during a "
+                     "Tri-Watch source change when Pathfinder has nothing "
+                     "to show - an uploaded one, the card shipped with "
+                     "Lynx, or none at all.")
+def get_testcard():
+    uploaded = _testcard_existing()
+    shipped = Path(__file__).parent / "lynx_testcard.png"
+    if uploaded is not None:
+        return {"source": "uploaded", "filename": uploaded.name,
+                "bytes": uploaded.stat().st_size}
+    if shipped.exists():
+        return {"source": "shipped", "filename": shipped.name,
+                "bytes": shipped.stat().st_size}
+    return {"source": "none", "filename": "", "bytes": 0}
+
+@app.post("/api/testcard", tags=["Configuration"],
+          summary="Upload a switch placeholder card",
+          description="Replaces the card shown during a Tri-Watch source "
+                      "change when Pathfinder has nothing to show. PNG, "
+                      "JPEG, GIF or WebP; 1920x1080 suits the video frame "
+                      "exactly, though anything is scaled to fill. Takes "
+                      "effect within a couple of seconds - no restart. The "
+                      "file is written outside the repository, so updates "
+                      "never overwrite it.")
+def post_testcard(req: TestcardUploadRequest):
+    try:
+        raw = base64.b64decode(req.data_base64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400,
+            detail="Could not decode the uploaded data")
+    if not raw:
+        raise HTTPException(status_code=400, detail="The file is empty")
+    if len(raw) > TESTCARD_MAX_BYTES:
+        raise HTTPException(status_code=413,
+            detail=f"That file is {len(raw) / 1048576:.1f} MB - the limit is "
+                   f"{TESTCARD_MAX_BYTES // 1048576} MB")
+    ext = _testcard_kind(raw)
+    if ext is None:
+        raise HTTPException(status_code=400,
+            detail="That doesn't look like a PNG, JPEG, GIF or WebP image")
+
+    TESTCARD_DIR.mkdir(parents=True, exist_ok=True)
+    # Any previous upload goes first, whatever its extension - otherwise
+    # replacing a .png with a .jpg would leave both behind and the
+    # overlay would pick whichever sorted first, which is not
+    # necessarily the new one.
+    for old in TESTCARD_DIR.glob("lynx_testcard.*"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    # Written via a temporary file and renamed, same as every other
+    # write in this file: the overlay re-reads this path on a timer of
+    # its own, and could otherwise catch a half-written image.
+    dest = TESTCARD_DIR / f"lynx_testcard{ext}"
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    tmp.write_bytes(raw)
+    os.replace(tmp, dest)
+    print(f"[testcard] uploaded {len(raw)} bytes -> {dest}")
+    return {"result": "ok", "filename": dest.name, "bytes": len(raw)}
+
+@app.delete("/api/testcard", tags=["Configuration"],
+            summary="Remove an uploaded switch placeholder card",
+            description="Deletes the uploaded card, so the overlay falls "
+                        "back to the one shipped with Lynx - or, if there "
+                        "isn't one, to a plain caption.")
+def delete_testcard():
+    existing = _testcard_existing()
+    if existing is None:
+        return {"result": "ok", "removed": False}
+    try:
+        existing.unlink()
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not remove it: {e}")
+    return {"result": "ok", "removed": True}
+
 class PathfinderTestRequest(BaseModel):
     """Injects a card directly, bypassing lock detection and QRZ - the
     only practical way to iterate on the layout without waiting for a
@@ -6426,6 +6562,25 @@ def config_page():
                         </div>
                         <button class="btn btn-save" onclick="savePathfinder()">Save Pathfinder settings</button>
                         <span id="pf-status" class="save-status ms-2"></span>
+                        <hr class="my-3">
+                        <div class="fw-semibold small mb-1">Switch placeholder card</div>
+                        <p class="text-muted small mb-2">
+                            Shown full-screen during a Tri-Watch source change when there is
+                            no Pathfinder map to show &mdash; a stream, or a station with no
+                            QRZ locator. Your own test card, club logo or holding slide.
+                            PNG, JPEG, GIF or WebP; 1920&times;1080 fits the picture exactly,
+                            anything else is scaled to fill. Takes effect within a couple of
+                            seconds, with no restart, and is kept outside the repository so
+                            updates never overwrite it.
+                        </p>
+                        <div id="tc-current" class="text-muted small mb-2">Checking...</div>
+                        <div class="d-flex align-items-center gap-2 flex-wrap">
+                            <input type="file" class="form-control form-control-sm" id="tc-file"
+                                   accept="image/png,image/jpeg,image/gif,image/webp" style="max-width:20rem;">
+                            <button class="btn btn-save" onclick="uploadTestcard()">Upload</button>
+                            <button class="btn btn-outline-secondary btn-sm" onclick="removeTestcard()">Use the shipped card</button>
+                            <span id="tc-status" class="save-status"></span>
+                        </div>
                     </div>
                 </div>
                 <div class="card mb-3">
@@ -7143,6 +7298,9 @@ async function loadCurrentConfig() {
         document.getElementById('pf-delay').value = pf.delay_secs ?? 2;
         document.getElementById('pf-duration').value = pf.duration_secs ?? 30;
         updatePathfinderWarning();
+        // Which placeholder card is in place isn't part of the config
+        // (it's a file, not a setting), so it's fetched separately.
+        refreshTestcard();
         // Re-check whenever any of the four inputs move, so the warning
         // appears the moment a conflict is created rather than only on
         // reload. Bound here (after the values are populated) rather
@@ -7519,6 +7677,86 @@ function matchCompanionSettle() {
             cs.textContent = 'Settle time changed - press Save Companion settings.';
             cs.className = 'save-status text-warning';
         }
+    }
+}
+
+async function refreshTestcard() {
+    const el = document.getElementById('tc-current');
+    if (!el) return;
+    try {
+        const r = await fetch('/api/testcard');
+        const info = await r.json();
+        const kb = Math.round(info.bytes / 1024);
+        if (info.source === 'uploaded') {
+            el.innerHTML = 'Currently using <strong>your uploaded card</strong> (' +
+                           info.filename + ', ' + kb + ' KB).';
+        } else if (info.source === 'shipped') {
+            el.innerHTML = 'Currently using the <strong>card shipped with Lynx</strong> (' + kb + ' KB).';
+        } else {
+            el.innerHTML = 'No card in place &mdash; a plain <strong>SWITCHING</strong> caption is shown instead.';
+        }
+    } catch (e) {
+        el.textContent = 'Could not check which card is in place.';
+        console.error(e);
+    }
+}
+
+async function uploadTestcard() {
+    const statusEl = document.getElementById('tc-status');
+    const input = document.getElementById('tc-file');
+    const file = input.files && input.files[0];
+    if (!file) {
+        statusEl.textContent = 'Choose a file first.';
+        statusEl.className = 'save-status text-danger';
+        return;
+    }
+    statusEl.textContent = 'Uploading...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        // Read as base64 rather than posting multipart - the backend
+        // deliberately takes JSON, so it needs no extra dependency.
+        // readAsDataURL gives "data:<type>;base64,<data>"; only the part
+        // after the comma is sent.
+        const b64 = await new Promise((resolve, reject) => {
+            const fr = new FileReader();
+            fr.onload = () => resolve(String(fr.result).split(',')[1]);
+            fr.onerror = () => reject(new Error('Could not read the file'));
+            fr.readAsDataURL(file);
+        });
+        const r = await fetch('/api/testcard', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({filename: file.name, data_base64: b64})
+        });
+        const result = await r.json();
+        if (!r.ok) throw new Error(result.detail || 'upload failed');
+        statusEl.textContent = 'Uploaded - it will appear on the next switch.';
+        statusEl.className = 'save-status text-success';
+        input.value = '';
+        refreshTestcard();
+    } catch (e) {
+        statusEl.textContent = 'Upload failed: ' + e.message;
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
+async function removeTestcard() {
+    const statusEl = document.getElementById('tc-status');
+    statusEl.textContent = 'Removing...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const r = await fetch('/api/testcard', {method: 'DELETE'});
+        const result = await r.json();
+        if (!r.ok) throw new Error(result.detail || 'failed');
+        statusEl.textContent = result.removed
+            ? 'Removed - back to the shipped card.'
+            : 'Nothing uploaded, already using the shipped card.';
+        statusEl.className = 'save-status text-success';
+        refreshTestcard();
+    } catch (e) {
+        statusEl.textContent = 'Failed: ' + e.message;
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
     }
 }
 

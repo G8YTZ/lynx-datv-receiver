@@ -61,6 +61,7 @@ gi.require_version('GdkPixbuf', '2.0')
 from gi.repository import Gtk, Gtk4LayerShell, GLib, Gdk, GdkPixbuf
 import cairo
 import lynx_map
+import glob
 import os
 import math
 
@@ -168,15 +169,30 @@ NOTIFICATION_SOUND_PATH = os.path.join(
 # tri_watch source-switch placeholder - shown full-frame in place of
 # the plain "SWITCHING" caption whenever Pathfinder has nothing to
 # draw for the switch (a stream-only transition, or an RF station
-# with no resolved QRZ result). Supply your own image here - a station
-# test card, a club logo, whatever suits; nothing is bundled, and the
-# filename is deliberately generic rather than named for any one
-# station. Built to the video frame size (1920x1080) so it can be
-# drawn edge-to-edge with no letterboxing. Entirely optional - if the
-# file is missing, on_draw() falls back to the original black slide
-# with the "SWITCHING" caption.
-TRI_WATCH_SWITCHING_GRAPHIC_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "lynx_testcard.png")
+# with no resolved QRZ result). Built to the video frame size
+# (1920x1080) so it can be drawn edge-to-edge with no letterboxing.
+# Entirely optional - if no file is found, on_draw() falls back to the
+# original black slide with the "SWITCHING" caption.
+#
+# Two places are looked at, in order. config/ comes first and holds
+# whatever was uploaded from the config page; the repo root holds the
+# card shipped with Lynx. That split matters more than it looks:
+# lynx_testcard.png in the repo root is a TRACKED file, so writing an
+# upload over it would leave the receiver's working tree dirty and
+# every later `git pull` would refuse to fast-forward. config/ is
+# gitignored, so an uploaded card survives updates and never collides
+# with one.
+#
+# Any extension GdkPixbuf can read works - it sniffs the content
+# rather than trusting the name - so png, jpg and webp are all fine.
+def _find_switching_graphic():
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = sorted(glob.glob(os.path.join(here, "config", "lynx_testcard.*")))
+    candidates.append(os.path.join(here, "lynx_testcard.png"))
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
 
 def play_notification_sound():
     """Fire-and-forget playback of the notification sound via a short-
@@ -808,18 +824,21 @@ class LynxOverlay(Gtk.Window):
             except Exception as e:
                 print(f"Could not load logo: {e}")
 
-        # See TRI_WATCH_SWITCHING_GRAPHIC_PATH's own comment - entirely
-        # optional, so a missing file here is not an error, just a
-        # fall-through to the plain "SWITCHING" caption.
+        # See _find_switching_graphic() - entirely optional, so finding
+        # nothing here is not an error, just a fall-through to the plain
+        # "SWITCHING" caption. Re-checked periodically rather than only
+        # here, so a card uploaded from the config page takes effect
+        # without restarting the overlay.
         self.switching_pixbuf = None
-        if os.path.exists(TRI_WATCH_SWITCHING_GRAPHIC_PATH):
-            try:
-                self.switching_pixbuf = GdkPixbuf.Pixbuf.new_from_file(
-                    TRI_WATCH_SWITCHING_GRAPHIC_PATH)
-            except Exception as e:
-                print(f"Could not load tri_watch switching graphic: {e}")
+        self._switching_pixbuf_path = None
+        self._load_switching_graphic()
 
         GLib.timeout_add(100, self.tick)
+        # Deliberately its own, much slower timer rather than anything
+        # in tick()/on_draw(): those run ten times a second and must
+        # never touch the filesystem. Two seconds is far more often than
+        # anyone changes a test card and still costs only a stat().
+        GLib.timeout_add(2000, self._switching_graphic_tick)
 
         self._pf_surface = None
         self._pf_surface_key = None
@@ -828,6 +847,40 @@ class LynxOverlay(Gtk.Window):
     def tick(self):
         self.drawing_area.queue_draw()
         return True
+
+    def _switching_graphic_tick(self):
+        self._load_switching_graphic()
+        return True
+
+    def _load_switching_graphic(self):
+        """Load the placeholder card, or reload it if the file on disk
+        has changed since last time.
+
+        Cheap enough to call repeatedly: it only touches the filesystem
+        to resolve the path and read the mtime, and only decodes the
+        image when one of those has actually changed.
+
+        Reloading at all is what lets a card uploaded from the config
+        page take effect without restarting the overlay.
+        """
+        path = _find_switching_graphic()
+        if path is None:
+            self.switching_pixbuf = None
+            self._switching_pixbuf_path = None
+            return
+        try:
+            key = (path, os.stat(path).st_mtime)
+        except OSError:
+            return
+        if key == self._switching_pixbuf_path:
+            return
+        try:
+            self.switching_pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
+            self._switching_pixbuf_path = key
+        except Exception as e:
+            print(f"Could not load tri_watch switching graphic {path}: {e}")
+            self.switching_pixbuf = None
+            self._switching_pixbuf_path = key   # don't retry a bad file every poll
 
     def on_draw(self, area, cr, width, height):
         # Proof a real render actually happened, not just that tick()
