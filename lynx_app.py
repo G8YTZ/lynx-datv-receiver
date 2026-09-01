@@ -6778,7 +6778,8 @@ def config_page():
                                 inline.
                             </div>
                             <label for="tw-rx1-plug" class="small">Plug</label>
-                            <select class="form-control mb-2" id="tw-rx1-plug-input">
+                            <select class="form-control mb-2" id="tw-rx1-plug-input"
+                                    onchange="onTwLnbSelectChange('1')">
                                 <option value="a">A</option>
                                 <option value="b">B</option>
                             </select>
@@ -6823,7 +6824,8 @@ def config_page():
                                 inline.
                             </div>
                             <label for="tw-rx2-plug" class="small">Plug</label>
-                            <select class="form-control mb-2" id="tw-rx2-plug-input">
+                            <select class="form-control mb-2" id="tw-rx2-plug-input"
+                                    onchange="onTwLnbSelectChange('2')">
                                 <option value="a">A</option>
                                 <option value="b" selected>B</option>
                             </select>
@@ -6936,14 +6938,80 @@ function twLnbLoKhz(rx) {
 function onTwLnbSelectChange(rx) {
     const sel = document.getElementById('tw-rx' + rx + '-lnb-input');
     const custom = document.getElementById('tw-rx' + rx + '-lnb-custom');
+    const plugSel = document.getElementById('tw-rx' + rx + '-plug-input');
     if (!sel) return;
     if (custom) custom.style.display = (sel.value === 'custom') ? '' : 'none';
-    // No plug restriction here, unlike the manual tune page. This is a
-    // repeater's standing configuration, set once by whoever built the
-    // site and who knows what is connected where - not a control someone
-    // reaches for while experimenting. The warning below the selector
-    // states the hazard; enforcing a plug choice would only obstruct a
-    // legitimate installation.
+
+    // Same rule as the manual tune page, plus the plug restriction. Two
+    // conditions have to hold before an up-converter or an IF output can
+    // be chosen at all:
+    //
+    //   1. plug B has no voltage generator fitted, and
+    //   2. plug B is the plug selected
+    //
+    // Plug A always carries 13/18V from the moment the board powers up,
+    // before Lynx is running, so its own software state is irrelevant -
+    // it can never be made safe. Only the absence of a generator, or a
+    // DC block, protects the equipment, which is what the warning below
+    // the selector says.
+    //
+    // The rule works in both directions, since it is the COMBINATION
+    // that is unsafe: the converters cannot be chosen while plug A is
+    // selected, and plug A cannot be chosen while one of them is.
+    //
+    // A Custom LO is left alone deliberately - it may perfectly well be
+    // an unlisted LNB that needs its supply.
+    const bAbsent = !!(twLnbPsuState && twLnbPsuState['plug_b'] === 'absent');
+    const onPlugA = !!(plugSel && plugSel.value === 'a');
+    for (const opt of sel.options) {
+        if (opt.dataset && opt.dataset.nodc === '1') {
+            opt.disabled = onPlugA || !bAbsent;
+            opt.title = onPlugA
+                ? 'Not available on plug A: it carries 13/18V LNB supply from the moment the '
+                  + 'board powers up, before Lynx starts, and would destroy this equipment. '
+                  + 'Select plug B first.'
+                : (!bAbsent
+                    ? 'Unavailable: a voltage generator is fitted on plug B, or its state is '
+                      + 'not yet known. It has to be physically removed before this can be '
+                      + 'connected.'
+                    : 'Connect to plug B, with the PicoTuner supply jumper removed.');
+        }
+    }
+
+    const chosen = sel.options[sel.selectedIndex];
+    const noDc = !!(chosen && chosen.dataset && chosen.dataset.nodc === '1');
+    if (plugSel) {
+        for (const opt of plugSel.options) {
+            if (opt.value === 'a') {
+                opt.disabled = noDc;
+                opt.title = noDc
+                    ? 'Plug A carries 13/18V from power-up, before Lynx starts. The selected '
+                      + 'converter would be destroyed. Use plug B.'
+                    : '';
+            }
+        }
+    }
+}
+
+let twLnbPsuState = null;
+
+// Read plug B's generator state, so the no-DC converters can be offered
+// only where there is none. Plain fetch, as the rest of this page uses -
+// api() is defined on the Receiver page, not this one.
+async function loadTwLnbPsuState() {
+    try {
+        const r = await fetch('/api/status');
+        const st = await r.json();
+        twLnbPsuState = st?.picotuner?.lnb_psu || null;
+    } catch (e) {
+        // Logged rather than swallowed: a silent failure here disables
+        // the presets, which is indistinguishable from a deliberate
+        // restriction and very hard to diagnose.
+        console.error('could not read LNB PSU state:', e);
+        twLnbPsuState = null;
+    }
+    onTwLnbSelectChange('1');
+    onTwLnbSelectChange('2');
 }
 
 // Put a stored LO back into the selector, choosing Custom LO for
@@ -7987,6 +8055,7 @@ async function loadDiscoveredPicotuners() {
 }
 
 loadCurrentConfig();
+loadTwLnbPsuState();
 loadGnssStatus();
 loadDiscoveredPicotuners();
 setInterval(loadDiscoveredPicotuners, 5000);
