@@ -6768,12 +6768,14 @@ def config_page():
                             <input type="number" step="1" class="form-control mb-2" id="tw-rx1-lnb-custom"
                                    placeholder="Converter LO (kHz)" style="display:none">
                             <div class="text-muted small mb-2" style="color:#d98a1e !important">
-                                &#x26A0;&#xFE0F; <strong>Up-converters and IF outputs: never plug A.</strong>
-                                Plug A carries 13/18V LNB supply from the moment the PicoTuner
-                                powers up, before Lynx runs - it would destroy a SpyVerter
-                                (4.2-5.5V) or an IC-9700's IF output. Remove the PicoTuner's
-                                LNB supply jumpers, or fit a DC block. A Custom LO gets the
-                                right maths but none of that protection.
+                                &#x26A0;&#xFE0F; <strong>Using an up-converter or an IF output?
+                                Check the PicoTuner's LNB supply jumper first.</strong>
+                                Plug A carries 13/18V from the moment the board powers up, long
+                                before Lynx is running, so nothing in software can make it safe.
+                                A SpyVerter expects 4.2-5.5V on that pin and an IC-9700's IF is
+                                an output - either is destroyed by it, once, silently. Remove
+                                the jumper for whichever plug it is on, or fit a DC block
+                                inline.
                             </div>
                             <label for="tw-rx1-plug" class="small">Plug</label>
                             <select class="form-control mb-2" id="tw-rx1-plug-input">
@@ -6811,12 +6813,14 @@ def config_page():
                             <input type="number" step="1" class="form-control mb-2" id="tw-rx2-lnb-custom"
                                    placeholder="Converter LO (kHz)" style="display:none">
                             <div class="text-muted small mb-2" style="color:#d98a1e !important">
-                                &#x26A0;&#xFE0F; <strong>Up-converters and IF outputs: never plug A.</strong>
-                                Plug A carries 13/18V LNB supply from the moment the PicoTuner
-                                powers up, before Lynx runs - it would destroy a SpyVerter
-                                (4.2-5.5V) or an IC-9700's IF output. Remove the PicoTuner's
-                                LNB supply jumpers, or fit a DC block. A Custom LO gets the
-                                right maths but none of that protection.
+                                &#x26A0;&#xFE0F; <strong>Using an up-converter or an IF output?
+                                Check the PicoTuner's LNB supply jumper first.</strong>
+                                Plug A carries 13/18V from the moment the board powers up, long
+                                before Lynx is running, so nothing in software can make it safe.
+                                A SpyVerter expects 4.2-5.5V on that pin and an IC-9700's IF is
+                                an output - either is destroyed by it, once, silently. Remove
+                                the jumper for whichever plug it is on, or fit a DC block
+                                inline.
                             </div>
                             <label for="tw-rx2-plug" class="small">Plug</label>
                             <select class="form-control mb-2" id="tw-rx2-plug-input">
@@ -6932,38 +6936,14 @@ function twLnbLoKhz(rx) {
 function onTwLnbSelectChange(rx) {
     const sel = document.getElementById('tw-rx' + rx + '-lnb-input');
     const custom = document.getElementById('tw-rx' + rx + '-lnb-custom');
-    const plugSel = document.getElementById('tw-rx' + rx + '-plug-input');
     if (!sel) return;
     if (custom) custom.style.display = (sel.value === 'custom') ? '' : 'none';
-
-    // Plug B's generator state comes from the API here rather than from
-    // a shared variable - the Receiver page's lastLnbPsuState does not
-    // exist on this page. Until it has been read, assume a generator IS
-    // fitted, which is the safe assumption.
-    const bAbsent = (twLnbPsuState && twLnbPsuState['plug_b'] === 'absent');
-    for (const opt of sel.options) {
-        if (opt.dataset && opt.dataset.nodc === '1') {
-            opt.disabled = !bAbsent;
-            opt.title = bAbsent
-                ? 'Connect to plug B. Plug A carries LNB voltage from power-up and would destroy it.'
-                : 'Unavailable: a voltage generator is fitted on plug B, or its state is not yet '
-                  + 'known. It has to be physically removed before this can be connected.';
-        }
-    }
-    const chosen = sel.options[sel.selectedIndex];
-    const noDc = !!(chosen && chosen.dataset && chosen.dataset.nodc === '1');
-    if (plugSel) {
-        for (const opt of plugSel.options) {
-            if (opt.value === 'a') {
-                opt.disabled = noDc;
-                opt.title = noDc
-                    ? 'Plug A carries LNB voltage from power-up, before Lynx starts. The '
-                      + 'selected converter would be destroyed. Use plug B.'
-                    : '';
-            }
-        }
-        if (noDc && plugSel.value !== 'b') plugSel.value = 'b';
-    }
+    // No plug restriction here, unlike the manual tune page. This is a
+    // repeater's standing configuration, set once by whoever built the
+    // site and who knows what is connected where - not a control someone
+    // reaches for while experimenting. The warning below the selector
+    // states the hazard; enforcing a plug choice would only obstruct a
+    // legitimate installation.
 }
 
 // Put a stored LO back into the selector, choosing Custom LO for
@@ -6983,30 +6963,6 @@ function setTwLnbLo(rx, lo) {
     onTwLnbSelectChange(rx);
 }
 
-let twLnbPsuState = null;
-
-// Read plug B's generator state once, so the no-DC presets can be
-// offered or withheld. Deliberately never throws: if this fails the
-// presets simply stay disabled, which is the safe way round.
-async function loadTwLnbPsuState() {
-    try {
-        // Plain fetch, as the rest of this page uses. An earlier version
-        // called api(), which is defined on the Receiver page and not
-        // this one - so it threw, the catch below swallowed it, and the
-        // no-DC presets stayed permanently disabled with no clue why.
-        const r = await fetch('/api/status');
-        const st = await r.json();
-        twLnbPsuState = st?.picotuner?.lnb_psu || null;
-    } catch (e) {
-        // Logged rather than swallowed. A silent failure here disables
-        // the presets, which looks like a deliberate restriction and is
-        // very hard to tell apart from one.
-        console.error('could not read LNB PSU state:', e);
-        twLnbPsuState = null;
-    }
-    onTwLnbSelectChange('1');
-    onTwLnbSelectChange('2');
-}
 
 async function loadCurrentConfig() {
     try {
@@ -8031,9 +7987,6 @@ async function loadDiscoveredPicotuners() {
 }
 
 loadCurrentConfig();
-// Read plug B's generator state so the no-DC converter presets can be
-// offered. Runs after the form has loaded, and never blocks it.
-loadTwLnbPsuState();
 loadGnssStatus();
 loadDiscoveredPicotuners();
 setInterval(loadDiscoveredPicotuners, 5000);
