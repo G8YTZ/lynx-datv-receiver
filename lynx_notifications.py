@@ -788,7 +788,22 @@ class NotificationManager:
         lnb_lo_khz, lnb_side = self.get_lnb_state()
         if lnb_lo_khz:
             lo_mhz = lnb_lo_khz / 1000
-            if lnb_side == "high":
+            if lnb_side == "up":
+                # Up-converter (transverter): the tuner's IF sits ABOVE
+                # the on-air frequency, so IF = freq + LO and the LO is
+                # SUBTRACTED to get back. Missing here until 2026-09-02,
+                # which sent QRZ 311.010 for a 71.010 MHz contact through
+                # a 120 MHz SpyVerter - wrong by twice the LO, in no
+                # amateur band, so ADIF's <band> came back empty and the
+                # entry was refused. Matches _compute_downlink_frequency()
+                # in lynx_app.py, which has always had this case.
+                #
+                # Tested first, in the same order as calc_tuner_freq() and
+                # converter_side(), so all four places agree on precedence.
+                # A SpyVerter's 120 MHz LO is low enough that its IF would
+                # otherwise satisfy a low-side test.
+                freq_mhz = freq_mhz_raw - lo_mhz
+            elif lnb_side == "high":
                 # High-side injection (C-band): IF = LO - downlink
                 freq_mhz = lo_mhz - freq_mhz_raw
             else:
