@@ -256,6 +256,14 @@ def _qrz_band_from_freq_mhz(freq_mhz):
     had nowhere to land. Range confirmed against ADIF's own Band
     Enumeration (10000-10500MHz). Extend further if a deployment ever
     needs a band beyond these four."""
+    # 4m, including the UK NoV extension. ADIF's own 4m range stops at
+    # 70.5, but an NoV under the spectrum release scheme reaches 71.5 and
+    # DATV activity sits up there. Confirmed 2026-09-02: QRZ derives the
+    # band itself when it can - a 70.010 contact logged fine with no band
+    # sent at all - but it has nothing to derive from above 70.5 and
+    # refuses the record, so that segment needs telling explicitly.
+    if 70 <= freq_mhz <= 71.5:
+        return "4m"
     if 430 <= freq_mhz <= 440:
         return "70cm"
     elif 1240 <= freq_mhz <= 1325:
@@ -814,7 +822,15 @@ class NotificationManager:
 
         return {
             "rx_callsign": src.get("callsign", "") or "",
-            "frequency_khz": freq_mhz * 1000.0,
+            # Rounded to 3 dp (1 Hz), matching the precision
+            # _compute_downlink_frequency() already applies in
+            # lynx_app.py. Without this, binary floating point sent QRZ
+            # 71009.99999999999 for a 71.010 MHz contact through a
+            # 120 MHz up-converter - right to within a rounding error,
+            # but untidy in a logbook. Done here, where the kHz value is
+            # built, so QRZ, Slack and the Pathfinder card all get the
+            # same clean number rather than each rounding separately.
+            "frequency_khz": round(freq_mhz * 1000.0, 3),
             "mer": to_float(src.get("mer")),
             "margin": to_float(src.get("margin")),
             "modcod": src.get("modcod", "") or "",

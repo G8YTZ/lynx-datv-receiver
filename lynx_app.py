@@ -11751,7 +11751,27 @@ if __name__ == "__main__":
                 global current_mode, current_preset, current_lnb_lo_khz
                 current_mode = "rf"
                 current_preset = f"{state['freq']/1000:.3f} MHz / {state['sr']} kS/s"
-                current_lnb_lo_khz = state.get("lnb_lo_khz", 0)
+                # Via set_converter_state() rather than assigning
+                # current_lnb_lo_khz directly, because the LO alone is
+                # not enough: current_lnb_side must be set with it, and
+                # this path used to set only the LO. Confirmed live -
+                # resuming on 71 MHz through a 120 MHz SpyVerter left the
+                # side at its "low" default, so the down-converter branch
+                # ADDED the LO and every consumer of these globals (OSD,
+                # Web UI Downlink, QRZ) showed 311.010 instead of 71.010.
+                #
+                # Also means this path finally logs a [converter] line.
+                # Its silence is why the fault looked like a value
+                # flipping at random: a manual retune set the side
+                # correctly and logged it, a restart quietly reverted it
+                # and logged nothing.
+                #
+                # rcv=1 deliberately - this branch is already gated on the
+                # non-diversity case, and the already-tuned check above
+                # only ever looks at rcv=1's own lock state.
+                set_converter_state(1, state["freq"],
+                                    state.get("lnb_lo_khz", 0),
+                                    'resume, already tuned')
                 return
 
             print(f"Resuming previous RF state: {state.get('freq')} kHz / {state.get('sr')} kS/s")
