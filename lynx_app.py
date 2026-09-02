@@ -4841,6 +4841,70 @@ def _pathfinder_via_qo100(rcv, telemetry):
         return False
 
 
+def _pathfinder_converter(rcv):
+    """The converter in front of a receiver, as (lo_khz, side).
+
+    The LO alone is not enough to reverse the conversion: an
+    up-converter ADDS its LO to reach the tuner while an LNB subtracts,
+    so the side has to be known too. converter_side() decides that from
+    the WANTED frequency and the LO - not from the IF - so both are read
+    here from the same source of truth
+    _pathfinder_lnb_lo_khz() already uses.
+
+    Returns (0, "low") when there is no converter, which the caller
+    treats as nothing to do.
+    """
+    try:
+        if _tri_watch_present():
+            for src in globals().get('tri_watch_sources_cfg', []):
+                if src.get('enabled') and src.get('type') == 'rf' \
+                        and src.get('rcv') == rcv:
+                    lo = int(src.get('lnb_lo_khz', 0) or 0)
+                    return lo, converter_side(int(src.get('freq', 0) or 0), lo)
+            return 0, "low"
+        state = load_last_state() or {}
+        lo = int(state.get('lnb_lo_khz', 0) or 0)
+        return lo, converter_side(int(state.get('freq', 0) or 0), lo)
+    except Exception as e:
+        print(f"[map] could not determine converter state: {e}")
+        return 0, "low"
+
+
+def _pathfinder_on_air_frequency(rcv, reported_mhz):
+    """The real on-air frequency for the card, from the reported IF.
+
+    The Picotuner reports the IF - it has no idea a converter is in
+    front of it. Confirmed live: 71.010 MHz through a 120 MHz SpyVerter
+    reported as 191.010, and the card showed 191 until this existed,
+    while the Web UI showed 71.010 correctly the whole time from the
+    same underlying state.
+
+    Reuses _compute_downlink_frequency() rather than repeating its
+    arithmetic. Three copies of this conversion already existed and
+    disagreed with each other, which is the whole reason the card was
+    wrong; a fourth would not help.
+
+    Returns the reported value unchanged when there is no converter, or
+    if anything at all goes wrong - a card showing the IF is a much
+    smaller problem than a card with no frequency on it.
+    """
+    raw = str(reported_mhz or '').strip()
+    if not raw:
+        return reported_mhz
+    try:
+        lo_khz, side = _pathfinder_converter(rcv)
+        if not lo_khz:
+            return reported_mhz
+        on_air = _compute_downlink_frequency(
+            state={"frequency": raw}, lo_khz=lo_khz, side=side)
+        if on_air is None:
+            return reported_mhz
+        return f"{on_air:.3f}"
+    except Exception as e:
+        print(f"[map] could not convert IF to on-air frequency: {e}")
+        return reported_mhz
+
+
 def _pathfinder_arm(callsign, rcv, telemetry):
     """Looks the station up and arms the card if it has a usable
     locator. The QRZ lookup runs on its own thread - never inline, for
@@ -4873,7 +4937,8 @@ def _pathfinder_arm(callsign, rcv, telemetry):
         'mer': telemetry.get('mer', ''),
         'modcod': telemetry.get('modcod', ''),
         'symbol_rate': telemetry.get('symbol_rate', ''),
-        'frequency': telemetry.get('frequency', ''),
+        'frequency': _pathfinder_on_air_frequency(
+            rcv, telemetry.get('frequency', '')),
     }
 
     def _lookup():
