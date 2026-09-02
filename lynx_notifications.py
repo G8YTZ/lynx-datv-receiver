@@ -630,7 +630,7 @@ class NotificationManager:
     POLL_SECS = 1.0
 
     def __init__(self, picotuner_state, picotuner_state_b, get_config, record_event=None,
-                 get_lnb_state=None, get_tri_watch_displayed_rcv=None, get_tri_watch_enabled=None,
+                 get_on_air_from_if=None, get_tri_watch_displayed_rcv=None, get_tri_watch_enabled=None,
                  get_stream_active=None, get_diversity_enabled=None):
         self.picotuner_state = picotuner_state
         self.picotuner_state_b = picotuner_state_b
@@ -656,7 +656,13 @@ class NotificationManager:
         # runtime state that changes on every tune, not a one-time value.
         # Defaults to "no LNB" so this class stays constructible/testable
         # standalone.
-        self.get_lnb_state = get_lnb_state or (lambda: (0, "low"))
+        # Supplied by lynx_app.py as on_air_from_if(rcv, if_mhz) - the
+        # single place converter arithmetic happens. This module used to
+        # be handed the raw LO and side and do its own sums, with no
+        # up-converter branch, which sent QRZ a frequency wrong by twice
+        # the LO. Defaults to "no converter" so the class stays
+        # constructible without lynx_app.py present.
+        self.get_on_air_from_if = get_on_air_from_if or (lambda rcv, if_mhz: None)
         # 1, 2, or None - which receiver tri_watch is currently displaying,
         # if any. Used by _current_source_data() to log whichever source
         # is actually on screen under tri_watch, rather than the MER
@@ -765,7 +771,7 @@ class NotificationManager:
                 print(f"[notifications] poll error: {type(e).__name__}: {e}")
             time.sleep(self.POLL_SECS)
 
-    def _source_data_from(self, src, to_float):
+    def _source_data_from(self, src, to_float, rcv=1):
         """Given a specific picotuner_state-shaped dict (already chosen
         by the caller - never does any A-vs-B picking itself), builds
         the callsign/frequency/mer/margin/modcod/symbol_rate dict every
@@ -795,32 +801,16 @@ class NotificationManager:
         # assuming tuner A the way that function does - the two tuners
         # are always tuned to the same frequency in diversity mode, but
         # not necessarily in single-plug-B-only or tri_watch operation.
-        lnb_lo_khz, lnb_side = self.get_lnb_state()
-        if lnb_lo_khz:
-            lo_mhz = lnb_lo_khz / 1000
-            if lnb_side == "up":
-                # Up-converter (transverter): the tuner's IF sits ABOVE
-                # the on-air frequency, so IF = freq + LO and the LO is
-                # SUBTRACTED to get back. Missing here until 2026-09-02,
-                # which sent QRZ 311.010 for a 71.010 MHz contact through
-                # a 120 MHz SpyVerter - wrong by twice the LO, in no
-                # amateur band, so ADIF's <band> came back empty and the
-                # entry was refused. Matches _compute_downlink_frequency()
-                # in lynx_app.py, which has always had this case.
-                #
-                # Tested first, in the same order as calc_tuner_freq() and
-                # converter_side(), so all four places agree on precedence.
-                # A SpyVerter's 120 MHz LO is low enough that its IF would
-                # otherwise satisfy a low-side test.
-                freq_mhz = freq_mhz_raw - lo_mhz
-            elif lnb_side == "high":
-                # High-side injection (C-band): IF = LO - downlink
-                freq_mhz = lo_mhz - freq_mhz_raw
-            else:
-                # Low-side injection (Ku-band): IF = downlink - LO
-                freq_mhz = freq_mhz_raw + lo_mhz
-        else:
-            freq_mhz = freq_mhz_raw
+        # The single derivation, supplied by lynx_app.py. This module
+        # no longer knows what an LO or an injection side is - it had
+        # its own copy of the arithmetic, missing the up-converter case
+        # entirely, and sent QRZ 311.010 for a 71.010 MHz contact.
+        #
+        # rcv matters: the caller has already chosen which receiver this
+        # contact came from, and the two can be on different converters
+        # under tri_watch. The old callback only ever read tuner A's.
+        on_air = self.get_on_air_from_if(rcv, freq_mhz_raw)
+        freq_mhz = freq_mhz_raw if on_air is None else on_air
 
         return {
             "rx_callsign": src.get("callsign", "") or "",
@@ -853,7 +843,7 @@ class NotificationManager:
             except (TypeError, ValueError):
                 return None
         src = self.picotuner_state_b if rcv == 2 else self.picotuner_state
-        return self._source_data_from(src, to_float)
+        return self._source_data_from(src, to_float, rcv)
 
     def _current_source_data(self):
         """Picks whichever tuner is actually the active signal right now
@@ -906,7 +896,7 @@ class NotificationManager:
         else:
             use_b = b_locked and (not a_locked or (b_mer is not None and (a_mer is None or b_mer > a_mer)))
         src = b if use_b else a
-        return self._source_data_from(src, to_float)
+        return self._source_data_from(src, to_float, 2 if use_b else 1)
 
     # -- lock/unlock transition handling (QRZ, Slack, Companion) --------
 

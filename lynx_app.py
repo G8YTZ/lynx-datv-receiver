@@ -371,24 +371,31 @@ current_stream_name: str = ""  # friendly name for the OSD, set by whoever
                                 # the stream content itself.
 current_stream_url: str = ""   # the actual URL, tracked separately from
                                 # the friendly name for protocol detection
-current_lnb_lo_khz: int = 0    # LNB LO in use for the current tune, so
-                                # the API can report both the L-band/IF
-                                # frequency the Picotuner is actually
-                                # locked on AND the real downlink
-                                # frequency for display.
-current_lnb_lo_khz_b: int = 0   # the same pair for tuner B. There was
-current_lnb_side_b: str = "low" # no such pair, so tuner B's on-air
-                                # frequency could never be shown - and
-                                # tri_watch, which tunes both receivers
-                                # itself, never set even tuner A's, so a
-                                # tri_watch source with a converter
-                                # showed the IF or a figure left over
-                                # from an unrelated manual tune.
-current_lnb_side: str = "low"  # "low" (Ku-band, IF=downlink-LO),
-                                # "up" (up-converter, IF=freq+LO) or
-                                # "high" (C-band, IF=LO-downlink) —
-                                # needed to correctly reverse the
-                                # calculation for display.
+# The converter in front of each receiver - THE single source of truth.
+#
+# Was four loose globals (current_lnb_lo_khz / _side / _b), which any
+# code could set independently. That is exactly how the resume shortcut
+# came to set the LO without the side and leave every display showing
+# 311.010 MHz for a 71.010 MHz contact: the side stayed at its default
+# while the LO was correct, and nothing could detect the mismatch
+# because the two were separate values.
+#
+# freq_khz is the WANTED on-air frequency, not the IF. It is kept
+# because converter_side() needs it and because a record that cannot
+# say what it was tuned to cannot be checked.
+#
+# Written ONLY by set_converter_state(). Read only through
+# on_air_from_if() / on_air_frequency(). Nothing else touches it.
+converter_state = {
+    1: {"freq_khz": 0, "lo_khz": 0, "side": "low"},
+    2: {"freq_khz": 0, "lo_khz": 0, "side": "low"},
+}
+
+
+def get_converter(rcv):
+    """This receiver's converter record. Never None - an unconfigured
+    receiver reads as no converter, which is the honest answer."""
+    return converter_state.get(2 if int(rcv or 1) == 2 else 1)
 current_lnb_psu_a: str = config.get('lnb_psu', {}).get('plug_a', 'off')
                                 # "off"/"lo"/"hi" - Plug A's (rcv=1's
                                 # own) LNB PSU voltage, sent to the
@@ -4519,6 +4526,42 @@ pathfinder_tracker = lynx_map.PathfinderTracker(
 
 _pathfinder_prev = {"receiving": False, "callsign": "", "rcv": 1, "telemetry": {}}
 
+
+def pathfinder_source_changed(why=""):
+    """Tell Pathfinder that Lynx has stopped listening to whatever it
+    was listening to.
+
+    Called whenever LYNX changes source - a tune, a preset, a stream -
+    as opposed to the station going off air. pathfinder_watcher() cannot
+    tell those apart on its own: both are simply a lock that is no
+    longer there, so without this an operator switching channel armed an
+    end-of-contact card for a contact that never ended. Confirmed live:
+    switch away from a locked signal and back, and the card appeared in
+    the gap before the new source produced a picture.
+
+    Resetting 'receiving' rather than setting a flag for the watcher to
+    consume is deliberate. The unlock is only noticed a poll or two
+    later, so a flag would have to survive an unknown delay. With prev
+    already reset there is no transition left for the watcher to see, so
+    no card is ever armed - nothing to suppress, hold or expire.
+
+    Telemetry is dropped with it: it belongs to the contact just left,
+    and keeping it would put the old station's MER and frequency on a
+    later card.
+    """
+    try:
+        _pathfinder_prev["receiving"] = False
+        _pathfinder_prev["callsign"] = ""
+        _pathfinder_prev["telemetry"] = {}
+        # Existing method for "cancel any card pending or showing" -
+        # covers a card already armed by an unlock the watcher noticed
+        # before this ran.
+        pathfinder_tracker.station_locked()
+        if why:
+            print(f"[map] source changed ({why}) - not an end of contact")
+    except Exception as e:
+        print(f"[map] could not reset on source change: {e}")
+
 # ---------------------------------------------------------------------
 #  Auto-Squeak - Lindos sequence measurement
 # ---------------------------------------------------------------------
@@ -4786,7 +4829,7 @@ def pathfinder_watcher():
             print(f"[map] watcher: {e}")
 
 
-def _pathfinder_lnb_lo_khz(rcv):
+def _pathfinder_lnb_lo_khz(rcv):  # noqa: F811  - retained, see converter_state
     """The LNB local oscillator currently in front of a receiver, in kHz.
 
     Needed because the frequency the Picotuner reports is the IF, not
@@ -4835,74 +4878,40 @@ def _pathfinder_via_qo100(rcv, telemetry):
         if not raw:
             return False
         if_khz = float(raw) * 1000.0     # Picotuner reports MHz
-        return lynx_map.is_qo100(if_khz + _pathfinder_lnb_lo_khz(rcv))
+        # Through the same single derivation as everything else. This
+        # used to add the LO itself, which was right for a down-converter
+        # and wrong for anything else - harmless in practice, since no
+        # up-converter contact is ever a 3cm satellite one, but a fifth
+        # copy of a rule that only needs to exist once.
+        on_air_mhz = on_air_from_if(rcv, if_khz / 1000.0)
+        return lynx_map.is_qo100(if_khz if on_air_mhz is None
+                                 else on_air_mhz * 1000.0)
     except Exception as e:
         print(f"[map] QO-100 check failed, assuming terrestrial: {e}")
         return False
 
 
-def _pathfinder_converter(rcv):
-    """The converter in front of a receiver, as (lo_khz, side).
-
-    The LO alone is not enough to reverse the conversion: an
-    up-converter ADDS its LO to reach the tuner while an LNB subtracts,
-    so the side has to be known too. converter_side() decides that from
-    the WANTED frequency and the LO - not from the IF - so both are read
-    here from the same source of truth
-    _pathfinder_lnb_lo_khz() already uses.
-
-    Returns (0, "low") when there is no converter, which the caller
-    treats as nothing to do.
-    """
-    try:
-        if _tri_watch_present():
-            for src in globals().get('tri_watch_sources_cfg', []):
-                if src.get('enabled') and src.get('type') == 'rf' \
-                        and src.get('rcv') == rcv:
-                    lo = int(src.get('lnb_lo_khz', 0) or 0)
-                    return lo, converter_side(int(src.get('freq', 0) or 0), lo)
-            return 0, "low"
-        state = load_last_state() or {}
-        lo = int(state.get('lnb_lo_khz', 0) or 0)
-        return lo, converter_side(int(state.get('freq', 0) or 0), lo)
-    except Exception as e:
-        print(f"[map] could not determine converter state: {e}")
-        return 0, "low"
-
-
 def _pathfinder_on_air_frequency(rcv, reported_mhz):
-    """The real on-air frequency for the card, from the reported IF.
+    """The card's frequency: the on-air one, not the IF.
 
-    The Picotuner reports the IF - it has no idea a converter is in
-    front of it. Confirmed live: 71.010 MHz through a 120 MHz SpyVerter
-    reported as 191.010, and the card showed 191 until this existed,
-    while the Web UI showed 71.010 correctly the whole time from the
-    same underlying state.
+    Reads on_air_from_if() rather than working anything out. An earlier
+    version of this function had its own converter lookup and its own
+    call into the display maths - a fourth copy of the very thing that
+    made the card wrong in the first place.
 
-    Reuses _compute_downlink_frequency() rather than repeating its
-    arithmetic. Three copies of this conversion already existed and
-    disagreed with each other, which is the whole reason the card was
-    wrong; a fourth would not help.
+    Takes the IF as an argument because the card is built from telemetry
+    captured while the signal was still live, not from whatever the
+    board reports by the time the QRZ lookup returns.
 
-    Returns the reported value unchanged when there is no converter, or
-    if anything at all goes wrong - a card showing the IF is a much
-    smaller problem than a card with no frequency on it.
+    Returns the reported value unchanged when there is no converter: a
+    card showing the IF is a far smaller problem than a card with no
+    frequency on it.
     """
     raw = str(reported_mhz or '').strip()
     if not raw:
         return reported_mhz
-    try:
-        lo_khz, side = _pathfinder_converter(rcv)
-        if not lo_khz:
-            return reported_mhz
-        on_air = _compute_downlink_frequency(
-            state={"frequency": raw}, lo_khz=lo_khz, side=side)
-        if on_air is None:
-            return reported_mhz
-        return f"{on_air:.3f}"
-    except Exception as e:
-        print(f"[map] could not convert IF to on-air frequency: {e}")
-        return reported_mhz
+    on_air = on_air_from_if(rcv, raw)
+    return reported_mhz if on_air is None else f"{on_air:.3f}"
 
 
 def _pathfinder_arm(callsign, rcv, telemetry):
@@ -5445,38 +5454,98 @@ def tri_watch_arbitrator_loop():
         except Exception as e:
             print(f"[tri_watch] arbitrator step failed: {e}")
 
-def _compute_downlink_frequency(state=None, lo_khz=None, side=None):
-    """When an LNB LO is in use, the Picotuner reports the L-band/IF
-    frequency it's actually locked on (e.g. 739.500 MHz), not the real
-    satellite downlink frequency. This reverses the LNB math to give
-    the real-world figure for display (e.g. 10489.500 MHz for QO-100).
-    Must match whichever injection side (low/high) was actually used
-    at tune time — see current_lnb_side."""
-    # Defaults to tuner A's state so existing callers are unchanged;
-    # tuner B passes its own.
-    state = picotuner_state if state is None else state
-    lo_khz = current_lnb_lo_khz if lo_khz is None else lo_khz
-    side = current_lnb_side if side is None else side
-    if not lo_khz:
-        return None
+def _reverse_converter(if_mhz, lo_khz, side):
+    """The on-air frequency for an IF, given a converter. THE only place
+    this arithmetic exists.
+
+    Exactly the inverse of calc_tuner_freq(), which is why no band
+    boundaries appear here: the side was already decided by
+    converter_side() from the wanted frequency and the LO, in the one
+    place that rule lives.
+
+    Rounded to 3 dp because binary floating point cannot represent these
+    subtractions exactly - 191.010 - 120.0 is 71.00999999999999, which
+    reached QRZ as a logged frequency before this rounding was central.
+    """
+    lo_mhz = lo_khz / 1000
+    if side == "up":
+        # Up-converter (transverter): IF = freq + LO, so freq = IF - LO.
+        # 6m/4m/10m depend on this; without it the answer is wrong by
+        # twice the LO.
+        return round(if_mhz - lo_mhz, 3)
+    if side == "high":
+        # High-side injection (C-band): IF = LO - freq
+        return round(lo_mhz - if_mhz, 3)
+    # Low-side (Ku LNB, or an IF down-converter like the IC-9700's):
+    # IF = freq - LO
+    return round(if_mhz + lo_mhz, 3)
+
+
+def on_air_from_if(rcv, if_mhz):
+    """The real on-air frequency for an IF this receiver reported.
+
+    Takes the IF as an argument rather than reading it, because the
+    callers that matter most - the Pathfinder card and the notifications
+    manager - work from an IF captured at the moment of a contact, not
+    from whatever the board happens to be reporting when they run.
+
+    Returns None when there is no converter, or when the IF is not a
+    usable number. None means "no separate on-air frequency", not an
+    error: consumers show the reported figure as-is.
+    """
     try:
-        ifreq_mhz = float(state["frequency"])
-        lo_mhz = lo_khz / 1000
-        if side == "up":
-            # Up-converter: IF = freq + LO, so freq = IF - LO. Without
-            # this the OSD would show an on-air frequency wrong by twice
-            # the LO for anything on 10m, 8m, 6m or 4m.
-            return round(ifreq_mhz - lo_mhz, 3)
-        if side == "high":
-            # High-side injection (C-band): IF = LO - downlink,
-            # so downlink = LO - IF
-            return round(lo_mhz - ifreq_mhz, 3)
-        else:
-            # Low-side injection (Ku-band): IF = downlink - LO,
-            # so downlink = IF + LO
-            return round(ifreq_mhz + lo_mhz, 3)
-    except (ValueError, TypeError):
+        conv = get_converter(rcv)
+        if not conv["lo_khz"]:
+            return None
+        return _reverse_converter(float(if_mhz), conv["lo_khz"], conv["side"])
+    except (TypeError, ValueError):
         return None
+
+
+def on_air_frequency(rcv=1):
+    """on_air_from_if() for whatever this receiver is reporting now.
+
+    Used by the API, and through it by the OSD and Web UI, neither of
+    which does any arithmetic of its own.
+    """
+    st = picotuner_state_b if int(rcv or 1) == 2 else picotuner_state
+    return on_air_from_if(rcv, st.get("frequency", ""))
+
+
+def init_converter_state():
+    """Seed both receivers' records at startup, before anything reads
+    them.
+
+    Without this there is a window at startup where the records hold
+    their defaults while the receivers are already locked and reporting.
+    Confirmed live 2026-09-02: the notifications manager's 5s settle
+    timer fired before _resume_on_startup()'s 7s delay had set any
+    converter state, so a 70.010 MHz contact was logged to QRZ as
+    190.010 - the raw IF, with no LO applied. Everything looked correct
+    seconds later, which is what made it so hard to see.
+
+    Same sources of truth the tune paths use: tri_watch's per-source
+    config when it is driving, otherwise the saved tuning state.
+    """
+    try:
+        if bool(globals().get('tri_watch_enabled')):
+            for src in globals().get('tri_watch_sources_cfg', []) or []:
+                if src.get('enabled') and src.get('type') == 'rf' \
+                        and src.get('rcv') in (1, 2):
+                    set_converter_state(src['rcv'], int(src.get('freq', 0) or 0),
+                                        int(src.get('lnb_lo_khz', 0) or 0),
+                                        'startup, tri_watch config')
+            return
+        state = load_last_state() or {}
+        if state.get('mode') != 'rf':
+            return
+        freq = int(state.get('freq', 0) or 0)
+        lo = int(state.get('lnb_lo_khz', 0) or 0)
+        set_converter_state(1, freq, lo, 'startup, saved state')
+        if str(state.get('plug', '')).lower() == 'diversity':
+            set_converter_state(2, freq, lo, 'startup, saved state')
+    except Exception as e:
+        print(f"[converter] could not seed startup state: {e}")
 
 @app.get("/api/picotuner/discovered", tags=["Status"],
          summary="List Picotuners currently heard on the local network",
@@ -5659,8 +5728,8 @@ def get_status():
             "callsign": picotuner_state["callsign"],
             "callsign_name": qrz_first_name(picotuner_state["callsign"]),
             "frequency": picotuner_state["frequency"],
-            "downlink_frequency": _compute_downlink_frequency(),
-            "lnb_lo_khz": current_lnb_lo_khz,
+            "downlink_frequency": on_air_frequency(1),
+            "lnb_lo_khz": get_converter(1)["lo_khz"],
             "symbol_rate": picotuner_state["symbol_rate"],
             "rx1": picotuner_state["rx1_raw"],
             "firmware": picotuner_state["firmware"],
@@ -5697,9 +5766,8 @@ def get_status():
                 "online": picotuner_state_b["online"],
                 "locked": picotuner_state_b["locked"],
                 "callsign": picotuner_state_b["callsign"],
-                "downlink_frequency": _compute_downlink_frequency(
-                    picotuner_state_b, current_lnb_lo_khz_b, current_lnb_side_b),
-                "lnb_lo_khz": current_lnb_lo_khz_b,
+                "downlink_frequency": on_air_frequency(2),
+                "lnb_lo_khz": get_converter(2)["lo_khz"],
                 "callsign_name": qrz_first_name(picotuner_state_b["callsign"]),
                 "frequency": picotuner_state_b["frequency"],
                 "mer": picotuner_state_b["mer"],
@@ -8682,12 +8750,13 @@ def set_converter_state(rcv: int, freq_khz: int, lnb_lo_khz: int, why: str):
     # honest; a confident wrong number is not.
     st = picotuner_state_b if rcv == 2 else picotuner_state
     st["frequency"] = ""
-    if rcv == 2:
-        globals()['current_lnb_lo_khz_b'] = lnb_lo_khz
-        globals()['current_lnb_side_b'] = side
-    else:
-        globals()['current_lnb_lo_khz'] = lnb_lo_khz
-        globals()['current_lnb_side'] = side
+    # One record, written whole. The frequency, the LO and the side can
+    # no longer be set apart from one another, which is what the resume
+    # shortcut managed to do when these were four separate globals.
+    conv = get_converter(rcv)
+    conv["freq_khz"] = int(freq_khz or 0)
+    conv["lo_khz"] = int(lnb_lo_khz or 0)
+    conv["side"] = side
     print(f"[converter] Rx{rcv}: freq={freq_khz} lo={lnb_lo_khz} "
           f"side={side} ({why})")
 
@@ -8795,7 +8864,7 @@ def tune(req: TuneRequest):
     # the actual tune is fully complete, not just accepted.
 
 def _tune_impl(req: TuneRequest):
-    global current_mode, current_preset, current_lnb_lo_khz, current_lnb_side, diversity_enabled, _tune_lock_handed_off
+    global current_mode, current_preset, diversity_enabled, _tune_lock_handed_off
     cfg = config['picotuner']
     is_diversity = req.plug.lower() == "diversity"
 
@@ -8827,6 +8896,11 @@ def _tune_impl(req: TuneRequest):
     # support reached Tri-Watch and the startup-resume check but NOT a
     # manual tune - the path most people use. Two copies of one
     # calculation is exactly how that happens.
+    # Lynx is changing source, so whatever was being received is no
+    # longer being listened to - see pathfinder_source_changed(). Done
+    # here, before the tuner is touched, so the watcher's next poll
+    # already knows rather than racing the lock going away.
+    pathfinder_source_changed("RF tune")
     tuner_freq = calc_tuner_freq(req.freq, req.lnb_lo_khz)
     # Recorded against the receiver actually being tuned. This used to
     # write tuner A's state unconditionally, whatever req.rcv said - so
@@ -9283,6 +9357,9 @@ def _start_stream_impl(req: StreamRequest):
     if not tri_watch_enabled:
         picotuner_cmd(f"[to@wh] rcv={picotuner_rcv('a')} fplug=a offset=0 freq=0 srate=333")
 
+    # Same as the RF tune path: this is Lynx changing source, not a
+    # station going off air, so no end-of-contact card is due.
+    pathfinder_source_changed("stream start")
     current_mode = "stream"
     # The friendly name is whatever the caller says it is — this is our
     # own record of what WE chose to play, not anything read from the
@@ -11482,6 +11559,10 @@ if __name__ == "__main__":
     connectivity.start()
     modcod_monitor = threading.Thread(target=picotuner_modcod_monitor, daemon=True)
     modcod_monitor.start()
+    # Before any consumer thread exists. The notifications manager can
+    # submit a contact within seconds of startup, and _resume_on_startup()
+    # does not run for another seven - see init_converter_state().
+    init_converter_state()
     drift_monitor = threading.Thread(target=mpv_drift_monitor, daemon=True)
     drift_monitor.start()
     rss_monitor = threading.Thread(target=memory_rss_monitor, daemon=True)
@@ -11558,7 +11639,7 @@ if __name__ == "__main__":
     notification_manager = lynx_notifications.NotificationManager(
         picotuner_state, picotuner_state_b, lambda: config,
         record_event=record_diagnostic_event,
-        get_lnb_state=lambda: (current_lnb_lo_khz, current_lnb_side),
+        get_on_air_from_if=on_air_from_if,
         get_tri_watch_displayed_rcv=lambda: tri_watch_target_rcv,
         get_tri_watch_enabled=lambda: tri_watch_enabled,
         get_stream_active=_stream_is_being_shown,
@@ -11748,7 +11829,7 @@ if __name__ == "__main__":
                 # risk resuming with mpv still pointed at the raw
                 # single-tuner port instead of the combiner's output.
                 print(f"Already locked on {state['freq']} kHz / {state['sr']} kS/s — skipping resume tune.")
-                global current_mode, current_preset, current_lnb_lo_khz
+                global current_mode, current_preset
                 current_mode = "rf"
                 current_preset = f"{state['freq']/1000:.3f} MHz / {state['sr']} kS/s"
                 # Via set_converter_state() rather than assigning
