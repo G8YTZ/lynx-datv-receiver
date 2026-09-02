@@ -2083,6 +2083,31 @@ def mpv_drift_monitor():
 
             if (hard_freeze_detected_at > 0 and
                     hard_freeze_detected_at != last_handled_hard_freeze_at and
+                    hard_freeze_target and
+                    mpv_transitioning):
+                # A source switch is in progress. mpv was killed
+                # deliberately, so playback stopping is expected, not a
+                # freeze - and restarting it here lands on top of the
+                # switch already underway. Confirmed as a real, repeating
+                # fault: every stream switch in the diagnostics log was
+                # preceded seconds earlier by a hard-freeze restart and a
+                # "did not confirm rendering" immediately after it, with
+                # user_stream_start (recorded only once the switch
+                # genuinely completes) arriving last.
+                #
+                # Marked handled rather than left pending: leaving it
+                # would simply fire the moment the cover comes down,
+                # moving the same race one step later. A freeze that is
+                # still genuinely present afterwards raises a fresh
+                # hard_freeze_detected_at from the Lua script and is
+                # caught then, on its own merits.
+                print("[mpv_drift] hard freeze flag seen during a source "
+                      "switch - expected while mpv is being replaced, "
+                      "ignoring")
+                last_handled_hard_freeze_at = hard_freeze_detected_at
+
+            elif (hard_freeze_detected_at > 0 and
+                    hard_freeze_detected_at != last_handled_hard_freeze_at and
                     hard_freeze_target):
                 now2 = time.time()
                 div_cfg = config.get('diversity', {})
