@@ -268,6 +268,8 @@ def _qrz_band_from_freq_mhz(freq_mhz):
         return "70cm"
     elif 1240 <= freq_mhz <= 1325:
         return "23cm"
+    elif 2300 <= freq_mhz <= 2450:
+        return "13cm"
     elif 3400 <= freq_mhz <= 3410:
         return "9cm"
     elif 10000 <= freq_mhz <= 10500:
