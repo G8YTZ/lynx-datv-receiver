@@ -3733,6 +3733,24 @@ class PathfinderConfigUpdate(BaseModel):
     duration_secs: float = 30.0
 
 
+class RemoteSourceConfigUpdate(BaseModel):
+    """A Slave Rx - a receiver at another site forwarding its tuner
+    status here over the network. See the Lynx-Slave-Rx repository for
+    the remote end.
+
+    Off by default: a receiver with no Slave should need no
+    configuration at all, and should bind no extra port.
+
+    status_port is NOT the local Picotuner's 9997. picotuner_monitor()
+    binds that on all interfaces, so a Slave sending there would
+    collide with the receiver's own tuner status. 10997 keeps Lynx's
+    own -93/-96 offsets free for the table and $n,m ports when those
+    are added.
+    """
+    enabled: bool = False
+    status_port: int = 10997
+
+
 class ConfigUpdateRequest(BaseModel):
     site: Optional[SiteConfigUpdate] = None
     picotuner: Optional[PicotunerConfigUpdate] = None
@@ -3747,6 +3765,7 @@ class ConfigUpdateRequest(BaseModel):
     pathfinder: Optional[PathfinderConfigUpdate] = None
     gnss: Optional[GnssConfigUpdate] = None
     squeak: Optional[SqueakConfigUpdate] = None
+    remote_source: Optional[RemoteSourceConfigUpdate] = None
 
 # ── Helpers ───────────────────────────────────────────────────
 def stop_current():
@@ -6843,6 +6862,35 @@ def config_page():
                     </div>
                 </div>
                 <div class="card mb-3">
+                    <div class="card-header">&#x1F4E1; Slave Rx (remote receiver)</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            Accepts tuner status from a receiver at another site, sent over
+                            the network, so a repeater can have an RF input somewhere it has
+                            no antenna. The remote end is a converted MiniTiouner and a Pi
+                            running the Lynx-Slave-Rx software.
+                        </p>
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="rs-enabled">
+                            <label class="form-check-label" for="rs-enabled">Enabled</label>
+                        </div>
+                        <div class="row g-2 mb-2">
+                            <div class="col-6">
+                                <label class="form-label small mb-1" for="rs-status-port">Status port</label>
+                                <input type="number" min="1024" max="65535" step="1" class="form-control form-control-sm" id="rs-status-port">
+                                <div class="small text-muted mt-1">Must not be 9997</div>
+                            </div>
+                        </div>
+                        <div id="rs-warning" class="alert alert-warning py-2 px-2 small mb-2" style="display:none;"></div>
+                        <div class="text-muted small mb-2">
+                            9997 is the port this receiver's own Picotuner uses. A Slave
+                            sending there would collide with it, so the Slave gets its own.
+                        </div>
+                        <button class="btn btn-save" onclick="saveRemoteSource()">Save Slave Rx settings</button>
+                        <span id="rs-status" class="save-status ms-2"></span>
+                    </div>
+                </div>
+                <div class="card mb-3">
                     <div class="card-header">&#x1F5FA;&#xFE0F; Pathfinder</div>
                     <div class="card-body">
                         <p class="text-muted small">
@@ -7607,6 +7655,12 @@ async function loadCurrentConfig() {
         document.getElementById('site-location-input').value = cfg.site?.location || '';
         document.getElementById('site-locator-input').value = cfg.site?.locator || '';
 
+        const rs = cfg.remote_source || {};
+        document.getElementById('rs-enabled').checked = rs.enabled === true;
+        document.getElementById('rs-status-port').value = rs.status_port ?? 10997;
+        updateRemoteSourceWarning();
+        document.getElementById('rs-status-port').addEventListener('input', updateRemoteSourceWarning);
+
         const pf = cfg.pathfinder || {};
         document.getElementById('pf-enabled').checked = pf.enabled !== false;
         document.getElementById('pf-delay').value = pf.delay_secs ?? 2;
@@ -8069,6 +8123,46 @@ async function removeTestcard() {
         refreshTestcard();
     } catch (e) {
         statusEl.textContent = 'Failed: ' + e.message;
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
+function updateRemoteSourceWarning() {
+    // 9997 is the one value that cannot work: picotuner_monitor() binds
+    // it for this receiver's own tuner, so a Slave sending there would
+    // be read as the local Picotuner. Caught here as well as in the
+    // Slave's own sender, because a wrong port produces confusing
+    // symptoms rather than an obvious failure - the local tuner would
+    // appear to report things it never sent.
+    const el = document.getElementById('rs-warning');
+    const port = parseInt(document.getElementById('rs-status-port').value, 10);
+    if (port === 9997) {
+        el.textContent = 'Port 9997 is used by this receiver\'s own Picotuner. ' +
+                          'Choose another - 10997 is the default.';
+        el.style.display = '';
+    } else {
+        el.style.display = 'none';
+    }
+}
+
+async function saveRemoteSource() {
+    const statusEl = document.getElementById('rs-status');
+    statusEl.textContent = 'Saving...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const body = { remote_source: {
+            enabled: document.getElementById('rs-enabled').checked,
+            status_port: parseInt(document.getElementById('rs-status-port').value, 10)
+        }};
+        const r = await fetch('/api/config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+        });
+        if (!r.ok) throw new Error(await r.text());
+        statusEl.textContent = 'Saved - restart required.';
+        statusEl.className = 'save-status text-success';
+    } catch (e) {
+        statusEl.textContent = 'Save failed - see console.';
         statusEl.className = 'save-status text-danger';
         console.error(e);
     }
@@ -10473,6 +10567,13 @@ def update_config(req: ConfigUpdateRequest):
         # live and takes effect on the next card.
         if req.squeak is not None:
             on_disk.setdefault('squeak', {}).update(req.squeak.model_dump())
+        # Slave Rx: needs a restart either way, so nothing is applied
+        # live here. The monitor thread is only started at boot if this
+        # is enabled, and it binds its port once at that moment -
+        # rebinding a socket underneath a running thread is real work
+        # for a setting that gets changed once.
+        if req.remote_source is not None:
+            on_disk.setdefault('remote_source', {}).update(req.remote_source.model_dump())
 
         tmp_path = str(CONFIG_PATH) + ".tmp"
         with open(tmp_path, 'w') as f:
