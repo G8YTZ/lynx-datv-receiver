@@ -8138,8 +8138,8 @@ function updateRemoteSourceWarning() {
     const el = document.getElementById('rs-warning');
     const port = parseInt(document.getElementById('rs-status-port').value, 10);
     if (port === 9997) {
-        el.textContent = 'Port 9997 is used by this receiver\'s own Picotuner. ' +
-                          'Choose another - 10997 is the default.';
+        el.textContent = 'Port 9997 belongs to this receiver and its own ' +
+                          'Picotuner. Choose another - 10997 is the default.';
         el.style.display = '';
     } else {
         el.style.display = 'none';
