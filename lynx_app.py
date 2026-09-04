@@ -9577,6 +9577,7 @@ def start_stream(req: StreamRequest):
 
 def _start_stream_impl(req: StreamRequest):
     global current_mode, current_preset, current_stream_name, current_stream_url, _tune_lock_handed_off
+    global diversity_enabled
 
     # Cover the screen well before touching the source — a full second
     # of head start, generous enough to absorb scheduling jitter if the
@@ -9606,6 +9607,22 @@ def _start_stream_impl(req: StreamRequest):
     # accepted trade-off for anyone who's turned this on.
     if not tri_watch_enabled:
         picotuner_cmd(f"[to@wh] rcv={picotuner_rcv('a')} fplug=a offset=0 freq=0 srate=333")
+        # Same reasoning as the detune above, and as _tune_impl()'s own
+        # switching-away-from-diversity branch: a combiner left running
+        # with nothing consuming its output reads both Picotuner TS
+        # sockets and produces a stream nobody watches, for as long as
+        # the stream is up. This path never did it, so diversity ->
+        # stream left the combiner running indefinitely - visible as a
+        # stale Rx 2 panel and a live combining-stats line on the main
+        # page while a stream played, both of which the front end hides
+        # correctly once diversity.enabled actually goes false.
+        #
+        # Inside the tri_watch gate deliberately: that feature exists to
+        # keep sources genuinely live regardless of what is on screen,
+        # so it keeps its combiner too.
+        if diversity_enabled:
+            stop_diversity_combiner()
+            diversity_enabled = False
 
     # Same as the RF tune path: this is Lynx changing source, not a
     # station going off air, so no end-of-contact card is due.
