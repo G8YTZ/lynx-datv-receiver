@@ -3287,6 +3287,54 @@ def picotuner_table_monitor_b():
                 sock = None
             time.sleep(1)
 
+# ── BATC reachability ────────────────────────────────────────
+# Whether BATC can be reached at all, as distinct from whether a stream
+# happens to be playing. Without it the Stream panel could only say
+# "nothing playing", which reads identically whether the band is quiet
+# or the receiver has lost its internet.
+#
+# Checked by refreshing the BATC stream list rather than by pinging
+# something unrelated. That request has to happen anyway, so the health
+# signal is free, and it answers the question actually being asked -
+# a ping to 8.8.8.8 would report success while BATC itself was down,
+# which is precisely the case worth catching.
+batc_health = {
+    "online": True,      # optimistic until proven otherwise, so a
+                          # receiver does not show red for the first few
+                          # seconds of every boot
+    "last_ok": 0,
+    "last_error": "",
+}
+
+BATC_CHECK_INTERVAL_SECS = 1800.0
+
+
+def batc_health_monitor():
+    """Background thread: refreshes the BATC stream cache every five
+    minutes and records whether it worked.
+
+    Failure is recorded, never raised - BATC being unreachable is a
+    perfectly ordinary condition at a site on a flaky connection, and
+    must not disturb anything else. The previous cache is deliberately
+    left in place on failure: a stale stream list is more useful than
+    an empty one, and the health flag already says it may be old.
+    """
+    global _batc_cache, _batc_cache_time
+    while True:
+        time.sleep(BATC_CHECK_INTERVAL_SECS)
+        try:
+            streams = fetch_batc_streams_from_api()
+            _batc_cache = streams
+            _batc_cache_time = time.time()
+            batc_health["online"] = True
+            batc_health["last_ok"] = time.time()
+            batc_health["last_error"] = ""
+        except Exception as e:
+            batc_health["online"] = False
+            batc_health["last_error"] = f"{type(e).__name__}: {e}"
+            print(f"[batc] unreachable: {batc_health['last_error']}")
+
+
 # ── Remote source (Slave Rx) state ───────────────────────────
 # A Slave Rx is a receiver at another site - a converted MiniTiouner
 # and a Pi - forwarding its tuner status here over the network, so a
@@ -5918,6 +5966,10 @@ def get_status():
         # can read remote.enabled once instead of testing whether the
         # key exists at all - the same reason the diversity block
         # below is always present even when idle.
+        "batc": {
+            "online": batc_health["online"],
+            "last_ok": batc_health["last_ok"],
+        },
         "remote": {
             "enabled": remote_source_enabled(),
             "online": remote_online(),
@@ -11335,8 +11387,13 @@ async function updateStatus() {
             setPanelState('tri-watch-stream-header', 'tri-watch-stream-status',
                           '&#x1F4FA; Stream', 'locked');
         } else {
+            // Amber when BATC is reachable and nothing is simply playing;
+            // red only when BATC itself cannot be reached. "Nothing on"
+            // and "no internet" look identical otherwise, and only one of
+            // them is a fault.
             setPanelState('tri-watch-stream-header', 'tri-watch-stream-status',
-                          '&#x1F4FA; Stream', 'offline');
+                          '&#x1F4FA; Stream',
+                          (s.batc?.online === false) ? 'offline' : 'idle');
         }
 
         // Slave Rx - a receiver at another site. Only the text status port
@@ -11978,6 +12035,11 @@ if __name__ == "__main__":
     if remote_source_enabled():
         remote_monitor = threading.Thread(target=remote_source_monitor, daemon=True)
         remote_monitor.start()
+    # Always started: BATC reachability is not conditional on anything
+    # being configured, and it is what tells "nothing playing" apart
+    # from "no internet" on the Stream panel.
+    batc_monitor = threading.Thread(target=batc_health_monitor, daemon=True)
+    batc_monitor.start()
     # Tri-watch (up to 3 sources, Stage 1) - probes for any enabled
     # stream sources are started here, once, rather than lazily on
     # first use, so their connect/handshake/reconnect cycle is already
