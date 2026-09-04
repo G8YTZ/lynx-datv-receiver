@@ -11294,8 +11294,14 @@ async function updateStatus() {
             // became permanent, not the stats.
             document.getElementById('diversity-stats-line').style.display = 'none';
             document.getElementById('site-name').style.display = '';
+            // Amber, not red: Rx 2 is a second receiver on the SAME
+            // Picotuner, so if the Picotuner is online then so is Rx 2 -
+            // it is simply not tuned to anything outside diversity or
+            // Tri-Watch. Red is reserved for genuinely unreachable, which
+            // for Rx 2 means the Picotuner itself being off.
             setPanelState('status-panel-b-header', 'status-panel-b',
-                          '&#x1F4E1; Tuner Rx 2', 'offline');
+                          '&#x1F4E1; Tuner Rx 2',
+                          pt.online ? 'idle' : 'offline');
         }
 
         // tri_watch: the stream's own info, shown independently of Rx1's
