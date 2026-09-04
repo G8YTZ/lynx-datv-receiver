@@ -11189,8 +11189,9 @@ async function updateStatus() {
         if (!pt.online) {
             panel.innerHTML = '<div class="text-danger small text-center mt-2">Picotuner offline</div>';
         } else if (locked) {
+            // No "Lock" row: the header badge above says it, and saying
+            // it twice a few pixels apart is noise.
             const rows = [
-                ['Lock',      '<span class="badge bg-success">LOCKED</span>'],
                 ['Callsign',  pt.callsign || '—'],
                 ['Programme', pt.programme || '—'],
             ];
@@ -11233,13 +11234,19 @@ async function updateStatus() {
         // confirmed as a real, reported gap.
         const triWatchUsesRx2 = (s.tri_watch?.sources || []).some(src => src.type === 'rf' && src.rcv === 2);
         const panelB = document.getElementById('diversity-panel-b');
-        if (div.enabled || triWatchUsesRx2) {
+        // Always shown. It used to appear only under diversity or
+        // Tri-Watch, so on an ordinary receiver Rx 2 was absent from the
+        // page entirely - and an input you cannot see is one you have to
+        // remember to miss. Red OFFLINE when nothing is using it, which
+        // is what rcv=2 genuinely is outside those modes: never tuned,
+        // so never locked.
+        panelB.style.display = '';
+        if (true) {
             panelB.style.display = '';
             const b = div.tuner_b || {};
             const bodyB = document.getElementById('status-panel-b');
             if (b.online && b.locked) {
                 const rowsB = [
-                    ['Lock',      '<span class="badge bg-success">LOCKED</span>'],
                     ['Callsign',  b.callsign || '—'],
                     ['Programme', b.programme || '—'],  // ptwh0v3k+ (2026-07-23): now genuinely available for rcv=2, confirmed in the live $0,2 capture
                     ['Frequency', b.frequency ? b.frequency + ' MHz' : '—'],
@@ -11280,10 +11287,15 @@ async function updateStatus() {
                     statsLine.textContent = 'Diversity: combiner starting...';
                 }
             }
-        } else {
-            panelB.style.display = 'none';
+        }
+        if (!(div.enabled || triWatchUsesRx2)) {
+            // The combining-stats line belongs to diversity alone and is
+            // still hidden when it is not running - only the panel itself
+            // became permanent, not the stats.
             document.getElementById('diversity-stats-line').style.display = 'none';
             document.getElementById('site-name').style.display = '';
+            setPanelState('status-panel-b-header', 'status-panel-b',
+                          '&#x1F4E1; Tuner Rx 2', 'offline');
         }
 
         // tri_watch: the stream's own info, shown independently of Rx1's
@@ -11295,6 +11307,9 @@ async function updateStatus() {
         // Whenever a stream is playing, in any mode. Previously gated to
         // Tri-Watch, which is the only reason ordinary stream mode had to
         // borrow Rx 1's panel at all.
+        // Always shown, for the same reason as Rx 2 above: red OFFLINE
+        // when nothing is playing rather than absent from the page.
+        streamPanel.style.display = '';
         if (lynxMode === 'stream') {
             streamPanel.style.display = '';
             const info = s.lynx?.stream_info || {};
@@ -11311,12 +11326,11 @@ async function updateStatus() {
                 '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;"><span>' + r[0] + '</span>' +
                 '<span class="status-value">' + r[1] + '</span></div>'
             ).join('');
-        } else {
-            streamPanel.style.display = 'none';
-        }
-        if (streamPanel.style.display !== 'none') {
             setPanelState('tri-watch-stream-header', 'tri-watch-stream-status',
                           '&#x1F4FA; Stream', 'locked');
+        } else {
+            setPanelState('tri-watch-stream-header', 'tri-watch-stream-status',
+                          '&#x1F4FA; Stream', 'offline');
         }
 
         // Slave Rx - a receiver at another site. Only the text status port
