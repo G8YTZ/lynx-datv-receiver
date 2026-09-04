@@ -10159,92 +10159,6 @@ def restore_wifi():
         raise HTTPException(status_code=502, detail=f"Failed to re-enable WiFi: {result.stderr}")
     return {"result": "ok", "message": "WiFi re-enabled."}
 
-class UpdateChannelRequest(BaseModel):
-    channel: str   # 'stable' or 'beta'
-
-@app.post("/api/update/channel", tags=["Configuration"],
-          summary="Switch update channel (stable/beta) and reboot",
-          description="Lets Lynx track a separate 'beta' branch of "
-                      "newer, less-proven code instead of the normal "
-                      "stable one, for anyone who wants to experiment "
-                      "- switchable back to stable at any time. Unlike "
-                      "a normal update, switching channels means "
-                      "actually checking out a DIFFERENT branch "
-                      "entirely (git checkout, not git pull). Fails "
-                      "safely: if the fetch or checkout fails for any "
-                      "reason, nothing is touched.")
-def post_update_channel(req: UpdateChannelRequest):
-    global config
-    if req.channel not in ("stable", "beta"):
-        raise HTTPException(status_code=400,
-            detail="channel must be 'stable' or 'beta'")
-
-    target_branch = "beta" if req.channel == "beta" else get_default_branch()
-
-    ok, err = git_cmd("fetch", "origin", target_branch)
-    if not ok:
-        raise HTTPException(status_code=502,
-            detail=f"Could not fetch the '{target_branch}' branch: {err}")
-
-    ok, err = git_cmd("checkout", "-B", target_branch, f"origin/{target_branch}")
-    if not ok:
-        raise HTTPException(status_code=502,
-            detail=f"Could not switch to the '{target_branch}' branch: {err}")
-
-    config.setdefault('update', {})['channel'] = req.channel
-    save_config(config)
-
-    update_state["current_version"] = detect_current_version()
-    update_state["channel"] = req.channel
-    update_state["update_available"] = False
-    update_state["commits_behind"] = 0
-    update_state["new_commits"] = []
-
-    if not sudo_ready("reboot"):
-        raise sudo_error(f"Switched to the '{req.channel}' channel successfully, "
-                         "but the Pi could not be rebooted automatically. The "
-                         "switch IS applied - reboot manually to run it.")
-
-    def _do_reboot():
-        time.sleep(1.0)
-        power_action(["reboot", "-i"], "channel-switch reboot")
-    threading.Thread(target=_do_reboot, daemon=True).start()
-
-    return {"result": "ok", "channel": req.channel,
-            "message": f"Switched to the '{req.channel}' channel - rebooting the Pi now."}
-
-@app.post("/api/wifi/kill", tags=["Control"],
-          summary="Disable WiFi entirely (rfkill block)",
-          description="For sites where WiFi is causing problems "
-                      "(power-save driver bugs, or roaming onto a "
-                      "second saved network and breaking the "
-                      "Picotuner/Knobler's local UDP broadcast "
-                      "discovery) - disables the WiFi radio "
-                      "completely via rfkill. Does NOT touch wired "
-                      "Ethernet. WARNING: if this Pi is only reachable "
-                      "over WiFi, this will cut off Web UI access "
-                      "until WiFi is re-enabled locally or via SSH.")
-def kill_wifi():
-    if not sudo_ready("rfkill"):
-        raise sudo_error("WiFi was NOT disabled.")
-    result = subprocess.run(["sudo", "rfkill", "block", "wifi"],
-                             capture_output=True, text=True, timeout=5)
-    if result.returncode != 0:
-        raise HTTPException(status_code=502, detail=f"Failed to disable WiFi: {result.stderr}")
-    return {"result": "ok", "message": "WiFi disabled."}
-
-@app.post("/api/wifi/restore", tags=["Control"],
-          summary="Re-enable WiFi (rfkill unblock)",
-          description="Reverses Kill WiFi.")
-def restore_wifi():
-    if not sudo_ready("rfkill"):
-        raise sudo_error("WiFi was NOT re-enabled.")
-    result = subprocess.run(["sudo", "rfkill", "unblock", "wifi"],
-                             capture_output=True, text=True, timeout=5)
-    if result.returncode != 0:
-        raise HTTPException(status_code=502, detail=f"Failed to re-enable WiFi: {result.stderr}")
-    return {"result": "ok", "message": "WiFi re-enabled."}
-
 class DefaultBootRequest(BaseModel):
     freq: int
     sr: int
@@ -11369,42 +11283,6 @@ async function playStream(url, name) {
 async function playCustom() {
     const url = document.getElementById('custom-url').value.trim();
     if (url) await playStream(url);
-}
-
-async function stopApp() {
-    if (!confirm('Stop Lynx? This closes the app and returns the Pi to its desktop - ' +
-                 'the receiver will be off the air until Lynx is started again.')) {
-        return;
-    }
-    try {
-        const result = await api('POST', '/api/app_stop');
-        if (result && result.detail) {
-            alert('Could not stop: ' + result.detail);
-            return;
-        }
-    } catch (e) {
-        // The server is expected to go down as part of this - not itself
-        // a sign anything went wrong.
-    }
-}
-
-async function shutdownPi() {
-    if (!confirm('Shut down the Pi completely? Unlike Reboot, it will NOT come back up on ' +
-                 'its own - you will need to physically power it back on (or use a remote ' +
-                 'power switch) to bring the receiver back.')) {
-        return;
-    }
-    try {
-        const result = await api('POST', '/api/shutdown');
-        if (result && result.detail) {
-            alert('Could not shut down: ' + result.detail);
-            return;
-        }
-    } catch (e) {
-        // The server is expected to go down as part of this - not itself
-        // a sign anything went wrong.
-    }
-    alert('Shutting down - the Pi will power off shortly.');
 }
 
 async function stopApp() {

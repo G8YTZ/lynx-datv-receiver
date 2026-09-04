@@ -984,44 +984,6 @@ class NotificationManager:
                   "cancelling pending Companion/GPIO Tx timers")
             self._on_confirmed_inactive(notif_cfg)
 
-        # "Is there a picture to transmit" - which is NOT the same
-        # question as "is RF locked", and conflating the two was a real,
-        # reported bug (DB0OV, Aug 2026). Companion's source-switching
-        # webhook and the GPIO Tx pin exist to key a transmitter and
-        # switch a vision mixer to the receiver when it has something to
-        # show. A web stream is something to show.
-        #
-        # Deliberately kept SEPARATE from raw_locked rather than folded
-        # into it, so each output gets the question it actually wants:
-        # Companion, the Tx pin and Slack all fire for a stream, while
-        # QRZ does not - a logbook entry needs a callsign, and a stream
-        # has none.
-        try:
-            stream_active = bool(self.get_stream_active())
-        except Exception as e:
-            print(f"[notifications] stream-active check failed: {e}")
-            stream_active = False
-        raw_active = raw_locked or stream_active
-
-        if raw_active:
-            self._inactive_streak = 0
-            self._active_streak += 1
-        else:
-            self._active_streak = 0
-            self._inactive_streak += 1
-
-        if self._active_streak >= self.LOCK_CONFIRM_POLLS and not self._confirmed_active:
-            self._confirmed_active = True
-            why = "RF lock" if raw_locked else "stream"
-            print(f"[notifications] confirmed ACTIVE INPUT ({why}) - "
-                  f"arming Companion/GPIO Tx settle timers")
-            self._on_confirmed_active(notif_cfg, cfg, stream_only=not raw_locked)
-        elif self._inactive_streak >= self.LOCK_CONFIRM_POLLS and self._confirmed_active:
-            self._confirmed_active = False
-            print("[notifications] confirmed NO ACTIVE INPUT - "
-                  "cancelling pending Companion/GPIO Tx timers")
-            self._on_confirmed_inactive(notif_cfg)
-
         if raw_locked:
             self._loss_streak = 0
             self._lock_streak += 1
@@ -1111,30 +1073,6 @@ class NotificationManager:
             if slack_cfg.get('enabled', False):
                 delay = float(slack_cfg.get('settle_secs', 15.0))
                 self._arm_action('slack', delay, lambda: self._fire_slack(slack_cfg, site_callsign), "Slack")
-
-    def _on_confirmed_active(self, notif_cfg, cfg=None, stream_only=False):
-        """Companion webhook + its GPIO mirror: driven by "there is a
-        picture to transmit", not by RF lock alone. Settling timers and
-        cancellation behaviour are unchanged - only the question that
-        triggers them.
-
-        Also fires Slack when the activity is a STREAM rather than RF.
-        The point of the Slack alert is telling people the repeater is
-        in use, and someone watching for that doesn't care how the
-        picture arrived. QRZ is not fired: a logbook entry needs a
-        callsign and a stream has none.
-        """
-        self._cancel_action('companion_unlock')
-        self._cancel_action('companion_gpio_unlock')
-
-        if stream_only and cfg is not None:
-            slack_cfg = notif_cfg.get('slack', {})
-            if slack_cfg.get('enabled', False):
-                site_callsign = cfg.get('site', {}).get('callsign', '')
-                delay = float(slack_cfg.get('settle_secs', 15.0))
-                self._arm_action('slack_stream', delay,
-                                  lambda: self._fire_slack_stream(slack_cfg, site_callsign),
-                                  "Slack-stream")
 
     def _on_confirmed_active(self, notif_cfg, cfg=None, stream_only=False):
         """Companion webhook + its GPIO mirror: driven by "there is a
