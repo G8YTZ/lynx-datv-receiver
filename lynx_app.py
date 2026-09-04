@@ -132,7 +132,15 @@ DRIFT_SCRIPT_PATH = Path(__file__).parent / "lynx_drift_correction.lua"
 # One shared lock around the read-modify-write-replace cycle, used by
 # every writer, closes this for GNSS and for the two pre-existing
 # paths at the same time.
-_config_write_lock = threading.Lock()
+# RLock, not Lock: update_config() holds this for its whole body and
+# calls _apply_gnss_mode() while still inside it, which in turn calls
+# _on_gnss_locator_change() to apply an already-established fix - a
+# nested acquisition by the same thread, and a legitimate one (a
+# config save applying a setting that itself writes config). A plain
+# Lock deadlocks there, holding the lock while it hangs so GNSS's own
+# writes pile up behind it. Re-entrant only for the holding thread;
+# every other caller blocks exactly as before.
+_config_write_lock = threading.RLock()
 
 def load_config():
     with open(CONFIG_PATH) as f:
@@ -266,6 +274,25 @@ def _apply_gnss_mode():
     gnss_reader.chrony_sock_path = (
         GNSS_CHRONY_SOCK_PATH if config.get('gnss', {}).get('time_sync', True) else None
     )
+
+    # Apply the locator already held, if any, now rather than waiting
+    # for the next one. _on_gnss_locator_change() fires only when the
+    # tracker accepts a DIFFERENT square, so switching Manual ->
+    # Automatic with a fix already established did nothing whatsoever:
+    # the square was confirmed minutes ago and will not change again
+    # while the receiver sits still, which is the normal case at a
+    # repeater. Rebooting appeared to fix it, but only because the
+    # reader starts with no locator at all, making the first confirmed
+    # fix a change - the setting was never actually being applied.
+    #
+    # Reuses the same callback rather than repeating the write: it
+    # already holds the config write lock, already re-checks the mode
+    # (so a switch to Manual correctly does nothing here), and already
+    # logs. Calling it directly is a no-op in every case except the
+    # one this exists for.
+    if (config.get('gnss', {}).get('mode', 'automatic') == 'automatic'
+            and gnss_reader.tracker.locator):
+        _on_gnss_locator_change(gnss_reader.tracker.locator)
 
 def _gnss_provenance() -> str:
     """'gnss' if the value currently in portable_locator is live,

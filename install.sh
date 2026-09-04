@@ -315,6 +315,31 @@ if [ -f /boot/firmware/config.txt ]; then
   fi
 fi
 
+# Third, nothing else may hold the port. cmdline.txt carries
+# console=serial0,115200, and once enable_uart=1 is set serial0
+# resolves to ttyAMA0 - so systemd's generator starts a getty on the
+# very port the HAT needs. The getty takes ownership as root:root 0600
+# and respawns whenever it exits, which silently undoes the udev rule
+# above on every boot and every respawn. Confirmed on real hardware
+# (2026-09-04): the HAT read correctly for a few seconds after a manual
+# chgrp, then went silent again, looking exactly like flaky hardware.
+#
+# Masked, not disabled. The unit is enabled-runtime - generated from
+# the kernel command line rather than enabled on disk - so `disable`
+# is simply regenerated at the next boot. Masking is one command to
+# undo (systemctl unmask) and leaves the serial console available on
+# any other port, which editing cmdline.txt would not.
+if systemctl list-unit-files serial-getty@.service >/dev/null 2>&1; then
+  if [ "$(systemctl is-enabled serial-getty@ttyAMA0 2>/dev/null)" = "masked" ]; then
+    echo "Serial getty on ttyAMA0 already masked."
+  else
+    echo "--- Masking the serial getty on the GNSS UART ---"
+    sudo systemctl stop serial-getty@ttyAMA0 2>/dev/null || true
+    sudo systemctl mask serial-getty@ttyAMA0 >/dev/null 2>&1 || true
+    echo "Serial getty masked - the GNSS UART stays available to Lynx."
+  fi
+fi
+
 if [ -f /etc/udev/rules.d/60-lynx-gnss.rules ]; then
   echo "GNSS serial permissions rule already present."
 else
