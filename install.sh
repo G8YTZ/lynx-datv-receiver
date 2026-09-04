@@ -251,6 +251,43 @@ sudo chown "$(id -un)":"$(id -gn)" /var/log/lynx
 # anything else below that would be genuinely unsafe to redo on an
 # already-configured system. See this section's own comment further
 # up (near the apt install list) for the full rationale.
+# --- Startup mechanism: systemd user service -------------------
+# Lynx starts from a systemd user service, NOT the labwc autostart
+# line this script used to write. lynx.service waits for the
+# compositor's Wayland socket directly; the graphical-session.target
+# ordering that made it unreliable - and was the only reason it was
+# previously installed but left disabled - is gone.
+#
+# Placed ABOVE the --deps-only exit deliberately, so "Update Now"
+# migrates an existing receiver rather than only fresh installs. The
+# autostart repair further down sits BELOW that exit and so has never
+# run on an existing install even once, which is exactly why receivers
+# are still found on the original exec-bit-dependent line.
+#
+# Why this matters beyond tidiness: the lxterminal line runs Lynx
+# inside a visible terminal window on the desktop. Whenever mpv shows
+# nothing - a stream that connects but delivers no data, for instance -
+# what is on the HDMI output is a desktop, a taskbar and a terminal
+# full of HTTP logs. At a repeater that goes out on air.
+echo "--- Setting up the systemd user service ---"
+mkdir -p ~/.config/systemd/user
+cp ~/lynx/lynx.service ~/.config/systemd/user/lynx.service
+systemctl --user daemon-reload
+systemctl --user enable lynx.service
+
+# Retire the old labwc autostart line if one is present. Commented out
+# rather than deleted: reversible by hand, and it leaves visible
+# evidence of what changed for whoever reads the file next. Both forms
+# are matched - the original one and the later "bash" repair of it -
+# since a receiver may be running either. Leaving either in place
+# alongside an enabled service would start Lynx twice.
+if [ -f ~/.config/labwc/autostart ] \
+   && grep -q "^[^#]*lynx_start\.sh" ~/.config/labwc/autostart; then
+  sed -i "s|^\([^#]*lynx_start\.sh.*\)$|# retired by install.sh - Lynx now starts from lynx.service\n#\1|" \
+      ~/.config/labwc/autostart
+  echo "Retired the old labwc autostart line - Lynx starts from lynx.service now."
+fi
+
 if [ "$1" = "--deps-only" ]; then
   echo "--- Dependencies confirmed (--deps-only) ---"
   exit 0
@@ -312,59 +349,18 @@ chmod +x ~/lynx/lynx_start.sh ~/lynx/install.sh 2>/dev/null || true
 # this location when it's writable, falling back to /tmp otherwise -
 # this just makes sure it's actually there and owned correctly from
 # the start.
-# --- Autostart file (labwc) -----------------------------------
-# This is the one part of Section 8 that's safe to script -
-# creating the file itself is unambiguous. Enabling auto-login
-# to the desktop is NOT scripted here deliberately: it's a
-# one-time GUI toggle, and getting it wrong via an unverified
-# raspi-config flag risks leaving the Pi in a broken boot state,
-# a worse outcome than just asking for one manual step.
-echo "--- Setting up labwc autostart ---"
+# --- labwc config directory ------------------------------------
+# Startup itself is handled by the systemd user service set up above
+# the --deps-only exit, so nothing is written to the autostart file
+# any more - an lxterminal line here alongside an enabled service
+# would start Lynx twice. The directory is still needed by the
+# cursor-hide rc.xml written further down.
+#
+# Auto-login to the desktop remains deliberately unscripted: it is a
+# one-time GUI toggle, and getting it wrong through an unverified
+# raspi-config flag risks a broken boot state, which is a worse
+# outcome than asking for one manual step.
 mkdir -p ~/.config/labwc
-# Repair an autostart written by an older installer, which invoked the
-# script directly and so depended on its execute bit. Done on every run,
-# including Update Now, so existing receivers are fixed without anyone
-# having to know this was ever a problem.
-if [ -f ~/.config/labwc/autostart ] \
-   && grep -q "lynx_start.sh" ~/.config/labwc/autostart \
-   && ! grep -q "bash .*lynx_start.sh" ~/.config/labwc/autostart; then
-  sed -i "s|lxterminal -e \(.*\)lynx_start.sh|lxterminal -e bash \1lynx_start.sh|" \
-      ~/.config/labwc/autostart
-  echo "Updated the autostart entry to invoke the script via bash."
-fi
-
-if [ -f ~/.config/labwc/autostart ] && grep -q "lynx_start.sh" ~/.config/labwc/autostart; then
-  echo "Autostart already configured - leaving it untouched."
-else
-  # Invoked as "bash <script>", NOT "./script". The execute bit is not
-  # preserved by every way a file reaches a receiver - SFTP drops it,
-  # and a file copied by hand rather than pulled arrives without it -
-  # and when that happens labwc's autostart fails SILENTLY: no picture,
-  # no overlay, no error anywhere, just the bare desktop. Passing the
-  # script to bash explicitly removes the dependency entirely, so a
-  # missing execute bit can no longer stop a receiver starting.
-  echo "lxterminal -e bash $HOME/lynx/lynx_start.sh &" >> ~/.config/labwc/autostart
-  chmod +x ~/.config/labwc/autostart
-fi
-
-# --- systemd user service (installed, NOT enabled) --------------
-# lynx.service exists and lynx_start.sh already calls systemd-notify
-# (READY, and WATCHDOG=1 from its own health-check loop) for exactly
-# this purpose - genuinely working when started manually
-# (systemctl --user start lynx.service). But confirmed directly on
-# real hardware (2026-07-31) that labwc doesn't reliably activate
-# graphical-session.target on its own, which lynx.service waits on -
-# meaning if enabled, it can sit there doing nothing at boot while
-# never actually starting Lynx, with no obvious sign anything's
-# wrong. Installed here so it's ready to experiment with later
-# (a fix for the graphical-session.target gap, once found, could be
-# added to this same autostart file above) - but NOT enabled, so the
-# proven, working lxterminal line above remains the one thing this
-# install actually depends on to start Lynx on boot.
-echo "--- Installing (not enabling) systemd user service ---"
-mkdir -p ~/.config/systemd/user
-cp ~/lynx/lynx.service ~/.config/systemd/user/lynx.service
-systemctl --user daemon-reload
 
 # --- Scheduled reboot (installed, NOT enabled) ------------------
 # A twice-daily reboot as a blunt backstop: it recovers from states

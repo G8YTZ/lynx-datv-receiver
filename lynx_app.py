@@ -9810,6 +9810,96 @@ def post_update_check():
     check_for_updates()
     return update_state
 
+def refresh_dependencies(context):
+    """Re-run install.sh --deps-only, so OS packages and every one of
+    Lynx's own apt/pip dependencies are re-confirmed against whatever
+    code is now checked out - not just Lynx's own source.
+
+    Extracted from post_update_apply(), which was the only caller, so
+    that post_update_channel() can use the identical logic rather than
+    a second copy of it. That mattered in practice: a channel switch
+    checks out an ENTIRELY different branch, which is far more likely
+    to need a dependency the running system has never had than an
+    ordinary same-branch pull is, and it was the one path that never
+    refreshed anything. A receiver switched from stable to beta landed
+    on beta code with a stable machine's setup underneath it.
+
+    Delegates to install.sh rather than duplicating its lists here -
+    install.sh is itself pulled fresh as part of the same update, so
+    this always runs the current, correct list, maintained in one
+    place.
+
+    install.sh needs sudo for apt, for writing to /etc, for
+    everything. A receiver without passwordless sudo cannot run it
+    non-interactively at all - and an earlier attempt to let it try
+    anyway, on the theory that install.sh is what configures
+    passwordless sudo, was simply wrong: install.sh needs sudo to
+    write the sudoers file, so it can never bootstrap the permission
+    it depends on. `sudo apt update` inside the script asked for a
+    password, found no terminal to ask on because it was running
+    inside this process, and sat there until the 1200s timeout - a
+    twenty-minute silent hang in place of an immediate, honest
+    refusal. Confirmed in the field.
+
+    So: if sudo is unavailable, skip the dependency step rather than
+    hang on it. The pull or checkout has already succeeded by this
+    point, so the code IS updated either way; what is lost is only the
+    OS/dependency refresh.
+
+    The BLANKET check, deliberately - not sudo_ready(), and not any
+    single command. install.sh runs apt, writes to /etc and more, so
+    "may I run one specific command" answers the wrong question. A
+    receiver carrying only a narrow rule - the /etc/sudoers.d/
+    lynx-reboot left by the old manual instructions, which grants
+    reboot and nothing else - passes sudo_ready("reboot") happily and
+    then hangs in apt, which is exactly the case this is here to
+    catch.
+
+    Never raises: callers reboot afterwards regardless, because on a
+    narrow-rule receiver rebooting is permitted even though the
+    installer is not, and skipping the refresh should not cost the
+    restart as well.
+    """
+    try:
+        can_run_installer = subprocess.run(
+            ["sudo", "-n", "true"], capture_output=True,
+            timeout=5).returncode == 0
+    except Exception:
+        can_run_installer = False
+
+    if not can_run_installer:
+        print(f"[{context}] passwordless sudo is not configured for this "
+              "user - skipping the dependency refresh, which needs "
+              "sudo throughout and would stop at a password prompt "
+              "with no terminal to answer it. The code IS updated. "
+              "Run ~/lynx/install.sh by hand once, from a terminal "
+              "where you can type your password, to sort this "
+              "permanently. Still attempting the reboot below.")
+        record_diagnostic_event("update_deps_skipped_no_sudo",
+                                f"{context}: dependency refresh skipped - "
+                                "no passwordless sudo",
+                                count_as_mpv_restart=False)
+        return
+
+    try:
+        install_script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "install.sh")
+        env = os.environ.copy()
+        env["DEBIAN_FRONTEND"] = "noninteractive"
+        # stdin closed, belt and braces. The blanket check above says
+        # this user has sudo, but it does not promise every command
+        # install.sh runs is covered by the same rule - and a sudo that
+        # decides to prompt with an inherited stdin waits for an answer
+        # that cannot come. With no stdin it fails immediately instead,
+        # which the timeout then does not have to catch twenty minutes
+        # later.
+        subprocess.run(["bash", install_script, "--deps-only"],
+                       env=env, timeout=1200,
+                       stdin=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"[{context}] Dependency check failed or timed out ({e}) "
+              "- rebooting anyway with whatever succeeded so far.")
+
 @app.post("/api/update/apply", tags=["Configuration"],
           summary="Pull the latest code and reboot",
           description="Fails safely: if git pull fails for any reason "
@@ -9893,57 +9983,9 @@ def post_update_apply():
     # on that same narrow-rule receiver rebooting is permitted even
     # though the installer is not. Skipping the refresh should not cost
     # the restart as well.
-    try:
-        can_run_installer = subprocess.run(
-            ["sudo", "-n", "true"], capture_output=True,
-            timeout=5).returncode == 0
-    except Exception:
-        can_run_installer = False
-
     def _do_reboot():
         time.sleep(1.0)  # let this HTTP response actually reach the browser first
-        # OS packages, AND every one of Lynx's own apt/pip
-        # dependencies, are (re-)confirmed here too, not just Lynx's
-        # own code - see this function's own patch history for the
-        # full rationale. Delegates to install.sh's own "--deps-only"
-        # mode rather than duplicating its dependency lists here -
-        # install.sh is itself pulled fresh as part of this same
-        # update, so this always runs whatever the current, correct
-        # list actually is, with only one place that list is ever
-        # maintained. A bounded timeout so even something going wrong
-        # here still lets the reboot below proceed rather than hanging
-        # indefinitely.
-        if not can_run_installer:
-            print("[update] passwordless sudo is not configured for this "
-                  "user - skipping the dependency refresh, which needs "
-                  "sudo throughout and would stop at a password prompt "
-                  "with no terminal to answer it. The code IS updated. "
-                  "Run ~/lynx/install.sh by hand once, from a terminal "
-                  "where you can type your password, to sort this "
-                  "permanently. Still attempting the reboot below.")
-            record_diagnostic_event("update_deps_skipped_no_sudo",
-                                    "dependency refresh skipped - no "
-                                    "passwordless sudo",
-                                    count_as_mpv_restart=False)
-        else:
-            try:
-                install_script = os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)), "install.sh")
-                env = os.environ.copy()
-                env["DEBIAN_FRONTEND"] = "noninteractive"
-                # stdin closed, belt and braces. The blanket check above
-                # says this user has sudo, but it does not promise every
-                # command install.sh runs is covered by the same rule -
-                # and a sudo that decides to prompt with an inherited
-                # stdin waits for an answer that cannot come. With no
-                # stdin it fails immediately instead, which the timeout
-                # then does not have to catch twenty minutes later.
-                subprocess.run(["bash", install_script, "--deps-only"],
-                               env=env, timeout=1200,
-                               stdin=subprocess.DEVNULL)
-            except Exception as e:
-                print(f"[update] Dependency check failed or timed out ({e}) "
-                      "- rebooting anyway with whatever succeeded so far.")
+        refresh_dependencies("update")
         # Captured, not a bare Popen. This usually succeeds and kills the
         # process mid-call - meaning anything reached below is a genuine
         # failure, and worth saying out loud rather than discarding. An
@@ -10044,6 +10086,14 @@ def post_update_channel(req: UpdateChannelRequest):
 
     def _do_reboot():
         time.sleep(1.0)  # let this HTTP response actually reach the browser first
+        # Same dependency refresh as a normal update, and needed MORE
+        # here, not less: this has just checked out a different branch
+        # entirely, so the running system's packages and setup were
+        # installed for other code. install.sh's own startup-mechanism
+        # migration sits above its --deps-only exit for the same
+        # reason, so a receiver switched from stable lands correctly
+        # rather than on whatever the old branch left behind.
+        refresh_dependencies("channel switch")
         power_action(["reboot", "-i"], "channel-switch reboot")
     threading.Thread(target=_do_reboot, daemon=True).start()
 
