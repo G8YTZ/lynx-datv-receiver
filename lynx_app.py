@@ -8168,6 +8168,31 @@ async function saveRemoteSource() {
     }
 }
 
+function setPanelState(headerId, bodyId, label, state) {
+    // One place sets the header, its badge and whether the body is shown,
+    // so a header can never disagree with what is underneath it - which
+    // is precisely how the Rx 1 panel came to be headed "Tuner Rx 1"
+    // above an RTMP stream.
+    //
+    // Three states, not two: "present but hearing nothing" (amber) and
+    // "not there at all" (red) are different things, and on an input at
+    // another site that difference is the whole point.
+    const badges = {
+        locked:  ['bg-success', 'LOCKED'],
+        idle:    ['bg-warning text-dark', 'NO LOCK'],
+        offline: ['bg-danger', 'OFFLINE'],
+    };
+    const [cls, text] = badges[state] || badges.offline;
+    const h = document.getElementById(headerId);
+    if (h) {
+        h.innerHTML = label +
+            '<span class="badge ' + cls + '" style="float:right; font-size:0.75em;">' +
+            text + '</span>';
+    }
+    const b = document.getElementById(bodyId);
+    if (b) b.style.display = (state === 'locked') ? '' : 'none';
+}
+
 async function savePathfinder() {
     const statusEl = document.getElementById('pf-status');
     statusEl.textContent = 'Saving...';
@@ -10724,7 +10749,7 @@ def web_ui():
             </div>
             <!-- Diversity: second tuner's own native status, shown only when diversity mode is active -->
             <div class="card mt-2" id="diversity-panel-b" style="display:none">
-                <div class="card-header">&#x1F4E1; Tuner Rx 2</div>
+                <div class="card-header" id="status-panel-b-header">&#x1F4E1; Tuner Rx 2</div>
                 <div class="card-body" id="status-panel-b"></div>
             </div>
             <!-- tri_watch: the active stream's own info, shown independently
@@ -10736,8 +10761,16 @@ def web_ui():
                  a stream was on screen, hiding Rx1's own status completely
                  until whichever one "came up first" lost that slot again. -->
             <div class="card mt-2" id="tri-watch-stream-panel" style="display:none">
-                <div class="card-header">&#x1F4FA; Stream</div>
+                <div class="card-header" id="tri-watch-stream-header">&#x1F4FA; Stream</div>
                 <div class="card-body" id="tri-watch-stream-status"></div>
+            </div>
+            <!-- Slave Rx: a receiver at another site forwarding its tuner
+                 status over the network. Shown only when one is configured -
+                 a receiver with no Slave should not carry a permanently red
+                 panel for hardware it does not have. -->
+            <div class="card mt-2" id="remote-panel" style="display:none">
+                <div class="card-header" id="remote-panel-header">&#x1F4E1; Slave Rx</div>
+                <div class="card-body" id="remote-panel-status"></div>
             </div>
         </div>
 
@@ -11151,12 +11184,18 @@ async function updateStatus() {
         // bitrate and codecs no tuner reports. Driven from the same flag
         // that chooses the body rather than a second test of its own, so
         // the two cannot disagree.
-        const panelHeader = document.getElementById('status-panel-header');
-        if (panelHeader) {
-            panelHeader.innerHTML = showStreamInMainPanel
-                ? '&#x1F4FA; Stream'
-                : '&#x1F4E1; Tuner Rx 1';
+        const mainLabel = showStreamInMainPanel
+            ? '&#x1F4FA; Stream'
+            : '&#x1F4E1; Tuner Rx 1';
+        let mainState;
+        if (showStreamInMainPanel) {
+            mainState = 'locked';          // a playing stream is the working input
+        } else if (!pt.online) {
+            mainState = 'offline';
+        } else {
+            mainState = locked ? 'locked' : 'idle';
         }
+        setPanelState('status-panel-header', 'status-panel', mainLabel, mainState);
 
         if (showStreamInMainPanel) {
             const info = s.lynx?.stream_info || {};
@@ -11244,11 +11283,13 @@ async function updateStatus() {
                     '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;"><span>' + r[0] + '</span>' +
                     '<span class="status-value">' + r[1] + '</span></div>'
                 ).join('');
-            } else if (b.online) {
-                bodyB.innerHTML = '<div class="text-muted small text-center mt-2">Searching for signal...</div>';
-            } else {
-                bodyB.innerHTML = '<div class="text-danger small text-center mt-2">Offline</div>';
             }
+            // Body collapses when there is no lock - the header's own
+            // badge already says why, and the space belongs to whichever
+            // input is actually working.
+            setPanelState('status-panel-b-header', 'status-panel-b',
+                          '&#x1F4E1; Tuner Rx 2',
+                          (b.online && b.locked) ? 'locked' : (b.online ? 'idle' : 'offline'));
             // Live combining stats - the combiner's own rolling window,
             // not a cumulative-since-start figure. Diversity-only,
             // deliberately not shown for tri_watch - there's no
@@ -11296,6 +11337,33 @@ async function updateStatus() {
             ).join('');
         } else {
             streamPanel.style.display = 'none';
+        }
+        if (streamPanel.style.display !== 'none') {
+            setPanelState('tri-watch-stream-header', 'tri-watch-stream-status',
+                          '&#x1F4FA; Stream', 'locked');
+        }
+
+        // Slave Rx - a receiver at another site. Only the text status port
+        // exists so far, so there is no MER or margin to show: online,
+        // lock state, frequency and callsign is genuinely all there is,
+        // and the header carries most of it.
+        const rem = s.remote || {};
+        const remotePanel = document.getElementById('remote-panel');
+        if (rem.enabled) {
+            remotePanel.style.display = '';
+            const remState = !rem.online ? 'offline' : (rem.locked ? 'locked' : 'idle');
+            setPanelState('remote-panel-header', 'remote-panel-status',
+                          '&#x1F4E1; Slave Rx', remState);
+            const remRows = [
+                ['Callsign',  rem.callsign || '—'],
+                ['Frequency', rem.frequency ? rem.frequency + ' MHz' : '—'],
+            ];
+            document.getElementById('remote-panel-status').innerHTML = remRows.map(r =>
+                '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;"><span>' + r[0] + '</span>' +
+                '<span class="status-value">' + r[1] + '</span></div>'
+            ).join('');
+        } else {
+            remotePanel.style.display = 'none';
         }
     } catch(e) {
         document.getElementById('status-panel').innerHTML = '<div class="text-danger small">Status unavailable</div>';
