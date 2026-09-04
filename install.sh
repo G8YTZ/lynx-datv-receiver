@@ -9,22 +9,31 @@ set -e   # stop on any error, rather than leaving a half-installed system
 
 REPO_URL="https://github.com/G8YTZ/lynx-datv-receiver.git"
 
-# Which branch to install. Defaults to beta, because that is the branch
-# this script itself lives on and is fetched from - the quick-install
-# one-liner in the guide points at .../beta/install.sh, so cloning
-# anything else silently installs code that does not match the installer.
+# Which branch a FRESH install clones. Stable by default; beta is opted
+# into explicitly:
+#   ./install.sh --branch beta
 #
-# That was a real, confirmed bug: `git clone` with no branch takes the
-# repository default (main), so fetching this script from beta and
-# running it produced a main checkout. The failure was not obvious -
-# it surfaced much later as "cannot stat lynx-scheduled-reboot.service",
-# because the systemd units only exist on beta.
+# This deliberately does NOT vary between branches. It used to say
+# "beta", on the reasoning that the script is fetched from
+# .../beta/install.sh and cloning anything else installs code that does
+# not match the installer - which was a real, confirmed bug, surfacing
+# much later as "cannot stat lynx-scheduled-reboot.service" because
+# those units existed only on beta. But once beta is merged to main,
+# correcting that value per-branch means a merge conflict on every
+# future beta -> main merge, forever, on the single line where being
+# wrong installs mismatched code. Identical on both branches, chosen by
+# the caller, is the safer arrangement.
 #
-# Override on the command line if you genuinely want another branch:
-#   ./install.sh --branch main
-BRANCH="beta"
+# This has no bearing on Update Now, which follows the receiver's own
+# configured update channel (get_update_branch() in lynx_app.py) - a
+# stable receiver pulls stable, a beta receiver pulls beta - and which
+# exits at --deps-only well above the clone section regardless. The
+# only thing decided here is what a machine with no ~/lynx gets.
+BRANCH="main"
+BRANCH_EXPLICIT=0
 if [ "$1" = "--branch" ] && [ -n "$2" ]; then
   BRANCH="$2"
+  BRANCH_EXPLICIT=1
   shift 2
 fi
 
@@ -443,16 +452,31 @@ echo "--- Fetching Lynx ---"
 if [ -d ~/lynx ]; then
   echo "~/lynx already exists - leaving it as-is."
   echo "(Delete it first if you want a completely fresh clone instead.)"
-  # Warn if what is already there is not the branch being installed -
-  # otherwise the rest of this script runs against unexpected code and
-  # fails later in ways that do not point back to here.
+  # An existing clone keeps the branch it is on, and the rest of this
+  # script follows it. Previously this only warned about a mismatch,
+  # which was right while BRANCH was hardcoded per-branch; now that it
+  # defaults to stable, a beta receiver re-running the installer - or
+  # running it with no arguments at all - would otherwise be told its
+  # own branch is wrong, and worse, the sections below would run
+  # against files from a branch it is not on. Adopting what is
+  # actually there cannot silently move a receiver between channels,
+  # which is the failure worth avoiding.
+  # An explicit --branch always wins: someone who typed it means it.
+  # Adoption applies only when no branch was asked for.
   EXISTING_BRANCH="$(git -C ~/lynx rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
-  if [ "$EXISTING_BRANCH" != "$BRANCH" ]; then
-    echo ""
-    echo ">>> WARNING: ~/lynx is on branch '$EXISTING_BRANCH', but this"
-    echo ">>> installer expects '$BRANCH'. Files this script needs may be"
-    echo ">>> missing. To switch:  cd ~/lynx && git checkout $BRANCH"
-    echo ""
+  if [ "$EXISTING_BRANCH" != "unknown" ] && [ "$EXISTING_BRANCH" != "$BRANCH" ]; then
+    if [ "$BRANCH_EXPLICIT" = "1" ]; then
+      echo ""
+      echo ">>> WARNING: ~/lynx is on '$EXISTING_BRANCH', but --branch"
+      echo ">>> $BRANCH was asked for. Continuing with $BRANCH as"
+      echo ">>> requested; the clone itself is left alone, so switch it"
+      echo ">>> with:  cd ~/lynx && git checkout $BRANCH"
+      echo ""
+    else
+      echo "~/lynx is on '$EXISTING_BRANCH' - continuing on that branch."
+      echo "(Use the Update Channel setting in the Web UI to change channel.)"
+      BRANCH="$EXISTING_BRANCH"
+    fi
   fi
 else
   git clone -b "$BRANCH" "$REPO_URL" ~/lynx
