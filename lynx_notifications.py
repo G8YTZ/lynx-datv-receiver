@@ -47,6 +47,7 @@ import threading
 import time
 import datetime
 import requests
+import xml.etree.ElementTree as ET
 
 # ── Physical (BOARD) pin -> BCM GPIO number, or a fixed power/ground label ──
 # Standard 40-pin header layout, unchanged across every 40-pin Raspberry Pi
@@ -207,15 +208,15 @@ class GpioPin:
 # the original field set (band/mode/call/qso_date/time_on/station_callsign/
 # freq/comment/rst_sent) - is carried over unchanged from the reference
 # code (confirmed tested, working in production for over a year), and
-# deliberately preserved exactly as proven, not redesigned. gridsquare is
-# a genuinely new, additive field (portable-locator override, see
+# deliberately preserved exactly as proven, not redesigned. my_gridsquare
+# is a genuinely new, additive field (portable-locator override, see
 # submit_qrz_logbook) - it's optional and only appears in the payload
 # when actually set, so it can't affect the proven, original behaviour.
 
 QRZ_LOGBOOK_URL = "https://logbook.qrz.com/api"
 
 def _build_qrz_adif(api_key, action, call, band, mode, qso_date, time_on,
-                     station_callsign, freq, comment, rst_sent, gridsquare=""):
+                     station_callsign, freq, comment, rst_sent, my_gridsquare=""):
     ps = ""
     ps += "KEY=" + api_key + "&"
     ps += "ACTION=" + action + "&"
@@ -229,11 +230,22 @@ def _build_qrz_adif(api_key, action, call, band, mode, qso_date, time_on,
     ps += "<freq:" + str(len(str(freq))) + ">" + str(freq)
     ps += "<comment:" + str(len(str(comment))) + ">" + str(comment)
     ps += "<rst_sent:" + str(len(str(rst_sent))) + ">" + str(rst_sent)
-    if gridsquare:
-        # Portable locator override (see submit_qrz_logbook) - only added
-        # when actually set, so normal operation produces byte-identical
+    if my_gridsquare:
+        # Portable locator override (see submit_qrz_logbook) - MY_GRIDSQUARE,
+        # not GRIDSQUARE. In ADIF, GRIDSQUARE is the WORKED/contacted
+        # station's own grid - QRZ already derives that correctly from
+        # that station's own profile, and nothing here has any business
+        # overriding it. MY_GRIDSQUARE is the logging station's grid at
+        # time of QSO, which is what "Lynx is operating portable, correct
+        # every contact logged during this session" actually means. Using
+        # plain GRIDSQUARE previously meant a GNSS-confirmed fix wrote
+        # Lynx's own coordinates onto whichever callsign happened to be
+        # logged at that moment - confirmed as a genuine, reported bug,
+        # not a corner case: 100% of logged contacts carried the wrong
+        # station's position. Only added when actually set, so normal
+        # operation with no override configured produces byte-identical
         # ADIF to before this field existed.
-        ps += "<gridsquare:" + str(len(gridsquare)) + ">" + str(gridsquare)
+        ps += "<my_gridsquare:" + str(len(my_gridsquare)) + ">" + str(my_gridsquare)
     ps += "<eor>"
     return ps
 
@@ -244,15 +256,195 @@ def _qrz_band_from_freq_mhz(freq_mhz):
     had nowhere to land. Range confirmed against ADIF's own Band
     Enumeration (10000-10500MHz). Extend further if a deployment ever
     needs a band beyond these four."""
+    # 4m, including the UK NoV extension. ADIF's own 4m range stops at
+    # 70.5, but an NoV under the spectrum release scheme reaches 71.5 and
+    # DATV activity sits up there. Confirmed 2026-09-02: QRZ derives the
+    # band itself when it can - a 70.010 contact logged fine with no band
+    # sent at all - but it has nothing to derive from above 70.5 and
+    # refuses the record, so that segment needs telling explicitly.
+    if 70 <= freq_mhz <= 71.5:
+        return "4m"
     if 430 <= freq_mhz <= 440:
         return "70cm"
     elif 1240 <= freq_mhz <= 1325:
         return "23cm"
+    elif 2300 <= freq_mhz <= 2450:
+        return "13cm"
     elif 3400 <= freq_mhz <= 3410:
         return "9cm"
     elif 10000 <= freq_mhz <= 10500:
         return "3cm"
     return ""
+
+# ── QRZ XML Data API - callsign lookup (separate from the Logbook API
+# above, which uses its own api_key) ──────────────────────────────
+_qrz_lookup_session_key = None
+_qrz_lookup_session_obtained_at = 0.0
+_qrz_lookup_cache = {}   # {callsign: (fname_or_None, cached_at)}
+QRZ_LOOKUP_URL = "https://xmldata.qrz.com/xml/current/"
+QRZ_LOOKUP_CACHE_TTL_SECS = 86400       # 24h - a callsign's registered name
+                                          # essentially never changes within a
+                                          # session, so this avoids repeated
+                                          # lookups for a station seen more
+                                          # than once
+QRZ_LOOKUP_SESSION_MAX_AGE_SECS = 3000   # ~50 min - proactively refreshed a
+                                          # little before QRZ's own ~1hr
+                                          # session expiry, rather than
+                                          # waiting to be told it's stale
+QRZ_LOOKUP_TIMEOUT_SECS = 10.0           # was 4.0 - increased per Justin's own
+                                          # report of misses on a poorer
+                                          # connection (cellular). Safe to be
+                                          # more generous here now: this runs
+                                          # entirely in its own background
+                                          # thread (see
+                                          # _kick_off_qrz_notification_lookup
+                                          # in lynx_app.py), so a slow lookup
+                                          # can no longer block the arbitrator
+                                          # or anything else, regardless of
+                                          # how long it takes - the only
+                                          # remaining cost of a slower timeout
+                                          # is the name arriving later (or not
+                                          # at all, if it exceeds the
+                                          # notification's own
+                                          # notification_duration_secs, 20s by
+                                          # default, before completing).
+
+def _qrz_xml_request(params):
+    """Fire one request against QRZ's XML Data API and return the
+    parsed root element, or None on any failure (network, timeout,
+    malformed response) - deliberately never raises, since every
+    caller in this section needs to degrade gracefully rather than
+    ever break the notification a lookup is meant to enhance."""
+    try:
+        r = requests.get(QRZ_LOOKUP_URL, params=params, timeout=QRZ_LOOKUP_TIMEOUT_SECS)
+        r.raise_for_status()
+        return ET.fromstring(r.content)
+    except Exception as e:
+        print(f"[qrz_lookup] request failed: {e}")
+        return None
+
+
+def _qrz_xml_ns(root):
+    """QRZ's XML responses are namespaced (xmlns=\"http://xmldata.qrz.com\")
+    - ElementTree requires that namespace on every tag name passed to
+    find(), so this extracts it once per response rather than
+    hardcoding it, in case QRZ ever changes it."""
+    if root.tag.startswith('{'):
+        return root.tag.split('}')[0] + '}'
+    return ''
+
+
+def _qrz_lookup_login(username, password):
+    """Logs in to the XML Data API and stores the session key for
+    reuse across multiple lookups - each individual lookup does NOT
+    need its own fresh login. Returns True/False rather than raising."""
+    global _qrz_lookup_session_key, _qrz_lookup_session_obtained_at
+    root = _qrz_xml_request({"username": username, "password": password, "agent": "LynxDATV1.0"})
+    if root is None:
+        return False
+    ns = _qrz_xml_ns(root)
+    session = root.find(f'{ns}Session')
+    if session is None:
+        print("[qrz_lookup] login response had no Session element")
+        return False
+    err = session.find(f'{ns}Error')
+    if err is not None:
+        print(f"[qrz_lookup] login error: {err.text}")
+        return False
+    key_el = session.find(f'{ns}Key')
+    if key_el is None or not key_el.text:
+        print("[qrz_lookup] login response had no session key")
+        return False
+    _qrz_lookup_session_key = key_el.text
+    _qrz_lookup_session_obtained_at = time.time()
+    return True
+
+
+def qrz_callsign_lookup(username, password, callsign):
+    """Looks up a callsign via QRZ's XML Data API and returns just the
+    first/given name, or None if not found, not configured, or on any
+    error - a lookup failure must never be allowed to break the
+    notification it's meant to enhance, so this always degrades
+    gracefully rather than raising. See the module-level comments
+    above for the caching/session-reuse rationale."""
+    global _qrz_lookup_session_key
+
+    callsign = (callsign or "").strip().upper()
+    if not callsign or not username or not password:
+        return None
+
+    cached = _qrz_lookup_cache.get(callsign)
+    if cached and (time.time() - cached[1]) < QRZ_LOOKUP_CACHE_TTL_SECS:
+        # Entries are (name, grid) since the map feature; older entries
+        # may still be a bare name, hence _as_details().
+        return _as_details(cached[0])[0]
+
+    if (_qrz_lookup_session_key is None or
+            (time.time() - _qrz_lookup_session_obtained_at) > QRZ_LOOKUP_SESSION_MAX_AGE_SECS):
+        if not _qrz_lookup_login(username, password):
+            return None
+
+    root = _qrz_xml_request({"s": _qrz_lookup_session_key, "callsign": callsign})
+    if root is None:
+        return None
+    ns = _qrz_xml_ns(root)
+
+    session = root.find(f'{ns}Session')
+    if session is not None and session.find(f'{ns}Error') is not None:
+        # Session key rejected/expired mid-use - log in once more and
+        # retry this one lookup, rather than failing outright.
+        if not _qrz_lookup_login(username, password):
+            return None
+        root = _qrz_xml_request({"s": _qrz_lookup_session_key, "callsign": callsign})
+        if root is None:
+            return None
+        ns = _qrz_xml_ns(root)
+
+    callsign_el = root.find(f'{ns}Callsign')
+    fname = None
+    grid = None
+    if callsign_el is not None:
+        fname_el = callsign_el.find(f'{ns}fname')
+        if fname_el is not None and fname_el.text:
+            fname = fname_el.text.strip()
+        # The grid comes from the same response at no extra cost - the
+        # end-of-contact map needs it, and a second lookup purely for
+        # the locator would double QRZ traffic for nothing.
+        grid_el = callsign_el.find(f'{ns}grid')
+        if grid_el is not None and grid_el.text:
+            grid = grid_el.text.strip().upper() or None
+
+    _qrz_lookup_cache[callsign] = ((fname, grid), time.time())
+    return fname
+
+
+def qrz_callsign_details(username, password, callsign):
+    """Same lookup as qrz_callsign_lookup(), but returns (name, grid).
+
+    Both come from a single QRZ response and share one cache entry, so
+    calling this costs nothing beyond the name lookup that tri_watch
+    already performs. Returns (None, None) on any failure - a lookup
+    problem must never break the thing it was meant to enhance.
+    """
+    callsign = (callsign or "").strip().upper()
+    if not callsign or not username or not password:
+        return (None, None)
+    cached = _qrz_lookup_cache.get(callsign)
+    if cached and (time.time() - cached[1]) < QRZ_LOOKUP_CACHE_TTL_SECS:
+        return _as_details(cached[0])
+    qrz_callsign_lookup(username, password, callsign)
+    cached = _qrz_lookup_cache.get(callsign)
+    return _as_details(cached[0]) if cached else (None, None)
+
+
+def _as_details(value):
+    """Cache entries were plain names before the map feature needed
+    grids; tolerate either shape so an in-flight cache can't break a
+    lookup after an upgrade."""
+    if isinstance(value, tuple):
+        return value
+    return (value, None)
+
 
 def submit_qrz_logbook(api_key, station_callsign, rx_callsign, freq_khz,
                         mode, mer, margin, portable_locator="", comment_override=None):
@@ -266,21 +458,27 @@ def submit_qrz_logbook(api_key, station_callsign, rx_callsign, freq_khz,
     dB) is used in its place for the comment/rst_sent fields as the
     closest available, meaningful signal-quality figure Lynx actually has.
 
-    portable_locator: an operator-supplied override for the contacted
-    station's grid square, for the case where they're operating portable
-    and haven't updated their QRZ profile - without this, QRZ calculates
-    distance/bearing from the contacted callsign's stale, registered
-    locator rather than where they actually are. Empty by default, in
-    which case no gridsquare is sent at all and QRZ's own lookup behaves
-    exactly as it always has.
+    portable_locator: an operator-supplied (or GNSS-confirmed) locator
+    for LYNX'S OWN current position - the logging station, not the
+    contacted one - for the case where Lynx itself is operating away
+    from its normal, registered site. Sent as ADIF's MY_GRIDSQUARE, not
+    GRIDSQUARE: the latter is the worked station's own grid, which QRZ
+    already derives correctly from that station's own profile and has
+    no reason to be overridden by anything Lynx knows. Without this,
+    QRZ calculates distance/bearing using the logged-in QRZ account's
+    stale, registered locator rather than wherever Lynx actually is
+    right now. Empty by default, in which case no gridsquare of any
+    kind is sent and QRZ's own lookup behaves exactly as it always has.
 
     Deliberately just a plain string, sourced from wherever the caller
-    gets it - today that's a manually-entered config value (see
-    NotificationManager._fire_qrz), but nothing here assumes a human
-    typed it. A future, automated source - an onboard GPS module, or a
-    phone's GPS relayed over Bluetooth, with the lat/long converted to a
-    Maidenhead locator - could populate the same underlying config value
-    on its own, and this function would need no changes at all to use it.
+    gets it - today that's a manually-entered config value or a
+    confirmed GNSS fix (see NotificationManager._fire_qrz and
+    lynx_app.py's _on_gnss_locator_change), but nothing here assumes a
+    human typed it. Applies uniformly to every contact logged while
+    set, which is exactly right for "Lynx itself is portable for this
+    session" - it would be wrong for trying to correct one specific
+    worked station's stale profile instead, which is a different thing
+    this field does not attempt.
 
     comment_override: replaces the normal, auto-built comment entirely
     when set - used by the /diagnostics test feature to mark its entries
@@ -307,10 +505,22 @@ def submit_qrz_logbook(api_key, station_callsign, rx_callsign, freq_khz,
     payload = _build_qrz_adif(api_key, "INSERT", call_trunc, band, str(mode),
                                qso_date, time_on, station_callsign,
                                str(freq_mhz), comment, str(rst_sent),
-                               gridsquare=portable_locator.strip())
+                               my_gridsquare=portable_locator.strip())
+
+    # Logged unconditionally (not just when portable_locator is set) -
+    # this is ground truth for exactly what left this machine, with no
+    # room for QRZ's own handling of it to be mistaken for something
+    # Lynx did or didn't send. API key redacted (everything up to and
+    # including "ADIF=" is dropped) since it's a credential, not
+    # diagnostic data - the ADIF body itself is the whole point of
+    # this line and contains every field actually being submitted,
+    # MY_GRIDSQUARE included when it's set.
+    adif_body = payload.split("ADIF=", 1)[-1]
+    print(f"[notifications] QRZ: submitting for {call_trunc} - {adif_body}")
 
     r = requests.post(QRZ_LOGBOOK_URL, data=payload,
                        headers={"User-agent": "lynx-notifications/1.0"}, timeout=10)
+    print(f"[notifications] QRZ: raw response - {r.status_code} {r.text}")
     result, logid, count, reason = "none", "none", "none", "none"
     if r.status_code == 200:
         for pair in r.text.split("&"):
@@ -420,7 +630,8 @@ class NotificationManager:
     POLL_SECS = 1.0
 
     def __init__(self, picotuner_state, picotuner_state_b, get_config, record_event=None,
-                 get_lnb_state=None, get_stream_active=None):
+                 get_on_air_from_if=None, get_tri_watch_displayed_rcv=None, get_tri_watch_enabled=None,
+                 get_stream_active=None, get_diversity_enabled=None):
         self.picotuner_state = picotuner_state
         self.picotuner_state_b = picotuner_state_b
         self.get_config = get_config
@@ -430,6 +641,11 @@ class NotificationManager:
         # lynx_app's globals. Optional, so an older caller still works -
         # it just never reports a stream as active input.
         self.get_stream_active = get_stream_active or (lambda: False)
+        # Diversity's RUNTIME state. The config file is not updated when
+        # diversity is turned on by tuning, so reading it there reports
+        # False and tuner B's lock gets ignored. Optional, falling back
+        # to the config, so an older caller still behaves as before.
+        self.get_diversity_enabled = get_diversity_enabled
         # Lets this module log onto the same, persistent Diagnostics page
         # timeline lynx_app.py already uses for mpv events, rather than
         # only to the terminal - defaults to a harmless no-op so this
@@ -440,7 +656,43 @@ class NotificationManager:
         # runtime state that changes on every tune, not a one-time value.
         # Defaults to "no LNB" so this class stays constructible/testable
         # standalone.
-        self.get_lnb_state = get_lnb_state or (lambda: (0, "low"))
+        # Supplied by lynx_app.py as on_air_from_if(rcv, if_mhz) - the
+        # single place converter arithmetic happens. This module used to
+        # be handed the raw LO and side and do its own sums, with no
+        # up-converter branch, which sent QRZ a frequency wrong by twice
+        # the LO. Defaults to "no converter" so the class stays
+        # constructible without lynx_app.py present.
+        self.get_on_air_from_if = get_on_air_from_if or (lambda rcv, if_mhz: None)
+        # 1, 2, or None - which receiver tri_watch is currently displaying,
+        # if any. Used by _current_source_data() to log whichever source
+        # is actually on screen under tri_watch, rather than the MER
+        # comparison below (which only means something in diversity mode,
+        # where both tuners chase the SAME signal - under tri_watch they're
+        # on independent frequencies, so comparing their MER to decide
+        # which to log doesn't mean anything and can silently pick the
+        # wrong one). Defaults to always-None so this class stays
+        # constructible/testable standalone, and diversity/normal-mode
+        # behaviour is completely unaffected when this isn't supplied.
+        self.get_tri_watch_displayed_rcv = get_tri_watch_displayed_rcv or (lambda: None)
+        # Whether tri_watch is enabled at all, independent of what it's
+        # currently displaying - needed because get_tri_watch_displayed_rcv()
+        # alone returns None in TWO genuinely different situations that must
+        # be told apart: tri_watch being completely off (where the MER
+        # comparison above is correct and intended), and tri_watch being on
+        # but currently displaying its stream source or sitting idle (where
+        # NEITHER receiver is the active, displayed source, even if one
+        # happens to be locked in the background - tri_watch keeps both
+        # continuously tuned regardless of what's shown). Confirmed as a
+        # real, reported bug: every logged QRZ contact showed the site's
+        # own callsign whenever the stream was active under tri_watch,
+        # because a background lock alone was enough to both arm the
+        # lock-settle timer in _poll() and, once fired, get silently
+        # picked up by the MER-comparison fallback here - despite neither
+        # receiver actually being what was on screen. Defaults to
+        # always-False so this class stays constructible/testable
+        # standalone, and diversity/normal-mode behaviour (which never
+        # reaches the tri_watch-specific branches at all) is unaffected.
+        self.get_tri_watch_enabled = get_tri_watch_enabled or (lambda: False)
 
         self._stop_event = threading.Event()
         self._thread = None
@@ -449,7 +701,30 @@ class NotificationManager:
         self._loss_streak = 0
         self._confirmed_locked = False
 
+        # Per-receiver lock tracking for QRZ/Slack specifically, used
+        # only when tri_watch is enabled - see _poll_tri_watch_qrz_slack()
+        # for the full rationale. Kept entirely separate from
+        # self._confirmed_locked above (which still drives Companion/
+        # GPIO Tx, and QRZ/Slack too outside tri_watch) rather than
+        # replacing it, since those still want a single, combined "is
+        # anything locked" signal - only QRZ/Slack logging needs to know
+        # about each receiver independently, so every genuine contact
+        # gets logged with its own correct data regardless of which (if
+        # either) receiver is currently displayed.
+        self._tw_lock_streak = {1: 0, 2: 0}
+        self._tw_loss_streak = {1: 0, 2: 0}
+        self._tw_confirmed_locked = {1: False, 2: False}
+
         self._qrz_last_logged = {}   # {callsign: unix_timestamp} - suppression window
+        # {callsign: retry_count} - see _fire_qrz's own MER-not-ready
+        # handling. Right after a restart, the lock/callsign broadcast
+        # (port 9997) and the quality broadcast carrying MER/modcod
+        # (port 9901, picotuner_quality_monitor - a genuinely separate
+        # background thread) can arrive at different times; if the
+        # settle timer fires in that gap, MER/modcod were being logged
+        # as literally "None" and blank rather than the real values a
+        # few seconds later would have given.
+        self._qrz_mer_retries = {}
 
         self._actions = {}   # {name: SettlingAction} - persistent, keyed store so a
                               # later event (e.g. unlock) can find and cancel an earlier
@@ -496,6 +771,80 @@ class NotificationManager:
                 print(f"[notifications] poll error: {type(e).__name__}: {e}")
             time.sleep(self.POLL_SECS)
 
+    def _source_data_from(self, src, to_float, rcv=1):
+        """Given a specific picotuner_state-shaped dict (already chosen
+        by the caller - never does any A-vs-B picking itself), builds
+        the callsign/frequency/mer/margin/modcod/symbol_rate dict every
+        output below reads from. Extracted as its own method so both
+        _current_source_data() (MER-comparison/displayed-receiver based)
+        and _source_data_for_rcv() (explicit, per-receiver - see its own
+        docstring) share this exact same, single-tested frequency/LNB
+        conversion logic rather than risking two copies drifting apart."""
+        # picotuner_state['frequency'] is parsed directly from the
+        # Picotuner's own status broadcast, which reports it in MHz (see
+        # lynx_app.py's own parsing comment: "437.024 G8YTZ") - genuinely
+        # converted to kHz here to match this field's name and the rest
+        # of Lynx's own kHz convention (presets, tuning). Confirmed bug:
+        # this used to just relabel the raw MHz value as "kHz" with no
+        # actual conversion, so submit_qrz_logbook()'s own /1000 (which
+        # correctly expects real kHz input) silently turned a genuine
+        # 437MHz signal into 0.437MHz - outside every defined ADIF band
+        # range, leaving QRZ's own <band> field empty and the whole
+        # submission rejected.
+        freq_mhz_raw = to_float(src.get("frequency")) or 0.0
+
+        # When an LNB is in use, the Picotuner reports the L-band/IF
+        # frequency it's actually locked on, not the real satellite
+        # downlink frequency - same underlying fact lynx_app.py's own
+        # _compute_downlink_frequency() exists to handle, reversed here
+        # against whichever source was actually picked, rather than
+        # assuming tuner A the way that function does - the two tuners
+        # are always tuned to the same frequency in diversity mode, but
+        # not necessarily in single-plug-B-only or tri_watch operation.
+        # The single derivation, supplied by lynx_app.py. This module
+        # no longer knows what an LO or an injection side is - it had
+        # its own copy of the arithmetic, missing the up-converter case
+        # entirely, and sent QRZ 311.010 for a 71.010 MHz contact.
+        #
+        # rcv matters: the caller has already chosen which receiver this
+        # contact came from, and the two can be on different converters
+        # under tri_watch. The old callback only ever read tuner A's.
+        on_air = self.get_on_air_from_if(rcv, freq_mhz_raw)
+        freq_mhz = freq_mhz_raw if on_air is None else on_air
+
+        return {
+            "rx_callsign": src.get("callsign", "") or "",
+            # Rounded to 3 dp (1 Hz), matching the precision
+            # _compute_downlink_frequency() already applies in
+            # lynx_app.py. Without this, binary floating point sent QRZ
+            # 71009.99999999999 for a 71.010 MHz contact through a
+            # 120 MHz up-converter - right to within a rounding error,
+            # but untidy in a logbook. Done here, where the kHz value is
+            # built, so QRZ, Slack and the Pathfinder card all get the
+            # same clean number rather than each rounding separately.
+            "frequency_khz": round(freq_mhz * 1000.0, 3),
+            "mer": to_float(src.get("mer")),
+            "margin": to_float(src.get("margin")),
+            "modcod": src.get("modcod", "") or "",
+            "symbol_rate": src.get("symbol_rate", "") or "",
+        }
+
+    def _source_data_for_rcv(self, rcv):
+        """Like _current_source_data(), but for an EXPLICIT receiver (1
+        or 2) rather than picking one via MER comparison or the tri_watch
+        displayed-receiver callback. Used only by
+        _poll_tri_watch_qrz_slack() - each receiver's own, independent
+        lock tracking already knows exactly which one just confirmed, so
+        there's no picking to do here at all, unlike
+        _current_source_data()."""
+        def to_float(v):
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                return None
+        src = self.picotuner_state_b if rcv == 2 else self.picotuner_state
+        return self._source_data_from(src, to_float, rcv)
+
     def _current_source_data(self):
         """Picks whichever tuner is actually the active signal right now
         (higher MER if both are locked simultaneously) and returns its
@@ -515,59 +864,125 @@ class NotificationManager:
         a_locked = a.get("locked", False)
         b_locked = b.get("locked", False)
 
-        use_b = b_locked and (not a_locked or (b_mer is not None and (a_mer is None or b_mer > a_mer)))
-        src = b if use_b else a
-        # picotuner_state['frequency'] is parsed directly from the
-        # Picotuner's own status broadcast, which reports it in MHz (see
-        # lynx_app.py's own parsing comment: "437.024 G8YTZ") - genuinely
-        # converted to kHz here to match this field's name and the rest
-        # of Lynx's own kHz convention (presets, tuning). Confirmed bug:
-        # this used to just relabel the raw MHz value as "kHz" with no
-        # actual conversion, so submit_qrz_logbook()'s own /1000 (which
-        # correctly expects real kHz input) silently turned a genuine
-        # 437MHz signal into 0.437MHz - outside every defined ADIF band
-        # range, leaving QRZ's own <band> field empty and the whole
-        # submission rejected.
-        freq_mhz_raw = to_float(src.get("frequency")) or 0.0
-
-        # When an LNB is in use, the Picotuner reports the L-band/IF
-        # frequency it's actually locked on, not the real satellite
-        # downlink frequency - same underlying fact lynx_app.py's own
-        # _compute_downlink_frequency() exists to handle, reversed here
-        # against whichever source (A or B) was actually picked above,
-        # rather than assuming tuner A the way that function does - the
-        # two tuners are always tuned to the same frequency in diversity
-        # mode, but not necessarily in single-plug-B-only operation.
-        lnb_lo_khz, lnb_side = self.get_lnb_state()
-        if lnb_lo_khz:
-            lo_mhz = lnb_lo_khz / 1000
-            if lnb_side == "high":
-                # High-side injection (C-band): IF = LO - downlink
-                freq_mhz = lo_mhz - freq_mhz_raw
-            else:
-                # Low-side injection (Ku-band): IF = downlink - LO
-                freq_mhz = freq_mhz_raw + lo_mhz
+        tri_watch_displayed_rcv = self.get_tri_watch_displayed_rcv()
+        if tri_watch_displayed_rcv is not None:
+            # tri_watch is actively displaying a specific receiver right
+            # now - log THAT one, not whichever happens to have a
+            # numerically better MER. Confirmed as a real, reported bug
+            # otherwise: the two receivers are on completely independent
+            # frequencies under tri_watch (unlike diversity mode's
+            # redundant-signal comparison below), and tri_watch keeps
+            # both continuously tuned regardless of which is displayed -
+            # so if the OTHER receiver also happened to be locked with a
+            # higher MER at that moment, the comparison below would
+            # silently log it instead of the one actually on screen.
+            use_b = (tri_watch_displayed_rcv == 2)
+        elif self.get_tri_watch_enabled():
+            # tri_watch is on but not currently displaying an RF source
+            # at all (stream or idle) - return neutral, empty data
+            # rather than falling through to the MER comparison below,
+            # which would otherwise silently pick up whichever
+            # background receiver happens to be locked, even though
+            # neither is actually the displayed source. This method is
+            # no longer used for QRZ/Slack under tri_watch at all (see
+            # _poll_tri_watch_qrz_slack()) - kept defensive regardless,
+            # since Companion/GPIO Tx settling actions don't currently
+            # call this, but nothing prevents a future caller from doing
+            # so.
+            return {
+                "rx_callsign": "", "frequency_khz": 0.0, "mer": None,
+                "margin": None, "modcod": "", "symbol_rate": "",
+            }
         else:
-            freq_mhz = freq_mhz_raw
-
-        return {
-            "rx_callsign": src.get("callsign", "") or "",
-            "frequency_khz": freq_mhz * 1000.0,
-            "mer": to_float(src.get("mer")),
-            "margin": to_float(src.get("margin")),
-            "modcod": src.get("modcod", "") or "",
-            "symbol_rate": src.get("symbol_rate", "") or "",
-        }
+            use_b = b_locked and (not a_locked or (b_mer is not None and (a_mer is None or b_mer > a_mer)))
+        src = b if use_b else a
+        return self._source_data_from(src, to_float, 2 if use_b else 1)
 
     # -- lock/unlock transition handling (QRZ, Slack, Companion) --------
 
     def _poll(self):
         cfg = self.get_config()
         notif_cfg = cfg.get('notifications', {})
-        diversity_enabled = cfg.get('diversity', {}).get('enabled', False)
+        # Runtime state first, config as a fallback - see __init__.
+        if self.get_diversity_enabled is not None:
+            try:
+                diversity_enabled = bool(self.get_diversity_enabled())
+            except Exception:
+                diversity_enabled = cfg.get('diversity', {}).get('enabled', False)
+        else:
+            diversity_enabled = cfg.get('diversity', {}).get('enabled', False)
+        # Rx2's lock status is only meaningful to consider when it's
+        # actually, deliberately being monitored - true during diversity
+        # mode (as before), but also true during tri_watch whenever it
+        # has an enabled Rx2 source configured. Missing this second case
+        # was a real, confirmed bug: QRZ/Slack/Companion/GPIO Tx all
+        # silently never fired for an Rx2-only lock under tri_watch,
+        # since raw_locked below never considered b_locked at all
+        # outside diversity mode - even though _current_source_data()
+        # just below already correctly, independently picks whichever
+        # tuner is actually active, with no such gating of its own.
+        tri_watch_cfg = cfg.get('tri_watch', {})
+        tri_watch_has_rx2 = tri_watch_cfg.get('enabled', False) and any(
+            src.get('type') == 'rf' and src.get('rcv') == 2 and src.get('enabled', False)
+            for src in tri_watch_cfg.get('sources', [])
+        )
+        b_locked_relevant = diversity_enabled or tri_watch_has_rx2
 
+        # Drives Companion lock/unlock and GPIO Tx - both represent a
+        # single, physical on/off indicator for "is the repeater's RF
+        # input active at all", independent of what's currently
+        # displayed, so genuine background activity on either receiver
+        # under tri_watch should still count here, exactly as it always
+        # did before tri_watch existed. QRZ/Slack are handled completely
+        # separately below when tri_watch is enabled (each receiver
+        # tracked independently, so every genuine contact gets logged
+        # correctly regardless of what's displayed) - outside tri_watch,
+        # they still piggyback on this same shared signal via
+        # _on_confirmed_lock/_on_confirmed_unlock below, unchanged.
         raw_locked = self.picotuner_state.get("locked", False) or \
-                     (diversity_enabled and self.picotuner_state_b.get("locked", False))
+                     (b_locked_relevant and self.picotuner_state_b.get("locked", False))
+
+        # "Is there a picture to transmit" - which is NOT the same
+        # question as "is RF locked", and conflating the two was a real,
+        # reported bug (DB0OV, Aug 2026). Companion's source-switching
+        # webhook and the GPIO Tx pin exist to key a transmitter and
+        # switch a vision mixer to the receiver when it has something to
+        # show. A web stream is something to show. Under tri_watch a
+        # stream is a first-class source, so a repeater with one
+        # configured would previously drop its transmitter the moment
+        # the arbitrator switched to it - the picture kept going out on
+        # the network while the repeater stopped transmitting it.
+        #
+        # Deliberately kept SEPARATE from raw_locked rather than folded
+        # into it. QRZ and Slack piggyback on raw_locked outside
+        # tri_watch, and they need a callsign: a stream has none, so
+        # widening that signal would have produced logbook entries for
+        # contacts that never happened.
+        try:
+            stream_active = bool(self.get_stream_active())
+        except Exception as e:
+            print(f"[notifications] stream-active check failed: {e}")
+            stream_active = False
+        raw_active = raw_locked or stream_active
+
+        if raw_active:
+            self._inactive_streak = 0
+            self._active_streak += 1
+        else:
+            self._active_streak = 0
+            self._inactive_streak += 1
+
+        if self._active_streak >= self.LOCK_CONFIRM_POLLS and not self._confirmed_active:
+            self._confirmed_active = True
+            why = "RF lock" if raw_locked else "stream"
+            print(f"[notifications] confirmed ACTIVE INPUT ({why}) - "
+                  f"arming Companion/GPIO Tx settle timers")
+            self._on_confirmed_active(notif_cfg, cfg, stream_only=not raw_locked)
+        elif self._inactive_streak >= self.LOCK_CONFIRM_POLLS and self._confirmed_active:
+            self._confirmed_active = False
+            print("[notifications] confirmed NO ACTIVE INPUT - "
+                  "cancelling pending Companion/GPIO Tx timers")
+            self._on_confirmed_inactive(notif_cfg)
 
         # "Is there a picture to transmit" - which is NOT the same
         # question as "is RF locked", and conflating the two was a real,
@@ -627,7 +1042,15 @@ class NotificationManager:
             self.record_event("notif_confirmed_unlock",
                                "Notifications manager's own unlock confirmation - cancelling pending settle timers",
                                count_as_mpv_restart=False)
-            self._on_confirmed_unlock(notif_cfg)
+            self._on_confirmed_unlock(notif_cfg, tri_watch_cfg.get('enabled', False))
+
+        # QRZ/Slack under tri_watch: tracked independently per receiver
+        # here, rather than via the shared _confirmed_locked above -
+        # see _poll_tri_watch_qrz_slack()'s own docstring for the full
+        # rationale. Runs alongside, not instead of, everything above -
+        # Companion/GPIO Tx keep using the shared signal regardless.
+        if tri_watch_cfg.get('enabled', False):
+            self._poll_tri_watch_qrz_slack(notif_cfg, cfg)
 
         self._poll_tx_pin(notif_cfg, cfg)
 
@@ -669,16 +1092,49 @@ class NotificationManager:
 
     def _on_confirmed_lock(self, notif_cfg, cfg):
         site_callsign = cfg.get('site', {}).get('callsign', '')
+        tri_watch_enabled_now = cfg.get('tri_watch', {}).get('enabled', False)
 
-        qrz_cfg = notif_cfg.get('qrz', {})
-        if qrz_cfg.get('enabled', False):
-            delay = float(qrz_cfg.get('settle_secs', 15.0))
-            self._arm_action('qrz', delay, lambda: self._fire_qrz(qrz_cfg, site_callsign), "QRZ")
+        # QRZ/Slack: only fired from here outside tri_watch - under
+        # tri_watch, _poll_tri_watch_qrz_slack() handles both
+        # independently per receiver instead, so firing them again here
+        # too (using this shared signal's own, MER-compared source data,
+        # which doesn't mean anything once two receivers are on
+        # independent frequencies) would risk duplicate or incorrectly-
+        # attributed entries alongside the correct, per-receiver ones.
+        if not tri_watch_enabled_now:
+            qrz_cfg = notif_cfg.get('qrz', {})
+            if qrz_cfg.get('enabled', False):
+                delay = float(qrz_cfg.get('settle_secs', 15.0))
+                self._arm_action('qrz', delay, lambda: self._fire_qrz(qrz_cfg, site_callsign), "QRZ")
 
-        slack_cfg = notif_cfg.get('slack', {})
-        if slack_cfg.get('enabled', False):
-            delay = float(slack_cfg.get('settle_secs', 15.0))
-            self._arm_action('slack', delay, lambda: self._fire_slack(slack_cfg, site_callsign), "Slack")
+            slack_cfg = notif_cfg.get('slack', {})
+            if slack_cfg.get('enabled', False):
+                delay = float(slack_cfg.get('settle_secs', 15.0))
+                self._arm_action('slack', delay, lambda: self._fire_slack(slack_cfg, site_callsign), "Slack")
+
+    def _on_confirmed_active(self, notif_cfg, cfg=None, stream_only=False):
+        """Companion webhook + its GPIO mirror: driven by "there is a
+        picture to transmit", not by RF lock alone. Settling timers and
+        cancellation behaviour are unchanged - only the question that
+        triggers them.
+
+        Also fires Slack when the activity is a STREAM rather than RF.
+        The point of the Slack alert is telling people the repeater is
+        in use, and someone watching for that doesn't care how the
+        picture arrived. QRZ is not fired: a logbook entry needs a
+        callsign and a stream has none.
+        """
+        self._cancel_action('companion_unlock')
+        self._cancel_action('companion_gpio_unlock')
+
+        if stream_only and cfg is not None:
+            slack_cfg = notif_cfg.get('slack', {})
+            if slack_cfg.get('enabled', False):
+                site_callsign = cfg.get('site', {}).get('callsign', '')
+                delay = float(slack_cfg.get('settle_secs', 15.0))
+                self._arm_action('slack_stream', delay,
+                                  lambda: self._fire_slack_stream(slack_cfg, site_callsign),
+                                  "Slack-stream")
 
     def _on_confirmed_active(self, notif_cfg, cfg=None, stream_only=False):
         """Companion webhook + its GPIO mirror: driven by "there is a
@@ -739,27 +1195,160 @@ class NotificationManager:
                 self._arm_action('companion_gpio_unlock', delay,
                                   lambda: gpio.set(False), "Companion-GPIO-unlock")
 
-    def _on_confirmed_unlock(self, notif_cfg):
+    def _on_confirmed_unlock(self, notif_cfg, tri_watch_enabled_now=False):
         # We're unlocked again - cancel anything the lock side had
         # pending, matching the reference code's explicit design: a
         # webhook (or now, GPIO change) must not fire if the state goes
         # back to unlocked during its own settling time.
-        self._cancel_action('qrz')
-        self._cancel_action('slack')
+        if not tri_watch_enabled_now:
+            self._cancel_action('qrz')
+            self._cancel_action('slack')
 
-    def _fire_qrz(self, qrz_cfg, site_callsign):
+    def _poll_tri_watch_qrz_slack(self, notif_cfg, cfg):
+        """QRZ/Slack under tri_watch: tracks Rx1 and Rx2's own lock state
+        completely independently of each other and of Companion/GPIO
+        Tx's shared signal above - confirmed as what's actually wanted
+        (Justin: "happy for it to be ALL"). Every genuine contact gets
+        logged, correctly attributed, from whichever receiver actually
+        decoded it, regardless of which (if either) is currently
+        displayed, and regardless of what the OTHER receiver happens to
+        be doing at the same moment - fixing a second, related gap
+        found while building this: with only one shared confirmed-lock
+        flag, a genuine, distinct contact on the non-displayed receiver
+        would previously never get its own settle timer armed at all
+        while the displayed one was already confirmed-locked, since the
+        shared flag never transitioned back to trigger it again.
+
+        Each receiver gets its own settle timer (the same configured
+        settle_secs, applied independently) and its own lock/loss
+        debounce, keyed apart via f'tw_qrz_{rcv}' / f'tw_slack_{rcv}' so
+        one receiver's timer can never cancel or be confused with the
+        other's. The suppress-window dedup (self._qrz_last_logged,
+        keyed by callsign, not receiver) is shared and unchanged - it
+        already correctly applies globally regardless of which receiver
+        decoded a given callsign."""
+        tri_watch_cfg = cfg.get('tri_watch', {})
+        site_callsign = cfg.get('site', {}).get('callsign', '')
+        sources = tri_watch_cfg.get('sources', [])
+        qrz_cfg = notif_cfg.get('qrz', {})
+        slack_cfg = notif_cfg.get('slack', {})
+
+        for rcv in (1, 2):
+            # Only track a receiver that's actually configured and
+            # enabled as a tri_watch source - one that isn't has no
+            # business independently triggering anything here.
+            rcv_enabled = any(
+                src.get('type') == 'rf' and src.get('rcv') == rcv and src.get('enabled', False)
+                for src in sources
+            )
+            if not rcv_enabled:
+                continue
+
+            state = self.picotuner_state_b if rcv == 2 else self.picotuner_state
+            locked = state.get("locked", False)
+
+            if locked:
+                self._tw_loss_streak[rcv] = 0
+                self._tw_lock_streak[rcv] += 1
+            else:
+                self._tw_lock_streak[rcv] = 0
+                self._tw_loss_streak[rcv] += 1
+
+            if self._tw_lock_streak[rcv] >= self.LOCK_CONFIRM_POLLS and not self._tw_confirmed_locked[rcv]:
+                self._tw_confirmed_locked[rcv] = True
+                print(f"[notifications] tri_watch Rx{rcv}: confirmed LOCK - arming its own QRZ/Slack settle timers")
+                self.record_event("notif_confirmed_lock",
+                                   f"tri_watch Rx{rcv}: own lock confirmation - arming settle timers",
+                                   count_as_mpv_restart=False)
+
+                if qrz_cfg.get('enabled', False):
+                    delay = float(qrz_cfg.get('settle_secs', 15.0))
+                    self._arm_action(
+                        f'tw_qrz_{rcv}', delay,
+                        lambda r=rcv: self._fire_qrz(qrz_cfg, site_callsign,
+                                                      source_override=self._source_data_for_rcv(r)),
+                        f"QRZ (tri_watch Rx{rcv})")
+
+                if slack_cfg.get('enabled', False):
+                    delay = float(slack_cfg.get('settle_secs', 15.0))
+                    self._arm_action(
+                        f'tw_slack_{rcv}', delay,
+                        lambda r=rcv: self._fire_slack(slack_cfg, site_callsign,
+                                                        source_override=self._source_data_for_rcv(r)),
+                        f"Slack (tri_watch Rx{rcv})")
+
+            elif self._tw_loss_streak[rcv] >= self.LOCK_CONFIRM_POLLS and self._tw_confirmed_locked[rcv]:
+                self._tw_confirmed_locked[rcv] = False
+                print(f"[notifications] tri_watch Rx{rcv}: confirmed UNLOCK - cancelling its own pending settle timers")
+                self.record_event("notif_confirmed_unlock",
+                                   f"tri_watch Rx{rcv}: own unlock confirmation - cancelling pending settle timers",
+                                   count_as_mpv_restart=False)
+                self._cancel_action(f'tw_qrz_{rcv}')
+                self._cancel_action(f'tw_slack_{rcv}')
+
+    def _fire_qrz(self, qrz_cfg, site_callsign, source_override=None):
         api_key = qrz_cfg.get('api_key', '')
         if not api_key:
             print("[notifications] QRZ enabled but no API key configured - skipping")
             self.record_event("qrz_skipped", "No API key configured", count_as_mpv_restart=False)
             return
-        src = self._current_source_data()
+        # source_override: an explicit source dict (from
+        # _source_data_for_rcv), used by tri_watch's own, independent
+        # per-receiver tracking - see _poll_tri_watch_qrz_slack(). Falls
+        # back to the MER-comparison/displayed-receiver logic otherwise,
+        # exactly as before, for normal/diversity mode.
+        src = source_override if source_override is not None else self._current_source_data()
         call = src["rx_callsign"].strip()
         if not call:
             print("[notifications] QRZ: no callsign decoded by settling time - skipping this entry")
             self.record_event("qrz_skipped", "No callsign had been decoded by the time the settle timer fired",
                                count_as_mpv_restart=False)
             return
+
+        # MER (and modcod, set in the same picotuner_quality_monitor()
+        # pass - see that function's own field list) can genuinely still
+        # be unset here, most often the very first contact right after a
+        # restart: the lock/callsign broadcast (port 9997) and the
+        # quality broadcast (port 9901) are read by two separate
+        # background threads that don't start in lockstep, so the settle
+        # timer can fire in the gap before quality data has arrived at
+        # all. Confirmed as a real, reported case: a logged entry
+        # carrying the literal text "None" for MER and no modcod at all.
+        # Deferred a few seconds rather than logged incomplete - bounded
+        # so a genuine, sustained absence (not just a startup race)
+        # still logs eventually rather than being silently dropped.
+        # Only for the non-tri_watch path: source_override, when given,
+        # is a fixed snapshot from tri_watch's own separate per-receiver
+        # tracking, and re-arming with that same stale snapshot would
+        # never actually pick up fresher data.
+        #
+        # Checks BOTH mer and modcod, not mer alone - confirmed as a
+        # real gap in the first version of this fix: mer can arrive
+        # from picotuner_table_monitor_b() (a THIRD background thread,
+        # which explicitly only backfills tuner A's mer/margin, never
+        # modcod) independently of and potentially earlier than modcod,
+        # which only ever comes from picotuner_quality_monitor()'s own,
+        # separate parsing. A logged entry with a real MER but still
+        # missing "QPSK 8/9" confirmed this was happening in practice.
+        if source_override is None and (src["mer"] is None or not src["modcod"]):
+            MAX_QRZ_MER_RETRIES = 3
+            QRZ_MER_RETRY_DELAY_SECS = 3.0
+            retries = self._qrz_mer_retries.get(call, 0)
+            if retries < MAX_QRZ_MER_RETRIES:
+                self._qrz_mer_retries[call] = retries + 1
+                missing = ", ".join(
+                    n for n, v in (("MER", src["mer"] is None), ("modcod", not src["modcod"])) if v)
+                print(f"[notifications] QRZ: {missing} not yet available for {call} "
+                      f"(most likely the first contact after a restart) - "
+                      f"deferring {QRZ_MER_RETRY_DELAY_SECS:.0f}s "
+                      f"(retry {retries + 1}/{MAX_QRZ_MER_RETRIES})")
+                self._arm_action('qrz', QRZ_MER_RETRY_DELAY_SECS,
+                                  lambda: self._fire_qrz(qrz_cfg, site_callsign), "QRZ")
+                return
+            print(f"[notifications] QRZ: MER/modcod still not fully available for {call} "
+                  f"after {MAX_QRZ_MER_RETRIES} retries - logging anyway rather than "
+                  f"losing the contact entirely")
+        self._qrz_mer_retries.pop(call, None)
 
         suppress_secs = float(qrz_cfg.get('suppress_mins', 60)) * 60.0
         now = time.time()
@@ -775,10 +1364,28 @@ class NotificationManager:
 
         try:
             portable_locator = qrz_cfg.get('portable_locator', '').strip()
+            # Off must be a hard guarantee that no portable locator is
+            # ever submitted - not merely "GNSS stops writing new
+            # values" (which _on_gnss_locator_change already handles in
+            # lynx_app.py). Without this check, switching Automatic -> Off
+            # left whatever GPS last confirmed still sitting in this
+            # field, and every contact logged afterwards - at a fixed
+            # site, GNSS genuinely off - kept carrying a stale portable
+            # position with nothing having actually asked for it.
+            # Confirmed as a real, reported case: logged at home, GNSS
+            # off, no value manually typed, yet a portable locator was
+            # still attached to the entry. gnss.mode is read fresh from
+            # the live config (self.get_config(), same getter qrz_cfg
+            # itself came from) rather than cached, so this reacts to a
+            # mode change on the very next contact, no restart needed.
+            gnss_mode = self.get_config().get('gnss', {}).get('mode', 'automatic')
+            if gnss_mode == 'off':
+                portable_locator = ''
             if portable_locator:
-                print(f"[notifications] QRZ: logging {call} with portable "
-                      f"locator override ({portable_locator}) instead of "
-                      f"their registered QRZ locator")
+                print(f"[notifications] QRZ: logging {call} with Lynx's own "
+                      f"current locator ({portable_locator}) attached as "
+                      f"MY_GRIDSQUARE - {call}'s own registered locator is "
+                      f"untouched")
             # ADIF's MODE field wants the standard name alongside the
             # modcod (confirmed against a genuine, correct QRZ Logbook
             # entry: "DVB-S2 QPSK 2/3") - src["modcod"] alone is just the
@@ -843,13 +1450,14 @@ class NotificationManager:
         except Exception as e:
             print(f"[notifications] Slack: stream send failed - {type(e).__name__}: {e}")
 
-    def _fire_slack(self, slack_cfg, site_callsign):
+    def _fire_slack(self, slack_cfg, site_callsign, source_override=None):
         webhook_url = slack_cfg.get('webhook_url', '')
         template = slack_cfg.get('message_template', '')
         if not webhook_url or not template:
             print("[notifications] Slack enabled but not fully configured - skipping")
             return
-        src = self._current_source_data()
+        # source_override: see _fire_qrz's own comment - same rationale.
+        src = source_override if source_override is not None else self._current_source_data()
         placeholders = {
             "site_callsign": site_callsign,
             "site_callsign_lower": site_callsign.lower(),
@@ -902,7 +1510,10 @@ class NotificationManager:
         )
         # "Is there a picture to transmit", not "is RF locked" - a
         # stream is equally something worth keying a transmitter for.
-        # The schedule-window logic below is untouched.
+        # The schedule-window logic below is untouched: a window still
+        # forces the pin on regardless, and leaving one still checks
+        # whether anything is currently on air before starting the
+        # power-down timer.
         locked = self._confirmed_active
         power_up_secs = float(tx_cfg.get('power_up_settle_secs', 5.0))
         power_down_secs = float(tx_cfg.get('power_down_settle_secs', 900.0))

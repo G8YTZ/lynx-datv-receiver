@@ -33,10 +33,12 @@ import asyncio
 import faulthandler
 import json
 import threading
+import base64
 import os
 import re
 import signal
 import socket
+import shlex
 import subprocess
 import time
 import urllib.request
@@ -53,6 +55,24 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import lynx_notifications
+import lynx_gnss
+import lynx_map
+
+# Auto-Squeak needs numpy, which older installs may not have - it was
+# added to install.sh at the same time as this feature, and anyone who
+# updates by copying files rather than running the installer will not
+# have picked it up. A missing optional feature must never stop the
+# receiver starting, so this degrades to "Auto-Squeak unavailable"
+# rather than taking Lynx down on an import error.
+try:
+    import lynx_squeak
+    SQUEAK_AVAILABLE = True
+except Exception as _e:
+    lynx_squeak = None
+    SQUEAK_AVAILABLE = False
+    print(f"[squeak] unavailable ({_e}) - install numpy to enable "
+          f"audio measurement: pip install --break-system-packages numpy")
+import lynx_rtmp_probe
 
 # Diagnostic: dump every thread's current stack trace to a log file on
 # demand (kill -USR1 <pid of lynx_app.py>) - added 2026-08-01 after a
@@ -96,6 +116,32 @@ CONFIG_PATH = Path(__file__).parent / "config" / "lynx_config.yaml"
 STATE_PATH = Path(__file__).parent / "lynx_state.json"
 DRIFT_SCRIPT_PATH = Path(__file__).parent / "lynx_drift_correction.lua"
 
+# Every writer of lynx_config.yaml (the /api/config POST handler, the
+# update-channel switcher, and the GNSS confirmed-fix callback) reads
+# the file fresh, modifies it, writes to the SAME "<config>.tmp" path,
+# then os.replace()s it into place - and none of that was ever guarded
+# by a lock, even before GNSS existed. Two human-triggered saves
+# genuinely landing in the same instant was rare enough not to matter
+# in practice. GNSS changes that: its callback is an AUTOMATIC,
+# high-frequency writer that can fire every time a fix is confirmed,
+# which meaningfully raises the odds of colliding with someone editing
+# Config in a browser tab at the same time - two processes opening the
+# same tmp path concurrently can truncate each other's write, and
+# whichever os.replace() lands second wins outright, silently
+# discarding the other save in full (not just the fields it touched).
+# One shared lock around the read-modify-write-replace cycle, used by
+# every writer, closes this for GNSS and for the two pre-existing
+# paths at the same time.
+# RLock, not Lock: update_config() holds this for its whole body and
+# calls _apply_gnss_mode() while still inside it, which in turn calls
+# _on_gnss_locator_change() to apply an already-established fix - a
+# nested acquisition by the same thread, and a legitimate one (a
+# config save applying a setting that itself writes config). A plain
+# Lock deadlocks there, holding the lock while it hangs so GNSS's own
+# writes pile up behind it. Re-entrant only for the holding thread;
+# every other caller blocks exactly as before.
+_config_write_lock = threading.RLock()
+
 def load_config():
     with open(CONFIG_PATH) as f:
         return yaml.safe_load(f)
@@ -126,6 +172,139 @@ def load_last_state():
 
 config = load_config()
 
+# ── GNSS (portable locator) ─────────────────────────────────────
+# Waveshare L76K HAT, GPIO header UART - see lynx_gnss.py's own
+# docstring for why /dev/ttyAMA0 rather than the /dev/serial0 symlink,
+# and why 9600 baud. Fixed here rather than exposed in config: a
+# repeater site simply doesn't have the HAT fitted, and GnssReader
+# already fails quietly and keeps retrying when there's nothing on
+# the port - so there is nothing here for a fixed site to configure
+# wrong. What IS configurable is gnss.mode (see GnssConfigUpdate) -
+# whether a fix, once confirmed, is trusted to drive the locator at
+# all.
+
+def _on_gnss_locator_change(locator: str):
+    """Called by GnssReader only once a fix has held the same 6-char
+    square for the full stability window (30s by default) - i.e. on a
+    genuinely confirmed fix, not on every NMEA sentence.
+
+    Writes straight into notifications.qrz.portable_locator, the same
+    field an operator would otherwise type by hand into the Config
+    page's QRZ card. This is not a new field: lynx_notifications.
+    submit_qrz_logbook's own docstring already anticipated exactly
+    this - "a future, automated source - an onboard GPS module ...
+    could populate the same underlying config value on its own, and
+    this function would need no changes at all to use it." GPS is
+    just that automated source now.
+
+    Only actually writes in "automatic" mode. "GPS always wins when
+    there's a fix" is a decision about automatic mode specifically -
+    manual mode's entire point is a fixed, operator-chosen value that
+    GPS must never silently overwrite, even with a HAT fitted and
+    locked. Any mode value other than "automatic" (which today just
+    means "manual", but also covers a legacy "off" from a config
+    written before that mode was removed) is treated the same way:
+    don't write.
+
+    Uses the shared _config_write_lock (see its own comment by
+    CONFIG_PATH) - this fires from GnssReader's own background thread,
+    completely independent of and concurrent with any /api/config POST
+    a browser tab might be doing at the same moment, and both write the
+    same file via the same tmp path. Distinct from tune_lock, which
+    serializes an unrelated pair of operations (tune/start_stream)."""
+    global config
+    with _config_write_lock:
+        mode = config.get('gnss', {}).get('mode', 'automatic')
+        if mode != 'automatic':
+            return
+        on_disk = load_config()
+        on_disk.setdefault('notifications', {}).setdefault('qrz', {})['portable_locator'] = locator
+        tmp_path = str(CONFIG_PATH) + ".tmp"
+        with open(tmp_path, 'w') as f:
+            yaml.safe_dump(on_disk, f, default_flow_style=False, sort_keys=False)
+        os.replace(tmp_path, CONFIG_PATH)
+        config = on_disk
+        print(f"[gnss] confirmed fix - portable_locator set to {locator}")
+
+gnss_reader = lynx_gnss.GnssReader(
+    port="/dev/ttyAMA0", baud=9600, stable_secs=30.0, length=6,
+    on_change=_on_gnss_locator_change,
+    # Mode 7 = GPS + BeiDou + GLONASS, all three the L76K can actually
+    # be told to use - QZSS is always on regardless and can't be
+    # configured, so this is every constellation available. Sent once
+    # via $PCAS04 on each serial connect; the module keeps the setting
+    # in its own memory afterwards. The board ships as GPS + GLONASS
+    # only - this was discussed and settled on, but never actually
+    # passed through until now.
+    constellations=7,
+)
+
+# Fixed, like the port/baud above - matched by a chrony.conf refclock
+# entry install.sh sets up automatically. Not user-configurable:
+# there's nothing about this path that varies per installation, only
+# whether it's used at all (gnss.time_sync).
+GNSS_CHRONY_SOCK_PATH = "/var/run/chrony.gnss.sock"
+
+def _apply_gnss_mode():
+    """Applies gnss.time_sync live. Called once at startup and again
+    after every /api/config save that touches the gnss section.
+
+    The reader itself is started once, unconditionally, at startup
+    (see the bottom of this file) and stays running for the life of
+    the process - there is deliberately no mode that stops it. A site
+    with no HAT fitted costs nothing either way: GnssReader already
+    fails quietly and keeps retrying forever with nothing on the port.
+    A site WITH a HAT fitted should almost always want at least GPS
+    time sync active regardless of whether GPS is trusted to drive the
+    locator - an earlier "Off" mode that stopped the whole reader,
+    time sync included, defeated that for no benefit: Manual mode
+    already gives an operator everything Off was for (GPS never
+    touches portable_locator) without also losing the clock
+    correction. Removed rather than kept as a third option nobody had
+    a real use for.
+
+    time_sync's own on/off is still separate from locator mode -
+    useful even while Manual is driving the locator. Setting
+    chrony_sock_path to None when disabled means _run()'s next
+    reconnect simply won't attempt a chrony connection at all. Like
+    constellations, this is only re-read once per serial reconnect,
+    not instantaneously mid-connection - toggling it off takes effect
+    on the next reconnect cycle, same limitation this module already
+    has for constellation changes."""
+    gnss_reader.chrony_sock_path = (
+        GNSS_CHRONY_SOCK_PATH if config.get('gnss', {}).get('time_sync', True) else None
+    )
+
+    # Apply the locator already held, if any, now rather than waiting
+    # for the next one. _on_gnss_locator_change() fires only when the
+    # tracker accepts a DIFFERENT square, so switching Manual ->
+    # Automatic with a fix already established did nothing whatsoever:
+    # the square was confirmed minutes ago and will not change again
+    # while the receiver sits still, which is the normal case at a
+    # repeater. Rebooting appeared to fix it, but only because the
+    # reader starts with no locator at all, making the first confirmed
+    # fix a change - the setting was never actually being applied.
+    #
+    # Reuses the same callback rather than repeating the write: it
+    # already holds the config write lock, already re-checks the mode
+    # (so a switch to Manual correctly does nothing here), and already
+    # logs. Calling it directly is a no-op in every case except the
+    # one this exists for.
+    if (config.get('gnss', {}).get('mode', 'automatic') == 'automatic'
+            and gnss_reader.tracker.locator):
+        _on_gnss_locator_change(gnss_reader.tracker.locator)
+
+def _gnss_provenance() -> str:
+    """'gnss' if the value currently in portable_locator is live,
+    GPS-derived data; 'config' if it's the operator's own configured
+    value - because mode is manual, or because mode is automatic but
+    there's no confirmed fix yet (cold start, indoors, or simply no
+    HAT - a fixed repeater site, exactly as expected)."""
+    mode = config.get('gnss', {}).get('mode', 'automatic')
+    if mode == 'automatic' and gnss_reader.tracker.locator:
+        return 'gnss'
+    return 'config'
+
 # ── App ───────────────────────────────────────────────────────
 app = FastAPI(
     title="Lynx DATV Receiver",
@@ -150,21 +329,100 @@ mpv_running_for_rf: bool = False  # tracks whether mpv has actually been started
                                    # for-lock) - see rf_mpv_lifecycle_monitor()
 mpv_last_started_at: float = 0.0  # timestamp of the most recent mpv start - lets
                                    # mpv_decoder_health_monitor grant a startup grace period
+# Tri-watch (up to 3 sources - any mix of RF-A, RF-B, and a stream
+# input - watched simultaneously) - Stage 1: infrastructure only.
+# Generalized from an earlier, more limited "dual-watch" (RF-A + one
+# fixed stream) design after a genuinely good real-world use case
+# surfaced: two RF sources on the SAME frequency but different symbol
+# rates, since a tuner given one specific, known symbol rate to lock
+# onto (rather than scanning a range) does noticeably better on weak
+# signals - this needed the source list to be generic (any type, any
+# combination), not RF-vs-stream-shaped, so it was worth generalizing
+# now rather than bolting a special case onto the earlier, narrower
+# design.
+#
+# Each configured, enabled source is watched continuously in the
+# background regardless of what's actually being displayed right now -
+# no priority/arbitration logic yet (Stage 2+), and RF sources are NOT
+# automatically tuned to their configured frequency/symbol-rate by this
+# stage either (that's active control, not detection - deliberately
+# left for Stage 2, matching the same scope boundary drawn for the
+# original, narrower dual-watch design). For now, getting an RF
+# source's configured tuning actually applied still means using the
+# existing Manual Tune feature by hand.
+#
+# Created once at startup from config, since this was described as a
+# fixed, permanent setup rather than something reconfigured often -
+# changing tri_watch config currently needs a restart to take effect,
+# not a live reload.
+tri_watch_enabled: bool = False
+tri_watch_sources_cfg = []  # a STABLE SNAPSHOT of config's tri_watch.sources[]
+                             # taken once at startup, alongside tri_watch_probes
+                             # below - deliberately NOT re-read live from config,
+                             # unlike most other settings in this file. Confirmed
+                             # as a real, reported bug otherwise: tri_watch_probes
+                             # (and the arbitrator's own internal per-index state)
+                             # are only ever built once at startup from this exact
+                             # list; if the arbitrator's own loop or the status
+                             # endpoint instead read the LIVE config.tri_watch.sources
+                             # after a Config-page save (which reloads config
+                             # immediately, before any restart), a source removed
+                             # or reordered there would silently shift every
+                             # later index - a stream probe built at startup
+                             # index 2 would suddenly be looked up at whatever
+                             # index 1 now means, mismatching real probes against
+                             # the wrong sources and breaking tri_watch's actual,
+                             # live status entirely, well before the restart the
+                             # UI already warns is required actually happens.
+tri_watch_probes = {}  # maps config's tri_watch.sources[] list index -> a
+                        # lynx_rtmp_probe.RTMPStreamProbe instance, for
+                        # type:stream sources only - RF sources need no
+                        # separate probe object, since their status is
+                        # already tracked by the existing
+                        # picotuner_state/picotuner_state_b globals
+tri_watch_arbitrator = None  # a TriWatchArbitrator instance once tri_watch
+                              # is enabled, or None otherwise - actually
+                              # instantiated further down, after its own
+                              # class and callback functions are defined
+tri_watch_target_rcv = None  # 1, 2, or None - which receiver tri_watch's
+                              # own arbitrator currently wants displayed,
+                              # if any (None while a stream is showing, or
+                              # while idle). Read by rf_mpv_lifecycle_monitor()
+                              # so it knows which receiver to actually watch
+                              # and start mpv for, instead of assuming Rx1
+                              # the way it always has for normal, non-
+                              # tri_watch RF mode.
 current_preset: str = ""
 current_stream_name: str = ""  # friendly name for the OSD, set by whoever
                                 # initiated the stream — not inspected from
                                 # the stream content itself.
 current_stream_url: str = ""   # the actual URL, tracked separately from
                                 # the friendly name for protocol detection
-current_lnb_lo_khz: int = 0    # LNB LO in use for the current tune, so
-                                # the API can report both the L-band/IF
-                                # frequency the Picotuner is actually
-                                # locked on AND the real downlink
-                                # frequency for display.
-current_lnb_side: str = "low"  # "low" (Ku-band, IF=downlink-LO) or
-                                # "high" (C-band, IF=LO-downlink) —
-                                # needed to correctly reverse the
-                                # calculation for display.
+# The converter in front of each receiver - THE single source of truth.
+#
+# Was four loose globals (current_lnb_lo_khz / _side / _b), which any
+# code could set independently. That is exactly how the resume shortcut
+# came to set the LO without the side and leave every display showing
+# 311.010 MHz for a 71.010 MHz contact: the side stayed at its default
+# while the LO was correct, and nothing could detect the mismatch
+# because the two were separate values.
+#
+# freq_khz is the WANTED on-air frequency, not the IF. It is kept
+# because converter_side() needs it and because a record that cannot
+# say what it was tuned to cannot be checked.
+#
+# Written ONLY by set_converter_state(). Read only through
+# on_air_from_if() / on_air_frequency(). Nothing else touches it.
+converter_state = {
+    1: {"freq_khz": 0, "lo_khz": 0, "side": "low"},
+    2: {"freq_khz": 0, "lo_khz": 0, "side": "low"},
+}
+
+
+def get_converter(rcv):
+    """This receiver's converter record. Never None - an unconfigured
+    receiver reads as no converter, which is the honest answer."""
+    return converter_state.get(2 if int(rcv or 1) == 2 else 1)
 current_lnb_psu_a: str = config.get('lnb_psu', {}).get('plug_a', 'off')
                                 # "off"/"lo"/"hi" - Plug A's (rcv=1's
                                 # own) LNB PSU voltage, sent to the
@@ -263,11 +521,17 @@ def get_default_branch():
 
 def get_update_branch():
     """Which branch update checks/pulls should actually use, based on
-    the configured update channel - stable users stay on the repo's
-    normal default branch (whatever it's actually named), while
-    anyone who's opted into 'beta' tracks that fixed, literal branch
-    name instead - there's only ever one beta branch, by definition,
-    so no auto-detection needed for that case."""
+    the configured update channel - added to support a beta channel
+    (per Justin's own request) alongside the existing stable one,
+    mirroring the model BATC's own Portsdown project already uses:
+    regular users stay on the repo's normal default branch (whatever
+    it's actually named - unaffected by any of this), while
+    experimenters can opt into tracking a separate 'beta' branch for
+    newer, less-proven code, and switch back to stable at any time.
+    'beta' is intentionally a fixed, literal branch name rather than
+    also going through get_default_branch()'s own auto-detection -
+    there's only ever one beta branch, by definition, so there's
+    nothing to detect."""
     channel = config.get('update', {}).get('channel', 'stable')
     if channel == 'beta':
         return 'beta'
@@ -378,7 +642,26 @@ def start_transition_cover():
     if the Pi is under load and scheduling is delayed."""
     global mpv_transitioning
     mpv_transitioning = True
-    open(MPV_TRANSITION_MARKER, 'w').close()
+    # Created only if it isn't already there, and atomically so.
+    # Re-touching an existing marker updates its mtime, and the overlay
+    # measures the age of the cover from exactly that - so a second
+    # start_transition_cover() during a cover that is already up would
+    # silently restart its clock. That is not hypothetical: the tri_watch
+    # loss-of-lock path in rf_mpv_lifecycle_monitor() raises the cover and
+    # deliberately never lowers it, leaving it up for whatever displays
+    # next; _start_stream_impl() then raises it again for its own switch.
+    # Confirmed live as a visible fault - the Pathfinder card appeared,
+    # vanished back to a black screen, and reappeared, because the second
+    # call sent the overlay back inside its own appearance delay.
+    #
+    # The cover has genuinely been up continuously the whole time, so the
+    # original timestamp is the honest one. Nesting starts is normal here
+    # and should extend a cover, never restart it.
+    try:
+        os.close(os.open(MPV_TRANSITION_MARKER,
+                         os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except FileExistsError:
+        pass
     # Mute the OLD process right away — launching the new one with
     # --mute=yes only silences audio from the new source, it does
     # nothing about the old source still being audible for however
@@ -443,6 +726,37 @@ def get_mpv_drift_status():
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
+
+def current_rf_target_port():
+    """Returns the UDP port mpv should currently be pointed at for RF
+    playback, given whatever mode is actually active right now -
+    tri_watch's own chosen receiver, diversity's combiner output, or
+    normal single-receiver mode's own port.
+
+    Centralises this decision specifically because it was previously
+    duplicated, inconsistently, across multiple call sites - two of
+    which (both inside mpv_decoder_health_monitor(), its playback-delay
+    and hard-freeze restart triggers) were never updated for tri_watch
+    at all, and kept silently restarting to Rx1's port even while
+    tri_watch was actively, correctly displaying Rx2. Confirmed as a
+    real, reproduced bug via the diagnostics timeline: a hard-freeze
+    restart during a genuine tri_watch Rx2 session pointed mpv at the
+    wrong receiver's port, which could never render there, producing a
+    repeated "restart did not confirm rendering" failure specifically
+    during Rx2 sessions - the freeze detection itself was correct, but
+    the recovery attempt was restarting the wrong thing entirely.
+
+    rf_mpv_lifecycle_monitor()'s own tri_watch-aware branch is left as
+    it already was rather than switched over to this helper too - it's
+    already proven correct and tested, and touching genuinely-working
+    code for its own sake adds risk without benefit."""
+    cfg = config['picotuner']
+    if tri_watch_enabled and tri_watch_target_rcv == 2:
+        return cfg['ts_port_b']
+    elif diversity_enabled:
+        return config['diversity']['combiner_out_port']
+    else:
+        return cfg['ts_port']
 
 def restart_mpv(target_url: str, is_rf: bool = True):
     """Fully kill and restart the mpv process, pointing it at a fresh
@@ -514,6 +828,7 @@ def restart_mpv(target_url: str, is_rf: bool = True):
     cmd = (
         f"mpv --fullscreen --ontop --border=no --no-osc --no-input-default-bindings "
         f"--cursor-autohide=always --force-window=yes --vo=gpu --hwdec=drm-copy --mute=yes "
+        f"{audio_device_flag()}"
         f"--audio-pitch-correction=no --script={DRIFT_SCRIPT_PATH} "
         f"{source_flags}"
         f"--keep-open=yes --idle=yes "
@@ -607,6 +922,28 @@ def restart_mpv(target_url: str, is_rf: bool = True):
     mpv_cmd({"command": ["set_property", "volume", current_volume]})
     mpv_cmd({"command": ["set_property", "mute", False]})
 
+def _recent_hevc_decoder_error(since_ts: float) -> bool:
+    """Checks dmesg for the specific hardware HEVC decoder error
+    ("rpi-hevc-dec ... Missing inuse DPB ent") directly tied to a real,
+    confirmed freeze earlier this session - one a plain mpv restart
+    couldn't recover from, only a full Pi reboot could. Scoped to
+    entries from since_ts onwards specifically, not the whole kernel
+    ring buffer (which persists across the entire uptime) - an old,
+    already-resolved occurrence from hours or days ago must not keep
+    incorrectly flagging every future render attempt as failed forever.
+    Best-effort only: dmesg can require elevated permissions on some
+    systems, or simply be unavailable - any failure here is treated as
+    "no error found" rather than blocking rendering confirmation on
+    something that isn't itself the actual video pipeline."""
+    try:
+        since_str = datetime.fromtimestamp(since_ts).strftime("%Y-%m-%d %H:%M:%S")
+        out = subprocess.run(["dmesg", "-T", "--since", since_str],
+                              capture_output=True, text=True, timeout=2)
+        return "rpi-hevc-dec" in out.stdout and "DPB" in out.stdout
+    except Exception as e:
+        print(f"[mpv_render] dmesg check failed (non-fatal, treating as no error found): {e}")
+        return False
+
 def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
     """Polls mpv's own log (freshly truncated by restart_mpv() just
     before this is called) for concrete evidence it has actually
@@ -622,6 +959,22 @@ def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
     resolving), so a fixed guess can't reliably cover every case. This
     polls for real evidence instead, bounded by a timeout so a genuine
     problem never blocks the caller indefinitely.
+
+    Also checks dmesg for a recent hardware HEVC decoder error before
+    trusting mpv's own "AV:"/"VO:" markers - confirmed as a real gap
+    otherwise: those markers only prove mpv's own software pipeline is
+    progressing (demuxing, decoding, submitting frames onward), not
+    that a frame actually reached the screen. If an earlier freeze left
+    the GPU decoder itself wedged, a fresh mpv process can still print
+    entirely normal progress markers while the hardware never produces
+    a real frame - reported directly as a stream switch that "swapped
+    OK" (this function returning True, cover dropped) but exposed the
+    desktop underneath, recovered only by a full Pi reboot, not a
+    simple mpv restart. Treating a detected decoder error as an
+    immediate, definite failure rather than retrying within this same
+    call - the hardware is confirmed wedged at that point, not just
+    "not ready yet", so further polling here would only waste the
+    remaining timeout.
 
     Returns True if confirmed within the timeout, False if it timed
     out. Callers now check this return value (a real bug, confirmed
@@ -646,6 +999,19 @@ def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
                 content = f.read()
             if any(m in content for m in markers):
                 elapsed = time.time() - start
+                if _recent_hevc_decoder_error(start):
+                    print(f"[mpv_render] mpv log shows rendering markers after {elapsed:.1f}s, "
+                          f"but a hardware HEVC decoder error was also just logged - treating "
+                          f"this as NOT genuinely rendering despite mpv's own pipeline appearing "
+                          f"to progress normally (likely a wedged GPU decoder from an earlier "
+                          f"crash - a full Pi reboot, not just an mpv restart, may be needed)")
+                    record_diagnostic_event(
+                        "mpv_render_hevc_decoder_error",
+                        "Rendering markers present but a hardware HEVC decoder error was also "
+                        "logged - treating as a failed render, GPU may be wedged and need a full "
+                        "Pi reboot to clear",
+                        count_as_mpv_restart=False)
+                    return False
                 print(f"[mpv_render] confirmed rendering after {elapsed:.1f}s")
                 return True
         except OSError:
@@ -653,6 +1019,173 @@ def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
         time.sleep(0.1)
     print(f"[mpv_render] did NOT confirm rendering within {timeout:.1f}s timeout")
     return False
+
+_audio_resolved_cache = {"value": "", "at": 0.0}
+
+
+def _cached_audio_device_resolved():
+    """What the configured device actually resolves to.
+
+    Cached for a minute: resolving "hdmi" shells out to mpv, and the
+    status endpoint is polled every second by the overlay - running mpv
+    that often to answer a question whose answer almost never changes
+    would be silly.
+    """
+    dev = str(config.get('display', {}).get('audio_device', 'hdmi')).strip()
+    if dev.lower() != 'hdmi':
+        return dev
+    now = time.time()
+    if now - _audio_resolved_cache["at"] > 60:
+        _audio_resolved_cache["value"] = _first_hdmi_device() or ""
+        _audio_resolved_cache["at"] = now
+    return _audio_resolved_cache["value"]
+
+
+def audio_device_flag():
+    """The --audio-device flag for mpv, or nothing if set to auto.
+
+    Defaults to HDMI rather than mpv's own auto-selection. Auto picks
+    whatever ALSA offers first, and a USB audio dongle left plugged in
+    outsorts the HDMI output - so sound disappears into a device nobody
+    is listening to, with no indication anything is wrong. Reported by
+    G8GKQ, who spent a while on it before finding a dongle was the
+    cause. A receiver driving a television should send its audio to the
+    television unless told otherwise.
+    """
+    dev = str(config.get('display', {}).get('audio_device', 'hdmi')).strip()
+    if not dev or dev.lower() == 'auto':
+        return ""
+    if dev.lower() == 'hdmi':
+        # Ask mpv for the first HDMI output ALSA is offering. Resolved
+        # at launch rather than baked in, since the card number varies
+        # between Pi models and between HDMI ports.
+        found = _first_hdmi_device()
+        if not found:
+            print("[mpv] audio_device is 'hdmi' but no HDMI output found - "
+                  "letting mpv choose")
+            return ""
+        dev = found
+    return f"--audio-device={shlex.quote(dev)} "
+
+
+def list_audio_devices():
+    """Every audio output mpv can see, as (name, description) pairs.
+
+    Asks mpv itself rather than parsing ALSA directly, so the names are
+    exactly what --audio-device will accept.
+    """
+    out = []
+    try:
+        r = subprocess.run(["mpv", "--audio-device=help"],
+                           capture_output=True, text=True, timeout=10)
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if not line.startswith("'"):
+                continue
+            # Format: 'name' (Description)
+            try:
+                name = line.split("'")[1]
+            except IndexError:
+                continue
+            desc = ""
+            if "(" in line:
+                desc = line[line.index("(") + 1:].rstrip(")").strip()
+            if name and name != "auto":
+                out.append({"name": name, "description": desc or name})
+    except Exception as e:
+        print(f"[mpv] could not list audio devices: {e}")
+    return out
+
+
+def physical_audio_devices():
+    """One entry per real output, and via PipeWire where it exists.
+
+    Two things matter here, and the first version got the second wrong.
+
+    mpv's raw list is mostly plumbing: a Pi with two HDMI ports reports
+    around twenty devices, being several ALSA access paths to each card
+    plus backend defaults for pipewire, pulse, alsa, jack, sdl and
+    sndio. Only a couple are things anyone would recognise.
+
+    But on a PipeWire system the "pipewire/..." entries are the ones to
+    use, not the raw ALSA ones. PipeWire owns the sound card; telling
+    mpv to open alsa/sysdefault:CARD=... directly either fights it for
+    the device or bypasses the graph altogether. Filtering those entries
+    out as "not physical devices" produced exactly that - no sound at
+    all, and no PPM either, since nothing then appeared on any PipeWire
+    node for the meter to tap.
+
+    So: prefer PipeWire node entries when they exist, and fall back to
+    grouped ALSA cards only on systems without it. The bonus is that a
+    PipeWire device name carries its node name, which makes the PPM's
+    monitor target exact rather than something to be inferred.
+    """
+    raw = list_audio_devices()
+
+    pw = []
+    for d in raw:
+        name = d["name"]
+        if name.startswith("pipewire/"):
+            pw.append({
+                "name": name,
+                "description": _friendly_audio_name(name, d["description"]),
+                "node": name.split("/", 1)[1],
+            })
+    if pw:
+        return pw
+
+    # No PipeWire: group the ALSA access paths down to one per card.
+    # sysdefault first because it does software format conversion;
+    # plughw and hw are the least forgiving, dmix is a mixing layer.
+    PREFER = ["sysdefault", "default", "hdmi", "dmix", "plughw", "hw"]
+    by_card = {}
+    for d in raw:
+        name = d["name"]
+        card = _alsa_card_from_device_name(name)
+        if not card:
+            continue
+        access = name.split("/", 1)[1].split(":", 1)[0] if "/" in name else ""
+        rank = PREFER.index(access) if access in PREFER else len(PREFER)
+        if card not in by_card or rank < by_card[card][0]:
+            by_card[card] = (rank, d)
+
+    return [{"name": d["name"],
+             "description": _friendly_audio_name(card, d["description"]),
+             "node": ""}
+            for card, (_, d) in sorted(by_card.items())]
+
+
+def _alsa_card_from_device_name(name):
+    """The ALSA card in an mpv device string, or None if it hasn't one."""
+    m = re.search(r'CARD=([A-Za-z0-9_\-]+)', name or "")
+    return m.group(1) if m else None
+
+
+def _friendly_audio_name(key, description):
+    """Something a person would recognise, rather than
+    'vc4-hdmi-0, MAI PCM i2s-hifi-0/Default Audio Device'."""
+    blob = f"{key} {description}"
+    m = re.search(r'vc4hdmi(\d+)', key, re.I)
+    if m:
+        return f"HDMI {int(m.group(1)) + 1}"
+    if "hdmi" in blob.lower():
+        # PipeWire names its HDMI sinks by platform address rather than
+        # port number, so there is nothing reliable to number them by.
+        return description.split("(")[0].strip() or "HDMI"
+    base = description.split("/")[0].strip()
+    base = re.sub(r',\s*(MAI PCM|USB Audio).*$', '', base).strip()
+    return base or key
+
+
+def _first_hdmi_device():
+    """The first HDMI output mpv reports, or None."""
+    # Uses the same filtered list the Config page offers, so the
+    # automatic choice and the visible choice can never disagree.
+    for d in physical_audio_devices():
+        if "hdmi" in (d["name"] + " " + d["description"]).lower():
+            return d["name"]
+    return None
+
 
 def mpv_cmd(cmd: dict):
     """Send a JSON command to mpv via IPC socket (fire and forget)."""
@@ -776,6 +1309,44 @@ picotuner_state = {
     "agc2": "",
 }
 
+def looks_like_callsign(token):
+    """Is this plausibly an amateur callsign?
+
+    The parser used to accept anything that was not "search", "lost" or
+    empty. That is a blocklist, and blocklists are always one surprise
+    behind: the Picotuner also emits "header", which sailed through and
+    produced 53 pointless QRZ lookups in a single overnight session -
+    one every eight minutes, none of which could ever succeed.
+
+    So test positively instead. Every callsign in the world has at least
+    one digit and at least two letters, which "header", "search",
+    "lost", "idle" and anything else of that kind all fail. Deliberately
+    permissive about length and about "/" and "-", so portable and
+    special-event suffixes are not rejected.
+    """
+    if not token:
+        return False
+    t = str(token).strip().upper()
+    if not (3 <= len(t) <= 16):
+        return False
+    if not all(c.isalnum() or c in "/-" for c in t):
+        return False
+    if not any(c.isdigit() for c in t):
+        return False
+    if sum(1 for c in t if c.isalpha()) < 2:
+        return False
+    # A short blocklist as well, for the handful of status tokens that
+    # happen to share a valid callsign's shape. Secondary to the test
+    # above, not a replacement for it - "K1A" is a real callsign and
+    # "RX1" is not, and nothing about their form distinguishes them.
+    # RX5-RX8 included because a board jumpered to be the second
+    # WinterHill unit uses those labels, and they would otherwise be
+    # mistaken for callsigns exactly as RX1-RX4 would.
+    if t in {"RX1", "RX2", "RX3", "RX4", "RX5", "RX6", "RX7", "RX8"}:
+        return False
+    return True
+
+
 def picotuner_monitor():
     """Background thread: reads Picotuner broadcast on port 9997.
     Keeps the socket open continuously for efficiency. Also parses
@@ -821,6 +1392,12 @@ def picotuner_monitor():
                 if mac:
                     discovered_picotuners[mac] = {
                         "ip": fields.get("IP address", addr[0]),
+                        # Kept per tuner, not globally: selecting a different board
+                        # must bring its own base port with it, and one remembered
+                        # value would be stale the moment someone switched to a
+                        # differently-jumpered unit.
+                        "base_port": fields.get("Base IP port", ""),
+                        "mode": fields.get("Mode", ""),
                         "host_name": fields.get("Host name", ""),
                         "serial": fields.get("Pico serial", ""),
                         "software": fields.get("Software", ""),
@@ -828,6 +1405,25 @@ def picotuner_monitor():
                         "mac": mac,
                         "last_seen": time.time(),
                     }
+                    # Follow the base port of the tuner actually in use - only
+                    # that one, since a broadcast arrives from every board on
+                    # the network and adopting someone else's would point Lynx
+                    # at ports nothing is sending to.
+                    if fields.get("IP address", addr[0]) == cfg['host']:
+                        adopt_picotuner_base_port(fields.get("Base IP port"))
+                        # The receiver numbers are in here too, as "RX5"/"RX6"
+                        # labels. Taken from this broadcast rather than only from
+                        # the table format, because of a deadlock: the command
+                        # ports derive from the receiver numbers, the numbers came
+                        # only from the table, and the table is only sent once the
+                        # tuner has been successfully tuned - which needs the
+                        # command ports. A jumpered board therefore sat in "search"
+                        # for ever, broadcasting discovery while being tuned on the
+                        # wrong ports. This broadcast is sent continuously WHILE the
+                        # tuner is idle, which is exactly when they are needed.
+                        learn_picotuner_rx_numbers(
+                            k[2:] for k in fields
+                            if k.startswith('RX') and k[2:].isdigit())
 
             # Everything below drives the actual status/OSD display, so -
             # unlike discovery above - it must only trust broadcasts from
@@ -909,16 +1505,36 @@ def picotuner_monitor():
                                   f"overload indication, please report it so "
                                   f"it can be shown properly.")
 
-            # Parse RX1 line: "437.024 G8YTZ" or "437.000T search"
+            # Parse tuner A's RX line: "437.024 G8YTZ" or "437.000T
+            # search". The label carries the board's OWN receiver number,
+            # so it is "RX1" on a normal board and "RX5" on one jumpered
+            # to be the second WinterHill. Matched against the learned
+            # number rather than the literal - otherwise a jumpered board
+            # reports its lock, callsign and frequency and Lynx sees none
+            # of it, leaving the OSD stuck on the last frequency it knew
+            # and permanently SEARCHING while the tuner is locked and
+            # decoding perfectly. Confirmed exactly that way on real
+            # hardware.
+            rx_label_a = f"RX{picotuner_rx_numbers['a']}"
+            rx_label_b = f"RX{picotuner_rx_numbers['b']}"
             for line in text.splitlines():
                 line = line.strip()
-                if line.startswith("RX1"):
-                    rx1 = line.replace("RX1", "").strip()
+                if line.startswith(rx_label_a):
+                    rx1 = line.replace(rx_label_a, "").strip()
                     picotuner_state["rx1_raw"] = rx1
                     parts = rx1.split()
-                    # "search" and "lost" both mean not locked
-                    unlocked_states = {"search", "lost", ""}
-                    if len(parts) >= 2 and parts[-1] not in unlocked_states:
+                    # Not-locked states. "header" is WinterHill's
+                    # intermediate state: it has found something
+                    # transport-stream-shaped and is trying to acquire,
+                    # but has no callsign and no picture yet - confirmed
+                    # by watching the broadcast, where a "header" line
+                    # carries a wandering frequency (436.085, 436.281,
+                    # 436.351...) while "search" sits exactly on the
+                    # tuned value. It was previously accepted as a
+                    # callsign and looked up on QRZ 53 times overnight.
+                    unlocked_states = {"search", "lost", "header", ""}
+                    if (len(parts) >= 2 and parts[-1] not in unlocked_states
+                            and looks_like_callsign(parts[-1])):
                         picotuner_state["locked"] = True
                         picotuner_state["callsign"] = parts[-1]
                         picotuner_state["frequency"] = parts[0].rstrip("TB")
@@ -927,17 +1543,20 @@ def picotuner_monitor():
                         picotuner_state["callsign"] = ""
                         if parts:
                             picotuner_state["frequency"] = parts[0].rstrip("TB")
-                if line.startswith("RX2"):
+                if line.startswith(rx_label_b):
                     # Same format as RX1 — confirmed live: "437.024B G8YTZ".
                     # The trailing letter (T/B here) appears to indicate
                     # which physical plug that receiver is currently on,
                     # not something specific to RX1 vs RX2 — strip either.
-                    rx2 = line.replace("RX2", "").strip()
+                    rx2 = line.replace(rx_label_b, "").strip()
                     picotuner_state_b["online"] = True
                     picotuner_state_b["last_seen"] = time.time()
                     parts = rx2.split()
-                    unlocked_states = {"search", "lost", ""}
-                    if len(parts) >= 2 and parts[-1] not in unlocked_states:
+                    # Same set as RX1 above - see the note there on
+                    # "header".
+                    unlocked_states = {"search", "lost", "header", ""}
+                    if (len(parts) >= 2 and parts[-1] not in unlocked_states
+                            and looks_like_callsign(parts[-1])):
                         picotuner_state_b["locked"] = True
                         picotuner_state_b["callsign"] = parts[-1]
                         picotuner_state_b["frequency"] = parts[0].rstrip("TB")
@@ -1228,12 +1847,12 @@ def mpv_decoder_health_monitor():
                         print(f"[mpv_decoder_health] {restart_reason} - restarting mpv for a fresh decoder")
                         start_transition_cover()
                         time.sleep(0.3)
-                        if diversity_enabled:
-                            div_cfg = config['diversity']
-                            restart_mpv(f"udp://@:{div_cfg['combiner_out_port']}")
-                        else:
-                            cfg = config['picotuner']
-                            restart_mpv(f"udp://@:{cfg['ts_port']}")
+                        # Was: hardcoded to Rx1's port outside diversity
+                        # mode, regardless of what tri_watch actually
+                        # wanted displayed - see current_rf_target_port()'s
+                        # own docstring for the confirmed, real bug this
+                        # caused.
+                        restart_mpv(f"udp://@:{current_rf_target_port()}")
                         rendering_confirmed = wait_for_mpv_rendering()  # real rendering, not a guess
                         record_diagnostic_event(restart_category, restart_reason)
                         if rendering_confirmed:
@@ -1475,9 +2094,55 @@ def mpv_drift_monitor():
                                          count_as_mpv_restart=False)
             last_breaker_active = breaker_active
 
+            # Streams count too, not just RF. This was gated to
+            # `current_mode == "rf" and mpv_running_for_rf`, so a frozen
+            # STREAM was detected by the Lua script, wrote
+            # hard_freeze_detected_at, and then nothing ever read it -
+            # the flag sat set while the picture stayed frozen. Confirmed
+            # twice on a real receiver watching a BATC stream: five
+            # drop-buffers resyncs, the breaker tripping with "external
+            # restart monitor takes over if needed", and then silence for
+            # an hour and forty minutes. The restart monitor was the very
+            # thing that never took over.
+            hard_freeze_target = None
+            hard_freeze_is_rf = True
+            if current_mode == "rf" and mpv_running_for_rf:
+                hard_freeze_target = f"udp://@:{current_rf_target_port()}"
+            elif current_mode == "stream" and current_stream_url:
+                hard_freeze_target = current_stream_url
+                # is_rf=False, exactly as the normal stream path calls
+                # it - the flag changes how mpv is set up for a remote
+                # source rather than a local Picotuner port.
+                hard_freeze_is_rf = False
+
             if (hard_freeze_detected_at > 0 and
                     hard_freeze_detected_at != last_handled_hard_freeze_at and
-                    current_mode == "rf" and mpv_running_for_rf):
+                    hard_freeze_target and
+                    mpv_transitioning):
+                # A source switch is in progress. mpv was killed
+                # deliberately, so playback stopping is expected, not a
+                # freeze - and restarting it here lands on top of the
+                # switch already underway. Confirmed as a real, repeating
+                # fault: every stream switch in the diagnostics log was
+                # preceded seconds earlier by a hard-freeze restart and a
+                # "did not confirm rendering" immediately after it, with
+                # user_stream_start (recorded only once the switch
+                # genuinely completes) arriving last.
+                #
+                # Marked handled rather than left pending: leaving it
+                # would simply fire the moment the cover comes down,
+                # moving the same race one step later. A freeze that is
+                # still genuinely present afterwards raises a fresh
+                # hard_freeze_detected_at from the Lua script and is
+                # caught then, on its own merits.
+                print("[mpv_drift] hard freeze flag seen during a source "
+                      "switch - expected while mpv is being replaced, "
+                      "ignoring")
+                last_handled_hard_freeze_at = hard_freeze_detected_at
+
+            elif (hard_freeze_detected_at > 0 and
+                    hard_freeze_detected_at != last_handled_hard_freeze_at and
+                    hard_freeze_target):
                 now2 = time.time()
                 div_cfg = config.get('diversity', {})
                 breaker_enabled = div_cfg.get('hard_freeze_breaker_enabled', True)
@@ -1528,12 +2193,16 @@ def mpv_drift_monitor():
                                                      "the slower playback-delay trigger")
                         start_transition_cover()
                         time.sleep(0.3)
-                        if diversity_enabled:
-                            div_cfg2 = config['diversity']
-                            restart_mpv(f"udp://@:{div_cfg2['combiner_out_port']}")
-                        else:
-                            cfg = config['picotuner']
-                            restart_mpv(f"udp://@:{cfg['ts_port']}")
+                        # Was: hardcoded to Rx1's port outside diversity
+                        # mode, regardless of what tri_watch actually
+                        # wanted displayed - the same bug as the
+                        # playback-delay trigger above, confirmed as the
+                        # real, reproduced cause of "restart did not
+                        # confirm rendering" specifically during
+                        # tri_watch Rx2 sessions.
+                        # Whichever source is actually playing - an RF port or a
+                        # stream URL. See hard_freeze_target above.
+                        restart_mpv(hard_freeze_target, is_rf=hard_freeze_is_rf)
                         rendering_confirmed = wait_for_mpv_rendering()  # real rendering, not a guess
                         if rendering_confirmed:
                             # Same safety margin as the stream-mode restart
@@ -1785,6 +2454,75 @@ def rf_mpv_lifecycle_monitor():
     while True:
         time.sleep(POLL_SECS)
         try:
+            # tri_watch, when enabled, gets its own genuinely separate
+            # branch here rather than being skipped entirely - it needs
+            # this same lock-confirm/start-mpv machinery just as much
+            # as normal RF mode does, just watching whichever receiver
+            # tri_watch_target_rcv currently points at (set by the
+            # arbitrator) instead of always assuming Rx1. Kept as a
+            # fully separate branch, not interleaved with the existing,
+            # proven non-tri_watch logic below, specifically to leave
+            # that logic completely untouched and at zero added risk.
+            if tri_watch_enabled:
+                if tri_watch_target_rcv is None:
+                    # No RF source is what tri_watch currently wants
+                    # displayed (a stream is showing, or it's idle) -
+                    # nothing for this monitor to do.
+                    lock_streak = 0
+                    loss_streak = 0
+                    continue
+                cfg = config['picotuner']
+                target_rcv = tri_watch_target_rcv
+                target_state = picotuner_state_b if target_rcv == 2 else picotuner_state
+                target_port = picotuner_ts_port('b' if target_rcv == 2 else 'a', cfg)
+                raw_locked = target_state.get("locked", False)
+
+                if raw_locked:
+                    loss_streak = 0
+                    lock_streak += 1
+                    if lock_streak >= LOCK_CONFIRM_POLLS and not mpv_running_for_rf:
+                        if tune_lock.acquire(timeout=2):
+                            try:
+                                print(f"[rf_mpv_lifecycle/tri_watch] Confirmed lock on Rx{target_rcv} "
+                                      f"after {lock_streak * POLL_SECS}s - starting mpv on {target_port}")
+                                restart_mpv(f"udp://@:{target_port}")
+                                rendering_confirmed = wait_for_mpv_rendering()
+                                if rendering_confirmed:
+                                    time.sleep(0.3)
+                                    end_transition_cover()
+                                    mpv_running_for_rf = True
+                                    mpv_last_started_at = time.time()
+                                    record_diagnostic_event("rf_lock_confirmed_start",
+                                                      f"after {lock_streak * POLL_SECS}s idle (tri_watch Rx{target_rcv})")
+                                else:
+                                    print("[rf_mpv_lifecycle/tri_watch] mpv did not confirm rendering "
+                                          "in time - keeping the cover up and retrying next poll")
+                                    record_diagnostic_event("rf_lock_render_not_confirmed",
+                                                      "mpv started but did not confirm rendering within "
+                                                      "the timeout - will retry (tri_watch)", count_as_mpv_restart=False)
+                            finally:
+                                tune_lock.release()
+                        # If the lock was busy, a user-initiated tune/
+                        # stream switch is already in progress and will
+                        # itself establish the correct mpv state - try
+                        # again next poll.
+                else:
+                    lock_streak = 0
+                    loss_streak += 1
+                    if loss_streak >= LOSS_CONFIRM_POLLS and mpv_running_for_rf:
+                        if tune_lock.acquire(timeout=2):
+                            try:
+                                print(f"[rf_mpv_lifecycle/tri_watch] Confirmed loss of lock on Rx{target_rcv} "
+                                      "- stopping mpv rather than leaving it running with no data")
+                                start_transition_cover()
+                                kill_mpv()
+                                mpv_running_for_rf = False
+                                record_diagnostic_event("rf_loss_confirmed_stop",
+                                                  f"after {loss_streak * POLL_SECS}s of confirmed loss (tri_watch Rx{target_rcv})")
+                            finally:
+                                tune_lock.release()
+                continue
+
             if current_mode != "rf":
                 lock_streak = 0
                 loss_streak = 0
@@ -1807,7 +2545,7 @@ def rf_mpv_lifecycle_monitor():
                                 restart_mpv(f"udp://@:{div_cfg['combiner_out_port']}")
                             else:
                                 cfg = config['picotuner']
-                                restart_mpv(f"udp://@:{cfg['ts_port']}")
+                                restart_mpv(f"udp://@:{picotuner_ts_port('a', cfg)}")
                             rendering_confirmed = wait_for_mpv_rendering()  # real rendering, not a guess
                             if rendering_confirmed:
                                 # Same safety margin as the other two RF
@@ -1864,6 +2602,283 @@ def rf_mpv_lifecycle_monitor():
         except Exception as e:
             print(f"[rf_mpv_lifecycle] error: {e}")
 
+# ── Port arithmetic ──────────────────────────────────────────────
+# Every port a PicoTuner uses derives from its BASE IP PORT, which the
+# board announces in its own broadcast. Base is 9900 normally, or 9904
+# when jumpered to present as the SECOND WinterHill unit, and it can be
+# set to any even number from xx00 to xx14 by remote command.
+#
+# Rules from Brian G4EWJ, confirmed live against a genuinely jumpered
+# board (2026-08-29):
+#
+#     command   9920 + receiver number      (NOT base-relative)
+#     TS        base + 41, base + 42
+#     $ info    (base & ~3) + 1
+#     table     base + 4
+#
+# The $ info rule is the trap. All four receivers of a WinterHill send
+# their $ info to ONE port, so the base is masked down to a multiple of
+# four first - meaning base 9912 and base 9914 both give 9913, not 9913
+# and 9915. Deriving it as base+1 works for 9900 and quietly breaks
+# everywhere else.
+#
+# Lynx previously derived these by subtracting from status_port (9997):
+# 9997-96 = 9901 and 9997-93 = 9904. Correct for base 9900 by
+# coincidence, wrong for every other base. A jumpered board sends its
+# status to 9905 and 9908 while Lynx listens on 9901 and 9904, so it
+# hears nothing at all - the tuner sits in "search" broadcasting
+# discovery, present and doing nothing. Confirmed exactly that way on
+# real hardware before this was written.
+PICOTUNER_DEFAULT_BASE_PORT = 9900
+
+picotuner_base_port = PICOTUNER_DEFAULT_BASE_PORT
+
+
+def picotuner_info_port(base=None):
+    """Port the $-tagged status arrives on. Masked - see above."""
+    b = picotuner_base_port if base is None else base
+    return (b & ~3) + 1
+
+
+def picotuner_table_port(base=None):
+    """Port the table-format status arrives on."""
+    b = picotuner_base_port if base is None else base
+    return b + 4
+
+
+def picotuner_ts_port(slot, cfg):
+    """Transport stream port for tuner A or B: base + 41 / base + 42.
+
+    Falls back to the configured value while the base port is still the
+    default, so a manually-addressed tuner - one on another subnet,
+    whose broadcasts never reach us at all - keeps working exactly as
+    before.
+    """
+    if picotuner_base_port != PICOTUNER_DEFAULT_BASE_PORT:
+        return picotuner_base_port + (41 if slot == 'a' else 42)
+    return cfg['ts_port'] if slot == 'a' else cfg['ts_port_b']
+
+
+def adopt_picotuner_base_port(base):
+    """Adopt a base port announced by the CONFIGURED tuner.
+
+    Deliberately not from just any board: a broadcast arrives from every
+    PicoTuner on the network, and taking the base port from someone
+    else's would point Lynx at ports nothing is sending to.
+
+    Nothing is auto-selected here - the user chooses which tuner to use
+    and this only follows what the chosen one says about itself. That
+    matters because a tuner on another subnet never broadcasts to us, so
+    its address must remain enterable by hand.
+    """
+    global picotuner_base_port
+    try:
+        b = int(base)
+    except (TypeError, ValueError):
+        return
+    if b == picotuner_base_port or not (9000 <= b <= 9999):
+        return
+    print(f"[picotuner] base IP port is {b} - status on "
+          f"{picotuner_info_port(b)}/{picotuner_table_port(b)}, "
+          f"TS on {b + 41}/{b + 42}")
+    # The board has restarted or been rejumpered, so nothing it was
+    # previously told still holds.
+    forget_commanded_tune()
+    picotuner_base_port = b
+
+
+# ── Which receiver numbers this board actually uses ──────────────
+# A PicoTunerWH can be jumpered (GP28 to ground - see the BATC PicoTuner
+# Ethernet Interface wiki) to present itself as the SECOND WinterHill
+# unit: receivers 5 and 6 on base port 9904, rather than 1 and 2 on
+# 9900. The jumper exists so two boards can share one network, and
+# WinterHill users are told to fit it. It is a configuration to live
+# with, not a mistake to correct - telling someone to remove it fixes
+# Lynx and breaks their WinterHill setup, which they then have to
+# remember to undo.
+#
+# Lynx assumed 1 and 2 unconditionally. On a jumpered board that means
+# addressing receivers which do not exist, on ports nothing is
+# listening to - so every command vanishes, while the status broadcasts,
+# which need no addressing at all, keep arriving perfectly. Two
+# receivers unusable while looking entirely healthy: right frequencies
+# on screen, every tune accepted, nothing ever happening.
+#
+# The board announces its own numbering in the broadcast Lynx already
+# reads, so it is taken from there rather than added as a setting for
+# anyone to get wrong. Read from the RX column of the table format on
+# 9904 - which lists both receivers in one packet, so a single broadcast
+# establishes the pair - with "Base IP port" as corroboration.
+#
+# Defaults to 1 and 2 so an unjumpered board behaves exactly as before
+# and nothing depends on a broadcast having been seen yet.
+picotuner_rx_numbers = {"a": 1, "b": 2}
+
+
+def learn_picotuner_rx_numbers(seen):
+    """Adopt the receiver numbers a broadcast actually reported.
+
+    seen: every RX number in one table broadcast. The lower is tuner A,
+    the higher tuner B - the firmware always lists them in that order,
+    and the pair is always consecutive (1/2, 5/6).
+    """
+    global picotuner_rx_numbers
+    nums = sorted({int(n) for n in seen if str(n).isdigit()})
+    if len(nums) < 2:
+        return
+    a, b = nums[0], nums[1]
+    if (a, b) != (picotuner_rx_numbers["a"], picotuner_rx_numbers["b"]):
+        print(f"[picotuner] board reports receivers {a} and {b} "
+              f"(command ports {9920 + a} and {9920 + b})")
+        picotuner_rx_numbers = {"a": a, "b": b}
+
+
+# Callsigns whose name lookup is in flight or has already been tried
+# and found nothing. Without this, /api/status - polled about twice a
+# second - would fire a fresh QRZ lookup on EVERY poll for any station
+# not in the cache: dozens of requests during one contact, for a
+# station that may simply not be on QRZ.
+_osd_name_lookups = set()
+_osd_name_absent = set()
+# {callsign: when_it_failed} - a lookup that ERRORED, as distinct from
+# one that succeeded with no name. Errors are usually transient (QRZ
+# down, no internet), so they are retried - but not immediately, or a
+# persistent outage means a fresh failed request on every poll for the
+# whole contact. Measured at 12 attempts and 12 log lines in a single
+# 60-second contact before this.
+_osd_name_failed_at = {}
+OSD_NAME_RETRY_SECS = 300
+_osd_name_lock = threading.Lock()
+
+
+def _start_osd_name_lookup(callsign):
+    """Warm the name cache for a callsign, off the request thread.
+
+    Without this the name only appeared on the SECOND contact with a
+    station: the cache is otherwise populated as a side effect of the
+    notifications module or Pathfinder looking the callsign up, which
+    happens on a confirmed lock or at end of contact - so on a first
+    contact there was nothing cached and the OSD showed the bare
+    callsign throughout.
+
+    Fires once per callsign and never blocks: /api/status returns
+    immediately with no name, and the next poll a second or two later
+    picks it up from the cache.
+    """
+    qrz_cfg = config.get('notifications', {}).get('qrz', {})
+    username = qrz_cfg.get('lookup_username', '')
+    password = qrz_cfg.get('lookup_password', '')
+    if not username or not password:
+        return
+
+    with _osd_name_lock:
+        if callsign in _osd_name_lookups or callsign in _osd_name_absent:
+            return
+        failed_at = _osd_name_failed_at.get(callsign)
+        if failed_at and (time.time() - failed_at) < OSD_NAME_RETRY_SECS:
+            return
+        _osd_name_lookups.add(callsign)
+
+    def _lookup():
+        try:
+            name, _grid = lynx_notifications.qrz_callsign_details(
+                username, password, callsign)
+            with _osd_name_lock:
+                if not name:
+                    # Not on QRZ, or no name recorded there. Permanent
+                    # as far as we care, so never looked up again -
+                    # cleared only on restart.
+                    _osd_name_absent.add(callsign)
+                else:
+                    _osd_name_failed_at.pop(callsign, None)
+        except Exception as e:
+            # Transient - retried, but not before OSD_NAME_RETRY_SECS.
+            with _osd_name_lock:
+                _osd_name_failed_at[callsign] = time.time()
+            print(f"[osd] name lookup for {callsign} failed: {e}")
+        finally:
+            with _osd_name_lock:
+                _osd_name_lookups.discard(callsign)
+
+    threading.Thread(target=_lookup, daemon=True,
+                     name=f"osd-name-{callsign}").start()
+
+
+def qrz_first_name(callsign):
+    """The operator's first name for the OSD, or "" if not known.
+
+    CACHE ONLY - never performs a lookup. This is called while building
+    /api/status, which the overlay polls about twice a second, and a QRZ
+    round trip there would stall every poll and the OSD with it.
+
+    The name arrives in the cache as a side effect of work already being
+    done: the notifications module looks it up on a confirmed lock, and
+    Pathfinder looks it up for the end-of-contact card. So it appears a
+    moment after the callsign does, and the OSD simply shows the
+    callsign alone until then - which is also what happens for anyone
+    not on QRZ, or when the lookup is not configured.
+    """
+    if not callsign or callsign in ("lost", "search", ""):
+        return ""
+    try:
+        cached = lynx_notifications._qrz_lookup_cache.get(
+            callsign.strip().upper())
+        # Entries are (details, cached_at). Checked rather than assumed:
+        # indexing blindly into an entry of some other shape - a bare
+        # string, say - yields its FIRST CHARACTER, which would put a
+        # single stray letter on the OSD instead of a name. Nothing
+        # writes such an entry today, but a garbage name on screen is a
+        # worse failure than no name at all.
+        if not isinstance(cached, (tuple, list)) or len(cached) != 2:
+            # Nothing cached - warm it in the background so the name
+            # appears on the FIRST contact rather than the second.
+            _start_osd_name_lookup(callsign.strip().upper())
+            return ""
+        name = lynx_notifications._as_details(cached[0])[0]
+        return name if isinstance(name, str) and name.strip() else ""
+    except Exception:
+        # A missing name must never break the status endpoint.
+        return ""
+
+
+def picotuner_rcv(slot):
+    """The receiver number to put in a command's rcv= field.
+
+    Not the same thing as choosing the right port. A command is
+    addressed BOTH ways - it goes to 9920 + receiver number, and it
+    names the receiver again inside the payload:
+
+        [to@wh] rcv=1 fplug=a offset=0 freq=1249000 srate=1000
+
+    Getting only the port right is not enough. Confirmed live on a
+    jumpered board: commands arrived correctly at 9925 and 9926, and the
+    board ignored every one of them because they said rcv=1 and rcv=2
+    while its receivers are 5 and 6. It sat in "search" looking
+    perfectly healthy - which is exactly the symptom that started all
+    this.
+    """
+    return picotuner_rx_numbers.get(slot, 1 if slot == 'a' else 2)
+
+
+def picotuner_cmd_port(slot, cfg):
+    """Command port for tuner A or B.
+
+    9920 + receiver number, per Brian G4EWJ: "Command port is 9920 +
+    receiver number." So a jumpered board answers on 9925/9926 rather
+    than 9921/9922.
+
+    Derived from what the board reports rather than from config, because
+    the board is authoritative about its own numbering and a stale
+    config value sends commands into silence. The configured value is
+    still used when nothing has been discovered yet - on the very first
+    tune after a cold start, before any broadcast has arrived.
+    """
+    n = picotuner_rx_numbers.get(slot)
+    if n:
+        return 9920 + n
+    return cfg['cmd_port'] if slot == 'a' else cfg['cmd_port_b']
+
+
 def picotuner_quality_monitor():
     """Background thread: reads rich status from Picotuner port 9901.
 
@@ -1890,15 +2905,41 @@ def picotuner_quality_monitor():
     global picotuner_state, picotuner_state_b
     cfg = config['picotuner']
     sock = None
+    bound_port = None
     while True:
         try:
-            if sock is None:
+            # Rebind when the derived port changes. The base port is
+            # learned from a broadcast by the discovery thread, which
+            # happens AFTER these sockets are first created - and
+            # picotuner_base_port resets to the default on every start, so
+            # it is always learned late. Without rebinding, a jumpered
+            # board's status goes to 9905/9908 while this stays bound to
+            # 9901/9904 and hears nothing, for ever. Confirmed exactly
+            # that way on real hardware: base port correctly adopted and
+            # logged, sockets still on the old ports, tuner stuck.
+            if sock is None or bound_port != picotuner_info_port():
+                if sock is not None:
+                    try: sock.close()
+                    except Exception: pass
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
                 sock.settimeout(5)
-                sock.bind(('', cfg['status_port'] - 96))  # 9997-96 = 9901
-            data, _ = sock.recvfrom(4096)
+                bound_port = picotuner_info_port()
+                sock.bind(('', bound_port))
+            data, addr = sock.recvfrom(4096)
+            # Only accept status from the PicoTuner we are actually using.
+            # Without this, ANY PicoTuner broadcasting on these ports is
+            # believed - and Brian G4EWJ confirms two boards sharing a base
+            # IP port both broadcast to the same place, so a second unit on
+            # the network would interleave its readings with ours at twice
+            # a second: MER from one, callsign from the other. That is the
+            # same shared-state corruption as the MER/modcod bug, except arriving
+            # from outside the process, where no amount of internal locking
+            # would help. The discovery listener has always filtered this
+            # way; these two monitors never did.
+            if addr[0] != cfg['host']:
+                continue
             fields = {}
             for line in data.decode(errors='replace').splitlines():
                 line = line.strip()
@@ -1909,9 +2950,17 @@ def picotuner_quality_monitor():
             if not fields:
                 continue
 
+            # $0 names which receiver this report is for, using the
+            # board's own numbering - so 5 and 6 on a jumpered board,
+            # not 1 and 2. Compared against what the board reports
+            # rather than against literals, or every packet from a
+            # jumpered board is silently discarded and the receiver
+            # looks entirely healthy while nothing works.
             rx_id = fields.get('$0')
+            rx_a = str(picotuner_rx_numbers["a"])
+            rx_b = str(picotuner_rx_numbers["b"])
 
-            if rx_id == '1':
+            if rx_id == rx_a:
                 picotuner_state["mer"]         = fields.get('$12', '')
                 picotuner_state["symbol_rate"] = fields.get('$9', '')
                 picotuner_state["margin"]      = fields.get('$30', '')
@@ -1924,7 +2973,7 @@ def picotuner_quality_monitor():
                 if '$26' in fields: picotuner_state["agc1"] = fields['$26']
                 if '$27' in fields: picotuner_state["agc2"] = fields['$27']
 
-            elif rx_id == '2':
+            elif rx_id == rx_b:
                 # Deliberately narrow, matching the same principle
                 # already established for tuner B elsewhere in this
                 # file: only fields genuinely new here, not
@@ -1942,8 +2991,10 @@ def picotuner_quality_monitor():
 
             elif rx_id == '0':
                 receiver_num = fields.get('$77')
-                target = (picotuner_state if receiver_num == '1' else
-                          picotuner_state_b if receiver_num == '2' else None)
+                # $77 names the receiver for the fast lock/AGC update,
+                # again in the board's own numbering.
+                target = (picotuner_state if receiver_num == rx_a else
+                          picotuner_state_b if receiver_num == rx_b else None)
                 if target is not None:
                     if '$85' in fields: target["dbm"]  = fields['$85']
                     if '$26' in fields: target["agc1"] = fields['$26']
@@ -2022,6 +3073,24 @@ def picotuner_table_monitor_b():
     FREQUENCY/SR/MODULATION/FPRO/CODECS/ANT/PACKETS/%NUL/NIMTYPE/
     TS DESTINATION.
 
+    SHARED-STATE WARNING: this is the ONLY function that writes fields
+    picotuner_quality_monitor() also owns - specifically
+    picotuner_state["mer"] and ["margin"] for tuner A. Every other
+    field in picotuner_state / picotuner_state_b has exactly one
+    writing function (verified by a full audit of both dicts). That
+    shared ownership caused a real, confirmed bug: this function reads
+    fixed whitespace COLUMN POSITIONS, whereas the 9901 monitor reads
+    explicitly TAGGED fields ($12 = MER, $30 = margin). Column
+    positions are not stable across firmware revisions, so on
+    ptwh0v3k-w5100s this wrote non-numeric junk over values that had
+    arrived correctly moments earlier, roughly twice a second - the
+    Web UI showed MER and Margin permanently blank while tcpdump
+    proved the correct values were being received. The writes below
+    are now guarded so a column mismatch leaves the tagged values
+    alone. If any further field is ever added here, check first
+    whether the 9901 monitor already owns it, and guard it the same
+    way - tagged data should always win over positional data.
+
     Primarily extracts the RX=2 row for tuner B's rich stats (rcv=1's
     own equivalent monitor already exists separately, reading the
     $-field format on port 9901 — left untouched since it's confirmed
@@ -2038,35 +3107,155 @@ def picotuner_table_monitor_b():
     the display code). Deliberately narrow: only mer/margin for tuner
     A here, not the full field set, to avoid touching anything already
     reliably sourced elsewhere.
+
+    Rx2's row is genuinely variable-width, not a fixed 16-column
+    layout - confirmed directly against real captured broadcasts: the
+    Picotuner sends a shorter row whenever it doesn't yet have the
+    full field set (no callsign while purely searching, a modulation-
+    type field appearing partway through acquisition, different column
+    counts seen live at different stages), and symbol_rate is present
+    in every one of these shorter rows too, just at a different column
+    position each time depending on what else is or isn't present.
+    Rows with the full 16+ columns (once genuinely locked) are parsed
+    by fixed column index as before; shorter rows use a second,
+    position-independent extraction instead, built around the one
+    pattern confirmed consistent across every real, observed variant:
+    the tuned frequency (a number >= 50, matching the tuner's own
+    valid 50-2500MHz range - low enough to rule out other numeric
+    fields seen in these same rows, like MER or NUL%) is always
+    immediately followed by the symbol rate, regardless of what comes
+    before it in that particular row.
     """
     global picotuner_state_b
     cfg = config['picotuner']
     sock = None
+    bound_port = None
     while True:
         try:
-            if sock is None:
+            # Rebind when the derived port changes. The base port is
+            # learned from a broadcast by the discovery thread, which
+            # happens AFTER these sockets are first created - and
+            # picotuner_base_port resets to the default on every start, so
+            # it is always learned late. Without rebinding, a jumpered
+            # board's status goes to 9905/9908 while this stays bound to
+            # 9901/9904 and hears nothing, for ever. Confirmed exactly
+            # that way on real hardware: base port correctly adopted and
+            # logged, sockets still on the old ports, tuner stuck.
+            if sock is None or bound_port != picotuner_table_port():
+                if sock is not None:
+                    try: sock.close()
+                    except Exception: pass
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
                 sock.settimeout(5)
-                sock.bind(('', cfg['status_port'] - 93))  # 9997-93 = 9904
-            data, _ = sock.recvfrom(4096)
+                bound_port = picotuner_table_port()
+                sock.bind(('', bound_port))
+            data, addr = sock.recvfrom(4096)
+            # Only accept status from the PicoTuner we are actually using.
+            # Without this, ANY PicoTuner broadcasting on these ports is
+            # believed - and Brian G4EWJ confirms two boards sharing a base
+            # IP port both broadcast to the same place, so a second unit on
+            # the network would interleave its readings with ours at twice
+            # a second: MER from one, callsign from the other. That is the
+            # same shared-state corruption as the MER/modcod bug, except arriving
+            # from outside the process, where no amount of internal locking
+            # would help. The discovery listener has always filtered this
+            # way; these two monitors never did.
+            if addr[0] != cfg['host']:
+                continue
             text = data.decode(errors='replace')
+            # Adopt the board's own receiver numbering. The table lists
+            # both receivers in a single packet, so one broadcast
+            # establishes the pair - see learn_picotuner_rx_numbers().
+            learn_picotuner_rx_numbers(
+                l.split()[0] for l in text.splitlines()
+                if l.split() and l.split()[0].isdigit())
+            rx_a = str(picotuner_rx_numbers["a"])
+            # Tuner B's rows too - the last hardcoded receiver numbers.
+            # Only reachable on a jumpered board, where B's row is 6
+            # rather than 2, which is why everything about tuner B
+            # worked EXCEPT its MER: that is the one field which comes
+            # from this table rather than from the $-tagged report, and
+            # rcv=2 never sends the richer report at all.
+            rx_b = str(picotuner_rx_numbers["b"])
             for line in text.splitlines():
                 parts = line.split()
-                # Data rows start with the RX number (1 or 2) — header
-                # and separator rows don't parse as a leading digit,
-                # so this alone is enough to skip them without needing
-                # to match the header text itself.
+                # Data rows start with the RX number - 1 and 2 on a normal
+                # board, 5 and 6 on a jumpered one, so compared against
+                # what the board reports rather than a literal. Header and
+                # separator rows don't parse as a leading digit, so this
+                # alone is enough to skip them.
                 if not parts or not parts[0].isdigit():
                     continue
-                if parts[0] == '1' and len(parts) >= 16:
+                if parts[0] == rx_a and len(parts) >= 16:
                     # Supplement tuner A's mer/margin only - see
                     # docstring above for why this specific gap exists.
-                    picotuner_state["mer"] = parts[3]
-                    picotuner_state["margin"] = parts[4]
+                    #
+                    # Guarded because this is the SECOND writer of these
+                    # two fields: picotuner_quality_monitor() already
+                    # sets them from the $-tagged broadcast on 9901,
+                    # where they arrive correctly tagged ($12 = MER,
+                    # $30 = margin). This function instead reads fixed
+                    # whitespace column positions from the table-format
+                    # broadcast, and those positions are not stable
+                    # across firmware revisions. Confirmed live on
+                    # ptwh0v3k-w5100s: the $-tagged packets carried
+                    # $12,25.0 and $30,14.3 while the Web UI showed
+                    # both fields blank, because this ran afterwards
+                    # and overwrote them with non-numeric junk from the
+                    # wrong columns. MER and Margin were exactly - and
+                    # only - the two fields affected, which is exactly
+                    # the pair written here.
+                    #
+                    # Now only supplements when the columns genuinely
+                    # hold numbers, so a column-layout mismatch quietly
+                    # leaves the already-correct tagged values alone
+                    # instead of destroying them.
+                    def _numeric(tok):
+                        try:
+                            float(tok)
+                            return True
+                        except ValueError:
+                            return False
+                    # Only supplement when the TAGGED source hasn't
+                    # provided a value yet - i.e. exactly the
+                    # unlocked/searching case this branch exists for
+                    # (see docstring). Once port 9901 is reporting,
+                    # its tagged values are authoritative and are
+                    # never overwritten from column positions here.
+                    #
+                    # A numeric-only guard is NOT sufficient on its
+                    # own: this table's rows are variable-width (the
+                    # docstring above documents that for Rx2, and the
+                    # same acquisition-stage variation applies to
+                    # Rx1), so a shifted layout can put a genuine but
+                    # WRONG number in parts[3]/parts[4] - which would
+                    # pass a numeric check and silently corrupt a good
+                    # reading rather than blanking it. That is the
+                    # intermittent, hard-to-reproduce form of this same
+                    # bug: values that look plausible but are wrong,
+                    # appearing and clearing at random depending on
+                    # what the tuner happened to include in the row.
+                    if not picotuner_state.get("mer"):
+                        if _numeric(parts[3]) and _numeric(parts[4]):
+                            picotuner_state["mer"] = parts[3]
+                            picotuner_state["margin"] = parts[4]
                     continue
-                if parts[0] != '2' or len(parts) < 16:
+                if parts[0] == rx_b and len(parts) < 16:
+                    # Shorter row - see docstring above. Still worth
+                    # checking for a usable symbol_rate even though it
+                    # doesn't have the full field set for MER/margin/
+                    # modcod/etc.
+                    for i, token in enumerate(parts):
+                        try:
+                            freq_val = float(token)
+                        except ValueError:
+                            continue
+                        if freq_val >= 50 and i + 1 < len(parts) and parts[i + 1].isdigit():
+                            picotuner_state_b["symbol_rate"] = parts[i + 1]
+                            break
+                if parts[0] != rx_b or len(parts) < 16:
                     continue
                 # Column indices confirmed directly against real
                 # captured output before deployment — see the
@@ -2155,7 +3344,8 @@ def start_diversity_combiner():
     script_path = Path(__file__).parent / "diversity_combiner_pcr.py"
     cmd = (
         f"python3 -u {script_path} "
-        f"--port-a {cfg['ts_port']} --port-b {cfg['ts_port_b']} "
+        f"--port-a {picotuner_ts_port('a', cfg)} "
+        f"--port-b {picotuner_ts_port('b', cfg)} "
         f"--out-ip 127.0.0.1 --out-port {div_cfg['combiner_out_port']} "
         f"--live-stats-file {DIVERSITY_STATS_PATH} --stats-interval 1.0 "
         f"--mer-switch-dwell-secs {div_cfg.get('mer_switch_dwell_secs', 10.0)} "
@@ -2221,6 +3411,19 @@ class TuneRequest(BaseModel):
                              # 10489500 kHz to an IF of 739500 kHz,
                              # which is what the Picotuner actually
                              # needs to be tuned to.
+    rcv: int = 1             # 1 or 2 — which actual receiver circuit
+                             # (NOT the same thing as plug, which only
+                             # selects the physical antenna input — see
+                             # tri_watch's own config comments for the
+                             # full rcv/fplug distinction). Only
+                             # meaningful outside diversity mode, which
+                             # always tunes both receivers together.
+                             # Defaults to 1, preserving every existing
+                             # caller's behaviour exactly - added
+                             # specifically so tri_watch's arbitrator
+                             # can reuse this exact, proven tune/display
+                             # path for Rx2 too, rather than maintaining
+                             # its own, separate reimplementation of it.
 
 class StreamRequest(BaseModel):
     url: str
@@ -2266,13 +3469,67 @@ class DiversityConfigUpdate(BaseModel):
     hard_freeze_breaker_required_clean_secs: Optional[float] = None
     hard_freeze_breaker_min_retry_interval_secs: Optional[float] = None
 
+class SqueakConfigUpdate(BaseModel):
+    # On by default - it is idle until a sequence arrives, and a
+    # receiver that measures itself when someone sends a test is more
+    # useful than one that must be configured first.
+    enabled: bool = True
+    # Blank means "monitor of the default output", which is what almost
+    # everyone wants and needs no maintenance if the output changes.
+    source: str = ""
+    # Worth matching to the gap between passes in the test file, so the
+    # previous result is still on screen while an adjustment is made.
+    hold_secs: float = 45.0
+
+
+class GnssConfigUpdate(BaseModel):
+    # automatic (default): GPS always wins once it has a confirmed,
+    # stable fix (see lynx_gnss.LocatorTracker) - it overwrites
+    # portable_locator itself, live, no restart. Until then - cold
+    # start, indoors, or simply no HAT - portable_locator is untouched,
+    # so it quietly falls back to whatever is already configured there.
+    # manual: the operator's own typed value in the QRZ card is
+    # authoritative and GPS, even if a HAT is fitted and locked, is
+    # never allowed to overwrite it.
+    #
+    # No "off": an earlier version had one, stopping the whole reader.
+    # Removed - a site with no HAT costs nothing either way (the
+    # reader fails quietly and keeps retrying), and a site WITH a HAT
+    # fitted should almost always want at least GPS time sync (see
+    # time_sync below) even while keeping GPS out of the locator,
+    # which Manual mode already gives with no downside. If an older
+    # config still has "off" saved, it's treated the same as "manual"
+    # (see _on_gnss_locator_change) - it just never gets cleaned up to
+    # "manual" automatically.
+    mode: str = "automatic"
+    # Independent of mode above (deliberately - a fixed value entered
+    # for Manual locator mode is still worth correcting the system
+    # clock from, and the two questions "should GPS drive the
+    # portable locator" and "should GPS feed chrony" are genuinely
+    # separate ones). Default on: it fails quietly if chrony isn't
+    # configured for it (see lynx_gnss._connect_chrony_sock), so
+    # there's no downside to leaving it on for an install that hasn't
+    # set up the chrony side yet.
+    time_sync: bool = True
+
 class QrzConfigUpdate(BaseModel):
     enabled: bool
     api_key: str
     settle_secs: float
     suppress_mins: float
     portable_locator: str = ""
-
+    lookup_username: str = ""    # QRZ XML Data API login - a genuinely
+    lookup_password: str = ""    # separate credential from api_key above
+                                   # (that one's for the Logbook API only).
+                                   # Both blank by default; the lookup
+                                   # feature simply does nothing if either
+                                   # is empty, rather than erroring.
+    lookup_for_notifications: bool = False  # whether tri_watch's own
+                                              # "someone else wants in"
+                                              # notification does a name
+                                              # lookup at all - independent
+                                              # of whether QRZ logging
+                                              # itself (enabled, above) is on
 class SlackConfigUpdate(BaseModel):
     enabled: bool
     webhook_url: str
@@ -2300,8 +3557,66 @@ class GpioTxConfigUpdate(BaseModel):
     schedule_weekend_start: str
     schedule_weekend_end: str
 
+class QuickLynxConfigUpdate(BaseModel):
+    """Off by default. It holds an outbound connection to BATC, and most
+    Lynx installations are terrestrial repeaters that would never use
+    it - so opt-in rather than opt-out."""
+    enabled: bool = False
+
+
 class DisplayConfigUpdate(BaseModel):
     ppm_style: str = "full_fat"  # "skeleton" or "full_fat"
+    # Display refresh rate, 50 or 60. 50 by default: broadcast
+    # television here is 25 fps, so each frame occupies exactly two
+    # refreshes. At 60 Hz a 25 fps source needs 3:2 pulldown - frames
+    # held alternately for two refreshes and three - which shows as
+    # judder on any horizontal pan. Only applied when the display has
+    # to be switched at all, i.e. when it exceeds max_height.
+    refresh_hz: int = 50
+    # Cap on display height in lines. Read by lynx_start.sh at startup,
+    # so a change needs a restart to take effect.
+    max_height: int = 1080
+    # "hdmi" (resolved to the first HDMI output at launch), "auto" to let
+    # mpv choose, or an explicit mpv device name from /api/audio/devices.
+    audio_device: str = "hdmi"
+
+class TriWatchRfSourceUpdate(BaseModel):
+    enabled: bool = True   # unchecked = this source is omitted from
+                            # tri_watch entirely, same as not listing
+                            # it in config.yaml at all
+    rcv: int                # 1 or 2 - which receiver this source uses
+    fplug: str = "a"        # which physical Picotuner plug feeds this receiver
+    freq: int                # kHz, matching the same convention used
+                              # throughout Lynx's own tuning UI
+    sr: int                  # kS/s
+    lnb_lo_khz: int = 0
+    label: str = ""
+    callsign: str = ""
+
+class TriWatchStreamSourceUpdate(BaseModel):
+    enabled: bool = True
+    domain: str = ""
+    app: str = ""
+    streamname: str = ""
+    port: int = 1935
+    label: str = ""
+    waiting_message: str = ""
+
+class TriWatchSourcesUpdate(BaseModel):
+    enabled: bool
+    rx1: TriWatchRfSourceUpdate
+    rx2: TriWatchRfSourceUpdate
+    stream: TriWatchStreamSourceUpdate
+
+class PathfinderConfigUpdate(BaseModel):
+    """Only the three settings worth changing from the UI. The span and
+    distance limits stay in config.yaml deliberately - they are tuned
+    once against the shipped map data and then never touched, and
+    exposing every knob makes the page harder to scan."""
+    enabled: bool = True
+    delay_secs: float = 2.0
+    duration_secs: float = 30.0
+
 
 class ConfigUpdateRequest(BaseModel):
     site: Optional[SiteConfigUpdate] = None
@@ -2311,7 +3626,12 @@ class ConfigUpdateRequest(BaseModel):
     notifications_slack: Optional[SlackConfigUpdate] = None
     notifications_companion: Optional[CompanionConfigUpdate] = None
     notifications_gpio_tx: Optional[GpioTxConfigUpdate] = None
+    quicklynx: Optional[QuickLynxConfigUpdate] = None
     display: Optional[DisplayConfigUpdate] = None
+    tri_watch: Optional[TriWatchSourcesUpdate] = None
+    pathfinder: Optional[PathfinderConfigUpdate] = None
+    gnss: Optional[GnssConfigUpdate] = None
+    squeak: Optional[SqueakConfigUpdate] = None
 
 # ── Helpers ───────────────────────────────────────────────────
 def stop_current():
@@ -2345,7 +3665,23 @@ def stop_current():
         start_transition_cover()
         kill_mpv()  # deliberately NOT restart_mpv() - Stop means stop, not "switch to
                      # whatever the raw tuner happens to be showing"
-        end_transition_cover()
+        # Deliberately NOT end_transition_cover() here - confirmed as
+        # the real cause of a reported ~1s flash of raw desktop when a
+        # tri_watch stream ends. The cover's own marker file is
+        # checked by the overlay in near-real-time (every frame), but
+        # state["mode"]/state["mpv_running_for_rf"] only update via
+        # its own, much slower periodic /api/status poll. Removing the
+        # marker here happened fast enough that the overlay could
+        # still be working off stale "still streaming" state for a
+        # second or two afterwards - marker gone + stale-but-still-
+        # "locked" belief together briefly told it to show through the
+        # now-transparent cover, except mpv had already been killed,
+        # so there was nothing left behind it but the desktop. The
+        # cover should simply stay up indefinitely after a genuine
+        # stop - only a path that starts a NEW, successfully-rendering
+        # source (which already calls end_transition_cover() itself,
+        # only once rendering is actually confirmed) should ever take
+        # it back down.
     threading.Thread(target=_stop_mpv, daemon=True).start()
 
 def fetch_batc_streams_from_api() -> list:
@@ -2389,7 +3725,7 @@ def get_batc_streams_cached() -> list:
     """Send a command to the Picotuner."""
     cfg = config['picotuner']
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.sendto(cmd.encode(), (cfg['host'], cfg['cmd_port']))
+    sock.sendto(cmd.encode(), (cfg['host'], picotuner_cmd_port('a', cfg)))
     sock.close()
 
 def ryde_cmd(request: dict) -> dict:
@@ -2420,44 +3756,1290 @@ def ryde_cmd(request: dict) -> dict:
     #     raise HTTPException(status_code=503, detail=f"Ryde unavailable: {e}")
 
 # ── API: Status ───────────────────────────────────────────────
-def _compute_downlink_frequency():
-    """When an LNB LO is in use, the Picotuner reports the L-band/IF
-    frequency it's actually locked on (e.g. 739.500 MHz), not the real
-    satellite downlink frequency. This reverses the LNB math to give
-    the real-world figure for display (e.g. 10489.500 MHz for QO-100).
-    Must match whichever injection side (low/high) was actually used
-    at tune time — see current_lnb_side."""
-    if not current_lnb_lo_khz:
-        return None
-    try:
-        ifreq_mhz = float(picotuner_state["frequency"])
-        lo_mhz = current_lnb_lo_khz / 1000
-        if current_lnb_side == "high":
-            # High-side injection (C-band): IF = LO - downlink,
-            # so downlink = LO - IF
-            return round(lo_mhz - ifreq_mhz, 3)
-        else:
-            # Low-side injection (Ku-band): IF = downlink - LO,
-            # so downlink = IF + LO
-            return round(ifreq_mhz + lo_mhz, 3)
-    except (ValueError, TypeError):
-        return None
+def _default_tri_watch_label(src_cfg):
+    """A sensible fallback label for a tri_watch source that wasn't
+    given an explicit one in config."""
+    if src_cfg.get('type') == 'rf':
+        return f"RF Rx{src_cfg.get('rcv', 1)} ({src_cfg.get('freq', '?')} kHz)"
+    elif src_cfg.get('type') == 'stream':
+        return src_cfg.get('streamname', 'Stream')
+    return "Unknown source"
 
-@app.get("/api/picotuner/discovered", tags=["Status"],
-         summary="List Picotuners currently heard on the local network",
-         description="Every Picotuner broadcasting on this network segment, "
-                     "not just the one currently configured - a genuine UDP "
-                     "broadcast, so this includes units never yet pointed at "
-                     "this Lynx instance. Entries not heard from in the last "
-                     "10 seconds are treated as offline and left out.")
-def get_discovered_picotuners():
-    now = time.time()
+def get_tri_watch_status():
+    """Builds the /api/status "tri_watch" section - a list of every
+    configured, enabled source (up to 3, any mix of Rx1, Rx2, and a
+    stream input), each with its own current active/locked status,
+    determined however is appropriate for that source's type. Purely a
+    status snapshot - no priority/arbitration logic here (Stage 2+).
+
+    RF sources are distinguished by `rcv` (1 or 2 - which actual
+    receiver/demodulator circuit), NOT `plug` (a/b - which physical
+    antenna input that circuit reads from). Confirmed directly against
+    _tune_impl()'s own, existing logic (2026-08-01): outside diversity
+    mode, a manual tune ALWAYS sends rcv=1 regardless of which plug was
+    selected - "plug B" in ordinary use still runs through the same
+    rcv=1 circuit, not a second one. picotuner_state_b (rcv=2's status)
+    is only ever genuinely populated during diversity mode, where rcv=1
+    and rcv=2 are each tuned separately and explicitly. An earlier
+    version of this function checked plug instead of rcv, which would
+    have silently, permanently shown "no lock" for any RF source
+    configured with plug: b outside diversity mode, regardless of
+    actual signal quality - caught and fixed before ever being deployed
+    to real hardware."""
+    if not tri_watch_enabled:
+        return {"enabled": False, "sources": []}
+
+    sources_out = []
+    # Deliberately the startup snapshot, NOT config.get('tri_watch',
+    # {}).get('sources', []) - see tri_watch_sources_cfg's own
+    # module-level comment. Confirmed as a real, reported bug when this
+    # read the live config directly: saving a Tri-Watch Sources change
+    # on the Config page reassigns the in-memory config immediately,
+    # well before any restart - reading it here would desync this
+    # status display from tri_watch_probes (built once at startup) the
+    # instant a source was added/removed/reordered, breaking the whole
+    # display rather than just leaving it correctly showing the old,
+    # still-actually-running configuration until a genuine restart.
+    for idx, src_cfg in enumerate(tri_watch_sources_cfg):
+        if not src_cfg.get('enabled', False):
+            continue
+        src_type = src_cfg.get('type')
+        entry = {
+            "idx": idx,
+            "type": src_type,
+            "label": src_cfg.get('label') or _default_tri_watch_label(src_cfg),
+        }
+        if src_type == 'rf':
+            rcv = src_cfg.get('rcv', 1)
+            state = picotuner_state_b if rcv == 2 else picotuner_state
+            entry["rcv"] = rcv
+            entry["active"] = state["locked"]
+        elif src_type == 'stream':
+            probe = tri_watch_probes.get(idx)
+            entry["active"] = probe.is_active if probe is not None else None
+            entry["last_change"] = probe.last_change if probe is not None else None
+        else:
+            entry["active"] = None
+        sources_out.append(entry)
+
     return {
-        "picotuners": [
-            info for info in discovered_picotuners.values()
-            if now - info["last_seen"] <= 10
-        ]
+        "enabled": True,
+        "sources": sources_out,
+        "displayed_source_idx": tri_watch_arbitrator.displayed_idx,
+        "notification": tri_watch_arbitrator.get_notification(),
     }
+
+def tri_watch_startup_tune():
+    """Actively tunes every enabled RF source in tri_watch to its own
+    configured frequency/symbol-rate at startup, rather than resuming
+    whatever was previously tuned - the whole point for a dedicated
+    repeater receiver is coming up on known, correct inputs every time,
+    regardless of what happened before the restart.
+
+    Sends raw tune commands directly rather than going through tune()/
+    _tune_impl() - confirmed neither can actually do what's needed
+    here: outside diversity mode, tune() only ever commands rcv=1
+    regardless of which plug is requested; in diversity mode it forces
+    rcv=1 and rcv=2 to the SAME frequency/symbol-rate, for combining.
+    Neither can independently tune two receivers to two different
+    values, which is exactly what two tri_watch RF sources need (e.g.
+    the same-frequency/different-symbol-rate weak-signal technique).
+
+    rcv=2 genuinely needs its own command port (cmd_port_b) - sending
+    it to the shared port with a different rcv= value in the command
+    text does NOT work, confirmed the hard way during diversity mode's
+    own development. Same 0.3s settling delay between commands that
+    diversity-mode tuning already proved necessary too: sent back-to-
+    back with no gap, rcv=1 could intermittently fail to lock despite
+    a strong signal.
+
+    Deliberately does NOT touch mpv, the display, or current_mode at
+    all - deciding what's actually worth showing is Stage 2's job
+    (once priority/arbitration logic exists), not this one's."""
+    cfg = config['picotuner']
+    # tri_watch_sources_cfg (the startup snapshot - see its own
+    # module-level comment) rather than reading config directly - by
+    # the time this runs (after _resume_on_startup's own 7s delay) the
+    # two are identical anyway, since this only ever executes once,
+    # immediately at startup, before any Config-page edit could
+    # possibly have happened - but reading the same source of truth as
+    # everything else here avoids any doubt.
+    for idx, src in enumerate(tri_watch_sources_cfg):
+        if not src.get('enabled', False) or src.get('type') != 'rf':
+            continue
+        rcv = src.get('rcv')
+        if rcv not in (1, 2):
+            print(f"[tri_watch] startup tune: source {idx} has an invalid rcv - skipping")
+            continue
+        try:
+            tuner_freq = calc_tuner_freq(src['freq'], src.get('lnb_lo_khz', 0))
+            # Record the converter in use for this receiver, so the OSD
+            # and Web UI can show the real on-air frequency rather than
+            # the IF. tri_watch tunes the board itself rather than going
+            # through tune(), so without this nothing ever set these and
+            # a tri_watch source with a converter displayed the IF.
+            set_converter_state(rcv, src['freq'], src.get('lnb_lo_khz', 0),
+                                'tri_watch startup tune')
+            fplug = src.get('fplug', 'a' if rcv == 1 else 'b')
+            cmd = (f"[to@wh] rcv={picotuner_rcv('a' if rcv == 1 else 'b')} "
+                   f"fplug={fplug} offset=0 freq={tuner_freq} srate={src['sr']}")
+            if rcv == 1:
+                picotuner_cmd(cmd)
+            else:
+                sock_b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                try:
+                    sock_b.sendto(cmd.encode(), (cfg['host'], picotuner_cmd_port('b', cfg)))
+                finally:
+                    sock_b.close()
+            record_commanded_tune(rcv, src['freq'], src['sr'],
+                                  src.get('lnb_lo_khz', 0), fplug)
+            print(f"[tri_watch] startup tune: Rx{rcv} -> {src['freq']} kHz / {src['sr']} kS/s")
+        except Exception as e:
+            print(f"[tri_watch] startup tune: source {idx} (Rx{rcv}) failed: {e}")
+        time.sleep(0.3)  # same settling delay diversity-mode tuning already proved necessary
+
+class PortDrainer:
+    """Continuously reads and discards UDP packets from a port -
+    used to keep a non-displayed RF source's TS stream from going
+    completely unread while another source is what's actually being
+    shown.
+
+    Built to test a specific hypothesis (2026-08-01, not yet confirmed
+    on real hardware): every other proven-working RF path that runs
+    both receivers simultaneously (diversity mode) always has SOMETHING
+    continuously reading from both TS ports - the combiner process.
+    tri_watch never did: only whichever port mpv is actively watching
+    ever gets read at all, and the other, non-displayed source's full
+    TS stream goes into a port with nothing on the other end. If the
+    Picotuner shares any internal buffering/resources between its two
+    output paths, a permanently unread stream could plausibly
+    destabilize the other one too - consistent with the reported
+    pattern: both receivers failing together (not just the unread one),
+    and even matching same-frequency/same-symbol-rate diversity-mode
+    settings (ruling out an RF-domain explanation) still failing under
+    tri_watch specifically, where this draining never happened.
+
+    Tested directly with real UDP sockets: correctly receives packets
+    sent to its port, and correctly releases the port on stop() so
+    something else (mpv) can bind to it afterward."""
+    def __init__(self, port):
+        self.port = port
+        self._sock = None
+        self._thread = None
+        self._stop_flag = threading.Event()
+
+    def start(self):
+        if self._thread is not None:
+            return
+        self._stop_flag.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                         name=f"tri_watch-drain-{self.port}")
+        self._thread.start()
+
+    def stop(self):
+        self._stop_flag.set()
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+        self._thread = None
+        self._sock = None
+
+    def _run(self):
+        try:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self._sock.bind(('0.0.0.0', self.port))
+            self._sock.settimeout(1.0)
+            while not self._stop_flag.is_set():
+                try:
+                    self._sock.recv(65536)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+        except Exception as e:
+            print(f"[tri_watch] port drainer for port {self.port} failed: {e}")
+
+tri_watch_port_drainers = {}  # idx -> PortDrainer, for enabled RF sources not currently displayed
+
+def _tri_watch_sync_drainers(currently_displayed_rf_idx):
+    """Ensures every enabled RF source EXCEPT the one currently being
+    displayed by mpv (if any) has an active port-drainer running -
+    call this any time the displayed source changes (to RF, to
+    stream, or to idle) so the set of drained ports always matches
+    reality. Pass None if no RF source is currently displayed (stream
+    playing, or idle) - every enabled RF source gets drained in that
+    case."""
+    # Deliberately the startup snapshot - see tri_watch_sources_cfg's
+    # own module-level comment. This runs repeatedly during live
+    # operation (any time the displayed source changes), so it has the
+    # exact same index-mismatch risk as the arbitrator loop if it read
+    # the live config instead - tri_watch_port_drainers is keyed by
+    # the same startup indices as tri_watch_probes.
+    # Disabled by default. PortDrainer was built to test a hypothesis
+    # that was never confirmed on real hardware - see its own docstring -
+    # and it causes a definite, reproducible failure: the drainer holds
+    # the TS port of a source that has since become the displayed one,
+    # so mpv cannot bind it, fails instantly with "Address already in
+    # use", and the lifecycle logic retries for ever while the cover
+    # stays up. Tuner locked, stream arriving at full rate, and a black
+    # screen - which looks like a hardware fault and is not.
+    #
+    # Confirmed live: `ss -ulnp` showing python3 holding 9942 while mpv
+    # died on every attempt, surviving restarts because the drainer
+    # re-acquires the port during startup. The stop path evidently does
+    # not always release it, and the exact mechanism is not yet
+    # understood.
+    #
+    # An unproven mitigation for a hypothetical problem should not stay
+    # switched on when it is causing a proven one. Re-enable with
+    # tri_watch.port_drainers: true to investigate the original
+    # hypothesis again, once the release path is properly understood.
+    if not (config.get('tri_watch', {}) or {}).get('port_drainers', False):
+        # Release anything already running, so turning it off takes
+        # effect immediately rather than only after a restart.
+        for idx in list(tri_watch_port_drainers):
+            drainer = tri_watch_port_drainers.pop(idx, None)
+            if drainer is not None:
+                try: drainer.stop()
+                except Exception: pass
+        return
+
+    sources = tri_watch_sources_cfg
+    cfg = config['picotuner']
+    for idx, src in enumerate(sources):
+        if not src.get('enabled', False) or src.get('type') != 'rf':
+            continue
+        rcv = src.get('rcv', 1)
+        port = picotuner_ts_port('b' if rcv == 2 else 'a', cfg)
+        if idx == currently_displayed_rf_idx:
+            drainer = tri_watch_port_drainers.pop(idx, None)
+            if drainer is not None:
+                drainer.stop()
+        else:
+            if idx not in tri_watch_port_drainers:
+                drainer = PortDrainer(port)
+                drainer.start()
+                tri_watch_port_drainers[idx] = drainer
+
+class TriWatchArbitrator:
+    """Decides which tri_watch source (if any) should currently be
+    displayed, and tracks "someone else wants in" notifications for
+    the OSD to show. Built and unit-tested as a standalone, pure-logic
+    class before ever being wired to real mpv/Picotuner control (7
+    scenarios confirmed directly: idle-to-active, notification-while-
+    displayed, no duplicate re-notification, handover on the displayed
+    source going inactive, notification expiry, everything-inactive-
+    goes-idle, and re-notification after a source drops out and comes
+    back) - kept exactly as tested, so display_callback/idle_callback
+    are the only genuinely new, untested surface here.
+
+    display_callback(idx, source_cfg) is called whenever the
+    arbitrator decides a NEW source should become the one shown -
+    responsible for actually starting mpv/RF playback. idle_callback()
+    is called when nothing should be shown anymore. Both are only ever
+    called on a genuine transition, never repeatedly for a source
+    that's already displayed.
+
+    settling_seconds: a source must be continuously active for at
+    least this long before the arbitrator acts on it at all (for
+    either display switching or a notification) - confirmed live as
+    genuinely needed: brief, noise-induced or accidental short-burst
+    "locks" were triggering notifications (and could equally have
+    triggered an unwanted switch) for something that was never a real,
+    sustained transmission. Applied uniformly to both the initial
+    display decision and notifications, not just notifications
+    specifically - a brief noise burst causing an unwanted switch when
+    nothing was previously displayed seemed just as worth filtering out
+    as an unwanted notification while something else plays.
+    """
+    def __init__(self, display_callback, idle_callback, notification_duration_secs=20,
+                 settling_seconds=15, lock_confirm_seconds=3):
+        self.display_callback = display_callback
+        self.idle_callback = idle_callback
+        self.notification_duration_secs = notification_duration_secs
+        self.settling_seconds = settling_seconds
+        self.lock_confirm_seconds = lock_confirm_seconds
+        self.displayed_idx = None
+        self.notification = None  # {"message": str, "triggered_at": float, "source_idx": int} or None
+        self._notified_while_active = set()
+        self._pending_since = {}  # idx -> monotonic time first seen active, not yet "settled" (for notifications)
+        self._confirmed_active = {}  # idx -> bool, the debounced state actually used for switching decisions
+        self._pending_confirm_change = {}  # idx -> (candidate_state, monotonic time first seen) - for the short switching debounce
+
+    def _confirm_for_switching(self, active_map: dict) -> dict:
+        """A SEPARATE, much SHORTER debounce than _settle() below -
+        requires lock_confirm_seconds of a sustained state change
+        (either direction: becoming active OR becoming inactive)
+        before it's reported here, used only for the actual display-
+        switching decision (both showing something new and noticing
+        the current source went away). Matches the same, already-
+        proven ~3s "confirm before acting" pattern normal RF mode
+        already gets from rf_mpv_lifecycle_monitor() (its own
+        LOCK_CONFIRM_POLLS/LOSS_CONFIRM_POLLS, deliberately bypassed
+        entirely while tri_watch is enabled, since that monitor has no
+        concept of tri_watch's own source selection at all - see its
+        own docstring). Without this, tri_watch's arbitrator inherited
+        none of that protection once the display decision was changed
+        to react immediately to the raw signal - confirmed live as a
+        real, reported symptom: brief flicker in the raw lock signal
+        (invisible on the OSD, which applies its own, separate
+        smoothing) was repeatedly tearing down and re-establishing the
+        display, most visible as a picture briefly appearing then
+        disappearing again, or on a source with more flicker, never
+        getting a complete cycle to show anything at all."""
+        now = time.monotonic()
+        confirmed = {}
+        for idx, raw_active in active_map.items():
+            last_confirmed = self._confirmed_active.get(idx, False)
+            if raw_active == last_confirmed:
+                self._pending_confirm_change.pop(idx, None)
+            else:
+                pending = self._pending_confirm_change.get(idx)
+                if pending is None or pending[0] != raw_active:
+                    self._pending_confirm_change[idx] = (raw_active, now)
+                elif (now - pending[1]) >= self.lock_confirm_seconds:
+                    self._confirmed_active[idx] = raw_active
+                    last_confirmed = raw_active
+                    self._pending_confirm_change.pop(idx, None)
+            confirmed[idx] = last_confirmed
+        return confirmed
+
+    def _settle(self, active_map: dict) -> dict:
+        """Filters a raw active_map down to only sources that have been
+        CONTINUOUSLY active for at least settling_seconds - a source
+        that drops out and comes back starts its settling clock over
+        from scratch, same as a genuinely fresh activation."""
+        now = time.monotonic()
+        settled = {}
+        for idx, active in active_map.items():
+            if not active:
+                self._pending_since.pop(idx, None)
+                settled[idx] = False
+                continue
+            if idx not in self._pending_since:
+                self._pending_since[idx] = now
+            settled[idx] = (now - self._pending_since[idx]) >= self.settling_seconds
+        # Sources present in _pending_since but no longer in active_map
+        # at all (e.g. a source got disabled) shouldn't linger forever.
+        for idx in list(self._pending_since):
+            if idx not in active_map:
+                self._pending_since.pop(idx, None)
+        return settled
+
+    def step(self, active_map: dict, sources_cfg: list, build_message_fn):
+        """active_map: {source_idx: bool} - current active/locked state
+        for every enabled source, RAW (not debounced at all).
+        sources_cfg: the tri_watch.sources config list.
+        build_message_fn(idx, src_cfg) -> str, called only when a
+        genuinely new notification is actually needed.
+
+        Two SEPARATE debounces, for two genuinely different concerns:
+        - _confirm_for_switching() (short, ~lock_confirm_seconds):
+          used for the actual display/switching decision - matches the
+          same, already-proven "confirm before acting" protection
+          normal RF mode already gets from rf_mpv_lifecycle_monitor(),
+          which tri_watch's arbitrator otherwise inherits none of at
+          all, since that monitor is deliberately bypassed while
+          tri_watch is enabled. Confirmed live as genuinely necessary:
+          without it, brief flicker in the raw lock signal (invisible
+          on the OSD, which applies its own, separate smoothing) was
+          repeatedly tearing the display down and re-establishing it,
+          sometimes never completing a full cycle at all.
+        - _settle() (much longer, ~settling_seconds): used ONLY for
+          deciding whether a notification appears for a new, waiting
+          source - filtering brief, noise-induced "locks" out of the
+          notification specifically, not the actual switch. Confirmed
+          live as a real bug when this and the switching decision were
+          accidentally the same debounce: a flickering raw signal could
+          then also block the actual picture from ever appearing,
+          despite the OSD showing a solid green light throughout."""
+        switch_map = self._confirm_for_switching(active_map)
+        settled_map = self._settle(active_map)
+
+        for idx in list(self._notified_while_active):
+            if not settled_map.get(idx, False):
+                self._notified_while_active.discard(idx)
+
+        # Noticing the displayed source going inactive uses the SHORT
+        # switching debounce, not the raw signal directly - a brief
+        # flicker shouldn't tear down an already-good display.
+        if self.displayed_idx is not None and not switch_map.get(self.displayed_idx, False):
+            self.displayed_idx = None
+            self.notification = None
+
+        if self.displayed_idx is None:
+            # The initial display decision ALSO uses the SHORT
+            # switching debounce - confirmed sustained for
+            # lock_confirm_seconds, not just a momentary blip, but
+            # still far short of the much longer notification-only
+            # settling_seconds. Tries every currently-confirmed-active
+            # source in order, moving on immediately if one fails,
+            # rather than stopping at the first (failing) one -
+            # confirmed as a real, live bug otherwise: if the earliest-
+            # indexed source's display attempt failed, the arbitrator
+            # would keep retrying only that same source forever on
+            # every subsequent step(), never even attempting a
+            # different, genuinely active source that might actually
+            # work.
+            last_exception = None
+            for idx in range(len(sources_cfg)):
+                if not switch_map.get(idx, False):
+                    continue
+                try:
+                    # displayed_idx is only set AFTER display_callback
+                    # genuinely succeeds (doesn't raise) - confirmed as
+                    # a real, live bug otherwise: if the switch silently
+                    # failed or got reverted by something else, the
+                    # arbitrator would believe it had already succeeded
+                    # and never retry, leaving the display stuck wrong
+                    # indefinitely with no way to notice.
+                    self.display_callback(idx, sources_cfg[idx])
+                except Exception as e:
+                    last_exception = e
+                    print(f"[tri_watch] source {idx} failed to display, trying next active source if any: {e}")
+                    continue
+                self.displayed_idx = idx
+                self._notified_while_active.discard(idx)
+                self.notification = None
+                return
+            if last_exception is not None:
+                raise last_exception  # every active source failed - still surface this rather than going silently idle
+            self.idle_callback()
+            return
+
+        # Notifications about a NEW, waiting source DO use the settled
+        # view - this is what the settling timer was actually meant
+        # for, filtering out brief, noise-induced or accidental short-
+        # burst "locks" from popping up a notification for something
+        # that was never a real, sustained transmission.
+        for idx in range(len(sources_cfg)):
+            if idx == self.displayed_idx:
+                continue
+            if settled_map.get(idx, False) and idx not in self._notified_while_active:
+                message = build_message_fn(idx, sources_cfg[idx])
+                self.notification = {"message": message, "triggered_at": time.time(), "source_idx": idx}
+                self._notified_while_active.add(idx)
+                break  # one new notification per step - avoids piling several up if multiple go active in the same instant
+
+    def get_notification(self):
+        """Returns the current notification dict if still within its
+        display window, else None."""
+        if self.notification is None:
+            return None
+        if time.time() - self.notification["triggered_at"] > self.notification_duration_secs:
+            return None
+        return self.notification
+
+def _build_tri_watch_message(idx, src_cfg):
+    """Builds the "someone else wants in" notification text for a
+    given source. RF uses a configurable template (tri_watch's own,
+    genuinely separate from the existing Slack notification system's
+    template - that one's built specifically around RF-lock events
+    with fields a stream source has no equivalent for, and wiring the
+    two together properly is Stage 4's job, not this one's) - default
+    wording matches what was actually asked for. Stream sources use
+    plain, user-typed text, since there's no live "who's transmitting"
+    data available for a stream the way there is for RF.
+
+    No format-based callsign validation here (an earlier version tried
+    filtering on "contains at least one digit", after the Picotuner's
+    own status parsing was observed picking up a stray word as though
+    it were a genuine callsign) - removed after Justin's own, direct
+    correction: callsign formats are genuinely diverse across countries
+    (his own EI3IOB/EI3IO span both 2- and 3-letter suffixes, and
+    GB3RS-style calls exist too), and a heuristic risks rejecting a
+    real, valid callsign in some format this doesn't account for. The
+    settling timer (see TriWatchArbitrator) already solves the actual
+    underlying problem more robustly - a transient parsing artifact
+    can't survive settling_seconds of sustained activity, so there's no
+    need to also guess at which specific values are "real"."""
+    if src_cfg.get('type') == 'rf':
+        rcv = src_cfg.get('rcv', 1)
+        state = picotuner_state_b if rcv == 2 else picotuner_state
+        live_callsign = state.get('callsign') or 'A station'
+
+        # QRZ name lookup, if configured, happens entirely in the
+        # BACKGROUND - never synchronously here. Confirmed as a real,
+        # serious risk otherwise: this function runs inside the
+        # arbitrator's own step() loop, which must stay responsive for
+        # tri_watch to work at all - a slow/unreachable QRZ could
+        # block it for the better part of a minute (multiple chained
+        # network timeouts: login, lookup, retry-after-expiry),
+        # delaying every other tri_watch decision for that entire
+        # window. The notification fires immediately with just the
+        # callsign; _kick_off_qrz_notification_lookup() below handles
+        # updating it in place afterwards, only if the same
+        # notification (matched by source_idx) is still showing by
+        # the time the lookup completes.
+        qrz_cfg = config.get('notifications', {}).get('qrz', {})
+        if qrz_cfg.get('lookup_for_notifications') and live_callsign != 'A station':
+            _kick_off_qrz_notification_lookup(idx, live_callsign, qrz_cfg, src_cfg)
+
+        return _format_rf_notification(live_callsign, "", src_cfg)
+    elif src_cfg.get('type') == 'stream':
+        site_callsign = config.get('site', {}).get('callsign') or 'this input'
+        return src_cfg.get('waiting_message') or f"Someone is waiting to access {site_callsign} via the web stream"
+    return "Another source wants attention"
+
+
+def _format_rf_notification(live_callsign, name, src_cfg):
+    """Builds the actual RF notification text, given whatever name is
+    currently known (empty string if none). Shared by both
+    _build_tri_watch_message()'s own immediate, name-less call and
+    _kick_off_qrz_notification_lookup()'s later, name-included one, so
+    the two can never drift apart in formatting."""
+    name_prefix = f"{name} " if name else ""
+    template = config.get('tri_watch', {}).get(
+        'rf_notification_template',
+        "{name_prefix}{callsign} is waiting to access {configured_callsign} on {frequency}")
+    try:
+        result = template.format(
+            callsign=live_callsign,
+            name=name,
+            name_prefix=name_prefix,
+            configured_callsign=src_cfg.get('callsign') or src_cfg.get('label') or 'this input',
+            frequency=f"{src_cfg.get('freq', 0) / 1000:.3f} MHz",
+        )
+    except (KeyError, ValueError) as e:
+        print(f"[tri_watch] rf_notification_template has an unusable placeholder ({e}) - using a plain fallback")
+        return f"{name_prefix}{live_callsign} is waiting on {src_cfg.get('label') or 'another input'}"
+
+    # A known name that the (possibly custom, possibly predating this
+    # feature) template doesn't actually reference anywhere would
+    # otherwise be silently dropped - confirmed as a real, reported
+    # gap: Python's str.format() ignores any keyword it's given that
+    # the template string doesn't use, so a template written before
+    # this feature existed computed the name correctly and then simply
+    # never showed it. Prepend it directly in that case, rather than
+    # requiring every existing, already-configured template to be
+    # manually updated just for the feature to do anything at all.
+    if name and "{name_prefix}" not in template and "{name}" not in template:
+        result = f"{name} {result}"
+
+    return result
+
+
+def _kick_off_qrz_notification_lookup(idx, live_callsign, qrz_cfg, src_cfg):
+    """Runs the QRZ name lookup in a background thread - see
+    _build_tri_watch_message()'s own comment for why this must never
+    run synchronously on the arbitrator's own step() loop. If it
+    completes while the SAME notification (matched by source_idx) is
+    still the one showing, rebuilds and replaces its message to
+    include the name. If a different/newer notification has since
+    replaced it, or it's already expired, the result is simply
+    discarded - never overwrites something unrelated."""
+    def _worker():
+        looked_up = lynx_notifications.qrz_callsign_lookup(
+            qrz_cfg.get('lookup_username', ''),
+            qrz_cfg.get('lookup_password', ''),
+            live_callsign)
+        if not looked_up:
+            return
+
+        # Wait briefly for the arbitrator to actually set
+        # self.notification. Confirmed as a real, reproduced race
+        # otherwise: this thread is started from INSIDE
+        # _build_tri_watch_message(), before that function has even
+        # returned its own message string back to the arbitrator's
+        # step() - which only sets self.notification on the very next
+        # line after that return. Normally a gap of microseconds, but
+        # a cached lookup (near-instant, e.g. the same callsign
+        # checked moments earlier via the /diagnostics test tool) can
+        # genuinely complete and check here before that single
+        # assignment has happened at all, silently discarding a
+        # perfectly good result. This bounded wait costs nothing in
+        # the normal case and only ever matters for this brief window.
+        deadline = time.time() + 2.0
+        current = tri_watch_arbitrator.notification
+        while (current is None or current.get("source_idx") != idx) and time.time() < deadline:
+            time.sleep(0.05)
+            current = tri_watch_arbitrator.notification
+        if current is None or current.get("source_idx") != idx:
+            return  # never appeared in time, or a different one is showing now
+
+        updated_message = _format_rf_notification(live_callsign, looked_up, src_cfg)
+        # Re-check immediately before writing - a best-effort UI
+        # enhancement, not something safety-critical, so this narrows
+        # the race against the notification expiring/changing between
+        # the check above and now without needing a full lock.
+        current = tri_watch_arbitrator.notification
+        if current is not None and current.get("source_idx") == idx:
+            current["message"] = updated_message
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _tri_watch_display_source(idx, src_cfg):
+    """The arbitrator's display_callback - actually switches to show
+    the given source. Reuses the exact same, proven tune()/
+    start_stream() paths a manual memory/preset selection would use,
+    rather than a separate, custom reimplementation of the display
+    logic - per Justin's own suggestion, after tri_watch's earlier,
+    hand-built RF-switching code missed a subtle but critical detail
+    (re-sending a fresh tune command every time, exactly like manual
+    selection always does) that a parallel reimplementation was always
+    at genuine risk of drifting from, and did.
+
+    For RF sources: sets tri_watch_target_rcv so the now tri_watch-
+    aware rf_mpv_lifecycle_monitor() knows which receiver to actually
+    watch and start mpv for, then calls tune() itself. This is
+    genuinely fire-and-forget for the mpv-starting part - exactly like
+    a normal, manual RF tune already is - since tune() itself never
+    starts mpv directly; the monitor handles confirming a stable lock
+    and getting mpv running from there, with its own, already-proven
+    retry logic, rather than this function needing its own, separate
+    copy of that same logic.
+
+    RF and stream sources need genuinely different locking: tune() and
+    start_stream() both acquire tune_lock internally, so this function
+    must never also acquire it itself, or it would deadlock against
+    itself."""
+    global tri_watch_target_rcv, mpv_running_for_rf, current_mode
+    src_type = src_cfg.get('type')
+    if src_type == 'rf':
+        rcv = src_cfg.get('rcv', 1)
+        # Stop draining THIS source's own port before mpv (once
+        # rf_mpv_lifecycle_monitor confirms lock) tries to bind to it -
+        # a drainer and mpv can't both be bound to the same UDP port at
+        # once - while every other enabled RF source keeps being
+        # drained. See PortDrainer's own docstring for why this might
+        # matter.
+        _tri_watch_sync_drainers(idx)
+        tri_watch_target_rcv = rcv
+        # Confirmed as a real bug: mpv_running_for_rf is a single,
+        # shared flag that doesn't distinguish which receiver mpv is
+        # actually running for. Switching targets here (e.g. Rx1 to
+        # Rx2) left it True from the previous receiver's session, so
+        # rf_mpv_lifecycle_monitor()'s own `not mpv_running_for_rf`
+        # check believed mpv was "already running" and never attempted
+        # to start it for the new target - it only got reset
+        # asynchronously by tune()'s own _kick_mpv() thread, after a
+        # delay, which wasn't reliably resolving this. Reset it
+        # immediately, synchronously, right here instead, so the very
+        # next poll correctly sees nothing running yet for this target.
+        mpv_running_for_rf = False
+        # Raised here, for BOTH paths below, rather than being left to
+        # fall out of tune() as a side effect.
+        #
+        # The cover belongs to the switch, not to the retune. It was
+        # only ever raised inside tune(), so when the retune-skip below
+        # was added - correctly, since re-tuning a receiver already on
+        # frequency just drops the lock and costs seconds - the cover
+        # silently went with it. Confirmed live: switching to an
+        # already-tuned Rx1 showed the bare acquisition screen, OSD and
+        # all, with no cover at all, while an Rx2 switch that happened
+        # to still need a retune covered correctly. The difference was
+        # never the receiver; it was whether that particular switch had
+        # a retune to hide behind.
+        #
+        # mpv is restarted either way - rf_mpv_lifecycle_monitor() owns
+        # that, and lowers this once it has confirmed real rendering -
+        # so either way there is a gap, and either way it wants
+        # covering. tune() calling start_transition_cover() again on the
+        # retune path is harmless: nested starts extend a cover rather
+        # than restarting its clock.
+        start_transition_cover()
+        _fplug = src_cfg.get('fplug', 'a' if rcv == 1 else 'b')
+        _lo = src_cfg.get('lnb_lo_khz', 0)
+        # Skip the tuner command when it would change nothing. tri_watch
+        # tunes every enabled RF source once at startup and leaves them
+        # there, so switching which one is DISPLAYED normally needs no
+        # tuning at all - but this went through tune() regardless, which
+        # dropped the lock and made the receiver reacquire from scratch:
+        # several seconds of black screen every time the display changed.
+        #
+        # The comparison is against what Lynx last COMMANDED this
+        # receiver, not against what the board reports. A reported
+        # frequency lags by a second or two and is briefly stale at
+        # exactly the moment of a switch, which is when it would be
+        # consulted; an earlier attempt compared against it and wrongly
+        # skipped retunes. What was commanded is exact and immediate.
+        #
+        # Anything unknown or different retunes as before, and the
+        # record is discarded whenever the board might have changed
+        # underneath - see forget_commanded_tune().
+        if commanded_tune_matches(rcv, src_cfg['freq'], src_cfg['sr'],
+                                  _lo, _fplug):
+            current_mode = "rf"
+            set_converter_state(rcv, src_cfg['freq'], _lo,
+                                'tri_watch display, already tuned')
+            print(f"[tri_watch] now displaying source {idx}: RF Rx{rcv} "
+                  f"(no retune - already commanded to this)")
+        else:
+            tune(TuneRequest(
+                freq=src_cfg['freq'],
+                sr=src_cfg['sr'],
+                plug=_fplug,
+                lnb_lo_khz=_lo,
+                rcv=rcv,
+            ))
+            print(f"[tri_watch] now displaying source {idx}: RF Rx{rcv}")
+    elif src_type == 'stream':
+        # No RF source is being displayed while a stream plays - every
+        # enabled RF source should be drained, and tri_watch_target_rcv
+        # cleared so rf_mpv_lifecycle_monitor() knows there's nothing
+        # for it to do.
+        _tri_watch_sync_drainers(None)
+        tri_watch_target_rcv = None
+        url = f"rtmp://{src_cfg['domain']}/{src_cfg['app']}/{src_cfg['streamname']}"
+        start_stream(StreamRequest(url=url, name=src_cfg.get('label', '')))
+        print(f"[tri_watch] now displaying source {idx}: stream")
+
+def _tri_watch_go_idle():
+    global tri_watch_target_rcv
+    if current_mode != "idle":
+        stop_current()
+        print("[tri_watch] no sources active - going idle")
+    # No RF source is displayed while idle either - drain everything
+    # and clear the target so rf_mpv_lifecycle_monitor() has nothing
+    # to watch.
+    _tri_watch_sync_drainers(None)
+    tri_watch_target_rcv = None
+
+tri_watch_arbitrator = TriWatchArbitrator(
+    _tri_watch_display_source, _tri_watch_go_idle,
+    notification_duration_secs=config.get('tri_watch', {}).get('notification_duration_secs', 20),
+    settling_seconds=config.get('tri_watch', {}).get('settling_seconds', 15),
+    lock_confirm_seconds=config.get('tri_watch', {}).get('lock_confirm_seconds', 3))
+
+# ---------------------------------------------------------------------
+#  End-of-contact station map
+# ---------------------------------------------------------------------
+#  Shows a full-screen card - where the station was, the path back here,
+#  and the signal figures from the contact - for a configurable window
+#  after the station stops transmitting. It replaces the idle logo
+#  screen rather than compositing over video, so it can never obscure a
+#  live picture.
+#
+#  No timers anywhere, deliberately. This follows the same pattern as
+#  TriWatchArbitrator.get_notification(): store a timestamp, work out on
+#  read whether the card is due, showing, or finished. A stale timer
+#  firing a card over a station that has since come back simply cannot
+#  happen, because nothing is ever scheduled.
+#
+#  WHY A WATCHER LOOP AND NOT A HOOK IN picotuner_monitor()
+#  --------------------------------------------------------
+#  The first version of this hooked the RX1 lock transition directly
+#  inside picotuner_monitor(), which is wrong in both of the modes that
+#  matter:
+#
+#    * Diversity - A and B receive the SAME station, and either one
+#      alone can carry the picture. Arming on A dropping would put a
+#      card up while B was still locked and the picture still playing.
+#      "Unlocked" here has to mean BOTH tuners unlocked, exactly as the
+#      OSD's own lock indicator already treats it.
+#
+#    * Tri-Watch - RX1 dropping is irrelevant if the arbitrator is
+#      currently displaying RX2 or a stream, and a station stopping on
+#      RX2 wouldn't have armed anything at all, because that monitor
+#      only parses RX1.
+#
+#  So the question is not "did a tuner unlock" but "did the thing we
+#  were actually SHOWING stop", which is a composite of mode, diversity
+#  state and the arbitrator's current choice. That is computed in one
+#  place below and evaluated on a slow poll - the same shape as the
+#  arbitrator's own loop.
+
+_pathfinder_cfg = config.get('pathfinder', {}) or {}
+pathfinder_tracker = lynx_map.PathfinderTracker(
+    delay_secs=_pathfinder_cfg.get('delay_secs', 2),
+    duration_secs=_pathfinder_cfg.get('duration_secs', 30),
+    max_distance_km=_pathfinder_cfg.get('max_distance_km', 1200),
+    enabled=_pathfinder_cfg.get('enabled', True))
+
+_pathfinder_prev = {"receiving": False, "callsign": "", "rcv": 1, "telemetry": {}}
+
+
+def pathfinder_source_changed(why=""):
+    """Tell Pathfinder that Lynx has stopped listening to whatever it
+    was listening to.
+
+    Called whenever LYNX changes source - a tune, a preset, a stream -
+    as opposed to the station going off air. pathfinder_watcher() cannot
+    tell those apart on its own: both are simply a lock that is no
+    longer there, so without this an operator switching channel armed an
+    end-of-contact card for a contact that never ended. Confirmed live:
+    switch away from a locked signal and back, and the card appeared in
+    the gap before the new source produced a picture.
+
+    Resetting 'receiving' rather than setting a flag for the watcher to
+    consume is deliberate. The unlock is only noticed a poll or two
+    later, so a flag would have to survive an unknown delay. With prev
+    already reset there is no transition left for the watcher to see, so
+    no card is ever armed - nothing to suppress, hold or expire.
+
+    Telemetry is dropped with it: it belongs to the contact just left,
+    and keeping it would put the old station's MER and frequency on a
+    later card.
+    """
+    try:
+        _pathfinder_prev["receiving"] = False
+        _pathfinder_prev["callsign"] = ""
+        _pathfinder_prev["telemetry"] = {}
+        # Existing method for "cancel any card pending or showing" -
+        # covers a card already armed by an unlock the watcher noticed
+        # before this ran.
+        pathfinder_tracker.station_locked()
+        if why:
+            print(f"[map] source changed ({why}) - not an end of contact")
+    except Exception as e:
+        print(f"[map] could not reset on source change: {e}")
+
+# ---------------------------------------------------------------------
+#  Auto-Squeak - Lindos sequence measurement
+# ---------------------------------------------------------------------
+# Listens continuously for a Lindos test sequence and measures the
+# audio path.
+#
+# OFF by default. It was on, on the reasoning that it costs only one
+# more reader on a monitor already being read for the PPM and does
+# nothing until a sequence arrives. That reasoning was wrong in a way
+# that only showed up on real hardware: a capture client influences how
+# PipeWire schedules the WHOLE audio graph, so an idle capture is not
+# free at all. Two receivers stuttered for days - audio breaking up,
+# video stalling - with provably perfect RF, and both were cured by
+# turning this off. The capture is now asked to be served in large lazy
+# chunks (see lynx_squeak.py), which should remove the cost, but a
+# feature most owners will never use should not be running on their
+# receiver by default while that is still a "should".
+_squeak_cfg = config.get('squeak', {}) or {}
+squeak_tracker = (lynx_squeak.SqueakTracker(
+    hold_secs=_squeak_cfg.get('hold_secs', 45),
+    enabled=_squeak_cfg.get('enabled', False))
+    if SQUEAK_AVAILABLE else None)
+squeak_listener = None
+
+# Longest Pathfinder will wait for an Auto-Squeak card to clear.
+SQUEAK_DEFER_MAX_S = 120.0
+
+
+def _squeak_monitor_target():
+    """Which monitor Auto-Squeak should listen on.
+
+    Follows mpv's output device, exactly as the PPM meter does, and for
+    the same reason it had to: the meter originally watched the default
+    sink, so with mpv sent to HDMI while a USB dongle was the system
+    default it sat reading silence with no indication why. Auto-Squeak
+    would fail the same way and look like a broken detector rather than
+    a misdirected one.
+
+    On PipeWire this is exact rather than inferred: mpv's device name
+    is "pipewire/<node>", so the monitor is "<node>.monitor". Falling
+    back to the default sink's monitor otherwise, which is right for a
+    single-output receiver and no worse than guessing on any other.
+    """
+    fallback = '@DEFAULT_SINK@.monitor'
+    try:
+        dev = str(config.get('display', {}).get('audio_device', 'hdmi')).strip()
+        if not dev or dev.lower() == 'auto':
+            return fallback
+        resolved = _cached_audio_device_resolved() or dev
+        if resolved.startswith('pipewire/'):
+            return resolved.split('/', 1)[1] + '.monitor'
+        m = re.search(r'CARD=([A-Za-z0-9_\-]+)', resolved)
+        if m:
+            for mon in list_audio_monitors():
+                if m.group(1).lower() in mon['name'].lower():
+                    return mon['name']
+        return fallback
+    except Exception as e:
+        print(f"[squeak] could not resolve the audio monitor ({e}) - "
+              f"using the default sink")
+        return fallback
+
+
+def list_audio_monitors():
+    """Monitor sources available for Auto-Squeak to listen on.
+
+    Uses pw-cli rather than pactl: pactl belongs to the PulseAudio
+    utilities package, which is not installed on a stock Raspberry Pi
+    OS running PipeWire, whereas pw-cli comes with PipeWire itself.
+    Confirmed the hard way on a receiver where pactl simply did not
+    exist."""
+    out = [{'name': '', 'description': 'Automatic (default output)'}]
+    try:
+        r = subprocess.run(['pw-cli', 'list-objects', 'Node'],
+                           capture_output=True, text=True, timeout=5)
+        name = None
+        for line in r.stdout.splitlines():
+            line = line.strip()
+            if line.startswith('node.name'):
+                name = line.split('=', 1)[1].strip().strip('"')
+            elif line.startswith('media.class') and name:
+                cls = line.split('=', 1)[1].strip().strip('"')
+                if cls == 'Audio/Sink':
+                    out.append({'name': name + '.monitor',
+                                'description': name + ' (monitor)'})
+                name = None
+    except Exception as e:
+        print(f"[squeak] could not list audio monitors: {e}")
+    return out
+
+
+def _squeak_status():
+    if squeak_tracker is None:
+        return None
+    """The card, trimmed for JSON. The response curves are numpy arrays
+    of a couple of hundred points each and are not JSON-serialisable,
+    so they are converted to plain lists here rather than anywhere that
+    would have to know about numpy."""
+    c = squeak_tracker.get_card()
+    if not c:
+        return None
+    out = {}
+    for k, v in c.items():
+        if k in ('resp_l', 'resp_r'):
+            out[k] = [list(map(float, v[0])), list(map(float, v[1]))]
+        elif k == 'segments':
+            continue
+        elif isinstance(v, (int, float, str, bool)) or v is None:
+            out[k] = v
+    return out
+
+
+def _squeak_result(res):
+    """Called by the listener when a pass completes."""
+    res['measured_at'] = time.time()
+    res['seq_name'] = _squeak_cfg.get('label', 'off-air')
+    if squeak_tracker is not None:
+        squeak_tracker.on_result(res)
+
+
+def _start_squeak():
+    """Started unconditionally like the other background threads, but
+    returns immediately unless enabled - the audio source is only
+    opened when the feature is actually wanted."""
+    global squeak_listener
+    if not SQUEAK_AVAILABLE or not _squeak_cfg.get('enabled', False):
+        return
+    # Blank means "follow whatever mpv is playing to" - see
+    # _squeak_monitor_target. An explicit name overrides it.
+    src = (_squeak_cfg.get('source') or '').strip() or _squeak_monitor_target()
+    print(f"[squeak] listening on {src}")
+    squeak_listener = lynx_squeak.SqueakListener(src, on_result=_squeak_result)
+    squeak_tracker.listener = squeak_listener
+    squeak_listener.start()
+
+
+
+
+def _pathfinder_current_source():
+    """Which tuner, if any, is currently supplying the displayed picture.
+
+    Returns (receiving, rcv) where rcv is 1 or 2. receiving is False
+    whenever nothing RF is on screen - including when Tri-Watch is
+    showing a stream, which has no callsign or locator and therefore no
+    card to draw.
+    """
+    tw = config.get('tri_watch', {}) or {}
+    if tw.get('enabled') and tri_watch_arbitrator is not None:
+        idx = tri_watch_arbitrator.displayed_idx
+        if idx is None:
+            return (False, 1)
+        try:
+            src = tri_watch_sources_cfg[idx]
+        except (IndexError, TypeError):
+            return (False, 1)
+        if src.get('type') != 'rf':
+            return (False, 1)          # a stream is showing - no card
+        rcv = src.get('rcv', 1)
+        st = picotuner_state_b if rcv == 2 else picotuner_state
+        return (bool(st.get('locked')), rcv)
+
+    # The RUNTIME flag, not config['diversity']['enabled']. Turning
+    # diversity on by tuning sets the global and does not write the
+    # config, so reading the file reports False - this branch was
+    # skipped entirely and the fall-through below looked only at tuner
+    # A. Pathfinder therefore drew nothing for a contact carried by Rx2
+    # alone, while mpv and the OSD showed it perfectly. The same
+    # mistake, in the same session, as the one that stopped QRZ logging
+    # an Rx2-only diversity contact.
+    if diversity_enabled:
+        # Either tuner alone can carry the picture, so the contact is
+        # only over once both have dropped.
+        a = bool(picotuner_state.get('locked'))
+        b = bool(picotuner_state_b.get('locked'))
+        if a:
+            return (True, 1)
+        if b:
+            return (True, 2)
+        return (False, 1)
+
+    return (bool(picotuner_state.get('locked')), 1)
+
+
+def pathfinder_watcher():
+    """Background thread - watches for the displayed station stopping,
+    and arms the end-of-contact card when it does.
+
+    Polls every second: fast enough that the configured delay is
+    accurate to within a second, slow enough to be free. Deliberately
+    tolerant of anything going wrong, since nothing here is worth taking
+    the receiver down for.
+    """
+    while True:
+        time.sleep(1)
+        try:
+            if not pathfinder_tracker.enabled:
+                continue
+            receiving, rcv = _pathfinder_current_source()
+            prev = _pathfinder_prev
+
+            if receiving:
+                st = picotuner_state_b if rcv == 2 else picotuner_state
+                cs = st.get('callsign', '')
+                if cs:
+                    prev['callsign'] = cs
+                    prev['rcv'] = rcv
+                if not prev['receiving']:
+                    # Something is on air again - cancel any card that
+                    # is pending or currently showing, and drop the
+                    # previous contact's telemetry. Done BEFORE caching
+                    # below, so this poll's own readings survive.
+                    pathfinder_tracker.station_locked()
+                    prev['telemetry'] = {}
+                prev['receiving'] = True
+                # Cache quality telemetry WHILE the signal is live.
+                # picotuner_quality_monitor() rebuilds these fields from
+                # each broadcast with fields.get('$12', '') /
+                # fields.get('$18', '') - so the moment the signal drops
+                # and the Picotuner stops sending those fields, mer and
+                # modcod are overwritten with empty strings, typically
+                # within ~500ms. Reading them at unlock is therefore a
+                # race that is essentially always lost: confirmed live,
+                # with a diagnostic print showing mer='10.8' one line
+                # before the snapshot that captured ''. symbol_rate and
+                # frequency survive that transition (they're not blanked
+                # the same way), which is exactly why those two kept
+                # appearing on the card while MER/MODCOD did not.
+                # Only overwrite with non-empty values, so a single
+                # broadcast missing a field can't wipe a good reading.
+                for k in ('modcod', 'symbol_rate', 'frequency'):
+                    v = st.get(k, '')
+                    if v:
+                        prev['telemetry'][k] = v
+                # MER is kept at its BEST value for the contact, not its
+                # most recent. Caching the latest reading on every poll
+                # sounds right but isn't: the final poll before unlock
+                # catches the signal already collapsing as the operator
+                # unkeys, so the card reported a far worse figure than
+                # the contact actually achieved (25.0 dB live on the
+                # tuner, 3.7 dB on the card, dropping further on repeat
+                # transmissions). The best reading is the honest
+                # summary of how the path actually performed, and it's
+                # what an operator means by "what was my MER".
+                # Margin is captured alongside whichever poll produced
+                # that best MER, so the two always come from the same
+                # instant rather than being mixed from different ones.
+                mer_now = st.get('mer', '')
+                if mer_now:
+                    try:
+                        if float(mer_now) > float(prev['telemetry'].get('mer') or '-inf'):
+                            prev['telemetry']['mer'] = mer_now
+                            margin_now = st.get('margin', '')
+                            if margin_now:
+                                prev['telemetry']['margin'] = margin_now
+                    except ValueError:
+                        pass
+                continue
+
+            if prev['receiving']:
+                prev['receiving'] = False
+                if prev['callsign']:
+                    _pathfinder_arm(prev['callsign'], prev['rcv'],
+                                     dict(prev['telemetry']))
+        except Exception as e:
+            print(f"[map] watcher: {e}")
+
+
+def _pathfinder_lnb_lo_khz(rcv):  # noqa: F811  - retained, see converter_state
+    """The LNB local oscillator currently in front of a receiver, in kHz.
+
+    Needed because the frequency the Picotuner reports is the IF, not
+    the downlink - the tuner has no idea an LNB sits in front of it.
+    With a 9750 LNB a QO-100 contact reports as roughly 743 MHz, and
+    with a 9000 LNB as roughly 1493 MHz; neither is the frequency being
+    received, and testing either against the 3cm bandplan would simply
+    return False for a contact that plainly did come via the satellite.
+    Adding the LO back reconstructs the real downlink, which is the
+    only number worth testing.
+
+    Mirrors _picotuner_expected_tuning()'s own source-of-truth rules
+    deliberately: tri_watch's per-source config when it is driving,
+    otherwise the saved tuning state."""
+    try:
+        if _tri_watch_present():
+            for src in globals().get('tri_watch_sources_cfg', []):
+                if src.get('enabled') and src.get('type') == 'rf' \
+                        and src.get('rcv') == rcv:
+                    return int(src.get('lnb_lo_khz', 0) or 0)
+            return 0
+        state = load_last_state() or {}
+        return int(state.get('lnb_lo_khz', 0) or 0)
+    except Exception as e:
+        print(f"[map] could not determine LNB LO: {e}")
+        return 0
+
+
+def _pathfinder_via_qo100(rcv, telemetry):
+    """Did this contact come via QO-100?
+
+    Config switch first: pathfinder.qo100_test forces the globe view on
+    for any contact, so the card can be developed and demonstrated at a
+    site with no 3cm satellite installation at all. Deliberately not
+    exposed on the Config page - it makes every card wrong, and is only
+    ever wanted by someone editing the file by hand.
+
+    Otherwise the downlink is reconstructed from the reported IF plus
+    the LNB LO and tested against the bandplan's satellite-only
+    segment. See lynx_map.is_qo100()."""
+    try:
+        if config.get('pathfinder', {}).get('qo100_test', False):
+            print("[map] pathfinder.qo100_test is set - forcing QO-100 globe view")
+            return True
+        raw = str(telemetry.get('frequency', '') or '').strip()
+        if not raw:
+            return False
+        if_khz = float(raw) * 1000.0     # Picotuner reports MHz
+        # Through the same single derivation as everything else. This
+        # used to add the LO itself, which was right for a down-converter
+        # and wrong for anything else - harmless in practice, since no
+        # up-converter contact is ever a 3cm satellite one, but a fifth
+        # copy of a rule that only needs to exist once.
+        on_air_mhz = on_air_from_if(rcv, if_khz / 1000.0)
+        return lynx_map.is_qo100(if_khz if on_air_mhz is None
+                                 else on_air_mhz * 1000.0)
+    except Exception as e:
+        print(f"[map] QO-100 check failed, assuming terrestrial: {e}")
+        return False
+
+
+def _pathfinder_on_air_frequency(rcv, reported_mhz):
+    """The card's frequency: the on-air one, not the IF.
+
+    Reads on_air_from_if() rather than working anything out. An earlier
+    version of this function had its own converter lookup and its own
+    call into the display maths - a fourth copy of the very thing that
+    made the card wrong in the first place.
+
+    Takes the IF as an argument because the card is built from telemetry
+    captured while the signal was still live, not from whatever the
+    board reports by the time the QRZ lookup returns.
+
+    Returns the reported value unchanged when there is no converter: a
+    card showing the IF is a far smaller problem than a card with no
+    frequency on it.
+    """
+    raw = str(reported_mhz or '').strip()
+    if not raw:
+        return reported_mhz
+    on_air = on_air_from_if(rcv, raw)
+    return reported_mhz if on_air is None else f"{on_air:.3f}"
+
+
+def _pathfinder_arm(callsign, rcv, telemetry):
+    """Looks the station up and arms the card if it has a usable
+    locator. The QRZ lookup runs on its own thread - never inline, for
+    the same reason tri_watch's name lookup doesn't: a slow or
+    unreachable QRZ must not stall anything.
+
+    telemetry (mer/modcod/symbol_rate/frequency) is passed in by
+    pathfinder_watcher(), which caches it continuously while the
+    signal is still LIVE. It is deliberately NOT read from
+    picotuner_state here, and this is the whole fix for a
+    long-standing bug where the card showed no MER or MODCOD:
+    picotuner_quality_monitor() rebuilds those fields from every
+    broadcast via fields.get('$12', '') / fields.get('$18', ''), so
+    the instant a signal drops and the Picotuner stops sending them,
+    both are overwritten with empty strings - typically within about
+    500ms, and always before this function gets to run. Confirmed
+    live: a diagnostic print here read mer='10.8' and modcod='QPSK
+    8/9', and the snapshot taken on the very next line captured ''
+    for both. symbol_rate and frequency aren't blanked on that
+    transition, which is exactly why they kept appearing on the card
+    while MER and MODCOD didn't - the one clue that separated a lost
+    race from a rendering problem.
+
+    Two earlier attempts at this misdiagnosed it as a startup race and
+    added a bounded wait for MER to *arrive*; both were wrong, because
+    the data was already there and about to be destroyed rather than
+    still on its way. Waiting made it strictly worse.
+    """
+    snapshot = {
+        'mer': telemetry.get('mer', ''),
+        'modcod': telemetry.get('modcod', ''),
+        'symbol_rate': telemetry.get('symbol_rate', ''),
+        'frequency': _pathfinder_on_air_frequency(
+            rcv, telemetry.get('frequency', '')),
+    }
+
+    def _lookup():
+        try:
+            qrz_cfg = config.get('notifications', {}).get('qrz', {})
+            name, grid = lynx_notifications.qrz_callsign_details(
+                qrz_cfg.get('lookup_username', ''),
+                qrz_cfg.get('lookup_password', ''),
+                callsign)
+            if not grid:
+                print(f"[map] {callsign}: no locator on QRZ - no card")
+                return
+            home = config.get('site', {}).get('locator', '')
+            pos_h = lynx_map.locator_to_latlon(home)
+            pos_s = lynx_map.locator_to_latlon(grid)
+            via_qo100 = _pathfinder_via_qo100(rcv, telemetry)
+            # max_distance_km exists to catch a stale or default QRZ
+            # locator on a terrestrial contact, where a few thousand km
+            # really does mean the data is wrong rather than the contact
+            # extraordinary. Via QO-100 that reasoning inverts: the
+            # satellite's footprint is most of a hemisphere, so a South
+            # African or Brazilian station is entirely ordinary and
+            # rejecting it is the bug. The sanity check the globe view
+            # relies on instead is the bandplan test that got us here -
+            # a contact in the satellite-only part of 3cm genuinely did
+            # come via the bird, whatever the distance.
+            if pos_h and pos_s and not via_qo100:
+                d = lynx_map.haversine_km(*pos_h, *pos_s)
+                if d > pathfinder_tracker.max_distance_km:
+                    # Almost always a stale or default QRZ locator rather
+                    # than a genuinely extraordinary contact. Better to
+                    # show nothing than to publish a confidently wrong
+                    # map on a live stream.
+                    print(f"[map] {callsign}: {d:.0f}km exceeds max_distance_km "
+                          f"- treating locator {grid} as unreliable, no card")
+                    return
+            # Queue behind Auto-Squeak rather than fighting it. A test
+            # transmission ends like any other, so Pathfinder arms as
+            # normal - but the squeak measurement is still running and
+            # its card is the one wanted first. Waiting here rather
+            # than suppressing means Pathfinder still gets its full
+            # display window afterwards instead of being lost.
+            #
+            # This runs on the QRZ lookup thread, so blocking is free.
+            # Bounded, because a card several minutes after the contact
+            # would be worse than none: if Auto-Squeak somehow never
+            # finishes, Pathfinder goes ahead anyway.
+            waited = 0.0
+            while squeak_tracker is not None and squeak_tracker.busy() \
+                    and waited < SQUEAK_DEFER_MAX_S:
+                if waited == 0.0:
+                    print(f"[map] {callsign}: holding card while Auto-Squeak finishes")
+                time.sleep(0.5)
+                waited += 0.5
+            if waited:
+                print(f"[map] {callsign}: resuming after {waited:.0f}s")
+
+            pathfinder_tracker.station_unlocked(
+                callsign, grid, name=name, via_qo100=via_qo100,
+                **snapshot)
+        except Exception as e:
+            print(f"[map] lookup for {callsign} failed: {e}")
+
+    threading.Thread(target=_lookup, daemon=True).start()
+
 
 # ---------------------------------------------------------------------
 #  Picotuner tuning watchdog
@@ -2498,11 +5080,6 @@ PICOTUNER_CHECK_SECS = 2.0          # how often to compare
 PICOTUNER_MISMATCH_SECS = 20.0      # sustained disagreement before acting
 PICOTUNER_RETUNE_SETTLE_SECS = 8.0  # let its firmware finish booting first
 PICOTUNER_RETUNE_COOLDOWN_SECS = 90.0   # don't hammer a tuner that won't take
-PICOTUNER_FUTILE_FIXES_WARN = 3     # restores in a row achieving nothing before
-                                    # suggesting the commands aren't arriving.
-                                    # Three rather than one: a genuine power
-                                    # cycle mid-restore, or a Pico still booting,
-                                    # can legitimately waste one or two.
 
 
 def _tri_watch_present():
@@ -2531,24 +5108,18 @@ def _stream_is_being_shown():
     transmitter keyed and its vision mixer switched exactly as it would
     for an RF signal.
 
-    tri_watch names are looked up rather than referenced directly, for
-    the same reason as _tri_watch_present(): this function is identical
-    on main, which has no tri_watch at all, and a bare reference would
-    raise NameError the first time it ran. Under tri_watch it follows
-    whichever source the arbitrator is actually displaying, so a
-    background stream that isn't on screen doesn't key anything.
-    Outside it, plain stream mode is the whole answer.
+    Under tri_watch, follows whichever source the arbitrator is actually
+    displaying, so a background stream that isn't on screen doesn't key
+    anything. Outside it, plain stream mode is the whole answer.
     """
     try:
-        if _tri_watch_present():
-            arb = globals().get('tri_watch_arbitrator')
-            if arb is None:
-                return False
-            idx = arb.displayed_idx
+        tw = config.get('tri_watch', {}) or {}
+        if tw.get('enabled') and tri_watch_arbitrator is not None:
+            idx = tri_watch_arbitrator.displayed_idx
             if idx is None:
                 return False
             try:
-                src = globals().get('tri_watch_sources_cfg', [])[idx]
+                src = tri_watch_sources_cfg[idx]
             except (IndexError, TypeError):
                 return False
             return src.get('type') == 'stream'
@@ -2651,7 +5222,6 @@ def picotuner_tuning_watchdog():
     tuning, whatever the cause."""
     bad_since = None
     last_fix = 0.0
-    futile_fixes = 0     # consecutive restores that changed nothing
     while True:
         time.sleep(PICOTUNER_CHECK_SECS)
         try:
@@ -2726,7 +5296,6 @@ def picotuner_tuning_watchdog():
 
             if not wrong:
                 bad_since = None
-                futile_fixes = 0       # a restore worked - start counting again
                 continue
 
             now = time.time()
@@ -2743,42 +5312,6 @@ def picotuner_tuning_watchdog():
                   "power cycle, so restoring:")
             for why in wrong:
                 print(f"[picotuner]     {why}")
-
-            # Restores that never take are worth saying out loud.
-            #
-            # Status and commands travel in opposite directions and only
-            # one of them needs to be configured correctly. Status is
-            # RECEIVED by binding a local port and listening to the
-            # Picotuner's broadcasts - which needs no knowledge of its
-            # address at all. Commands are SENT to picotuner.host on
-            # picotuner.cmd_port, fire-and-forget UDP that deliberately
-            # never raises, so a wrong-but-valid address or port produces
-            # no error and no log line anywhere.
-            #
-            # The result is a receiver showing perfect, live status from
-            # a Picotuner it cannot actually command: every tune returns
-            # 200 OK, nothing ever changes, and this watchdog restores
-            # forever without once remarking that its restores achieve
-            # nothing. Reported from the field and diagnosed the long way
-            # round; this is the line that would have shortened it.
-            futile_fixes += 1
-            if futile_fixes == PICOTUNER_FUTILE_FIXES_WARN:
-                cfg_pt = config['picotuner']
-                print(f"[picotuner] WARNING: {futile_fixes} restores in a row "
-                      f"have not changed anything. Commands may not be "
-                      f"reaching the Picotuner at all - status is received by "
-                      f"listening, so it stays correct even when commands go "
-                      f"nowhere. Check that host={cfg_pt.get('host')} and "
-                      f"cmd_port={cfg_pt.get('cmd_port')} are really this "
-                      f"Picotuner's. Its actual address is the source of the "
-                      f"status broadcasts: "
-                      f"sudo tcpdump -n -i any udp port "
-                      f"{cfg_pt.get('status_port', 9997) - 96} -c 5")
-                record_diagnostic_event("picotuner_restores_futile",
-                                        f"{futile_fixes} consecutive restores "
-                                        f"with no change - check host/cmd_port",
-                                        count_as_mpv_restart=False)
-
             last_fix = now
             bad_since = None
             threading.Thread(target=_picotuner_restore_tuning,
@@ -2826,10 +5359,7 @@ def _picotuner_restore_tuning():
             if current_lnb_psu_b == 'absent':
                 pass          # no generator fitted - nothing to command
             elif current_lnb_psu_b != v_b or (v_b != "off" and current_lnb_tone_b != t_b):
-                # NB: main's picotuner_rcv2_cmd() takes the command
-                # ONLY - beta's takes a config dict as well. Lifting
-                # beta's call form across broke main's startup entirely.
-                picotuner_rcv2_cmd(f"[to@wh] vgy={cmd_b}")
+                picotuner_rcv2_cmd(f"[to@wh] vgy={cmd_b}", config['picotuner'])
                 print(f"[picotuner] restore: LNB supply B -> {cmd_b}")
                 sent_psu = sent_psu or v_b != "off"
         except Exception as e:
@@ -2847,9 +5377,7 @@ def _picotuner_restore_tuning():
             print("[picotuner] restore: re-tuning tri_watch RF sources")
             # Looked up rather than called directly, for the same reason
             # as _tri_watch_present(): this file is identical on main,
-            # which has no tri_watch at all. The branch can't be reached
-            # there, but relying on that is fragile - an explicit lookup
-            # can't turn into a NameError if anything ever changes.
+            # which has no tri_watch at all.
             _startup_tune = globals().get('tri_watch_startup_tune')
             if not _startup_tune:
                 print("[picotuner] restore: tri_watch enabled but its tune "
@@ -2900,10 +5428,6 @@ def _picotuner_restore_tuning():
         # True from this path is always cleared. Verified rather than
         # assumed; the failure here is theft, not deadlock.)
         #
-        # Backing off when the lock is busy does not lose the restore:
-        # the watchdog keeps polling, still sees the mismatch, and fires
-        # again after its cooldown.
-        #
         # Safe to block here: this runs on its own daemon thread, spawned
         # by the watchdog loop, holding nothing.
         if not tune_lock.acquire(timeout=15):
@@ -2924,6 +5448,237 @@ def _picotuner_restore_tuning():
         print(f"[picotuner] restore failed: {e}")
 
 
+def tri_watch_arbitrator_loop():
+    """Background thread - periodically builds the current active/
+    locked state for every enabled tri_watch source and feeds it to
+    the arbitrator's step() to decide what, if anything, needs to
+    change. Every 2s: frequent enough that switching feels reasonably
+    prompt, infrequent enough not to spam restart_mpv()/picotuner_cmd()
+    if something is flapping right at the edge of lock."""
+    while True:
+        time.sleep(2)
+        if not tri_watch_enabled:
+            continue
+        # Deliberately the startup snapshot, NOT config.get('tri_watch',
+        # {}).get('sources', []) - see tri_watch_sources_cfg's own
+        # module-level comment for why: this list's indices must stay
+        # exactly matched to tri_watch_probes, which is also only ever
+        # built once at startup.
+        sources_cfg = tri_watch_sources_cfg
+        active_map = {}
+        for idx, src in enumerate(sources_cfg):
+            if not src.get('enabled', False):
+                continue
+            if src.get('type') == 'rf':
+                rcv = src.get('rcv', 1)
+                state = picotuner_state_b if rcv == 2 else picotuner_state
+                active_map[idx] = state['locked']
+            elif src.get('type') == 'stream':
+                probe = tri_watch_probes.get(idx)
+                active_map[idx] = probe.is_active if probe is not None else False
+        try:
+            tri_watch_arbitrator.step(active_map, sources_cfg, _build_tri_watch_message)
+        except Exception as e:
+            print(f"[tri_watch] arbitrator step failed: {e}")
+
+def _reverse_converter(if_mhz, lo_khz, side):
+    """The on-air frequency for an IF, given a converter. THE only place
+    this arithmetic exists.
+
+    Exactly the inverse of calc_tuner_freq(), which is why no band
+    boundaries appear here: the side was already decided by
+    converter_side() from the wanted frequency and the LO, in the one
+    place that rule lives.
+
+    Rounded to 3 dp because binary floating point cannot represent these
+    subtractions exactly - 191.010 - 120.0 is 71.00999999999999, which
+    reached QRZ as a logged frequency before this rounding was central.
+    """
+    lo_mhz = lo_khz / 1000
+    if side == "up":
+        # Up-converter (transverter): IF = freq + LO, so freq = IF - LO.
+        # 6m/4m/10m depend on this; without it the answer is wrong by
+        # twice the LO.
+        return round(if_mhz - lo_mhz, 3)
+    if side == "high":
+        # High-side injection (C-band): IF = LO - freq
+        return round(lo_mhz - if_mhz, 3)
+    # Low-side (Ku LNB, or an IF down-converter like the IC-9700's):
+    # IF = freq - LO
+    return round(if_mhz + lo_mhz, 3)
+
+
+def on_air_from_if(rcv, if_mhz):
+    """The real on-air frequency for an IF this receiver reported.
+
+    Takes the IF as an argument rather than reading it, because the
+    callers that matter most - the Pathfinder card and the notifications
+    manager - work from an IF captured at the moment of a contact, not
+    from whatever the board happens to be reporting when they run.
+
+    Returns None when there is no converter, or when the IF is not a
+    usable number. None means "no separate on-air frequency", not an
+    error: consumers show the reported figure as-is.
+    """
+    try:
+        conv = get_converter(rcv)
+        if not conv["lo_khz"]:
+            return None
+        return _reverse_converter(float(if_mhz), conv["lo_khz"], conv["side"])
+    except (TypeError, ValueError):
+        return None
+
+
+def on_air_frequency(rcv=1):
+    """on_air_from_if() for whatever this receiver is reporting now.
+
+    Used by the API, and through it by the OSD and Web UI, neither of
+    which does any arithmetic of its own.
+    """
+    st = picotuner_state_b if int(rcv or 1) == 2 else picotuner_state
+    return on_air_from_if(rcv, st.get("frequency", ""))
+
+
+def init_converter_state():
+    """Seed both receivers' records at startup, before anything reads
+    them.
+
+    Without this there is a window at startup where the records hold
+    their defaults while the receivers are already locked and reporting.
+    Confirmed live 2026-09-02: the notifications manager's 5s settle
+    timer fired before _resume_on_startup()'s 7s delay had set any
+    converter state, so a 70.010 MHz contact was logged to QRZ as
+    190.010 - the raw IF, with no LO applied. Everything looked correct
+    seconds later, which is what made it so hard to see.
+
+    Same sources of truth the tune paths use: tri_watch's per-source
+    config when it is driving, otherwise the saved tuning state.
+    """
+    try:
+        if bool(globals().get('tri_watch_enabled')):
+            for src in globals().get('tri_watch_sources_cfg', []) or []:
+                if src.get('enabled') and src.get('type') == 'rf' \
+                        and src.get('rcv') in (1, 2):
+                    set_converter_state(src['rcv'], int(src.get('freq', 0) or 0),
+                                        int(src.get('lnb_lo_khz', 0) or 0),
+                                        'startup, tri_watch config')
+            return
+        state = load_last_state() or {}
+        if state.get('mode') != 'rf':
+            return
+        freq = int(state.get('freq', 0) or 0)
+        lo = int(state.get('lnb_lo_khz', 0) or 0)
+        set_converter_state(1, freq, lo, 'startup, saved state')
+        if str(state.get('plug', '')).lower() == 'diversity':
+            set_converter_state(2, freq, lo, 'startup, saved state')
+    except Exception as e:
+        print(f"[converter] could not seed startup state: {e}")
+
+@app.get("/api/picotuner/discovered", tags=["Status"],
+         summary="List Picotuners currently heard on the local network",
+         description="Every Picotuner broadcasting on this network segment, "
+                     "not just the one currently configured - a genuine UDP "
+                     "broadcast, so this includes units never yet pointed at "
+                     "this Lynx instance. Entries not heard from in the last "
+                     "10 seconds are treated as offline and left out.")
+def get_discovered_picotuners():
+    now = time.time()
+    return {
+        "picotuners": [
+            info for info in discovered_picotuners.values()
+            if now - info["last_seen"] <= 10
+        ]
+    }
+
+@app.get("/quicklynx", include_in_schema=False)
+def serve_quicklynx():
+    """Serves QuickLynx from this receiver, when enabled.
+
+    Two things this buys over running it from a laptop. Served from the
+    same origin as /api/tune there is no host to configure and no
+    cross-origin question - the setting people most often get wrong
+    otherwise. And it is reachable from any device on the network
+    without running anything locally.
+
+    Off by default: it holds an outbound connection to BATC, and most
+    installations are repeaters that would never use it. QuickLynx's own
+    standalone server still works unchanged for anyone who prefers it.
+    """
+    if not config.get('quicklynx', {}).get('enabled', False):
+        return HTMLResponse(
+            "<h3>QuickLynx is not enabled</h3>"
+            "<p>Turn it on in <a href='/config'>Config</a>, under "
+            "QuickLynx Spectrum Tuner.</p>", status_code=404)
+
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "quicklynx.html")
+    if not os.path.exists(path):
+        return HTMLResponse(
+            "<h3>quicklynx.html not found</h3>"
+            "<p>It is expected alongside lynx_app.py. Copy it from the "
+            "QuickLynx repository.</p>", status_code=404)
+    with open(path, encoding='utf-8') as f:
+        html = f.read()
+    # Tells the page which server it is under, so it can pick the right
+    # chat proxy path and default the receiver address to this origin.
+    # The same file is also served by QuickLynx's own standalone server,
+    # where neither applies.
+    html = html.replace("<head>", '<head>\n<meta name="lynx-hosted" content="1">', 1)
+    return HTMLResponse(html)
+
+
+@app.get("/quicklynx/chat", include_in_schema=False)
+def proxy_quicklynx_chat():
+    """Re-serves BATC's wideband chat page so it can be framed.
+
+    BATC send X-Frame-Options, which stops the page being embedded from
+    another origin - it loads fine in its own tab but comes up blank in
+    an iframe. Fetching it here and serving it from this origin sidesteps
+    that: the browser's frame check only cares where the framed DOCUMENT
+    came from, not where its scripts and sockets subsequently talk to,
+    which continue to reach BATC directly.
+    """
+    if not config.get('quicklynx', {}).get('enabled', False):
+        return HTMLResponse("QuickLynx is not enabled", status_code=404)
+    CHAT_URL = "https://eshail.batc.org.uk/wb/chat/"
+    try:
+        req = urllib.request.Request(
+            CHAT_URL,
+            # Some servers reject urllib's default User-Agent outright.
+            headers={"User-Agent": "Mozilla/5.0 (compatible; Lynx QuickLynx proxy)"})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            charset = r.headers.get_content_charset() or "utf-8"
+            html = r.read().decode(charset, errors="replace")
+
+        # A <base> tag is essential, not cosmetic. Without it every
+        # relative URL in the page - stylesheets, scripts, and any
+        # relative Socket.IO connection its own JavaScript builds -
+        # resolves against THIS server instead of BATC. The browser then
+        # fetches a pile of files that do not exist here and renders a
+        # blank white block, which is exactly what happened when this was
+        # first written without one.
+        base_tag = f'<base href="{CHAT_URL}">'
+        if "<head>" in html:
+            html = html.replace("<head>", "<head>" + base_tag, 1)
+        elif "<head " in html:
+            # a <head> with attributes: insert just after its closing >
+            idx = html.index("<head ")
+            close = html.index(">", idx) + 1
+            html = html[:close] + base_tag + html[close:]
+        else:
+            html = base_tag + html
+
+        # Deliberately a fresh response from this origin rather than a
+        # forwarding of BATC's own headers - not carrying their
+        # X-Frame-Options across is the entire point of proxying.
+        return HTMLResponse(html)
+    except Exception as e:
+        print(f"[quicklynx] chat proxy failed: {e}")
+        return HTMLResponse(
+            f"<p style='font-family:sans-serif;padding:1em'>"
+            f"Chat unavailable: {e}</p>", status_code=502)
+
+
 @app.get("/api/status", tags=["Status"],
          summary="Get current receiver status",
          description="Returns lock state, MER, callsign, frequency and more. "
@@ -2941,16 +5696,67 @@ def get_status():
             "mpv_restarts_total": diagnostics["mpv_restarts_total"],
             "mpv_drift": get_mpv_drift_status(),
             "portable_locator": config.get('notifications', {}).get('qrz', {}).get('portable_locator', ''),
+            "portable_locator_provenance": _gnss_provenance(),
+            "gnss": {"mode": config.get('gnss', {}).get('mode', 'automatic'),
+                      "running": gnss_reader.running, **gnss_reader.status()},
             "ppm_style": config.get('display', {}).get('ppm_style', 'full_fat'),
+            "refresh_hz": config.get('display', {}).get('refresh_hz', 50),
+            "max_height": config.get('display', {}).get('max_height', 1080),
+            "quicklynx_enabled": bool(config.get('quicklynx', {}).get('enabled', False)),
+            "site_locator": config.get('site', {}).get('locator', ''),
+            # Published so the overlay's PPM can follow mpv to whichever
+            # device it is actually using. Without this the meter taps
+            # the default sink and would read silence whenever mpv is
+            # sent somewhere else.
+            "audio_device": config.get('display', {}).get('audio_device', 'hdmi'),
+            "audio_device_resolved": _cached_audio_device_resolved(),
+            "site_location": config.get('site', {}).get('location', ''),
+            # End-of-contact map: None unless a card is due to be on
+            # screen right now. The overlay only has to check presence -
+            # all the timing is worked out here, from a timestamp.
+            # Told whether there is genuinely a picture on screen, so the
+            # card is held across the gap between a station locking and
+            # its picture appearing, rather than vanishing on the lock and
+            # leaving the idle screen up while the source acquires.
+            # mpv_running_for_rf is set only once mpv has confirmed it is
+            # rendering, which is exactly when the picture arrives.
+            #
+            # Deliberately only applied to RF, the case this was reported
+            # for. Anything else reports ready immediately, so behaviour
+            # elsewhere is unchanged.
+            "pathfinder": pathfinder_tracker.get_card(
+                picture_ready=(current_mode != "rf" or mpv_running_for_rf)
+            ),
+            # Published so the overlay can hold its own switch cover back
+            # by the same delay, for the same reason. The Pathfinder card
+            # waits this long before appearing so a brief fade doesn't
+            # throw a full-screen card up over a contact that hasn't
+            # actually ended; a placeholder shown instantly during a
+            # source change makes exactly that mistake in a different
+            # place. One configured value, one behaviour, rather than the
+            # overlay carrying a second timer that could disagree with
+            # this one.
+            "pathfinder_delay_secs": pathfinder_tracker.delay_secs,
+            # The other half of the configured Pathfinder window. The
+            # overlay adds the two together for the longest it will hold
+            # a switch cover - the same total the config page already
+            # calls the Pathfinder window and warns against setting too
+            # high (see pathfinderWindow() there). A cover exists to
+            # carry the screen until something replaces it, and there is
+            # nothing left for it to carry once the card it was covering
+            # for would itself have finished.
+            "pathfinder_duration_secs": pathfinder_tracker.duration_secs,
+            "squeak": _squeak_status(),
             "timestamp": utc_now_iso()
         },
         "picotuner": {
             "online": picotuner_state["online"],
             "locked": picotuner_state["locked"],
             "callsign": picotuner_state["callsign"],
+            "callsign_name": qrz_first_name(picotuner_state["callsign"]),
             "frequency": picotuner_state["frequency"],
-            "downlink_frequency": _compute_downlink_frequency(),
-            "lnb_lo_khz": current_lnb_lo_khz,
+            "downlink_frequency": on_air_frequency(1),
+            "lnb_lo_khz": get_converter(1)["lo_khz"],
             "symbol_rate": picotuner_state["symbol_rate"],
             "rx1": picotuner_state["rx1_raw"],
             "firmware": picotuner_state["firmware"],
@@ -2987,6 +5793,9 @@ def get_status():
                 "online": picotuner_state_b["online"],
                 "locked": picotuner_state_b["locked"],
                 "callsign": picotuner_state_b["callsign"],
+                "downlink_frequency": on_air_frequency(2),
+                "lnb_lo_khz": get_converter(2)["lo_khz"],
+                "callsign_name": qrz_first_name(picotuner_state_b["callsign"]),
                 "frequency": picotuner_state_b["frequency"],
                 "mer": picotuner_state_b["mer"],
                 "margin": picotuner_state_b["margin"],
@@ -3008,7 +5817,8 @@ def get_status():
             # which get less representative of current conditions
             # the longer the combiner has been running.
             "stats": read_diversity_stats(),
-        }
+        },
+        "tri_watch": get_tri_watch_status()
     }
     # Ryde status block — commented out, see ryde_cmd() docstring for why.
     # if config['ryde']['enabled']:
@@ -3031,6 +5841,219 @@ def get_diagnostics():
         "mpv_restarts_by_reason": diagnostics["mpv_restarts_by_reason"],
         "events": list(reversed(diagnostics["events"])),  # newest first
     }
+
+class TestcardUploadRequest(BaseModel):
+    """The switch placeholder card, posted as base64 rather than as a
+    multipart file upload.
+
+    Multipart would be the obvious choice, but FastAPI needs
+    python-multipart for it and that isn't among Lynx's dependencies -
+    adding one means every existing receiver has to complete a
+    dependency refresh before the config page works at all, which is a
+    poor trade for a single small upload. Base64 in a JSON body needs
+    nothing that isn't already here, and a test card is a few hundred
+    kilobytes to a local server."""
+    filename: str = ""       # only used to pick the saved extension
+    data_base64: str
+
+
+# Where an uploaded card is written, and what it may be.
+#
+# config/ rather than the repo root, deliberately. lynx_testcard.png in
+# the root is a TRACKED file - writing an upload over it would leave the
+# receiver's working tree dirty and every later `git pull` would refuse
+# to fast-forward, breaking updates for exactly the people who used this
+# feature. config/ is gitignored (alongside lynx_config.yaml, for the
+# same reason), so an uploaded card survives updates and never collides
+# with the shipped one. The overlay looks here first and falls back to
+# the repo copy - see _find_switching_graphic() in lynx_overlay.py.
+TESTCARD_DIR = Path(__file__).parent / "config"
+TESTCARD_MAX_BYTES = 12 * 1024 * 1024
+
+# Checked against the file's own leading bytes, not its name. An
+# extension is a claim by whoever uploaded the file; the magic number is
+# what GdkPixbuf will actually act on when the overlay loads it, so that
+# is what gets validated. Every format here is one GdkPixbuf reads.
+TESTCARD_MAGIC = (
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"GIF87a", ".gif"),
+    (b"GIF89a", ".gif"),
+)
+
+def _testcard_existing():
+    """The uploaded card currently in place, or None."""
+    for p in sorted(TESTCARD_DIR.glob("lynx_testcard.*")):
+        return p
+    return None
+
+def _testcard_kind(raw: bytes):
+    """The extension implied by the data itself, or None if it isn't an
+    image format the overlay can draw."""
+    for magic, ext in TESTCARD_MAGIC:
+        if raw.startswith(magic):
+            return ext
+    # WebP is the one that needs more than a prefix: "RIFF" then a
+    # four-byte length then "WEBP".
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return ".webp"
+    return None
+
+@app.get("/api/testcard", tags=["Configuration"],
+         summary="Whether a switch placeholder card is in place",
+         description="Reports which card the overlay would draw during a "
+                     "Tri-Watch source change when Pathfinder has nothing "
+                     "to show - an uploaded one, the card shipped with "
+                     "Lynx, or none at all.")
+def get_testcard():
+    uploaded = _testcard_existing()
+    shipped = Path(__file__).parent / "lynx_testcard.png"
+    if uploaded is not None:
+        return {"source": "uploaded", "filename": uploaded.name,
+                "bytes": uploaded.stat().st_size}
+    if shipped.exists():
+        return {"source": "shipped", "filename": shipped.name,
+                "bytes": shipped.stat().st_size}
+    return {"source": "none", "filename": "", "bytes": 0}
+
+@app.post("/api/testcard", tags=["Configuration"],
+          summary="Upload a switch placeholder card",
+          description="Replaces the card shown during a Tri-Watch source "
+                      "change when Pathfinder has nothing to show. PNG, "
+                      "JPEG, GIF or WebP; 1920x1080 suits the video frame "
+                      "exactly, though anything is scaled to fill. Takes "
+                      "effect within a couple of seconds - no restart. The "
+                      "file is written outside the repository, so updates "
+                      "never overwrite it.")
+def post_testcard(req: TestcardUploadRequest):
+    try:
+        raw = base64.b64decode(req.data_base64, validate=True)
+    except Exception:
+        raise HTTPException(status_code=400,
+            detail="Could not decode the uploaded data")
+    if not raw:
+        raise HTTPException(status_code=400, detail="The file is empty")
+    if len(raw) > TESTCARD_MAX_BYTES:
+        raise HTTPException(status_code=413,
+            detail=f"That file is {len(raw) / 1048576:.1f} MB - the limit is "
+                   f"{TESTCARD_MAX_BYTES // 1048576} MB")
+    ext = _testcard_kind(raw)
+    if ext is None:
+        raise HTTPException(status_code=400,
+            detail="That doesn't look like a PNG, JPEG, GIF or WebP image")
+
+    TESTCARD_DIR.mkdir(parents=True, exist_ok=True)
+    # Any previous upload goes first, whatever its extension - otherwise
+    # replacing a .png with a .jpg would leave both behind and the
+    # overlay would pick whichever sorted first, which is not
+    # necessarily the new one.
+    for old in TESTCARD_DIR.glob("lynx_testcard.*"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    # Written via a temporary file and renamed, same as every other
+    # write in this file: the overlay re-reads this path on a timer of
+    # its own, and could otherwise catch a half-written image.
+    dest = TESTCARD_DIR / f"lynx_testcard{ext}"
+    tmp = dest.with_suffix(dest.suffix + ".tmp")
+    tmp.write_bytes(raw)
+    os.replace(tmp, dest)
+    print(f"[testcard] uploaded {len(raw)} bytes -> {dest}")
+    return {"result": "ok", "filename": dest.name, "bytes": len(raw)}
+
+@app.delete("/api/testcard", tags=["Configuration"],
+            summary="Remove an uploaded switch placeholder card",
+            description="Deletes the uploaded card, so the overlay falls "
+                        "back to the one shipped with Lynx - or, if there "
+                        "isn't one, to a plain caption.")
+def delete_testcard():
+    existing = _testcard_existing()
+    if existing is None:
+        return {"result": "ok", "removed": False}
+    try:
+        existing.unlink()
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Could not remove it: {e}")
+    return {"result": "ok", "removed": True}
+
+class PathfinderTestRequest(BaseModel):
+    """Injects a card directly, bypassing lock detection and QRZ - the
+    only practical way to iterate on the layout without waiting for a
+    real station to appear and then stop."""
+    callsign: str = "DL5BCA"
+    locator: str = "JO31KL"
+    name: str = ""
+    mer: str = "9.4"
+    modcod: str = "QPSK 2/3"
+    symbol_rate: str = "333"
+
+
+@app.get("/api/audio/monitors", tags=["Control"],
+         summary="List audio monitor sources for Auto-Squeak",
+         description="Monitor sources Auto-Squeak can listen on. The blank "
+                     "entry means the monitor of whatever output is current, "
+                     "which is the sensible default.")
+def api_audio_monitors():
+    return {"current": (config.get('squeak', {}) or {}).get('source', ''),
+            "monitors": list_audio_monitors()}
+
+
+@app.get("/api/audio/devices", tags=["Control"],
+         summary="List the audio outputs mpv can see",
+         description="Asks mpv directly, so the names returned are exactly "
+                     "what the audio_device setting will accept. Used to "
+                     "populate the Config page selector.")
+def api_audio_devices():
+    devices = physical_audio_devices()
+    current = str(config.get('display', {}).get('audio_device', 'hdmi'))
+    return {
+        "current": current,
+        "resolved": _first_hdmi_device() if current.lower() == 'hdmi' else current,
+        "devices": devices,
+    }
+
+
+@app.post("/api/pathfinder/test", tags=["Status"],
+          summary="Show a test end-of-contact map card",
+          description="Arms the end-of-contact map for the given callsign "
+                      "and locator as though that station had just stopped "
+                      "transmitting. Honours the configured delay, so the "
+                      "card appears after delay_secs and clears after "
+                      "duration_secs. Any real station locking will cancel "
+                      "it, exactly as it would a genuine card.")
+def pathfinder_test(req: PathfinderTestRequest):
+    if not pathfinder_tracker.enabled:
+        raise HTTPException(status_code=400,
+                            detail="pathfinder is disabled in the config")
+    pos = lynx_map.locator_to_latlon(req.locator)
+    if pos is None:
+        raise HTTPException(status_code=400,
+                            detail=f"'{req.locator}' is not a usable Maidenhead locator")
+    # Honours pathfinder.qo100_test, so this endpoint is the way to
+    # exercise the QO-100 globe at a site with no 3cm satellite
+    # installation: set the switch, POST a distant locator, watch the
+    # card. Without that the globe could only ever be seen by someone
+    # who already had the hardware working.
+    pathfinder_tracker.station_unlocked(
+        req.callsign, req.locator, name=req.name or None, mer=req.mer,
+        modcod=req.modcod, symbol_rate=req.symbol_rate,
+        via_qo100=bool(config.get('pathfinder', {}).get('qo100_test', False)))
+    home = config.get('site', {}).get('locator', '')
+    pos_h = lynx_map.locator_to_latlon(home)
+    dist = lynx_map.haversine_km(*pos_h, *pos) if pos_h else None
+    return {
+        "armed": True,
+        "callsign": req.callsign,
+        "locator": req.locator,
+        "distance_km": round(dist, 1) if dist is not None else None,
+        "home_locator": home,
+        "appears_in_secs": pathfinder_tracker.delay_secs,
+        "visible_for_secs": pathfinder_tracker.duration_secs,
+        "note": None if home else
+                "site.locator is not set in the config - no card can be drawn",
+    }
+
 
 class QrzTestRequest(BaseModel):
     mode: str = "DVB-S2"
@@ -3059,6 +6082,46 @@ def qrz_test(req: QrzTestRequest):
         comment_override="Lynx diagnostic test entry - safe to delete"
     )
     return result
+
+class QrzLookupTestRequest(BaseModel):
+    test_callsign: str = "G8YTZ"
+
+@app.post("/api/qrz/lookup_test", tags=["Status"],
+          summary="Test the QRZ XML Data API name lookup",
+          description="Directly tests the callsign-name lookup used for "
+                      "tri_watch's notification, independent of an actual "
+                      "notification firing - reports exactly which "
+                      "pre-condition (if any) isn't met, or the real lookup "
+                      "result. Deliberately synchronous/blocking here, unlike "
+                      "the notification path itself - this is a one-off, "
+                      "user-initiated test request, not something running "
+                      "inside any time-critical loop.")
+def qrz_lookup_test(req: QrzLookupTestRequest):
+    qrz_cfg = config.get('notifications', {}).get('qrz', {})
+    username = qrz_cfg.get('lookup_username', '')
+    password = qrz_cfg.get('lookup_password', '')
+    lookup_for_notifications = qrz_cfg.get('lookup_for_notifications', False)
+
+    if not username or not password:
+        return {
+            "success": False,
+            "reason": "No lookup_username/lookup_password configured - set both on "
+                      "the Config page (or in config.yaml directly) first. These are "
+                      "your normal QRZ.com login, separate from the Logbook API key above.",
+            "lookup_for_notifications": lookup_for_notifications,
+        }
+
+    name = lynx_notifications.qrz_callsign_lookup(username, password, req.test_callsign)
+
+    return {
+        "success": name is not None,
+        "test_callsign": req.test_callsign.strip().upper(),
+        "name_found": name,
+        "lookup_for_notifications": lookup_for_notifications,
+        "note": (None if lookup_for_notifications else
+                 "lookup_for_notifications is currently OFF - the lookup itself just "
+                 "worked, but real notifications won't use it until this is turned on."),
+    }
 
 @app.get("/diagnostics", response_class=HTMLResponse, include_in_schema=False)
 def diagnostics_page():
@@ -3105,6 +6168,23 @@ def diagnostics_page():
                 configured on the Config page.</p>
             <button class="btn btn-outline-warning btn-sm" onclick="sendQrzTest()">Send Test Entry</button>
             <pre id="qrz-test-result" class="mt-3 mb-0 small" style="white-space: pre-wrap;"></pre>
+        </div>
+    </div>
+
+    <div class="card mb-3">
+        <div class="card-header">Test QRZ Name Lookup</div>
+        <div class="card-body">
+            <p class="text-muted small">Directly tests the callsign-name lookup used for tri_watch's
+                waiting-station notification, independent of an actual notification firing. Shows
+                exactly which pre-condition (if any) isn't met, or the real lookup result. Uses
+                whatever lookup_username/lookup_password are currently configured on the Config
+                page - a genuinely separate login from the Logbook API key above.</p>
+            <div class="input-group input-group-sm mb-2" style="max-width: 300px;">
+                <input type="text" class="form-control" id="qrz-lookup-test-callsign" value="G8YTZ"
+                       placeholder="Callsign to look up">
+                <button class="btn btn-outline-warning" onclick="sendQrzLookupTest()">Test Lookup</button>
+            </div>
+            <pre id="qrz-lookup-test-result" class="mt-3 mb-0 small" style="white-space: pre-wrap;"></pre>
         </div>
     </div>
 
@@ -3198,6 +6278,40 @@ async function sendQrzTest() {
     }
 }
 
+async function sendQrzLookupTest() {
+    const resultEl = document.getElementById('qrz-lookup-test-result');
+    const callsign = document.getElementById('qrz-lookup-test-callsign').value.trim() || 'G8YTZ';
+    resultEl.textContent = 'Looking up...';
+    try {
+        const r = await fetch('/api/qrz/lookup_test', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({test_callsign: callsign})
+        });
+        const data = await r.json();
+        if (!r.ok) {
+            resultEl.textContent = 'Error: ' + (data.detail || 'request failed');
+            return;
+        }
+        let lines = [
+            'success:                  ' + data.success,
+        ];
+        if (data.reason) {
+            lines.push('reason:                   ' + data.reason);
+        } else {
+            lines.push('test_callsign:            ' + data.test_callsign);
+            lines.push('name_found:               ' + data.name_found);
+        }
+        lines.push('lookup_for_notifications: ' + data.lookup_for_notifications);
+        if (data.note) {
+            lines.push('note:                     ' + data.note);
+        }
+        resultEl.textContent = lines.join('\\n');
+    } catch (e) {
+        resultEl.textContent = 'Request failed: ' + e;
+    }
+}
+
 async function refresh() {
     try {
         const r = await fetch('/api/diagnostics');
@@ -3261,10 +6375,51 @@ def config_page():
         label { color: #a8b5c7; font-size: 0.85em; margin-bottom: 2px; }
         .form-control { background: #0f3460; border: 1px solid #1e4a7a; color: #e0e0e0; }
         .form-control:focus { background: #0f3460; border-color: #00d4aa; color: #e0e0e0; box-shadow: none; }
+        /* .form-select is a genuinely different Bootstrap 5 class from
+           .form-control (used for <select> specifically) - every select
+           on this page already deliberately uses form-control instead,
+           which is why they've always matched; audio-device-select is
+           the one exception that used the more "correct" Bootstrap
+           class, which meant it fell through to Bootstrap's own default
+           (light) select styling with nothing here overriding it. Styled
+           to match form-control exactly rather than changing that
+           input's own class, in case anything future uses form-select
+           deliberately. */
+        .form-select { background: #0f3460; border: 1px solid #1e4a7a; color: #e0e0e0; }
+        .form-select:focus { background: #0f3460; border-color: #00d4aa; color: #e0e0e0; box-shadow: none; }
+        /* Disabled inputs (e.g. the QRZ card's portable-locator field
+           while GNSS Automatic mode is driving it) had no override at
+           all, so they fell back to the browser's own default disabled
+           styling - a light, out-of-place box against this dark theme.
+           Keeps the same dark background, dims the text to signal
+           "not editable right now" without breaking the theme. */
+        .form-control:disabled, .form-select:disabled { background: #0f3460; opacity: 0.55; color: #a8b5c7; }
+        /* Tells the browser to render native form-control chrome - the
+           time-picker spinner/icon on <input type="time"> (GPIO Tx's
+           schedule fields), and any date/datetime-local input - using
+           its own built-in dark variant. background/color on the outer
+           input don't reach into that native widget chrome at all,
+           which is why those specific fields were still showing white
+           despite already having the same form-control styling as
+           every other input on the page. */
+        input[type="time"], input[type="date"], input[type="datetime-local"] { color-scheme: dark; }
         .btn-save { background: #e94560; border-color: #e94560; }
         .btn-save:hover { background: #c73652; border-color: #c73652; }
         .save-status { font-size: 0.85em; min-height: 1.2em; }
         .placeholder-card { opacity: 0.6; }
+        .gnss-unavailable { opacity: 0.5; }
+        /* Visually masks sensitive fields (API keys, passwords) the same
+           way type="password" would, without actually using that type -
+           deliberately avoids browsers treating these as login
+           credentials to offer saving/autofilling, which type="password"
+           triggers regardless of autocomplete="off" (browsers routinely
+           ignore that specific override on real password fields).
+           -webkit-text-security is Chromium/WebKit-only (Chrome, Safari,
+           Edge) - Firefox has no equivalent, so the field there falls
+           back to showing plain text rather than being masked at all;
+           an acceptable trade-off given the alternative was a genuinely
+           broken, unwanted save-password prompt on every visit. */
+        .mask-field { -webkit-text-security: disc; }
     </style>
 </head>
 <body>
@@ -3284,8 +6439,79 @@ def config_page():
 
         <div class="col-md-4">
                 <div class="card mb-3">
+                    <div class="card-header">&#x1F3AC; Video Switching (Bitfocus Companion / GPIO)</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            Switches your video source to this receiver when it has
+                            something to show, and away again when it hasn't. Fires a
+                            webhook, a GPIO pin, or both. Bitfocus Companion is the
+                            usual thing on the other end, but anything that accepts an
+                            HTTP request or a contact closure will do - you don't need
+                            Companion to use this.
+                        </p>
+                        <p class="text-muted small">
+                            Follows RF <em>and</em> streams: a relayed stream switches
+                            the source just as an off-air signal does. To key a
+                            transmitter rather than switch a source, see GPIO Tx On/Off
+                            below.
+                        </p>
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="companion-enabled-input">
+                            <label class="form-check-label" for="companion-enabled">Enabled</label>
+                        </div>
+                        <label for="companion-lock-url">Lock URL</label>
+                        <input type="text" class="form-control mb-1" id="companion-lock-url-input"
+                               placeholder="http://companion-ip:8888/api/...">
+                        <label for="companion-lock-settle" class="small text-muted">Settle time (s)</label>
+                        <input type="number" step="1" min="0" class="form-control mb-2" id="companion-lock-settle-input">
+                        <label for="companion-unlock-url">Unlock URL</label>
+                        <input type="text" class="form-control mb-1" id="companion-unlock-url-input"
+                               placeholder="http://companion-ip:8888/api/...">
+                        <label for="companion-unlock-settle" class="small text-muted">Settle time (s)</label>
+                        <input type="number" step="1" min="0" class="form-control" id="companion-unlock-settle-input">
+                        <div id="companion-pathfinder-warning" class="alert alert-warning py-2 px-2 small mt-2 mb-0" style="display:none;"></div>
+                        <hr>
+                        <div class="form-check form-switch mb-2">
+                            <input class="form-check-input" type="checkbox" id="companion-gpio-enabled-input">
+                            <label class="form-check-label" for="companion-gpio-enabled">
+                                Also mirror on a GPIO pin (relay-based switching)
+                            </label>
+                        </div>
+                        <p class="text-muted small mb-2">
+                            Follows lock/unlock using the same settle times above - no separate timing.
+                        </p>
+                        <div class="row g-2">
+                            <div class="col-8">
+                                <label for="companion-gpio-pin" class="small">Physical pin</label>
+                                <select class="form-control" id="companion-gpio-pin-input"></select>
+                            </div>
+                            <div class="col-4">
+                                <label for="companion-gpio-polarity" class="small">Polarity</label>
+                                <select class="form-control" id="companion-gpio-polarity-input">
+                                    <option value="high">Active high</option>
+                                    <option value="low">Active low</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div class="mt-3 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveCompanion()">Save Companion settings</button>
+                            <span class="save-status" id="companion-save-status"></span>
+                        </div>
+                    </div>
+                </div>
+                <div class="card mb-3">
                     <div class="card-header">&#x1F50C; GPIO Tx On/Off</div>
                     <div class="card-body">
+                        <p class="text-muted small">
+                            Keys a transmitter when there is something to send, with
+                            long settle times so it isn't cycled by brief gaps, and
+                            optional scheduled on-air windows.
+                        </p>
+                        <p class="text-muted small">
+                            This is <em>not</em> the pin for switching a video source -
+                            for that use Video Switching above, which has its own pin
+                            and much shorter timings.
+                        </p>
                         <div class="form-check form-switch mb-3">
                             <input class="form-check-input" type="checkbox" id="gpio-enabled-input">
                             <label class="form-check-label" for="gpio-enabled">Enabled</label>
@@ -3386,114 +6612,7 @@ def config_page():
                         </div>
                     </div>
                 </div>
-                <div class="card mb-3">
-                    <div class="card-header">&#x1F3AF; PPM Meter Style</div>
-                    <div class="card-body">
-                        <p class="text-muted small">Applies live within a few seconds - no restart needed.</p>
-                        <div class="form-check">
-                            <input class="form-check-input" type="radio" name="ppm-style" id="ppm-style-skeleton" value="skeleton">
-                            <label class="form-check-label" for="ppm-style-skeleton">
-                                Skeleton <span class="text-muted small">- needles and graduations only</span>
-                            </label>
-                        </div>
-                        <div class="form-check mb-2">
-                            <input class="form-check-input" type="radio" name="ppm-style" id="ppm-style-full-fat" value="full_fat">
-                            <label class="form-check-label" for="ppm-style-full-fat">
-                                Full Fat <span class="text-muted small">- with the round meter housing</span>
-                            </label>
-                        </div>
-                        <button class="btn btn-outline-light btn-sm" onclick="savePpmStyle()">Save</button>
-                        <span id="ppm-style-status" class="save-status ms-2"></span>
-                    </div>
-                </div>
 
-        </div>
-
-        <div class="col-md-4">
-                <div class="card mb-3">
-                    <div class="card-header">&#x1F3AC; Bitfocus Companion</div>
-                    <div class="card-body">
-                        <div class="form-check form-switch mb-3">
-                            <input class="form-check-input" type="checkbox" id="companion-enabled-input">
-                            <label class="form-check-label" for="companion-enabled">Enabled</label>
-                        </div>
-                        <label for="companion-lock-url">Lock URL</label>
-                        <input type="text" class="form-control mb-1" id="companion-lock-url-input"
-                               placeholder="http://companion-ip:8888/api/...">
-                        <label for="companion-lock-settle" class="small text-muted">Settle time (s)</label>
-                        <input type="number" step="1" min="0" class="form-control mb-2" id="companion-lock-settle-input">
-                        <label for="companion-unlock-url">Unlock URL</label>
-                        <input type="text" class="form-control mb-1" id="companion-unlock-url-input"
-                               placeholder="http://companion-ip:8888/api/...">
-                        <label for="companion-unlock-settle" class="small text-muted">Settle time (s)</label>
-                        <input type="number" step="1" min="0" class="form-control" id="companion-unlock-settle-input">
-                        <hr>
-                        <div class="form-check form-switch mb-2">
-                            <input class="form-check-input" type="checkbox" id="companion-gpio-enabled-input">
-                            <label class="form-check-label" for="companion-gpio-enabled">
-                                Also mirror on a GPIO pin (relay-based switching)
-                            </label>
-                        </div>
-                        <p class="text-muted small mb-2">
-                            Follows lock/unlock using the same settle times above - no separate timing.
-                        </p>
-                        <div class="row g-2">
-                            <div class="col-8">
-                                <label for="companion-gpio-pin" class="small">Physical pin</label>
-                                <select class="form-control" id="companion-gpio-pin-input"></select>
-                            </div>
-                            <div class="col-4">
-                                <label for="companion-gpio-polarity" class="small">Polarity</label>
-                                <select class="form-control" id="companion-gpio-polarity-input">
-                                    <option value="high">Active high</option>
-                                    <option value="low">Active low</option>
-                                </select>
-                            </div>
-                        </div>
-                        <div class="mt-3 d-flex align-items-center gap-2">
-                            <button class="btn btn-save" onclick="saveCompanion()">Save Companion settings</button>
-                            <span class="save-status" id="companion-save-status"></span>
-                        </div>
-                    </div>
-                </div>
-                <div class="card mb-3">
-                    <div class="card-header">&#x1F4D6; QRZ.com Logbook</div>
-                    <div class="card-body">
-                        <div class="form-check form-switch mb-3">
-                            <input class="form-check-input" type="checkbox" id="qrz-enabled-input">
-                            <label class="form-check-label" for="qrz-enabled">Enabled</label>
-                        </div>
-                        <label for="qrz-api-key">API key</label>
-                        <input type="text" class="form-control mb-2" id="qrz-api-key-input"
-                               placeholder="Your QRZ Logbook API key">
-                        <div class="row g-2">
-                            <div class="col-6">
-                                <label for="qrz-settle">Settle time (s)</label>
-                                <input type="number" step="1" min="0" class="form-control" id="qrz-settle-input">
-                            </div>
-                            <div class="col-6">
-                                <label for="qrz-suppress">Suppress (min)</label>
-                                <input type="number" step="1" min="0" class="form-control" id="qrz-suppress-input">
-                            </div>
-                        </div>
-                        <label for="qrz-portable-locator" class="mt-2">Portable locator override</label>
-                        <input type="text" class="form-control" id="qrz-portable-locator-input"
-                               placeholder="e.g. IO91VG - leave blank for normal operation">
-                        <p class="text-muted small mt-2 mb-0">
-                            Settle time: delay after lock before logging, so the callsign has time to
-                            decode. Suppress: don't log the same callsign again within this many minutes.
-                            Portable locator override: when a contacted station is operating portable and
-                            hasn't updated their QRZ profile, QRZ's own distance/bearing calculation uses
-                            their stale, registered locator. Set this to override it with their actual,
-                            current one for every contact logged while it's set - clear it (empty + save)
-                            once the portable session ends.
-                        </p>
-                        <div class="mt-3 d-flex align-items-center gap-2">
-                            <button class="btn btn-save" onclick="saveQrz()">Save QRZ settings</button>
-                            <span class="save-status" id="qrz-save-status"></span>
-                        </div>
-                    </div>
-                </div>
                 <div class="card mb-3">
                     <div class="card-header">&#x1F4AC; Slack</div>
                     <div class="card-body">
@@ -3518,6 +6637,256 @@ def config_page():
                             <span class="save-status" id="slack-save-status"></span>
                         </div>
                     </div>
+                </div>
+        </div>
+
+        <div class="col-md-4">
+                <div class="card mb-3">
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F50A; Audio Output</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            Which device mpv sends audio to. Defaults to HDMI, so sound
+                            follows the picture to the television. Left on automatic,
+                            a USB audio dongle plugged in for some other purpose can
+                            quietly capture the audio instead. The PPM meter follows
+                            this setting, so it always reads whatever is actually
+                            being sent out.
+                        </p>
+                        <label class="small text-muted mb-1" for="audio-device-select">Device</label>
+                        <select class="form-select form-select-sm mb-2" id="audio-device-select">
+                            <option value="hdmi">HDMI (recommended)</option>
+                            <option value="auto">Automatic - let mpv choose</option>
+                        </select>
+                        <div id="audio-device-resolved" class="small text-muted mb-2"></div>
+                        <button class="btn btn-save" onclick="saveAudioDevice()">Save Audio settings</button>
+                        <span id="audio-save-status" class="save-status ms-2"></span>
+                    </div>
+                </div>
+
+                    <div class="card-header">&#x1F3AF; PPM Meter Style</div>
+                    <div class="card-body">
+                        <p class="text-muted small">Applies live within a few seconds - no restart needed.</p>
+                        <div class="form-check">
+                            <input class="form-check-input" type="radio" name="ppm-style" id="ppm-style-skeleton" value="skeleton">
+                            <label class="form-check-label" for="ppm-style-skeleton">
+                                Skeleton <span class="text-muted small">- needles and graduations only</span>
+                            </label>
+                        </div>
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="radio" name="ppm-style" id="ppm-style-full-fat" value="full_fat">
+                            <label class="form-check-label" for="ppm-style-full-fat">
+                                Full Fat <span class="text-muted small">- with the round meter housing</span>
+                            </label>
+                        </div>
+                        <button class="btn btn-save" onclick="savePpmStyle()">Save PPM style</button>
+                        <span id="ppm-style-status" class="save-status ms-2"></span>
+                    </div>
+                </div>
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F5A5;&#xFE0F; Screen</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            Lynx caps the screen at 1080 lines, switching a 4K monitor down when it
+                            starts. A 4K screen is more than a Raspberry Pi can drive while also
+                            decoding a live picture &mdash; it causes picture glitches, audio dropouts
+                            and a missing overlay. Nothing is lost: DATV video is well below 1080
+                            anyway, so a bigger screen buffer only draws more pixels for exactly the
+                            same picture. An ultrawide monitor is unaffected.
+                        </p>
+                        <input type="hidden" id="max-height-hidden" value="1080">
+                        <label class="small text-muted mb-1" for="refresh-hz-select">Refresh rate</label>
+                        <select class="form-select form-select-sm mb-2" id="refresh-hz-select">
+                            <option value="50">50 Hz &mdash; UK, Europe (25 fps)</option>
+                            <option value="60">60 Hz &mdash; North America, Japan (30 fps)</option>
+                        </select>
+                        <p class="text-muted small mb-2">
+                            Only used when the screen actually has to be switched. 50 Hz suits 25 fps
+                            television: each frame then lasts exactly two refreshes. At 60 Hz a 25 fps
+                            picture judders on pans, because frames are held alternately for two
+                            refreshes and three. A monitor with no mode at the chosen rate falls back
+                            to the highest it offers.
+                        </p>
+                        <div class="mt-2 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveScreen()">Save screen settings</button>
+                            <span class="save-status" id="screen-save-status"></span>
+                        </div>
+                    </div>
+                </div>
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F5FA;&#xFE0F; Pathfinder</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            Shows a full-screen map after a station stops transmitting -
+                            where they were, the path back here, and the signal figures
+                            from the contact. Needs the QRZ.com lookup below configured,
+                            since the station's position comes from their QRZ locator.
+                        </p>
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="pf-enabled">
+                            <label class="form-check-label" for="pf-enabled">Enabled</label>
+                        </div>
+                        <div class="row g-2 mb-2">
+                            <div class="col-6">
+                                <label class="form-label small mb-1" for="pf-delay">Delay (s)</label>
+                                <input type="number" min="0" max="300" step="1" class="form-control form-control-sm" id="pf-delay">
+                                <div class="small text-muted mt-1">Quiet gap after unlock</div>
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label small mb-1" for="pf-duration">Duration (s)</label>
+                                <input type="number" min="1" max="300" step="1" class="form-control form-control-sm" id="pf-duration">
+                                <div class="small text-muted mt-1">How long it stays up</div>
+                            </div>
+                        </div>
+                        <div id="pf-window" class="text-muted small mb-2"></div>
+                        <div id="pf-warning" class="alert alert-warning py-2 px-2 small mb-2" style="display:none;"></div>
+                        <div class="text-muted small mb-2">
+                            At a repeater, also check your controller's own hang/tail timer -
+                            Lynx can't see that, and it will cut the transmitter regardless
+                            of anything set here.
+                        </div>
+                        <button class="btn btn-save" onclick="savePathfinder()">Save Pathfinder settings</button>
+                        <span id="pf-status" class="save-status ms-2"></span>
+                        <hr class="my-3">
+                        <div class="fw-semibold small mb-1">Switch placeholder card</div>
+                        <p class="text-muted small mb-2">
+                            Shown full-screen during a Tri-Watch source change when there is
+                            no Pathfinder map to show &mdash; a stream, or a station with no
+                            QRZ locator. Your own test card, club logo or holding slide.
+                            PNG, JPEG, GIF or WebP; 1920&times;1080 fits the picture exactly,
+                            anything else is scaled to fill. Takes effect within a couple of
+                            seconds, with no restart, and is kept outside the repository so
+                            updates never overwrite it.
+                        </p>
+                        <div id="tc-current" class="text-muted small mb-2">Checking...</div>
+                        <div class="d-flex align-items-center gap-2 flex-wrap">
+                            <input type="file" class="form-control form-control-sm" id="tc-file"
+                                   accept="image/png,image/jpeg,image/gif,image/webp" style="max-width:20rem;">
+                            <button class="btn btn-save" onclick="uploadTestcard()">Upload</button>
+                            <button class="btn btn-outline-secondary btn-sm" onclick="removeTestcard()">Use the shipped card</button>
+                            <span id="tc-status" class="save-status"></span>
+                        </div>
+                    </div>
+                </div>
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F4D6; QRZ.com Logbook</div>
+                    <div class="card-body">
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="qrz-enabled-input">
+                            <label class="form-check-label" for="qrz-enabled">Enabled</label>
+                        </div>
+                        <label for="qrz-api-key">API key</label>
+                        <div class="input-group mb-2">
+                            <input type="text" class="form-control mask-field" id="qrz-api-key-input"
+                                   autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+                                   placeholder="Your QRZ Logbook API key">
+                            <button class="btn btn-outline-secondary reveal-btn" type="button" tabindex="-1"
+                                    data-reveal-target="qrz-api-key-input" title="Hold to reveal">&#x1F441;&#xFE0F;</button>
+                        </div>
+                        <div class="row g-2">
+                            <div class="col-6">
+                                <label for="qrz-settle">Settle time (s)</label>
+                                <input type="number" step="1" min="0" class="form-control" id="qrz-settle-input">
+                            </div>
+                            <div class="col-6">
+                                <label for="qrz-suppress">Suppress (min)</label>
+                                <input type="number" step="1" min="0" class="form-control" id="qrz-suppress-input">
+                            </div>
+                        </div>
+                        <label for="qrz-portable-locator" class="mt-2">Portable locator (this receiver's own position)</label>
+                        <input type="text" class="form-control" id="qrz-portable-locator-input"
+                               placeholder="e.g. IO91VG - leave blank for normal operation">
+                        <p class="text-muted small mt-2 mb-0">
+                            Settle time: delay after lock before logging, so the callsign has time to
+                            decode. Suppress: don't log the same callsign again within this many minutes.
+                            Portable locator: set this when Lynx itself is operating away from its
+                            normal, registered site - it's attached to every logged contact as Lynx's
+                            own current position (ADIF MY_GRIDSQUARE), so QRZ's distance/bearing figures
+                            are correct for wherever Lynx actually is right now, not its usual fixed
+                            site. It does not touch the worked station's own locator, which QRZ
+                            continues to derive from their profile as normal. Clear it (empty + save)
+                            once the portable session ends. See GNSS Portable Locator below to populate
+                            this automatically from a GPS receiver instead of typing it by hand.
+                        </p>
+                        <hr class="my-3">
+                        <p class="text-muted small mb-2">
+                            <strong>Callsign lookup</strong> (used to add a station's first name to
+                            tri_watch's "someone else wants in" notification) uses QRZ's separate XML
+                            Data API - a genuinely different login to the Logbook API key above, since
+                            it authenticates with your normal QRZ username/password rather than an API
+                            key. Requires an XML-subscriber-level QRZ account.
+                        </p>
+                        <div class="row g-2 mb-2">
+                            <div class="col-6">
+                                <label for="qrz-lookup-username">QRZ username</label>
+                                <input type="text" class="form-control" id="qrz-lookup-username-input"
+                                       autocomplete="off"
+                                       placeholder="Your QRZ.com login">
+                            </div>
+                            <div class="col-6">
+                                <label for="qrz-lookup-password">QRZ password</label>
+                                <div class="input-group">
+                                    <input type="text" class="form-control mask-field" id="qrz-lookup-password-input"
+                                           autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+                                           placeholder="Your QRZ.com password">
+                                    <button class="btn btn-outline-secondary reveal-btn" type="button" tabindex="-1"
+                                            data-reveal-target="qrz-lookup-password-input" title="Hold to reveal">&#x1F441;&#xFE0F;</button>
+                                </div>
+                            </div>
+                        </div>
+                        <div class="form-check form-switch">
+                            <input class="form-check-input" type="checkbox" id="qrz-lookup-notif-input">
+                            <label class="form-check-label" for="qrz-lookup-notif">
+                                Add looked-up name to tri_watch's waiting-station notification
+                            </label>
+                        </div>
+                        <div class="mt-3 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveQrz()">Save QRZ settings</button>
+                            <span class="save-status" id="qrz-save-status"></span>
+                        </div>
+                    </div>
+                </div>
+                <div class="card mb-3">
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F4C8; Auto-Squeak &mdash; audio measurement</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            Listens for a Lindos test sequence on the received audio and puts a
+                            measurement card on screen after each pass: level against alignment,
+                            channel balance, frequency response, noise, separation and distortion.
+                            Nothing to send from here &mdash; whoever transmits the sequence provides
+                            the signal, and Lindos publish the standard sequences as WAV files, so
+                            no test equipment is needed at either end. On by default: it stays idle
+                            until a sequence actually arrives.
+                        </p>
+                        <div class="form-check form-switch mb-2">
+                            <input class="form-check-input" type="checkbox" id="squeak-enabled-input">
+                            <label class="form-check-label" for="squeak-enabled-input">
+                                Measure the audio path when a test sequence is received
+                            </label>
+                        </div>
+                        <label class="small text-muted mb-1" for="squeak-source-select">Listen on</label>
+                        <select class="form-select form-select-sm mb-2" id="squeak-source-select"></select>
+                        <p class="text-muted small mb-2">
+                            Automatic follows whatever output is selected above, so it keeps working
+                            if that is changed. Only pick a specific monitor to override this.
+                        </p>
+                        <label class="small text-muted mb-1" for="squeak-hold-input">Card on screen for (seconds)</label>
+                        <input type="number" min="10" max="300" step="5"
+                               class="form-control mb-2" id="squeak-hold-input">
+                        <p class="text-muted small mb-2">
+                            Worth matching to the gap between passes in the test file, so the previous
+                            result is still visible while an adjustment is being made. The card is drawn
+                            over the picture, and takes precedence over a Pathfinder map &mdash; the map
+                            waits its turn rather than being lost.
+                        </p>
+                        <div class="mt-2 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveSqueak()">Save Auto-Squeak settings</button>
+                            <span class="save-status" id="squeak-save-status"></span>
+                        </div>
+                    </div>
+                </div>
+
                 </div>
         </div>
 
@@ -3649,8 +7018,9 @@ def config_page():
                         <p class="text-muted small">
                             Stable is the recommended channel for everyday/repeater use -
                             known-working releases only. Beta tracks newer, less-tested code
-                            for anyone who wants to try new features early. Switchable back
-                            to Stable at any time.
+                            for anyone who wants to try new features early, mirroring how
+                            BATC Portsdown offers its own beta channel. Switchable back to
+                            Stable at any time.
                         </p>
                         <div class="form-check">
                             <input class="form-check-input" type="radio" name="update-channel"
@@ -3670,9 +7040,9 @@ def config_page():
                         </div>
                         <div id="beta-warning" class="alert alert-warning py-2 px-3 small mb-2" style="display:none;">
                             &#x26A0;&#xFE0F; <strong>Beta channel:</strong> newer code that hasn't
-                            been as thoroughly tested - may be less stable. Not recommended
-                            for an unattended repeater without someone available to fix
-                            issues if something goes wrong.
+                            been as thoroughly tested - may be less stable, and could contain
+                            bugs not yet caught. Not recommended for an unattended repeater
+                            without someone available to fix issues if something goes wrong.
                         </div>
                         <div class="mt-2 d-flex align-items-center gap-2">
                             <button class="btn btn-outline-warning btn-sm" onclick="switchUpdateChannel()">Switch Channel</button>
@@ -3703,13 +7073,403 @@ def config_page():
                         </div>
                     </div>
                 </div>
+
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F4E1; QuickLynx Spectrum Tuner</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            Serves QuickLynx from this receiver: the QO-100 wideband
+                            spectrum, with click-to-tune straight into Lynx. Served
+                            from here it needs no address configuring and can be
+                            opened from any device on your network.
+                        </p>
+                        <div class="form-check form-switch mb-2">
+                            <input class="form-check-input" type="checkbox" id="quicklynx-enabled">
+                            <label class="form-check-label" for="quicklynx-enabled">Enabled</label>
+                        </div>
+                        <div class="small text-muted mb-2">
+                            Off by default. Needs internet access for the spectrum feed
+                            and the chat pane, so it is opt-in rather than something a
+                            repeater carries unasked.
+                        </div>
+                        <button class="btn btn-save" onclick="saveQuickLynx()">Save QuickLynx settings</button>
+                        <span id="quicklynx-status" class="save-status ms-2"></span>
+                    </div>
+                </div>
+                    <div class="card mb-3">
+                    <div class="card-header">&#x1F6F0;&#xFE0F; GNSS Portable Locator</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            Reads a Waveshare L76K HAT on /dev/ttyAMA0 and, once a fix has held
+                            steady in the same 6-character square for 30 seconds, writes it straight
+                            into the "Portable locator" field above - the same field an operator
+                            would otherwise type by hand, attached to every logged contact as this
+                            receiver's own current position. A fixed repeater site simply doesn't
+                            have the HAT fitted, so this fails quietly and does nothing there.
+                            Configures the module for GPS + BeiDou + GLONASS (plus QZSS, always on
+                            regardless) on each connect - every constellation the L76K can actually
+                            use, for the widest satellite visibility.
+                        </p>
+                        <div class="form-check">
+                            <input class="form-check-input" type="radio" name="gnss-mode"
+                                   id="gnss-mode-manual" value="manual" onchange="onGnssModeChange()">
+                            <label class="form-check-label" for="gnss-mode-manual">
+                                <strong>Manual</strong>
+                                <span class="text-muted small">- the typed value above is authoritative; GPS is only shown</span>
+                            </label>
+                        </div>
+                        <div id="gnss-no-module-warning" class="alert alert-warning py-1 px-2 small mb-2" style="display:none;">
+                            &#x26A0;&#xFE0F; No GNSS module detected on /dev/ttyAMA0. Automatic is greyed
+                            out below until one responds - Manual above is unaffected either way, and
+                            un-greys live, no reload, the moment a fitted HAT starts answering.
+                        </div>
+                        <div id="gnss-hw-dependent">
+                        <div class="form-check mb-2">
+                            <input class="form-check-input" type="radio" name="gnss-mode"
+                                   id="gnss-mode-automatic" value="automatic" onchange="onGnssModeChange()">
+                            <label class="form-check-label" for="gnss-mode-automatic">
+                                <strong>Automatic</strong>
+                                <span class="text-muted small">- GPS drives the locator on every confirmed fix (default)</span>
+                            </label>
+                        </div>
+                        <hr class="my-2">
+                        <div class="form-check form-switch mb-2">
+                            <input class="form-check-input" type="checkbox" id="gnss-time-sync-input">
+                            <label class="form-check-label" for="gnss-time-sync">
+                                Set the clock from GPS when there's no internet
+                            </label>
+                            <p class="text-muted small mt-1 mb-0">
+                                Keeps logged contacts correctly timestamped at a site with no
+                                network. Uses the internet as usual whenever it's available.
+                            </p>
+                        </div>
+                        </div>
+                        <div id="gnss-status-box" class="small p-2 mb-2" style="background:#0f3460; border-radius:4px;">
+                            <div class="d-flex justify-content-between"><span>Receiver</span><span class="status-value" id="gnss-connected">—</span></div>
+                            <div class="d-flex justify-content-between"><span>Locator (8-char)</span><span class="status-value" id="gnss-locator-display">—</span></div>
+                            <div class="d-flex justify-content-between"><span>Satellites / HDOP</span><span class="status-value" id="gnss-quality">—</span></div>
+                            <div class="d-flex justify-content-between"><span>Time sync</span><span class="status-value" id="gnss-time-sync-status">—</span></div>
+                            <div class="d-flex justify-content-between"><span>Status</span><span class="status-value" id="gnss-detail">—</span></div>
+                        </div>
+                        <div class="mt-2 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveGnssMode()">Save GNSS mode</button>
+                            <span class="save-status" id="gnss-save-status"></span>
+                        </div>
+                    </div>
+                    </div>
+
         </div>
 
+    </div>
+
+    <div class="row g-3 mt-1">
+        <div class="col-12">
+            <div class="card mb-3">
+                <div class="card-header">&#x1F500; Tri-Watch Sources</div>
+                <div class="card-body">
+                    <div class="form-check form-switch mb-2">
+                        <input class="form-check-input" type="checkbox" id="tw-enabled-input">
+                        <label class="form-check-label" for="tw-enabled">Tri-Watch enabled</label>
+                    </div>
+                    <p class="text-muted small">
+                        Up to three sources - any mix of Rx1, Rx2, and a stream. Uncheck
+                        "Include" on a source to leave it out entirely, same as not listing
+                        it in config.yaml at all. Frequency is in kHz, matching the RF
+                        Tuning card elsewhere on this page. Changes here need a Lynx
+                        restart to take effect - tri_watch's sources are set up once at
+                        startup, unlike most other settings on this page.
+                    </p>
+                    <div class="row g-3">
+                        <div class="col-md-4">
+                            <h6 class="mb-2">Rx 1</h6>
+                            <div class="form-check form-switch mb-2">
+                                <input class="form-check-input" type="checkbox" id="tw-rx1-enabled-input">
+                                <label class="form-check-label" for="tw-rx1-enabled">Include Rx1</label>
+                            </div>
+                            <label for="tw-rx1-freq" class="small">Frequency (kHz)</label>
+                            <input type="number" step="1" class="form-control mb-2" id="tw-rx1-freq-input" placeholder="e.g. 437000">
+                            <label for="tw-rx1-sr" class="small">Symbol rate (kS/s)</label>
+                            <input type="number" step="1" class="form-control mb-2" id="tw-rx1-sr-input" placeholder="e.g. 1000">
+                            <label for="tw-rx1-lnb" class="small">Converter LO</label>
+                            <select class="form-control mb-2" id="tw-rx1-lnb-input"
+                                    onchange="onTwLnbSelectChange('1')">
+                                <option value="0">None (direct)</option>
+                                <option value="9750000">Ku 9750 MHz (QO-100 std.)</option>
+                                <option value="9000000">Ku 9000 MHz (QO-100, 9-10GHz mod. LNB)</option>
+                                <option value="10600000">Ku 10600 MHz</option>
+                                <option value="10750000">Ku 10750 MHz</option>
+                                <option value="5150000">C-band 5150 MHz (3.4 GHz)</option>
+                                <option value="929000" data-nodc="1">Icom IC-9700 23cm IF (929 MHz) - plug B only</option>
+                                <option value="120000" data-nodc="1">Airspy SpyVerter up-conv. (120 MHz) - plug B only</option>
+                                <option value="custom">Custom LO...</option>
+                            </select>
+                            <input type="number" step="1" class="form-control mb-2" id="tw-rx1-lnb-custom"
+                                   placeholder="Converter LO (kHz)" style="display:none">
+                            <div class="text-muted small mb-2" style="color:#d98a1e !important">
+                                &#x26A0;&#xFE0F; <strong>Using an up-converter or an IF output?
+                                Check the PicoTuner's LNB supply jumper first.</strong>
+                                Plug A carries 13/18V from the moment the board powers up, long
+                                before Lynx is running, so nothing in software can make it safe.
+                                A SpyVerter expects 4.2-5.5V on that pin and an IC-9700's IF is
+                                an output - either is destroyed by it, once, silently. Remove
+                                the jumper for whichever plug it is on, or fit a DC block
+                                inline.
+                            </div>
+                            <label for="tw-rx1-plug" class="small">Plug</label>
+                            <select class="form-control mb-2" id="tw-rx1-plug-input"
+                                    onchange="onTwLnbSelectChange('1')">
+                                <option value="a">A</option>
+                                <option value="b">B</option>
+                            </select>
+                            <label for="tw-rx1-label" class="small">Label</label>
+                            <input type="text" class="form-control mb-2" id="tw-rx1-label-input" placeholder="e.g. 70cm Live">
+                            <label for="tw-rx1-callsign" class="small">Expected callsign</label>
+                            <input type="text" class="form-control" id="tw-rx1-callsign-input" placeholder="e.g. GB3JT">
+                        </div>
+                        <div class="col-md-4">
+                            <h6 class="mb-2">Rx 2</h6>
+                            <div class="form-check form-switch mb-2">
+                                <input class="form-check-input" type="checkbox" id="tw-rx2-enabled-input">
+                                <label class="form-check-label" for="tw-rx2-enabled">Include Rx2</label>
+                            </div>
+                            <label for="tw-rx2-freq" class="small">Frequency (kHz)</label>
+                            <input type="number" step="1" class="form-control mb-2" id="tw-rx2-freq-input" placeholder="e.g. 1249000">
+                            <label for="tw-rx2-sr" class="small">Symbol rate (kS/s)</label>
+                            <input type="number" step="1" class="form-control mb-2" id="tw-rx2-sr-input" placeholder="e.g. 1000">
+                            <label for="tw-rx2-lnb" class="small">Converter LO</label>
+                            <select class="form-control mb-2" id="tw-rx2-lnb-input"
+                                    onchange="onTwLnbSelectChange('2')">
+                                <option value="0">None (direct)</option>
+                                <option value="9750000">Ku 9750 MHz (QO-100 std.)</option>
+                                <option value="9000000">Ku 9000 MHz (QO-100, 9-10GHz mod. LNB)</option>
+                                <option value="10600000">Ku 10600 MHz</option>
+                                <option value="10750000">Ku 10750 MHz</option>
+                                <option value="5150000">C-band 5150 MHz (3.4 GHz)</option>
+                                <option value="929000" data-nodc="1">Icom IC-9700 23cm IF (929 MHz) - plug B only</option>
+                                <option value="120000" data-nodc="1">Airspy SpyVerter up-conv. (120 MHz) - plug B only</option>
+                                <option value="custom">Custom LO...</option>
+                            </select>
+                            <input type="number" step="1" class="form-control mb-2" id="tw-rx2-lnb-custom"
+                                   placeholder="Converter LO (kHz)" style="display:none">
+                            <div class="text-muted small mb-2" style="color:#d98a1e !important">
+                                &#x26A0;&#xFE0F; <strong>Using an up-converter or an IF output?
+                                Check the PicoTuner's LNB supply jumper first.</strong>
+                                Plug A carries 13/18V from the moment the board powers up, long
+                                before Lynx is running, so nothing in software can make it safe.
+                                A SpyVerter expects 4.2-5.5V on that pin and an IC-9700's IF is
+                                an output - either is destroyed by it, once, silently. Remove
+                                the jumper for whichever plug it is on, or fit a DC block
+                                inline.
+                            </div>
+                            <label for="tw-rx2-plug" class="small">Plug</label>
+                            <select class="form-control mb-2" id="tw-rx2-plug-input"
+                                    onchange="onTwLnbSelectChange('2')">
+                                <option value="a">A</option>
+                                <option value="b" selected>B</option>
+                            </select>
+                            <label for="tw-rx2-label" class="small">Label</label>
+                            <input type="text" class="form-control mb-2" id="tw-rx2-label-input" placeholder="e.g. 23cm Live">
+                            <label for="tw-rx2-callsign" class="small">Expected callsign</label>
+                            <input type="text" class="form-control" id="tw-rx2-callsign-input" placeholder="e.g. GB3JT">
+                        </div>
+                        <div class="col-md-4">
+                            <h6 class="mb-2">Stream</h6>
+                            <div class="form-check form-switch mb-2">
+                                <input class="form-check-input" type="checkbox" id="tw-stream-enabled-input">
+                                <label class="form-check-label" for="tw-stream-enabled">Include stream</label>
+                            </div>
+                            <label for="tw-stream-domain" class="small">RTMP domain</label>
+                            <input type="text" class="form-control mb-2" id="tw-stream-domain-input" placeholder="e.g. rtmp.batc.org.uk">
+                            <label for="tw-stream-app" class="small">App</label>
+                            <input type="text" class="form-control mb-2" id="tw-stream-app-input" placeholder="e.g. live">
+                            <label for="tw-stream-name" class="small">Stream name</label>
+                            <input type="text" class="form-control mb-2" id="tw-stream-name-input" placeholder="e.g. gb3jtinput">
+                            <label for="tw-stream-port" class="small">Port</label>
+                            <input type="number" step="1" class="form-control mb-2" id="tw-stream-port-input" placeholder="1935">
+                            <label for="tw-stream-label" class="small">Label</label>
+                            <input type="text" class="form-control mb-2" id="tw-stream-label-input" placeholder="e.g. Live Stream">
+                            <label for="tw-stream-waiting-message" class="small">Notification text</label>
+                            <input type="text" class="form-control" id="tw-stream-waiting-message-input"
+                                   placeholder="Leave blank for the default wording">
+                        </div>
+                    </div>
+                    <div class="mt-3 d-flex align-items-center gap-2">
+                        <button class="btn btn-save" onclick="saveTriWatch()">Save Tri-Watch sources</button>
+                        <span class="save-status" id="tw-save-status"></span>
+                    </div>
+                </div>
+            </div>
+        </div>
     </div>
 
 </div>
 
 <script>
+// ── Reveal sensitive fields (API keys, passwords) ────────────────
+// Click-to-toggle (not hold-to-view - that was tried first and,
+// despite passing every isolated event-dispatch test, repeatedly
+// didn't work for Justin in practice; a genuinely quick click on a
+// hold-only control can reveal-and-immediately-re-hide within
+// milliseconds, easy to miss and easy to mistake for "does nothing"
+// at all). A plain click is the simplest, most universally-reliable
+// interaction there is - identical for mouse and touch, with no
+// press-duration timing involved anywhere. Auto-hides after 10s so a
+// revealed value still can't be left exposed indefinitely if someone
+// walks away - keeping the original camera/shoulder-surfing concern
+// addressed without needing a sustained hold to do it. Toggles the
+// CSS masking (see .mask-field) directly rather than the input's
+// type - these fields are genuinely type="text" throughout,
+// deliberately never type="password", so browsers never treat them
+// as login credentials to offer saving/autofilling (confirmed as a
+// real, reported annoyance when they briefly were: an unwanted
+// save-password prompt on every visit, sometimes guessing a
+// nonsensical "username" from an unrelated nearby field).
+function revealField(id) {
+    const el = document.getElementById(id);
+    if (el) el.style.webkitTextSecurity = 'none';
+}
+function hideField(id) {
+    const el = document.getElementById(id);
+    if (el) el.style.webkitTextSecurity = 'disc';
+}
+function setupRevealButtons() {
+    document.querySelectorAll('.reveal-btn').forEach(btn => {
+        const targetId = btn.getAttribute('data-reveal-target');
+        let autoHideTimer = null;
+        btn.addEventListener('click', () => {
+            const el = document.getElementById(targetId);
+            if (!el) return;
+            const isRevealed = el.style.webkitTextSecurity === 'none';
+            clearTimeout(autoHideTimer);
+            if (isRevealed) {
+                hideField(targetId);
+                btn.textContent = '\U0001F441\uFE0F';
+            } else {
+                revealField(targetId);
+                btn.textContent = '\U0001F648';  // visually distinct "currently revealed" state
+                autoHideTimer = setTimeout(() => {
+                    hideField(targetId);
+                    btn.textContent = '\U0001F441\uFE0F';
+                }, 10000);
+            }
+        });
+    });
+}
+setupRevealButtons();
+
+// Tri-Watch's converter selectors. These live on THIS page because the
+// Tri-Watch fields do - the Config and Receiver pages are separate
+// documents with separate scripts, and a function defined on one is
+// simply not there on the other. Defining these alongside the manual
+// tune page's equivalents left the calls below throwing
+// "setTwLnbLo is not defined", which aborted the rest of the form load
+// and left every field after it - the whole stream section - blank.
+function twLnbLoKhz(rx) {
+    const sel = document.getElementById('tw-rx' + rx + '-lnb-input');
+    if (!sel) return 0;
+    if (sel.value === 'custom') {
+        return parseInt(document.getElementById('tw-rx' + rx + '-lnb-custom').value) || 0;
+    }
+    return parseInt(sel.value) || 0;
+}
+
+function onTwLnbSelectChange(rx) {
+    const sel = document.getElementById('tw-rx' + rx + '-lnb-input');
+    const custom = document.getElementById('tw-rx' + rx + '-lnb-custom');
+    const plugSel = document.getElementById('tw-rx' + rx + '-plug-input');
+    if (!sel) return;
+    if (custom) custom.style.display = (sel.value === 'custom') ? '' : 'none';
+
+    // Same rule as the manual tune page, plus the plug restriction. Two
+    // conditions have to hold before an up-converter or an IF output can
+    // be chosen at all:
+    //
+    //   1. plug B has no voltage generator fitted, and
+    //   2. plug B is the plug selected
+    //
+    // Plug A always carries 13/18V from the moment the board powers up,
+    // before Lynx is running, so its own software state is irrelevant -
+    // it can never be made safe. Only the absence of a generator, or a
+    // DC block, protects the equipment, which is what the warning below
+    // the selector says.
+    //
+    // The rule works in both directions, since it is the COMBINATION
+    // that is unsafe: the converters cannot be chosen while plug A is
+    // selected, and plug A cannot be chosen while one of them is.
+    //
+    // A Custom LO is left alone deliberately - it may perfectly well be
+    // an unlisted LNB that needs its supply.
+    const bAbsent = !!(twLnbPsuState && twLnbPsuState['plug_b'] === 'absent');
+    const onPlugA = !!(plugSel && plugSel.value === 'a');
+    for (const opt of sel.options) {
+        if (opt.dataset && opt.dataset.nodc === '1') {
+            opt.disabled = onPlugA || !bAbsent;
+            opt.title = onPlugA
+                ? 'Not available on plug A: it carries 13/18V LNB supply from the moment the '
+                  + 'board powers up, before Lynx starts, and would destroy this equipment. '
+                  + 'Select plug B first.'
+                : (!bAbsent
+                    ? 'Unavailable: a voltage generator is fitted on plug B, or its state is '
+                      + 'not yet known. It has to be physically removed before this can be '
+                      + 'connected.'
+                    : 'Connect to plug B, with the PicoTuner supply jumper removed.');
+        }
+    }
+
+    const chosen = sel.options[sel.selectedIndex];
+    const noDc = !!(chosen && chosen.dataset && chosen.dataset.nodc === '1');
+    if (plugSel) {
+        for (const opt of plugSel.options) {
+            if (opt.value === 'a') {
+                opt.disabled = noDc;
+                opt.title = noDc
+                    ? 'Plug A carries 13/18V from power-up, before Lynx starts. The selected '
+                      + 'converter would be destroyed. Use plug B.'
+                    : '';
+            }
+        }
+    }
+}
+
+let twLnbPsuState = null;
+
+// Read plug B's generator state, so the no-DC converters can be offered
+// only where there is none. Plain fetch, as the rest of this page uses -
+// api() is defined on the Receiver page, not this one.
+async function loadTwLnbPsuState() {
+    try {
+        const r = await fetch('/api/status');
+        const st = await r.json();
+        twLnbPsuState = st?.picotuner?.lnb_psu || null;
+    } catch (e) {
+        // Logged rather than swallowed: a silent failure here disables
+        // the presets, which is indistinguishable from a deliberate
+        // restriction and very hard to diagnose.
+        console.error('could not read LNB PSU state:', e);
+        twLnbPsuState = null;
+    }
+    onTwLnbSelectChange('1');
+    onTwLnbSelectChange('2');
+}
+
+// Put a stored LO back into the selector, choosing Custom LO for
+// anything that is not one of the presets.
+function setTwLnbLo(rx, lo) {
+    const sel = document.getElementById('tw-rx' + rx + '-lnb-input');
+    const custom = document.getElementById('tw-rx' + rx + '-lnb-custom');
+    if (!sel) return;
+    const v = String(lo || 0);
+    if (Array.from(sel.options).some(o => o.value === v)) {
+        sel.value = v;
+        if (custom) custom.value = '';
+    } else {
+        sel.value = 'custom';
+        if (custom) custom.value = lo;
+    }
+    onTwLnbSelectChange(rx);
+}
+
+
 async function loadCurrentConfig() {
     try {
         const cfg = await fetch('/api/config').then(r => r.json());
@@ -3717,6 +7477,35 @@ async function loadCurrentConfig() {
         document.getElementById('site-callsign-input').value = cfg.site?.callsign || '';
         document.getElementById('site-location-input').value = cfg.site?.location || '';
         document.getElementById('site-locator-input').value = cfg.site?.locator || '';
+
+        const pf = cfg.pathfinder || {};
+        document.getElementById('pf-enabled').checked = pf.enabled !== false;
+        document.getElementById('pf-delay').value = pf.delay_secs ?? 2;
+        document.getElementById('pf-duration').value = pf.duration_secs ?? 30;
+        updatePathfinderWarning();
+        // Which placeholder card is in place isn't part of the config
+        // (it's a file, not a setting), so it's fetched separately.
+        refreshTestcard();
+        // Re-check whenever any of the four inputs move, so the warning
+        // appears the moment a conflict is created rather than only on
+        // reload. Bound here (after the values are populated) rather
+        // than at page load, so setting the initial values can't itself
+        // fire the handler before the config has arrived.
+        ['pf-enabled', 'pf-delay', 'pf-duration',
+         'companion-unlock-settle-input', 'companion-enabled-input'
+        ].forEach(id => {
+            const el = document.getElementById(id);
+            if (el && !el.dataset.pfBound) {
+                el.addEventListener('change', updatePathfinderWarning);
+                el.addEventListener('input', updatePathfinderWarning);
+                el.dataset.pfBound = '1';
+            }
+        });
+
+        loadAudioDevices(cfg.display?.audio_device || 'hdmi');
+
+        document.getElementById('refresh-hz-select').value = String(cfg.display?.refresh_hz ?? 50);
+        document.getElementById('max-height-hidden').value = String(cfg.display?.max_height ?? 1080);
 
         const ppmStyle = cfg.display?.ppm_style || 'full_fat';
         document.getElementById(ppmStyle === 'full_fat' ? 'ppm-style-full-fat' : 'ppm-style-skeleton').checked = true;
@@ -3748,6 +7537,29 @@ async function loadCurrentConfig() {
         document.getElementById('qrz-suppress-input').value = qrz.suppress_mins ?? 60;
         document.getElementById('qrz-portable-locator-input').value = qrz.portable_locator || '';
 
+        // Off unless explicitly on, matching the server-side default.
+        // Was "!== false", which showed the box ticked on any config
+        // with no squeak section at all - i.e. claiming a feature was
+        // running that the server had not started.
+        document.getElementById('squeak-enabled-input').checked = (cfg.squeak?.enabled === true);
+        document.getElementById('squeak-hold-input').value = cfg.squeak?.hold_secs ?? 45;
+        loadSqueakSources();
+
+        const rawGnssMode = cfg.gnss?.mode;
+        // Anything other than exactly 'automatic' displays as Manual -
+        // covers a genuinely unset config (defaults to automatic,
+        // matching the backend) as well as a legacy 'off' value from
+        // before that mode was removed, which the backend already
+        // treats the same as manual (see _on_gnss_locator_change).
+        const gnssMode = (rawGnssMode === undefined || rawGnssMode === 'automatic')
+            ? 'automatic' : 'manual';
+        document.getElementById('gnss-mode-' + gnssMode).checked = true;
+        document.getElementById('gnss-time-sync-input').checked = cfg.gnss?.time_sync ?? true;
+        onGnssModeChange();
+        document.getElementById('qrz-lookup-username-input').value = qrz.lookup_username || '';
+        document.getElementById('qrz-lookup-password-input').value = qrz.lookup_password || '';
+        document.getElementById('qrz-lookup-notif-input').checked = qrz.lookup_for_notifications || false;
+
         const slack = cfg.notifications?.slack || {};
         document.getElementById('slack-enabled-input').checked = slack.enabled || false;
         document.getElementById('slack-webhook-url-input').value = slack.webhook_url || '';
@@ -3775,6 +7587,41 @@ async function loadCurrentConfig() {
         // Pin dropdown is built dynamically (see loadGpioPinList) - set
         // its value once populated, defaulting sensibly if unset.
         await loadGpioPinList(gpio.pin ?? 11);
+
+        // Tri-Watch: sources is a list (any mix of Rx1/Rx2/stream, in
+        // any order) rather than fixed fields, so each is found by
+        // type/rcv rather than assumed to be at a fixed index.
+        const tw = cfg.tri_watch || {};
+        const twSources = tw.sources || [];
+        const twRx1 = twSources.find(s => s.type === 'rf' && s.rcv === 1 && s.enabled !== false);
+        const twRx2 = twSources.find(s => s.type === 'rf' && s.rcv === 2 && s.enabled !== false);
+        const twStream = twSources.find(s => s.type === 'stream' && s.enabled !== false);
+
+        document.getElementById('tw-enabled-input').checked = tw.enabled || false;
+
+        document.getElementById('tw-rx1-enabled-input').checked = !!twRx1;
+        document.getElementById('tw-rx1-freq-input').value = twRx1?.freq ?? '';
+        document.getElementById('tw-rx1-sr-input').value = twRx1?.sr ?? '';
+        setTwLnbLo('1', twRx1?.lnb_lo_khz ?? 0);
+        document.getElementById('tw-rx1-plug-input').value = twRx1?.fplug || 'a';
+        document.getElementById('tw-rx1-label-input').value = twRx1?.label || '';
+        document.getElementById('tw-rx1-callsign-input').value = twRx1?.callsign || '';
+
+        document.getElementById('tw-rx2-enabled-input').checked = !!twRx2;
+        document.getElementById('tw-rx2-freq-input').value = twRx2?.freq ?? '';
+        document.getElementById('tw-rx2-sr-input').value = twRx2?.sr ?? '';
+        setTwLnbLo('2', twRx2?.lnb_lo_khz ?? 0);
+        document.getElementById('tw-rx2-plug-input').value = twRx2?.fplug || 'b';
+        document.getElementById('tw-rx2-label-input').value = twRx2?.label || '';
+        document.getElementById('tw-rx2-callsign-input').value = twRx2?.callsign || '';
+
+        document.getElementById('tw-stream-enabled-input').checked = !!twStream;
+        document.getElementById('tw-stream-domain-input').value = twStream?.domain || '';
+        document.getElementById('tw-stream-app-input').value = twStream?.app || '';
+        document.getElementById('tw-stream-name-input').value = twStream?.streamname || '';
+        document.getElementById('tw-stream-port-input').value = twStream?.port ?? 1935;
+        document.getElementById('tw-stream-label-input').value = twStream?.label || '';
+        document.getElementById('tw-stream-waiting-message-input').value = twStream?.waiting_message || '';
     } catch (e) {
         console.error('Failed to load config', e);
     }
@@ -3869,7 +7716,7 @@ async function switchUpdateChannel() {
             statusEl.className = 'save-status text-muted';
             return;
         }
-    } catch (e) { /* fall through and let the switch itself report any real problem */ }
+    } catch (e) { /* if this check fails, fall through and let the switch itself report any real problem */ }
 
     const warning = selected === 'beta'
         ? 'Switch to the Beta channel? This pulls newer, less-tested code and reboots the Pi. ' +
@@ -3893,6 +7740,8 @@ async function switchUpdateChannel() {
         statusEl.textContent = 'Switched - rebooting the Pi now, back in about a minute.';
         statusEl.className = 'save-status text-warning';
     } catch (e) {
+        // The server may already be going down as part of the reboot by
+        // the time this resolves - not itself a sign anything went wrong.
         statusEl.textContent = 'Switched - rebooting the Pi now, back in about a minute.';
         statusEl.className = 'save-status text-warning';
     }
@@ -3932,13 +7781,304 @@ async function restoreWifi() {
     }
 }
 
+// The card is on screen from delay_secs to delay_secs + duration_secs
+// after unlock. Anything reacting to that unlock can cut away before
+// viewers see it - so cross-check the Companion unlock action here and
+// say so, rather than silently rewriting a value the operator set
+// deliberately. Note unlock_settle_secs is a DEBOUNCE ("has it really
+// unlocked?"), not a hold-off, so lengthening it delays every unlock
+// notification, not just the source switch. That is the operator's call
+// to make knowingly, which is why the field stays editable.
+function pathfinderWindow() {
+    const d = parseFloat(document.getElementById('pf-delay').value) || 0;
+    const u = parseFloat(document.getElementById('pf-duration').value) || 0;
+    return d + u;
+}
+
+function updatePathfinderWarning() {
+    const on = document.getElementById('pf-enabled').checked;
+    const total = pathfinderWindow();
+    const winEl = document.getElementById('pf-window');
+    const warnEl = document.getElementById('pf-warning');
+    const compWarnEl = document.getElementById('companion-pathfinder-warning');
+
+    winEl.textContent = on
+        ? `Card is on screen until ${total.toFixed(0)}s after the station stops.`
+        : '';
+
+    const hide = () => {
+        if (warnEl) warnEl.style.display = 'none';
+        if (compWarnEl) compWarnEl.style.display = 'none';
+    };
+
+    const settleEl = document.getElementById('companion-unlock-settle-input');
+    const compEnabled = document.getElementById('companion-enabled-input');
+    // No conflict worth flagging if the map is off, or if Companion
+    // isn't enabled - nothing is firing on unlock to switch away.
+    if (!on || !settleEl || !compEnabled || !compEnabled.checked) { hide(); return; }
+
+    const settle = parseFloat(settleEl.value);
+    if (isNaN(settle) || settle >= total) { hide(); return; }
+
+    const btn = `<button type="button" class="btn btn-sm btn-outline-dark py-0 px-2 ms-1" ` +
+                `onclick="matchCompanionSettle()">Match to ${total.toFixed(0)}s</button>`;
+
+    // Shown in BOTH cards deliberately. The Station Map card is where
+    // the timings were just changed; the Companion card is where the
+    // field that needs changing actually lives, and someone editing
+    // settle times may never scroll past it.
+    if (warnEl) {
+        warnEl.innerHTML =
+            `&#9888; The Companion unlock action fires at <strong>${settle}s</strong>, ` +
+            `before this card finishes at <strong>${total.toFixed(0)}s</strong>. ` +
+            `If it switches the output away from Lynx, nobody will see the map. ` + btn;
+        warnEl.style.display = 'block';
+    }
+    if (compWarnEl) {
+        compWarnEl.innerHTML =
+            `&#9888; Pathfinder shows a card until <strong>${total.toFixed(0)}s</strong> ` +
+            `after unlock, but this action fires at <strong>${settle}s</strong>. ` +
+            `If it switches the output away from Lynx, the map won't be seen. ` + btn;
+        compWarnEl.style.display = 'block';
+    }
+}
+
+function matchCompanionSettle() {
+    const settleEl = document.getElementById('companion-unlock-settle-input');
+    if (settleEl) {
+        settleEl.value = pathfinderWindow().toFixed(0);
+        settleEl.dispatchEvent(new Event('change'));
+        updatePathfinderWarning();
+        const st = document.getElementById('pf-status');
+        if (st) {
+            st.textContent = 'Companion settle updated - save the Companion section too.';
+            st.className = 'save-status text-warning';
+        }
+        // Deliberately not saved for you: writing to another section on
+        // your behalf is exactly the silent-change behaviour this design
+        // set out to avoid.
+        const cs = document.getElementById('companion-save-status');
+        if (cs) {
+            cs.textContent = 'Settle time changed - press Save Companion settings.';
+            cs.className = 'save-status text-warning';
+        }
+    }
+}
+
+async function refreshTestcard() {
+    const el = document.getElementById('tc-current');
+    if (!el) return;
+    try {
+        const r = await fetch('/api/testcard');
+        const info = await r.json();
+        const kb = Math.round(info.bytes / 1024);
+        if (info.source === 'uploaded') {
+            el.innerHTML = 'Currently using <strong>your uploaded card</strong> (' +
+                           info.filename + ', ' + kb + ' KB).';
+        } else if (info.source === 'shipped') {
+            el.innerHTML = 'Currently using the <strong>card shipped with Lynx</strong> (' + kb + ' KB).';
+        } else {
+            el.innerHTML = 'No card in place &mdash; a plain <strong>SWITCHING</strong> caption is shown instead.';
+        }
+    } catch (e) {
+        el.textContent = 'Could not check which card is in place.';
+        console.error(e);
+    }
+}
+
+async function uploadTestcard() {
+    const statusEl = document.getElementById('tc-status');
+    const input = document.getElementById('tc-file');
+    const file = input.files && input.files[0];
+    if (!file) {
+        statusEl.textContent = 'Choose a file first.';
+        statusEl.className = 'save-status text-danger';
+        return;
+    }
+    statusEl.textContent = 'Uploading...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        // Read as base64 rather than posting multipart - the backend
+        // deliberately takes JSON, so it needs no extra dependency.
+        // readAsDataURL gives "data:<type>;base64,<data>"; only the part
+        // after the comma is sent.
+        const b64 = await new Promise((resolve, reject) => {
+            const fr = new FileReader();
+            fr.onload = () => resolve(String(fr.result).split(',')[1]);
+            fr.onerror = () => reject(new Error('Could not read the file'));
+            fr.readAsDataURL(file);
+        });
+        const r = await fetch('/api/testcard', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({filename: file.name, data_base64: b64})
+        });
+        const result = await r.json();
+        if (!r.ok) throw new Error(result.detail || 'upload failed');
+        statusEl.textContent = 'Uploaded - it will appear on the next switch.';
+        statusEl.className = 'save-status text-success';
+        input.value = '';
+        refreshTestcard();
+    } catch (e) {
+        statusEl.textContent = 'Upload failed: ' + e.message;
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
+async function removeTestcard() {
+    const statusEl = document.getElementById('tc-status');
+    statusEl.textContent = 'Removing...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const r = await fetch('/api/testcard', {method: 'DELETE'});
+        const result = await r.json();
+        if (!r.ok) throw new Error(result.detail || 'failed');
+        statusEl.textContent = result.removed
+            ? 'Removed - back to the shipped card.'
+            : 'Nothing uploaded, already using the shipped card.';
+        statusEl.className = 'save-status text-success';
+        refreshTestcard();
+    } catch (e) {
+        statusEl.textContent = 'Failed: ' + e.message;
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
+async function savePathfinder() {
+    const statusEl = document.getElementById('pf-status');
+    statusEl.textContent = 'Saving...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const body = { pathfinder: {
+            enabled: document.getElementById('pf-enabled').checked,
+            delay_secs: parseFloat(document.getElementById('pf-delay').value),
+            duration_secs: parseFloat(document.getElementById('pf-duration').value)
+        }};
+        const r = await fetch('/api/config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+        });
+        if (!r.ok) throw new Error(await r.text());
+        statusEl.textContent = 'Saved - restart required.';
+        statusEl.className = 'save-status text-success';
+        updatePathfinderWarning();
+    } catch (e) {
+        statusEl.textContent = 'Save failed - see console.';
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
+async function loadAudioDevices(current) {
+    const sel = document.getElementById('audio-device-select');
+    const note = document.getElementById('audio-device-resolved');
+    if (!sel) return;
+    try {
+        const r = await fetch('/api/audio/devices');
+        const d = await r.json();
+        // Keep the two friendly options at the top, then whatever mpv
+        // actually reports - asked of mpv rather than ALSA so the names
+        // are exactly what --audio-device will accept.
+        sel.length = 2;
+        (d.devices || []).forEach(dev => {
+            const o = document.createElement('option');
+            o.value = dev.name;
+            o.textContent = dev.description + '  (' + dev.name + ')';
+            sel.appendChild(o);
+        });
+        sel.value = current;
+        if (sel.value !== current) {
+            // The saved device is no longer present - a dongle unplugged,
+            // or a card renumbered. Say so rather than silently showing
+            // something else as selected.
+            const o = document.createElement('option');
+            o.value = current;
+            o.textContent = current + '  (not currently present)';
+            sel.appendChild(o);
+            sel.value = current;
+        }
+        if (note) {
+            note.textContent = (current === 'hdmi' && d.resolved)
+                ? 'Currently resolves to: ' + d.resolved
+                : '';
+        }
+    } catch (e) {
+        console.error('audio device list failed', e);
+        if (note) note.textContent = 'Could not read the device list from mpv.';
+    }
+}
+
+async function saveAudioDevice() {
+    const st = document.getElementById('audio-save-status');
+    st.textContent = 'Saving...';
+    st.className = 'save-status text-muted';
+    try {
+        const body = { display: {
+            ppm_style: document.querySelector('input[name="ppm-style"]:checked')?.value || 'full_fat',
+            audio_device: document.getElementById('audio-device-select').value
+        }};
+        const r = await fetch('/api/config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body)
+        });
+        if (!r.ok) throw new Error(await r.text());
+        st.textContent = 'Saved - takes effect when mpv next starts.';
+        st.className = 'save-status text-success';
+    } catch (e) {
+        st.textContent = 'Save failed - see console.';
+        st.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
+async function saveScreen() {
+    const el = document.getElementById('screen-save-status');
+    el.textContent = 'Saving...'; el.className = 'save-status text-muted';
+    try {
+        // Every display field must be sent, not just the ones this card
+        // owns. The API merges with update(model_dump()), and model_dump
+        // fills anything unsent with the model's DEFAULT - so omitting a
+        // field silently resets it on disk rather than leaving it alone.
+        // savePpmStyle() already sends audio_device for exactly this
+        // reason; refresh_hz and max_height now need the same treatment
+        // from both.
+        const body = {display: {
+            refresh_hz: parseInt(document.getElementById('refresh-hz-select').value, 10) || 50,
+            max_height: parseInt(document.getElementById('max-height-hidden').value, 10) || 1080,
+            ppm_style: document.querySelector('input[name="ppm-style"]:checked')?.value || 'full_fat',
+            audio_device: document.getElementById('audio-device-select')?.value || 'hdmi'
+        }};
+        const r = await fetch('/api/config', {method: 'POST',
+            headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+        if (!r.ok) throw new Error(await r.text());
+        // The screen mode is set once, by lynx_start.sh, before mpv and
+        // the overlay start - changing it underneath them is exactly
+        // what breaks them - so this cannot take effect live.
+        el.textContent = 'Saved - restart Lynx for this to take effect.';
+        el.className = 'save-status text-success';
+    } catch (e) {
+        el.textContent = 'Save failed - see console.';
+        el.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
 async function savePpmStyle() {
     const statusEl = document.getElementById('ppm-style-status');
     statusEl.textContent = 'Saving...';
     statusEl.className = 'save-status text-muted';
     try {
         const style = document.querySelector('input[name="ppm-style"]:checked').value;
-        const body = { display: { ppm_style: style } };
+        // Both fields are sent together: the config save merges the
+        // whole display block, so sending only one would drop the other.
+        const body = { display: {
+            ppm_style: style,
+            // Carried through for the same reason this already carries
+            // audio_device - see saveScreen().
+            refresh_hz: parseInt(document.getElementById('refresh-hz-select')?.value, 10) || 50,
+            max_height: parseInt(document.getElementById('max-height-hidden')?.value, 10) || 1080,
+            audio_device: document.getElementById('audio-device-select')?.value || 'hdmi'
+        }};
         const r = await fetch('/api/config', {
             method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
         });
@@ -4056,6 +8196,9 @@ async function saveQrz() {
                 settle_secs: parseFloat(document.getElementById('qrz-settle-input').value),
                 suppress_mins: parseFloat(document.getElementById('qrz-suppress-input').value),
                 portable_locator: document.getElementById('qrz-portable-locator-input').value.trim(),
+                lookup_username: document.getElementById('qrz-lookup-username-input').value.trim(),
+                lookup_password: document.getElementById('qrz-lookup-password-input').value,
+                lookup_for_notifications: document.getElementById('qrz-lookup-notif-input').checked,
             }
         };
         const r = await fetch('/api/config', {
@@ -4070,6 +8213,203 @@ async function saveQrz() {
         console.error(e);
     }
 }
+
+function onGnssModeChange() {
+    // In Automatic mode GPS is authoritative and will overwrite the
+    // QRZ field on its own next confirmed fix, so it's disabled here
+    // to avoid a typed edit that looks saved but is about to be
+    // silently overwritten - and, while disabled, loadGnssStatus()
+    // keeps its value live-updated to whatever GPS actually currently
+    // reports, rather than leaving it showing a stale config snapshot
+    // from page load. Manual leaves it a normal, editable field - the
+    // operator's typed value is the whole point.
+    const mode = document.querySelector('input[name="gnss-mode"]:checked')?.value || 'automatic';
+    const qrzInput = document.getElementById('qrz-portable-locator-input');
+    qrzInput.disabled = (mode === 'automatic');
+    qrzInput.placeholder = mode === 'automatic'
+        ? 'Driven by GPS - see GNSS card below'
+        : 'e.g. IO91VG - leave blank for normal operation';
+}
+
+async function loadSqueakSources() {
+    try {
+        const r = await fetch('/api/audio/monitors').then(r => r.json());
+        const sel = document.getElementById('squeak-source-select');
+        sel.innerHTML = '';
+        (r.monitors || []).forEach(m => {
+            const o = document.createElement('option');
+            o.value = m.name; o.textContent = m.description;
+            sel.appendChild(o);
+        });
+        sel.value = r.current || '';
+    } catch (e) { console.error(e); }
+}
+
+async function saveSqueak() {
+    const el = document.getElementById('squeak-save-status');
+    el.textContent = 'Saving...'; el.className = 'save-status text-muted';
+    try {
+        const body = {squeak: {
+            enabled: document.getElementById('squeak-enabled-input').checked,
+            source: document.getElementById('squeak-source-select').value,
+            hold_secs: parseFloat(document.getElementById('squeak-hold-input').value) || 45
+        }};
+        const r = await fetch('/api/config', {method: 'POST',
+            headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
+        if (!r.ok) throw new Error(await r.text());
+        // Enabling or changing the source needs a restart: the listener
+        // holds an open reader on the audio monitor for the life of the
+        // process. The display time alone applies to the next card.
+        el.textContent = 'Saved - restart Lynx to start or stop listening.';
+        el.className = 'save-status text-success';
+    } catch (e) {
+        el.textContent = 'Save failed - see console.';
+        el.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
+async function saveGnssMode() {
+    const statusEl = document.getElementById('gnss-save-status');
+    statusEl.textContent = 'Saving...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const mode = document.querySelector('input[name="gnss-mode"]:checked')?.value || 'automatic';
+        const timeSync = document.getElementById('gnss-time-sync-input').checked;
+        // Also submits the QRZ card's current field values, portable_locator
+        // included - not just gnss.mode/time_sync. Without this, switching
+        // to Manual and clearing the locator field looked saved (the field
+        // itself went blank) but wasn't: this button only ever wrote the
+        // gnss section, so GPS's last-written value stayed sitting in
+        // notifications.qrz.portable_locator until "Save QRZ settings" was
+        // ALSO clicked separately - confirmed as the actual cause of a
+        // reported bug (a stale GPS locator kept appearing in the logbook
+        // after switching to Manual, since nothing had told the backend
+        // the field was now meant to be empty). One save now covers both.
+        const body = {
+            gnss: {mode: mode, time_sync: timeSync},
+            notifications_qrz: {
+                enabled: document.getElementById('qrz-enabled-input').checked,
+                api_key: document.getElementById('qrz-api-key-input').value,
+                settle_secs: parseFloat(document.getElementById('qrz-settle-input').value),
+                suppress_mins: parseFloat(document.getElementById('qrz-suppress-input').value),
+                portable_locator: document.getElementById('qrz-portable-locator-input').value.trim(),
+                lookup_username: document.getElementById('qrz-lookup-username-input').value.trim(),
+                lookup_password: document.getElementById('qrz-lookup-password-input').value,
+                lookup_for_notifications: document.getElementById('qrz-lookup-notif-input').checked,
+            }
+        };
+        const r = await fetch('/api/config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(body)
+        });
+        if (!r.ok) throw new Error(await r.text());
+        statusEl.textContent = 'Saved - applied immediately.';
+        statusEl.className = 'save-status text-success';
+        onGnssModeChange();
+    } catch (e) {
+        statusEl.textContent = 'Save failed - see console.';
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
+function setGnssHardwareAvailable(available) {
+    // No module fitted (a repeater site, or the HAT not wired up yet)
+    // gets the same treatment as the PicoTuner's own LNB-plug-absent
+    // buttons: disabled and dimmed rather than left looking live, with
+    // the reason moved onto a hover tooltip. pointerEvents is forced
+    // back to 'auto' because a disabled control's own title attribute
+    // doesn't reliably show on hover in every browser otherwise - the
+    // same fix already proven there.
+    //
+    // Manual (gnss-mode-manual) is deliberately outside
+    // #gnss-hw-dependent and never touched here - unlike Automatic
+    // (which does nothing at all without a HAT actually answering),
+    // Manual's whole behaviour is hardware-independent by definition:
+    // it just means GPS doesn't touch the typed value, which is true
+    // and useful whether or not a HAT exists. It stays the always-
+    // selectable option, including to back out of Automatic if a HAT
+    // stops answering.
+    const why = 'No GNSS module detected on /dev/ttyAMA0 - fit the HAT ' +
+                '(or check the serial connection) to use this mode.';
+    document.getElementById('gnss-no-module-warning').style.display = available ? 'none' : 'block';
+
+    const wrap = document.getElementById('gnss-hw-dependent');
+    wrap.classList.toggle('gnss-unavailable', !available);
+
+    for (const id of ['gnss-mode-automatic']) {
+        const input = document.getElementById(id);
+        input.disabled = !available;
+        for (const el of [input, input.closest('.form-check')]) {
+            if (!el) continue;
+            if (!available) {
+                if (!el.dataset.titleOrig) el.dataset.titleOrig = el.title || '';
+                el.title = why;
+                el.style.cursor = 'not-allowed';
+                el.style.pointerEvents = 'auto';
+            } else if (el.dataset.titleOrig !== undefined) {
+                el.title = el.dataset.titleOrig;
+                el.style.cursor = '';
+            }
+        }
+    }
+}
+
+async function loadGnssStatus() {
+    // Polls regardless of which mode is currently selected - the
+    // no-module warning/greying needs to track real hardware state
+    // continuously, not just while Automatic happens to be selected.
+    try {
+        const s = await fetch('/api/status').then(r => r.json());
+        const g = s.lynx?.gnss || {};
+        const noModule = g.running && !g.connected;
+        setGnssHardwareAvailable(!noModule);
+
+        document.getElementById('gnss-connected').textContent =
+            noModule ? 'No GNSS Module' : (g.connected ? 'Connected' : 'Not connected');
+        document.getElementById('gnss-locator-display').textContent = g.locator_display || g.locator || '—';
+        const sats = g.satellites != null ? g.satellites : '—';
+        const hdop = g.hdop != null ? g.hdop : '—';
+        document.getElementById('gnss-quality').textContent = sats + ' / ' + hdop;
+        const tsEl = document.getElementById('gnss-time-sync-status');
+        if (!document.getElementById('gnss-time-sync-input').checked) {
+            tsEl.textContent = 'Off';
+        } else if (g.time_synced) {
+            tsEl.textContent = 'Active';
+        } else if (g.time_quality_ok) {
+            tsEl.textContent = 'Unavailable on this receiver';
+        } else {
+            tsEl.textContent = 'Waiting for a fix';
+        }
+        let detail;
+        if (noModule) {
+            detail = 'No GNSS Module';
+        } else if (!g.connected) {
+            detail = g.last_error || 'Not yet connected';
+        } else if (g.pending_secs != null) {
+            detail = 'New square settling, ' + Math.ceil(g.pending_secs) + 's to confirm';
+        } else if (g.locator) {
+            detail = 'Confirmed fix';
+        } else {
+            detail = 'Waiting for a fix';
+        }
+        document.getElementById('gnss-detail').textContent = detail;
+
+        // In Automatic mode the QRZ field is disabled (see
+        // onGnssModeChange) and shows the live GPS value rather than
+        // a stale config snapshot from whenever the page happened to
+        // load - keeps it visibly in sync with whatever's actually
+        // about to be logged, not just at load time.
+        const currentMode = document.querySelector('input[name="gnss-mode"]:checked')?.value;
+        if (currentMode === 'automatic') {
+            document.getElementById('qrz-portable-locator-input').value = g.locator || '';
+        }
+    } catch (e) {
+        console.error(e);
+    }
+}
+setInterval(loadGnssStatus, 3000);
 
 async function saveSlack() {
     const statusEl = document.getElementById('slack-save-status');
@@ -4160,6 +8500,58 @@ async function saveGpioTx() {
     }
 }
 
+async function saveTriWatch() {
+    const statusEl = document.getElementById('tw-save-status');
+    statusEl.textContent = 'Saving...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const body = {
+            tri_watch: {
+                enabled: document.getElementById('tw-enabled-input').checked,
+                rx1: {
+                    enabled: document.getElementById('tw-rx1-enabled-input').checked,
+                    rcv: 1,
+                    fplug: document.getElementById('tw-rx1-plug-input').value,
+                    freq: parseInt(document.getElementById('tw-rx1-freq-input').value) || 0,
+                    sr: parseInt(document.getElementById('tw-rx1-sr-input').value) || 0,
+                    lnb_lo_khz: twLnbLoKhz('1'),
+                    label: document.getElementById('tw-rx1-label-input').value,
+                    callsign: document.getElementById('tw-rx1-callsign-input').value,
+                },
+                rx2: {
+                    enabled: document.getElementById('tw-rx2-enabled-input').checked,
+                    rcv: 2,
+                    fplug: document.getElementById('tw-rx2-plug-input').value,
+                    freq: parseInt(document.getElementById('tw-rx2-freq-input').value) || 0,
+                    sr: parseInt(document.getElementById('tw-rx2-sr-input').value) || 0,
+                    lnb_lo_khz: twLnbLoKhz('2'),
+                    label: document.getElementById('tw-rx2-label-input').value,
+                    callsign: document.getElementById('tw-rx2-callsign-input').value,
+                },
+                stream: {
+                    enabled: document.getElementById('tw-stream-enabled-input').checked,
+                    domain: document.getElementById('tw-stream-domain-input').value,
+                    app: document.getElementById('tw-stream-app-input').value,
+                    streamname: document.getElementById('tw-stream-name-input').value,
+                    port: parseInt(document.getElementById('tw-stream-port-input').value) || 1935,
+                    label: document.getElementById('tw-stream-label-input').value,
+                    waiting_message: document.getElementById('tw-stream-waiting-message-input').value,
+                },
+            }
+        };
+        const r = await fetch('/api/config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+        });
+        if (!r.ok) throw new Error(await r.text());
+        statusEl.textContent = 'Saved - restart Lynx to apply.';
+        statusEl.className = 'save-status text-warning';
+    } catch (e) {
+        statusEl.textContent = 'Save failed - see console.';
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
 async function loadDiscoveredPicotuners() {
     const listEl = document.getElementById('discovered-picotuners-list');
     try {
@@ -4184,8 +8576,51 @@ async function loadDiscoveredPicotuners() {
 }
 
 loadCurrentConfig();
+loadTwLnbPsuState();
+loadGnssStatus();
 loadDiscoveredPicotuners();
 setInterval(loadDiscoveredPicotuners, 5000);
+
+// ── QuickLynx ────────────────────────────────────────────────
+// Deliberately self-contained, with its own polling rather than a hook
+// into an existing update function. An earlier attempt edited the middle
+// of a large handler and left it broken, which took the whole page down
+// with it. This way a fault here fails alone.
+async function saveQuickLynx() {
+    const st = document.getElementById('quicklynx-status');
+    if (!st) return;
+    st.textContent = 'Saving...';
+    st.className = 'save-status text-muted';
+    try {
+        const r = await fetch('/api/config', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ quicklynx: {
+                enabled: document.getElementById('quicklynx-enabled').checked
+            }})
+        });
+        if (!r.ok) throw new Error(await r.text());
+        st.textContent = 'Saved.';
+        st.className = 'save-status text-success';
+    } catch (e) {
+        st.textContent = 'Save failed - see console.';
+        st.className = 'save-status text-danger';
+        console.error('QuickLynx save failed', e);
+    }
+}
+
+async function loadQuickLynxSetting() {
+    try {
+        const r = await fetch('/api/config');
+        const cfg = await r.json();
+        const el = document.getElementById('quicklynx-enabled');
+        if (el) el.checked = !!(cfg.quicklynx && cfg.quicklynx.enabled);
+    } catch (e) {
+        console.error('QuickLynx setting load failed', e);
+    }
+}
+document.addEventListener('DOMContentLoaded', loadQuickLynxSetting);
+
 </script>
 </body>
 </html>"""
@@ -4219,7 +8654,7 @@ def picotuner_cmd(cmd: str):
         host = cfg.get('host', '')
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            sock.sendto(cmd.encode(), (host, cfg['cmd_port']))
+            sock.sendto(cmd.encode(), (host, picotuner_cmd_port('a', cfg)))
         finally:
             sock.close()
         return True
@@ -4227,20 +8662,19 @@ def picotuner_cmd(cmd: str):
         print(f"[picotuner_cmd] could not send (Picotuner likely not configured/reachable): {e}")
         return False
 
-def picotuner_rcv2_cmd(cmd: str):
+def picotuner_rcv2_cmd(cmd: str, cfg: dict):
     """Same fire-and-forget, never-raises contract as picotuner_cmd()
     above - sends to Rx2's own, separate command port instead of Rx1's,
     since the Picotuner genuinely requires this (a single shared port
-    with different rcv=/vgy= values in the command text does NOT work
-    - confirmed directly in this file's own diversity tuning code,
-    which already sends rcv=2's tune commands to cmd_port_b for
-    exactly this reason)."""
+    with different rcv= values in the command text does NOT work,
+    confirmed the hard way during diversity mode's own development).
+    Takes cfg explicitly (config['picotuner']) rather than reading it
+    itself, since callers already have it in scope."""
     try:
-        cfg = config['picotuner']
         host = cfg.get('host', '')
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
-            sock.sendto(cmd.encode(), (host, cfg['cmd_port_b']))
+            sock.sendto(cmd.encode(), (host, picotuner_cmd_port('b', cfg)))
         finally:
             sock.close()
         return True
@@ -4248,18 +8682,174 @@ def picotuner_rcv2_cmd(cmd: str):
         print(f"[picotuner_rcv2_cmd] could not send (Picotuner likely not configured/reachable): {e}")
         return False
 
+# Lowest frequency the Picotuner's own NIM can reach, in kHz.
+#
+# Used only to tell an UP-converter apart from a down-converting LNB,
+# and the distinction is unambiguous: an up-converter exists precisely
+# because its input is below what the tuner can reach, while a
+# satellite downlink is always GHz. Nothing here restricts what can be
+# tuned - it is a discriminator, not a limit.
+PICOTUNER_MIN_TUNE_KHZ = 145000   # 145 MHz - the NIM's own lower limit
+
+
+# What Lynx last COMMANDED each receiver to, keyed by receiver number.
+#
+# Deliberately not what the board reports. A reported frequency lags the
+# command by a second or two and is briefly stale at exactly the moment
+# a switch happens - which is when it would be consulted. An earlier
+# attempt at this compared against the reported state and got it wrong,
+# skipping retunes it should have made. What was commanded is exact and
+# immediate, and it is the thing that actually determines whether a
+# retune would change anything.
+#
+# Cleared on anything that could invalidate it, so an empty entry always
+# means "retune", never "assume it is still there".
+picotuner_last_commanded = {}
+
+
+def record_commanded_tune(rcv: int, freq_khz: int, sr_ks: int, lnb_lo_khz: int,
+                          fplug: str):
+    """Remember exactly what this receiver was last told to do."""
+    picotuner_last_commanded[int(rcv)] = {
+        'freq': int(freq_khz), 'sr': int(sr_ks),
+        'lnb_lo_khz': int(lnb_lo_khz or 0), 'fplug': str(fplug or '').lower(),
+    }
+
+
+def forget_commanded_tune(rcv=None):
+    """Forget what a receiver was told - or all of them.
+
+    Called wherever the board might no longer be doing what it was last
+    asked: a power cycle, a base-port change, losing contact with it. The
+    cost of forgetting unnecessarily is one retune; the cost of
+    remembering wrongly is a receiver left on the wrong channel.
+    """
+    if rcv is None:
+        picotuner_last_commanded.clear()
+    else:
+        picotuner_last_commanded.pop(int(rcv), None)
+
+
+def commanded_tune_matches(rcv: int, freq_khz: int, sr_ks: int,
+                           lnb_lo_khz: int, fplug: str) -> bool:
+    """Would retuning this receiver change anything at all?
+
+    Exact comparison of every parameter that goes into the tune command.
+    Anything unknown or different returns False, meaning retune as
+    before.
+    """
+    last = picotuner_last_commanded.get(int(rcv))
+    if not last:
+        return False
+    return (last['freq'] == int(freq_khz)
+            and last['sr'] == int(sr_ks)
+            and last['lnb_lo_khz'] == int(lnb_lo_khz or 0)
+            and last['fplug'] == str(fplug or '').lower())
+
+
+def set_converter_state(rcv: int, freq_khz: int, lnb_lo_khz: int, why: str):
+    """Record which converter is in use for a receiver, and log it.
+
+    One function so there is one place to look, and one log line per
+    change so a fault can be read from the log rather than inferred.
+    The state feeds the on-air frequency shown on the OSD and in the Web
+    UI: get it wrong and the IF is displayed instead, which is a
+    confusing symptom a long way from its cause.
+    """
+    side = converter_side(freq_khz, lnb_lo_khz)
+    # Drop the frequency the board last reported, at the same moment.
+    #
+    # The two are only meaningful together: the reported figure is an IF,
+    # and the converter state is what turns it back into an on-air
+    # frequency. The board takes a second or two to report a new tune, so
+    # keeping the old figure while the converter state has already
+    # changed pairs them wrongly and shows a number that is simply false.
+    #
+    # Confirmed as the cause of "the OSD shows the IF sometimes, then
+    # corrects itself": tune the IC-9700 (board reports 320, LO 929000,
+    # shown as 1249 - right), then tune something with no converter, and
+    # the LO becomes 0 while the board is still reporting 320. It shows
+    # 320 until the board catches up. The reverse gives a different
+    # nonsense - 1129 for a direct 1249 with a SpyVerter selected.
+    #
+    # Cleared rather than guessed at, so the OSD shows nothing for that
+    # moment instead of something wrong. A blank field for a second is
+    # honest; a confident wrong number is not.
+    st = picotuner_state_b if rcv == 2 else picotuner_state
+    st["frequency"] = ""
+    # One record, written whole. The frequency, the LO and the side can
+    # no longer be set apart from one another, which is what the resume
+    # shortcut managed to do when these were four separate globals.
+    conv = get_converter(rcv)
+    conv["freq_khz"] = int(freq_khz or 0)
+    conv["lo_khz"] = int(lnb_lo_khz or 0)
+    conv["side"] = side
+    print(f"[converter] Rx{rcv}: freq={freq_khz} lo={lnb_lo_khz} "
+          f"side={side} ({why})")
+
+
+def converter_side(freq_khz: int, lnb_lo_khz: int) -> str:
+    """Which converter arrangement calc_tuner_freq() will use: "up",
+    "low" or "high".
+
+    Exists so the answer is computed in ONE place. The rule was already
+    duplicated between the tune path, the browser and the display
+    reversal, and they disagreed - which is how a frequency below the
+    tuner's range came to be rejected outright in the Web UI while the
+    backend handled it correctly. Anything needing to know the side asks
+    here.
+    """
+    if not lnb_lo_khz:
+        return "low"
+    if freq_khz < PICOTUNER_MIN_TUNE_KHZ:
+        return "up"
+    if freq_khz >= lnb_lo_khz:
+        return "low"
+    return "high"
+
+
 def calc_tuner_freq(freq_khz: int, lnb_lo_khz: int) -> int:
-    """Given a downlink frequency and an LNB LO (0 = no LNB), returns
+    """Given a wanted frequency and a converter LO (0 = none), returns
     the actual IF frequency the Picotuner needs to be tuned to.
-    Auto-detects low-side (Ku-band) vs high-side (C-band) injection —
-    see tune() for the full explanation. Shared so the startup resume
-    logic can check whether the Picotuner is already correctly tuned
-    without duplicating this calculation."""
+
+    Handles all three converter arrangements, distinguished from the
+    numbers themselves rather than from a setting anyone has to get
+    right:
+
+        Up-converter   freq below the        IF = freq + LO
+                       tuner's own range
+        Down-converter freq >= LO            IF = freq - LO
+        C-band LNB     GHz downlink < LO     IF = LO - freq
+
+    The up-converter case is what makes 6m and 4m possible: a
+    transverter takes 50 or 70 MHz up into the Picotuner's range, so
+    the LO is ADDED rather than subtracted. It is told apart safely
+    because an up-converter is only ever used when the wanted frequency
+    is below what the tuner can reach - if it were reachable directly,
+    nobody would need the converter. A satellite downlink, by contrast,
+    is always thousands of MHz, so the two can never be confused.
+
+    Without this, entering 50 MHz with a 1000 MHz transverter LO fell
+    into the C-band branch and produced 950 MHz - a plausible-looking
+    number, on which nothing would ever be found.
+
+    Shared so the startup resume logic can check whether the Picotuner
+    is already correctly tuned without duplicating this calculation.
+    """
     if not lnb_lo_khz:
         return freq_khz
+    # Up-conversion is tested FIRST, because a wanted frequency below
+    # what the tuner can reach is unambiguous evidence of it regardless
+    # of how that frequency compares to the LO. Testing freq >= LO
+    # first gets this wrong whenever the LO is itself low: an Airspy
+    # SpyVerter has a 120 MHz LO, so 130 MHz would satisfy freq >= LO
+    # and be subtracted down to 10 MHz - below the tuner's range, and
+    # nonsense.
+    if freq_khz < PICOTUNER_MIN_TUNE_KHZ:
+        return freq_khz + lnb_lo_khz          # up-converter (transverter)
     if freq_khz >= lnb_lo_khz:
-        return freq_khz - lnb_lo_khz   # low-side (Ku-band)
-    return lnb_lo_khz - freq_khz        # high-side (C-band)
+        return freq_khz - lnb_lo_khz          # low-side (Ku LNB, or an IF down-converter)
+    return lnb_lo_khz - freq_khz              # high-side (C-band LNB)
 
 _tune_lock_handed_off = False  # set by _tune_impl() once the async thread has taken over
                                 # responsibility for releasing tune_lock - protects against a
@@ -4301,7 +8891,7 @@ def tune(req: TuneRequest):
     # the actual tune is fully complete, not just accepted.
 
 def _tune_impl(req: TuneRequest):
-    global current_mode, current_preset, current_lnb_lo_khz, current_lnb_side, diversity_enabled, _tune_lock_handed_off
+    global current_mode, current_preset, diversity_enabled, _tune_lock_handed_off
     cfg = config['picotuner']
     is_diversity = req.plug.lower() == "diversity"
 
@@ -4328,15 +8918,32 @@ def _tune_impl(req: TuneRequest):
     # LO from downlink regardless of which was larger, which produced
     # a nonsensical negative frequency for C-band — that was a genuine
     # calculation bug, not a case of that frequency being unreceivable.)
-    if req.lnb_lo_khz:
-        if req.freq >= req.lnb_lo_khz:
-            tuner_freq = req.freq - req.lnb_lo_khz       # low-side (Ku-band)
-            current_lnb_side = "low"
-        else:
-            tuner_freq = req.lnb_lo_khz - req.freq        # high-side (C-band)
-            current_lnb_side = "high"
+    # Uses the shared calc_tuner_freq() rather than repeating the
+    # arithmetic. This block had its own copy, which meant up-converter
+    # support reached Tri-Watch and the startup-resume check but NOT a
+    # manual tune - the path most people use. Two copies of one
+    # calculation is exactly how that happens.
+    # Lynx is changing source, so whatever was being received is no
+    # longer being listened to - see pathfinder_source_changed(). Done
+    # here, before the tuner is touched, so the watcher's next poll
+    # already knows rather than racing the lock going away.
+    pathfinder_source_changed("RF tune")
+    tuner_freq = calc_tuner_freq(req.freq, req.lnb_lo_khz)
+    # Recorded against the receiver actually being tuned. This used to
+    # write tuner A's state unconditionally, whatever req.rcv said - so
+    # displaying Rx2 overwrote Rx1's converter with Rx2's, and tuner B's
+    # was never set at all. The visible symptom was the OSD showing the
+    # IF instead of the on-air frequency for whichever receiver had been
+    # displaced, which is a long way from its cause.
+    #
+    # In diversity both receivers carry the same frequency and converter,
+    # so both are set.
+    _rcv = 1 if is_diversity else int(getattr(req, 'rcv', 1) or 1)
+    if is_diversity:
+        set_converter_state(1, req.freq, req.lnb_lo_khz, 'tune() diversity')
+        set_converter_state(2, req.freq, req.lnb_lo_khz, 'tune() diversity')
     else:
-        tuner_freq = req.freq
+        set_converter_state(_rcv, req.freq, req.lnb_lo_khz, 'tune()')
 
     # CRITICAL SAFETY CHECK — a mismatched LNB selection can produce a
     # negative or nonsensical frequency (e.g. downlink 3404 MHz minus a
@@ -4355,7 +8962,7 @@ def _tune_impl(req: TuneRequest):
             )
         )
 
-    current_lnb_lo_khz = req.lnb_lo_khz
+    # (the converter state is recorded above, per receiver)
 
     # Cover the screen well before touching the source. This must come
     # AFTER the safety check above — if it started earlier and the
@@ -4380,8 +8987,10 @@ def _tune_impl(req: TuneRequest):
         # different rcv= values in the command text does NOT work —
         # confirmed the hard way during tonight's standalone testing.
         div_cfg = config['diversity']
+        record_commanded_tune(1, req.freq, req.sr, req.lnb_lo_khz,
+                              div_cfg.get('rcv1_plug', 'a'))
         picotuner_cmd(
-            f"[to@wh] rcv=1 fplug={div_cfg.get('rcv1_plug', 'a')} offset=0 freq={tuner_freq} srate={req.sr}"
+            f"[to@wh] rcv={picotuner_rcv('a')} fplug={div_cfg.get('rcv1_plug', 'a')} offset=0 freq={tuner_freq} srate={req.sr}"
         )
         # Give rcv=1's own tune command time to fully register on the
         # Picotuner's firmware before rcv=2's arrives - confirmed these
@@ -4395,8 +9004,9 @@ def _tune_impl(req: TuneRequest):
         time.sleep(0.3)
         sock_b = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock_b.sendto(
-            f"[to@wh] rcv=2 fplug={div_cfg.get('rcv2_plug', 'b')} offset=0 freq={tuner_freq} srate={req.sr}".encode(),
-            (cfg['host'], cfg['cmd_port_b'])
+            f"[to@wh] rcv={picotuner_rcv('b')} fplug={div_cfg.get('rcv2_plug', 'b')} offset=0 freq={tuner_freq} srate={req.sr}".encode(),
+            # (recorded below, once the send has been attempted)
+            (cfg['host'], picotuner_cmd_port('b', cfg))
         )
         sock_b.close()
         # Same settling delay as rcv=1 above, closing the one clear
@@ -4418,14 +9028,28 @@ def _tune_impl(req: TuneRequest):
         # only kills the old process ~1s later via the async
         # _kick_mpv() thread below, which is too late for the
         # combiner's own startup.
+        record_commanded_tune(2, req.freq, req.sr, req.lnb_lo_khz,
+                              div_cfg.get('rcv2_plug', 'b'))
         kill_mpv()
         start_diversity_combiner()
         diversity_enabled = True
     else:
-        picotuner_cmd(
-            f"[to@wh] rcv=1 fplug={req.plug} offset=0 "
-            f"freq={tuner_freq} srate={req.sr}"
-        )
+        record_commanded_tune(int(getattr(req, 'rcv', 1) or 1), req.freq,
+                              req.sr, req.lnb_lo_khz, req.plug)
+        if req.rcv == 2:
+            # Same command format and port already confirmed working
+            # via tri_watch's own startup-tuning and diversity mode's
+            # own rcv=2 command - reused directly, not reimplemented.
+            picotuner_rcv2_cmd(
+                f"[to@wh] rcv={picotuner_rcv('b')} fplug={req.plug} offset=0 "
+                f"freq={tuner_freq} srate={req.sr}",
+                cfg
+            )
+        else:
+            picotuner_cmd(
+                f"[to@wh] rcv={picotuner_rcv('a')} fplug={req.plug} offset=0 "
+                f"freq={tuner_freq} srate={req.sr}"
+            )
         if diversity_enabled:
             # Switching away from diversity mode — stop the combiner
             # rather than leaving it running with nothing using its
@@ -4451,15 +9075,36 @@ def _tune_impl(req: TuneRequest):
         global mpv_running_for_rf
         try:
             time.sleep(1)
-            # Deliberately do NOT start mpv here. It's only started once
-            # rf_mpv_lifecycle_monitor confirms a stable signal lock -
-            # see that function's docstring for why. Just ensure nothing
-            # from a previous tune/stream is left running against what
-            # is now a stale target, and leave the cover up; the
-            # overlay already shows the useful status/metadata (call-
-            # sign, MER, modcod) during acquisition on its own.
-            kill_mpv()
-            mpv_running_for_rf = False
+            if not tri_watch_enabled:
+                # Deliberately do NOT start mpv here. It's only started once
+                # rf_mpv_lifecycle_monitor confirms a stable signal lock -
+                # see that function's docstring for why. Just ensure nothing
+                # from a previous tune/stream is left running against what
+                # is now a stale target, and leave the cover up; the
+                # overlay already shows the useful status/metadata (call-
+                # sign, MER, modcod) during acquisition on its own.
+                kill_mpv()
+                mpv_running_for_rf = False
+            # else: tri_watch is enabled. Confirmed as a genuine, serious
+            # race condition otherwise: this unconditional kill_mpv(),
+            # delayed by a fixed 1s, has no way to know whether a NEWLY,
+            # correctly-started mpv process (from rf_mpv_lifecycle_monitor()'s
+            # own tri_watch-aware branch, which can legitimately fire
+            # within that same second - tri_watch's receivers are often
+            # already continuously locked, unlike normal RF mode where a
+            # genuinely fresh lock confirmation always takes at least
+            # LOCK_CONFIRM_POLLS seconds after any tune) is what's
+            # actually running by the time this delay elapses, and would
+            # kill it just as readily as a genuinely stale one - this was
+            # confirmed as the actual reason Rx2 never showed video even
+            # after the earlier mpv_running_for_rf fix, which addressed a
+            # real but different problem and didn't touch this one at
+            # all. tri_watch's own caller (_tri_watch_display_source())
+            # already resets mpv_running_for_rf itself, synchronously,
+            # and restart_mpv() (called by rf_mpv_lifecycle_monitor()'s
+            # own tri_watch-aware branch) already kills any existing
+            # process immediately before starting the new one - nothing
+            # further is needed or safe to do here in that case.
         finally:
             tune_lock.release()
     threading.Thread(target=_kick_mpv, daemon=True).start()
@@ -4727,8 +9372,21 @@ def _start_stream_impl(req: StreamRequest):
     # target address — this also frees up genuine RF/network bandwidth
     # a locked Picotuner would otherwise be consuming the whole time a
     # stream plays.
-    picotuner_cmd("[to@wh] rcv=1 fplug=a offset=0 freq=0 srate=333")
+    #
+    # Skipped entirely when tri-watch is enabled (2026-08-01, renamed
+    # from an earlier "dual-watch") - the whole point of that feature is
+    # keeping the Picotuner genuinely tuned and monitored continuously,
+    # regardless of what's currently being displayed, so real RF
+    # activity on a configured repeater frequency is never missed just
+    # because the stream happens to be on screen right now. The
+    # RF/network bandwidth this normally frees up is a deliberate,
+    # accepted trade-off for anyone who's turned this on.
+    if not tri_watch_enabled:
+        picotuner_cmd(f"[to@wh] rcv={picotuner_rcv('a')} fplug=a offset=0 freq=0 srate=333")
 
+    # Same as the RF tune path: this is Lynx changing source, not a
+    # station going off air, so no end-of-contact card is due.
+    pathfinder_source_changed("stream start")
     current_mode = "stream"
     # The friendly name is whatever the caller says it is — this is our
     # own record of what WE chose to play, not anything read from the
@@ -4970,15 +9628,11 @@ def stop():
                       "standard Raspberry Pi OS. Checked synchronously "
                       "before responding, rather than assumed.")
 def restart_lynx():
-    # 'sudo -n' fails immediately with a clear, non-zero exit code if it
-    # would otherwise prompt for a password, rather than hanging or
-    # silently doing nothing - exactly the failure mode confirmed live
-    # as the likely cause of the reboot button appearing to do nothing:
-    # the async reboot below is fire-and-forget by design (it has to
-    # be - the server can't wait around for its own reboot to finish),
-    # so without this check, a missing passwordless-sudo setup would
-    # return a false "success" that never actually reboots anything,
-    # with no way for the operator to know why.
+    # Checked before responding: the reboot below is fire-and-forget by
+    # necessity, so without this a missing sudo rule would return a
+    # false "success" and nothing would happen, with no way for the
+    # operator to know why. See sudo_ready() for why it tests the real
+    # command rather than sudo in general.
     if not sudo_ready("reboot"):
         raise sudo_error("The Pi was NOT rebooted.")
 
@@ -5011,6 +9665,7 @@ def shutdown_pi():
         # process is killed mid-call and nothing below runs, so the only
         # way execution continues past here is failure - which under
         # Popen was discarded entirely, leaving a Shutdown button that
+        # stopped playback, reported success, and left the Pi running,
         power_action(["poweroff", "-i"], "shutdown")
     threading.Thread(target=_do_shutdown, daemon=True).start()
     return {"success": True, "message": "Shutting down - the Pi will power off shortly and will NOT restart on its own."}
@@ -5147,7 +9802,7 @@ def set_lnb_psu(req: LnbPsuRequest):
         picotuner_cmd(f"[to@wh] vgx={combined}")
         current_lnb_psu_a, current_lnb_tone_a = new_voltage, new_tone
     else:
-        picotuner_rcv2_cmd(f"[to@wh] vgy={combined}")
+        picotuner_rcv2_cmd(f"[to@wh] vgy={combined}", config['picotuner'])
         current_lnb_psu_b, current_lnb_tone_b = new_voltage, new_tone
 
     config.setdefault('lnb_psu', {})[f'plug_{plug}'] = new_voltage
@@ -5182,6 +9837,96 @@ def post_update_check():
     check_for_updates()
     return update_state
 
+def refresh_dependencies(context):
+    """Re-run install.sh --deps-only, so OS packages and every one of
+    Lynx's own apt/pip dependencies are re-confirmed against whatever
+    code is now checked out - not just Lynx's own source.
+
+    Extracted from post_update_apply(), which was the only caller, so
+    that post_update_channel() can use the identical logic rather than
+    a second copy of it. That mattered in practice: a channel switch
+    checks out an ENTIRELY different branch, which is far more likely
+    to need a dependency the running system has never had than an
+    ordinary same-branch pull is, and it was the one path that never
+    refreshed anything. A receiver switched from stable to beta landed
+    on beta code with a stable machine's setup underneath it.
+
+    Delegates to install.sh rather than duplicating its lists here -
+    install.sh is itself pulled fresh as part of the same update, so
+    this always runs the current, correct list, maintained in one
+    place.
+
+    install.sh needs sudo for apt, for writing to /etc, for
+    everything. A receiver without passwordless sudo cannot run it
+    non-interactively at all - and an earlier attempt to let it try
+    anyway, on the theory that install.sh is what configures
+    passwordless sudo, was simply wrong: install.sh needs sudo to
+    write the sudoers file, so it can never bootstrap the permission
+    it depends on. `sudo apt update` inside the script asked for a
+    password, found no terminal to ask on because it was running
+    inside this process, and sat there until the 1200s timeout - a
+    twenty-minute silent hang in place of an immediate, honest
+    refusal. Confirmed in the field.
+
+    So: if sudo is unavailable, skip the dependency step rather than
+    hang on it. The pull or checkout has already succeeded by this
+    point, so the code IS updated either way; what is lost is only the
+    OS/dependency refresh.
+
+    The BLANKET check, deliberately - not sudo_ready(), and not any
+    single command. install.sh runs apt, writes to /etc and more, so
+    "may I run one specific command" answers the wrong question. A
+    receiver carrying only a narrow rule - the /etc/sudoers.d/
+    lynx-reboot left by the old manual instructions, which grants
+    reboot and nothing else - passes sudo_ready("reboot") happily and
+    then hangs in apt, which is exactly the case this is here to
+    catch.
+
+    Never raises: callers reboot afterwards regardless, because on a
+    narrow-rule receiver rebooting is permitted even though the
+    installer is not, and skipping the refresh should not cost the
+    restart as well.
+    """
+    try:
+        can_run_installer = subprocess.run(
+            ["sudo", "-n", "true"], capture_output=True,
+            timeout=5).returncode == 0
+    except Exception:
+        can_run_installer = False
+
+    if not can_run_installer:
+        print(f"[{context}] passwordless sudo is not configured for this "
+              "user - skipping the dependency refresh, which needs "
+              "sudo throughout and would stop at a password prompt "
+              "with no terminal to answer it. The code IS updated. "
+              "Run ~/lynx/install.sh by hand once, from a terminal "
+              "where you can type your password, to sort this "
+              "permanently. Still attempting the reboot below.")
+        record_diagnostic_event("update_deps_skipped_no_sudo",
+                                f"{context}: dependency refresh skipped - "
+                                "no passwordless sudo",
+                                count_as_mpv_restart=False)
+        return
+
+    try:
+        install_script = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "install.sh")
+        env = os.environ.copy()
+        env["DEBIAN_FRONTEND"] = "noninteractive"
+        # stdin closed, belt and braces. The blanket check above says
+        # this user has sudo, but it does not promise every command
+        # install.sh runs is covered by the same rule - and a sudo that
+        # decides to prompt with an inherited stdin waits for an answer
+        # that cannot come. With no stdin it fails immediately instead,
+        # which the timeout then does not have to catch twenty minutes
+        # later.
+        subprocess.run(["bash", install_script, "--deps-only"],
+                       env=env, timeout=1200,
+                       stdin=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"[{context}] Dependency check failed or timed out ({e}) "
+              "- rebooting anyway with whatever succeeded so far.")
+
 @app.post("/api/update/apply", tags=["Configuration"],
           summary="Pull the latest code and reboot",
           description="Fails safely: if git pull fails for any reason "
@@ -5203,9 +9948,14 @@ def post_update_apply():
     branch = get_update_branch()
 
     # Defensive: git pull merges into whatever's CURRENTLY checked out
-    # locally, not necessarily the branch named in the command below -
-    # if the local checkout ever drifted out of sync with the
-    # configured channel, self-heal by checking out the correct
+    # locally, not necessarily the branch actually named in the
+    # command below - if the local checkout ever drifted out of sync
+    # with the configured channel (shouldn't normally happen, since
+    # POST /api/update/channel always does an explicit checkout
+    # whenever the channel itself changes, but worth guarding against
+    # regardless given the stakes: a mismatched pull here could
+    # silently merge beta content into what's meant to be a stable
+    # checkout, or vice versa), self-heal by checking out the correct
     # branch first rather than trusting it's already right.
     ok, current_branch = git_cmd("branch", "--show-current")
     if ok and current_branch and current_branch != branch:
@@ -5228,78 +9978,44 @@ def post_update_apply():
     update_state["commits_behind"] = 0
     update_state["new_commits"] = []
 
-    # Whether the dependency step can run at all is decided HERE, and on
-    # the BLANKET check rather than a specific command.
+    # Whether the dependency step can run at all is decided HERE, not
+    # inside the thread, and on the BLANKET check rather than a specific
+    # command.
     #
     # install.sh needs sudo for apt, for writing to /etc, for everything.
     # A receiver without passwordless sudo cannot run it non-interactively
-    # at all: `sudo apt update` inside the script asks for a password,
-    # finds no terminal to ask on because it is running inside this
-    # process, and sits there until the 1200s timeout - a twenty-minute
-    # silent hang. Confirmed in the field.
+    # at all - and an earlier attempt to let it try anyway, on the theory
+    # that install.sh is what configures passwordless sudo, was simply
+    # wrong: install.sh needs sudo to write the sudoers file, so it can
+    # never bootstrap the permission it depends on. That attempt made
+    # things worse rather than better. `sudo apt update` inside the
+    # script asked for a password, found no terminal to ask on because it
+    # was running inside this process, and sat there until the 1200s
+    # timeout - a twenty-minute silent hang in place of an immediate,
+    # honest refusal. Confirmed in the field.
     #
-    # sudo_ready() is the wrong test here precisely because it is
-    # permissive: a receiver carrying only a narrow rule - the
-    # /etc/sudoers.d/lynx-reboot left by the old manual instructions,
-    # which grants reboot and nothing else - passes it happily and then
-    # hangs in apt. That is the exact case this exists to catch.
+    # So: if sudo is unavailable, skip the dependency step rather than
+    # hang on it. The pull has already succeeded, so the code IS updated
+    # either way; what is lost is only the OS/dependency refresh.
     #
-    # The reboot is judged separately and always attempted, because on
-    # that same narrow-rule receiver rebooting IS permitted even though
-    # the installer is not. Skipping the refresh must not cost the
-    # restart as well. The pull has already succeeded regardless, so the
-    # code is updated either way.
-    try:
-        can_run_installer = subprocess.run(
-            ["sudo", "-n", "true"], capture_output=True,
-            timeout=5).returncode == 0
-    except Exception:
-        can_run_installer = False
-
+    # The BLANKET check, deliberately - not sudo_ready(), and not any
+    # single command. install.sh runs apt, writes to /etc and more, so
+    # "may I run one specific command" answers the wrong question. A
+    # receiver carrying only a narrow rule - the /etc/sudoers.d/lynx-reboot
+    # left by the old manual instructions, which grants reboot and
+    # nothing else - passes sudo_ready("reboot") happily and then hangs
+    # in apt, which is exactly the case this is here to catch.
+    #
+    # The reboot below is judged separately and always attempted, because
+    # on that same narrow-rule receiver rebooting is permitted even
+    # though the installer is not. Skipping the refresh should not cost
+    # the restart as well.
     def _do_reboot():
         time.sleep(1.0)  # let this HTTP response actually reach the browser first
-        # OS packages, AND every one of Lynx's own apt/pip
-        # dependencies, are (re-)confirmed here too, not just Lynx's
-        # own code - see this function's own patch history for the
-        # full rationale. Delegates to install.sh's own "--deps-only"
-        # mode rather than duplicating its dependency lists here -
-        # install.sh is itself pulled fresh as part of this same
-        # update, so this always runs whatever the current, correct
-        # list actually is, with only one place that list is ever
-        # maintained. A bounded timeout so even something going wrong
-        # here still lets the reboot below proceed rather than hanging
-        # indefinitely.
-        if not can_run_installer:
-            print("[update] passwordless sudo is not configured for this "
-                  "user - skipping the dependency refresh, which needs "
-                  "sudo throughout and would stop at a password prompt "
-                  "with no terminal to answer it. The code IS updated. "
-                  "Run ~/lynx/install.sh by hand once, from a terminal "
-                  "where you can type your password, to sort this "
-                  "permanently. Still attempting the reboot below.")
-            record_diagnostic_event("update_deps_skipped_no_sudo",
-                                    "dependency refresh skipped - no "
-                                    "passwordless sudo",
-                                    count_as_mpv_restart=False)
-        else:
-            try:
-                install_script = os.path.join(
-                    os.path.dirname(os.path.abspath(__file__)), "install.sh")
-                env = os.environ.copy()
-                env["DEBIAN_FRONTEND"] = "noninteractive"
-                # stdin closed, belt and braces. The blanket check above
-                # says this user has sudo, but it does not promise every
-                # command install.sh runs is covered by the same rule -
-                # and a sudo that decides to prompt with an inherited
-                # stdin waits for an answer that cannot come. With no
-                # stdin it fails immediately instead, which the timeout
-                # then does not have to catch twenty minutes later.
-                subprocess.run(["bash", install_script, "--deps-only"],
-                               env=env, timeout=1200,
-                               stdin=subprocess.DEVNULL)
-            except Exception as e:
-                print(f"[update] Dependency check failed or timed out ({e}) "
-                      "- rebooting anyway with whatever succeeded so far.")
+        refresh_dependencies("update")
+        # Captured, not a bare Popen. This usually succeeds and kills the
+        # process mid-call - meaning anything reached below is a genuine
+        # failure, and worth saying out loud rather than discarding. An
         # The code is already updated at this point, so a refusal here
         # costs only the restart - which the log line says, so nobody
         # concludes the update itself failed.
@@ -5311,6 +10027,137 @@ def post_update_apply():
     return {"result": "ok",
             "message": "Update pulled successfully - now updating OS packages and rebooting (this can take a few minutes). If the Pi has not restarted after a few minutes, the update is still applied - reboot it manually to run the new version.",
             "pull_output": pull_output}
+
+class UpdateChannelRequest(BaseModel):
+    channel: str   # 'stable' or 'beta'
+
+@app.post("/api/update/channel", tags=["Configuration"],
+          summary="Switch update channel (stable/beta) and reboot",
+          description="Per Justin's own request, mirroring BATC Portsdown's "
+                      "existing beta-channel model: lets Lynx track a "
+                      "separate 'beta' branch of newer, less-proven code "
+                      "instead of the normal stable one, for anyone who "
+                      "wants to experiment - switchable back to stable at "
+                      "any time. Unlike a normal update (POST /api/update/"
+                      "apply, which pulls within whatever branch is "
+                      "already checked out), switching channels means "
+                      "actually checking out a DIFFERENT branch entirely - "
+                      "git checkout, not git pull. Fails safely: if the "
+                      "fetch or checkout fails for any reason, this "
+                      "returns an error and nothing is touched - no "
+                      "reboot is triggered unless the switch itself "
+                      "succeeded cleanly first.")
+def post_update_channel(req: UpdateChannelRequest):
+    global config
+    if req.channel not in ("stable", "beta"):
+        raise HTTPException(status_code=400,
+            detail="channel must be 'stable' or 'beta'")
+
+    target_branch = "beta" if req.channel == "beta" else get_default_branch()
+
+    # Make sure the remote branch's latest content is actually known
+    # locally before trying to check it out - a plain `git checkout
+    # -B x origin/x` against a stale/never-fetched remote ref would
+    # otherwise silently land on old content rather than genuinely
+    # failing, which would be a much more confusing failure mode than
+    # this fetch simply erroring out cleanly if the branch doesn't
+    # exist or the network's unreachable.
+    ok, err = git_cmd("fetch", "origin", target_branch)
+    if not ok:
+        raise HTTPException(status_code=502,
+            detail=f"Could not fetch the '{target_branch}' branch: {err}")
+
+    # -B creates the local branch if it doesn't exist yet (first time
+    # ever switching to beta) or forcibly resets it to exactly match
+    # the remote if it does (switching back again later, possibly
+    # after diverging locally somehow) - one command handles both
+    # cases identically rather than needing to detect which applies.
+    ok, err = git_cmd("checkout", "-B", target_branch, f"origin/{target_branch}")
+    if not ok:
+        raise HTTPException(status_code=502,
+            detail=f"Could not switch to the '{target_branch}' branch: {err}")
+
+    # Persist the choice - same read-fresh-from-disk, write-via-tmp-
+    # then-replace pattern as every other config write in this file,
+    # now under the same shared lock as all of them (see
+    # _config_write_lock's own comment by CONFIG_PATH).
+    with _config_write_lock:
+        with open(CONFIG_PATH) as f:
+            on_disk = yaml.safe_load(f)
+        on_disk.setdefault('update', {})['channel'] = req.channel
+        tmp_path = str(CONFIG_PATH) + ".tmp"
+        with open(tmp_path, 'w') as f:
+            yaml.safe_dump(on_disk, f, default_flow_style=False, sort_keys=False)
+        os.replace(tmp_path, CONFIG_PATH)
+        config = on_disk
+
+    # Refresh state immediately, same reasoning as post_update_apply()
+    # above - a client that doesn't reload fast enough after the
+    # reboot at least sees the truth if it asks again.
+    update_state["current_version"] = detect_current_version()
+    update_state["channel"] = req.channel
+    update_state["update_available"] = False
+    update_state["commits_behind"] = 0
+    update_state["new_commits"] = []
+
+    # Same passwordless-sudo check, and for the same reason, as Reboot/
+    # update-apply above: a fire-and-forget reboot can't report back
+    # if it silently fails to actually happen. The channel switch has
+    # already succeeded by this point though, so a failed check here
+    # still leaves the code genuinely on the new channel - just not
+    # yet running - which the error message says explicitly.
+    if not sudo_ready("reboot"):
+        raise sudo_error(f"Switched to the '{req.channel}' channel successfully, "
+                         "but the Pi could not be rebooted automatically. The "
+                         "switch IS applied - reboot manually to run it.")
+
+    def _do_reboot():
+        time.sleep(1.0)  # let this HTTP response actually reach the browser first
+        # Same dependency refresh as a normal update, and needed MORE
+        # here, not less: this has just checked out a different branch
+        # entirely, so the running system's packages and setup were
+        # installed for other code. install.sh's own startup-mechanism
+        # migration sits above its --deps-only exit for the same
+        # reason, so a receiver switched from stable lands correctly
+        # rather than on whatever the old branch left behind.
+        refresh_dependencies("channel switch")
+        power_action(["reboot", "-i"], "channel-switch reboot")
+    threading.Thread(target=_do_reboot, daemon=True).start()
+
+    return {"result": "ok", "channel": req.channel,
+            "message": f"Switched to the '{req.channel}' channel - rebooting the Pi now."}
+
+@app.post("/api/wifi/kill", tags=["Control"],
+          summary="Disable WiFi entirely (rfkill block)",
+          description="For sites where WiFi is causing problems "
+                      "(power-save driver bugs, or roaming onto a "
+                      "second saved network and breaking the "
+                      "Picotuner/Knobler's local UDP broadcast "
+                      "discovery) - disables the WiFi radio "
+                      "completely via rfkill. Does NOT touch wired "
+                      "Ethernet. WARNING: if this Pi is only reachable "
+                      "over WiFi, this will cut off Web UI access "
+                      "until WiFi is re-enabled locally or via SSH.")
+def kill_wifi():
+    if not sudo_ready("rfkill"):
+        raise sudo_error("WiFi was NOT disabled.")
+    result = subprocess.run(["sudo", "rfkill", "block", "wifi"],
+                             capture_output=True, text=True, timeout=5)
+    if result.returncode != 0:
+        raise HTTPException(status_code=502, detail=f"Failed to disable WiFi: {result.stderr}")
+    return {"result": "ok", "message": "WiFi disabled."}
+
+@app.post("/api/wifi/restore", tags=["Control"],
+          summary="Re-enable WiFi (rfkill unblock)",
+          description="Reverses Kill WiFi.")
+def restore_wifi():
+    if not sudo_ready("rfkill"):
+        raise sudo_error("WiFi was NOT re-enabled.")
+    result = subprocess.run(["sudo", "rfkill", "unblock", "wifi"],
+                             capture_output=True, text=True, timeout=5)
+    if result.returncode != 0:
+        raise HTTPException(status_code=502, detail=f"Failed to re-enable WiFi: {result.stderr}")
+    return {"result": "ok", "message": "WiFi re-enabled."}
 
 class UpdateChannelRequest(BaseModel):
     channel: str   # 'stable' or 'beta'
@@ -5437,82 +10284,164 @@ def get_config():
                       "(presets, streams, and all other settings) completely untouched.")
 def update_config(req: ConfigUpdateRequest):
     global config
-    # Read the actual on-disk file fresh, not the in-memory config -
-    # avoids clobbering anything changed directly on disk since the
-    # last reload, and guarantees every other section (presets,
-    # streams, ryde, relay, dial, web, diversity,
-    # default_boot_preset) is preserved byte-for-byte.
-    with open(CONFIG_PATH) as f:
-        on_disk = yaml.safe_load(f)
+    # Everything below is one atomic read-modify-write-replace cycle,
+    # held under the shared _config_write_lock (see its own comment by
+    # CONFIG_PATH) - without this, a GNSS confirmed-fix write landing
+    # mid-way through this handler could either corrupt the shared tmp
+    # file both writers use, or silently discard whichever save
+    # completed second. Confirmed as a real, reported failure: QRZ
+    # logging stopped entirely after GNSS and a Config page save
+    # happened to land close together during testing.
+    with _config_write_lock:
+        # Read the actual on-disk file fresh, not the in-memory config -
+        # avoids clobbering anything changed directly on disk since the
+        # last reload, and guarantees every other section (presets,
+        # streams, ryde, relay, dial, web, diversity,
+        # default_boot_preset) is preserved byte-for-byte.
+        with open(CONFIG_PATH) as f:
+            on_disk = yaml.safe_load(f)
 
-    picotuner_changed = False
-    if req.site is not None:
-        on_disk.setdefault('site', {}).update(req.site.model_dump())
-    if req.picotuner is not None:
-        new_pt = req.picotuner.model_dump()
-        picotuner_changed = on_disk.get('picotuner', {}) != {**on_disk.get('picotuner', {}), **new_pt}
-        on_disk.setdefault('picotuner', {}).update(new_pt)
+        picotuner_changed = False
+        if req.site is not None:
+            on_disk.setdefault('site', {}).update(req.site.model_dump())
+        if req.picotuner is not None:
+            new_pt = req.picotuner.model_dump()
+            picotuner_changed = on_disk.get('picotuner', {}) != {**on_disk.get('picotuner', {}), **new_pt}
+            on_disk.setdefault('picotuner', {}).update(new_pt)
 
-    diversity_changed = False
-    if req.diversity is not None:
-        new_div = req.diversity.model_dump(exclude_none=True)
-        # update() merges these in without disturbing enabled/
-        # combiner_out_port/rcv1_plug/rcv2_plug, which this endpoint
-        # never sees or sends. exclude_none above means a save from
-        # either the MER-hysteresis card or the hard-freeze-recovery
-        # card only touches its own fields, leaving the other
-        # untouched, rather than requiring every field from both on
-        # every single save.
-        current_div = on_disk.get('diversity', {})
-        # Only the MER-hysteresis fields actually require a restart -
-        # they're passed as combiner CLI args, read once at process
-        # launch. The hard_freeze_breaker_* fields are read fresh from
-        # config on every check (mpv_drift_monitor's own loop) and take
-        # effect immediately. Checked only against keys THIS request
-        # actually included - otherwise a breaker-only save would
-        # compare its own absent MER keys (None) against their real,
-        # unrelated saved values and wrongly report a restart needed.
-        RESTART_NEEDED_KEYS = ('mer_switch_dwell_secs', 'mer_switch_margin_db')
-        diversity_changed = any(
-            k in new_div and current_div.get(k) != new_div.get(k) for k in RESTART_NEEDED_KEYS
-        )
-        on_disk.setdefault('diversity', {}).update(new_div)
+        diversity_changed = False
+        if req.diversity is not None:
+            new_div = req.diversity.model_dump(exclude_none=True)
+            # update() merges these in without disturbing enabled/
+            # combiner_out_port/rcv1_plug/rcv2_plug, which this endpoint
+            # never sees or sends. exclude_none above means a save from
+            # either the MER-hysteresis card or the hard-freeze-recovery
+            # card only touches its own fields, leaving the other
+            # untouched, rather than requiring every field from both on
+            # every single save.
+            current_div = on_disk.get('diversity', {})
+            # Only the MER-hysteresis fields actually require a restart -
+            # they're passed as combiner CLI args, read once at process
+            # launch. The hard_freeze_breaker_* fields are read fresh from
+            # config on every check (mpv_drift_monitor's own loop) and take
+            # effect immediately. Checked only against keys THIS request
+            # actually included - otherwise a breaker-only save would
+            # compare its own absent MER keys (None) against their real,
+            # unrelated saved values and wrongly report a restart needed.
+            RESTART_NEEDED_KEYS = ('mer_switch_dwell_secs', 'mer_switch_margin_db')
+            diversity_changed = any(
+                k in new_div and current_div.get(k) != new_div.get(k) for k in RESTART_NEEDED_KEYS
+            )
+            on_disk.setdefault('diversity', {}).update(new_div)
 
-    # Notifications: none of these ever require a restart. QRZ/Slack/
-    # Companion settings are re-read fresh on every poll (NotificationManager
-    # holds a getter, not a captured config reference). The GPIO pin object
-    # itself is also rebuilt automatically the moment its pin/polarity
-    # config changes (see NotificationManager._poll_tx_pin's cfg_key check) -
-    # so even that takes effect live, no restart needed.
-    if req.notifications_qrz is not None:
-        on_disk.setdefault('notifications', {}).setdefault('qrz', {}).update(
-            req.notifications_qrz.model_dump())
-    if req.notifications_slack is not None:
-        on_disk.setdefault('notifications', {}).setdefault('slack', {}).update(
-            req.notifications_slack.model_dump())
-    if req.notifications_companion is not None:
-        on_disk.setdefault('notifications', {}).setdefault('companion', {}).update(
-            req.notifications_companion.model_dump())
-    if req.notifications_gpio_tx is not None:
-        on_disk.setdefault('notifications', {}).setdefault('gpio_tx', {}).update(
-            req.notifications_gpio_tx.model_dump())
+        # Notifications: none of these ever require a restart. QRZ/Slack/
+        # Companion settings are re-read fresh on every poll (NotificationManager
+        # holds a getter, not a captured config reference). The GPIO pin object
+        # itself is also rebuilt automatically the moment its pin/polarity
+        # config changes (see NotificationManager._poll_tx_pin's cfg_key check) -
+        # so even that takes effect live, no restart needed.
+        if req.notifications_qrz is not None:
+            on_disk.setdefault('notifications', {}).setdefault('qrz', {}).update(
+                req.notifications_qrz.model_dump())
+        if req.notifications_slack is not None:
+            on_disk.setdefault('notifications', {}).setdefault('slack', {}).update(
+                req.notifications_slack.model_dump())
+        if req.notifications_companion is not None:
+            on_disk.setdefault('notifications', {}).setdefault('companion', {}).update(
+                req.notifications_companion.model_dump())
+        if req.notifications_gpio_tx is not None:
+            on_disk.setdefault('notifications', {}).setdefault('gpio_tx', {}).update(
+                req.notifications_gpio_tx.model_dump())
 
-    # Display: takes effect live, no restart - the overlay picks this
-    # up on its own next /api/status poll (a few seconds), same as
-    # portable_locator and the notification settings above.
-    if req.display is not None:
-        on_disk.setdefault('display', {}).update(req.display.model_dump())
+        # Display: takes effect live, no restart - the overlay picks this
+        # up on its own next /api/status poll (a few seconds), same as
+        # portable_locator and the notification settings above.
+        if req.quicklynx is not None:
+            on_disk.setdefault('quicklynx', {}).update(req.quicklynx.model_dump())
 
-    tmp_path = str(CONFIG_PATH) + ".tmp"
-    with open(tmp_path, 'w') as f:
-        yaml.safe_dump(on_disk, f, default_flow_style=False, sort_keys=False)
-    os.replace(tmp_path, CONFIG_PATH)
+        if req.display is not None:
+            on_disk.setdefault('display', {}).update(req.display.model_dump())
 
-    config = on_disk  # reload in-memory immediately - site fields take effect right away
-    return {
-        "success": True,
-        "restart_required": picotuner_changed or diversity_changed,
-    }
+        # pathfinder: merges only the three fields the form sends, leaving
+        # min_span_km/max_span_km/max_distance_km untouched - the form never
+        # sees them, and a blind update() would wipe them.
+        if req.pathfinder is not None:
+            on_disk.setdefault('pathfinder', {}).update(req.pathfinder.model_dump())
+
+        # tri_watch: rebuilds just the `sources` list and top-level
+        # `enabled` flag from whichever of Rx1/Rx2/stream are actually
+        # enabled in the submitted form - every other tri_watch field
+        # (settling_seconds, lock_confirm_seconds, notification_duration_secs,
+        # rf_notification_template) is left completely untouched, since
+        # this form never sees or sends them. Always needs a restart to
+        # take effect - tri_watch's own probes/arbitrator are set up once
+        # at process start from this exact list, unlike most other
+        # sections here which are re-read live.
+        tri_watch_changed = req.tri_watch is not None
+        if req.tri_watch is not None:
+            new_sources = []
+            # Every existing tri_watch reader (get_tri_watch_status, the
+            # arbitrator loop, startup tune, the port drainer sync) checks
+            # src_cfg.get('enabled', False) on each individual source dict
+            # - defaulting to False if that key is absent entirely. This
+            # form only ever appends a source here when its own "Include"
+            # checkbox was on, so it's always enabled - but that must be
+            # written explicitly as its own field, not left implied by
+            # presence in the list, or every single saved source would
+            # silently fail that check and disappear, not just an
+            # intentionally-excluded one. Confirmed as a real, reported bug
+            # otherwise: a save that only meant to drop Rx2 dropped Rx1 and
+            # the stream too, since neither carried this field either.
+            if req.tri_watch.rx1.enabled:
+                r = req.tri_watch.rx1
+                new_sources.append({
+                    "type": "rf", "rcv": 1, "fplug": r.fplug, "freq": r.freq, "sr": r.sr,
+                    "lnb_lo_khz": r.lnb_lo_khz, "label": r.label, "callsign": r.callsign,
+                    "enabled": True,
+                })
+            if req.tri_watch.rx2.enabled:
+                r = req.tri_watch.rx2
+                new_sources.append({
+                    "type": "rf", "rcv": 2, "fplug": r.fplug, "freq": r.freq, "sr": r.sr,
+                    "lnb_lo_khz": r.lnb_lo_khz, "label": r.label, "callsign": r.callsign,
+                    "enabled": True,
+                })
+            if req.tri_watch.stream.enabled:
+                s = req.tri_watch.stream
+                new_sources.append({
+                    "type": "stream", "domain": s.domain, "app": s.app,
+                    "streamname": s.streamname, "port": s.port, "label": s.label,
+                    "waiting_message": s.waiting_message, "enabled": True,
+                })
+            on_disk.setdefault('tri_watch', {})['enabled'] = req.tri_watch.enabled
+            on_disk.setdefault('tri_watch', {})['sources'] = new_sources
+
+        # GNSS: no restart needed either - _apply_gnss_mode() below
+        # applies time_sync live, immediately after config is
+        # reassigned, the same "takes effect right away" pattern as
+        # site. Mode itself needs no live-apply step at all: it only
+        # gates whether _on_gnss_locator_change writes on the next
+        # confirmed fix, which reads config fresh every time anyway.
+        if req.gnss is not None:
+            on_disk.setdefault('gnss', {}).update(req.gnss.model_dump())
+        # Auto-Squeak: enabling or changing the source needs a restart,
+        # because the listener holds an open ffmpeg reader on the audio
+        # monitor for the life of the process. hold_secs alone is read
+        # live and takes effect on the next card.
+        if req.squeak is not None:
+            on_disk.setdefault('squeak', {}).update(req.squeak.model_dump())
+
+        tmp_path = str(CONFIG_PATH) + ".tmp"
+        with open(tmp_path, 'w') as f:
+            yaml.safe_dump(on_disk, f, default_flow_style=False, sort_keys=False)
+        os.replace(tmp_path, CONFIG_PATH)
+
+        config = on_disk  # reload in-memory immediately - site fields take effect right away
+        _apply_gnss_mode()
+        return {
+            "success": True,
+            "restart_required": picotuner_changed or diversity_changed or tri_watch_changed,
+        }
 
 @app.post("/api/config/reload", tags=["Configuration"],
           summary="Reload configuration from disk")
@@ -5583,12 +10512,23 @@ def web_ui():
                 <a href="/diagnostics" class="btn btn-sm btn-outline-light">&#x1F4CA; Diagnostics</a>
                 <a href="/config" class="btn btn-sm btn-outline-light">&#x2699;&#xFE0F; Config</a>
                 <a href="/docs" class="btn btn-sm btn-outline-light">&#x1F4D6; API Docs</a>
+                <!-- Rendered disabled rather than hidden when switched off:
+                     a button that simply is not there teaches nobody the
+                     feature exists. Greyed with an explanation on hover does. -->
+                <a href="/quicklynx" target="_blank" rel="noopener"
+                   id="quicklynx-btn"
+                   style="pointer-events: auto; cursor: help;"
+                   class="btn btn-sm btn-outline-light disabled"
+                   aria-disabled="true"
+                   title="QuickLynx is switched off. It shows the QO-100 wideband spectrum and lets you click a signal to tune this receiver to it. Turn it on in Config to use it.">&#x1F4E1; QuickLynx</a>
             </div>
             <small class="text-muted" id="site-name"></small>
             <!-- Diversity: replaces the site-name line above with a highlighted stats box while diversity mode is active -->
             <div id="diversity-stats-line" style="display:none; background:#0f3460; color:#ffffff; font-weight:500; padding: 4px 10px; border-radius: 4px; font-size: 1rem;"></div>
+            <!-- Tri-watch (Stage 1): shows status for every currently-enabled source (any mix of RF-A/RF-B/stream), only when enabled in config. Element id kept as "dual-watch-line" from the earlier, narrower design - purely cosmetic, no need to rename it -->
+            <div id="dual-watch-line" style="display:none; background:#3a2a5c; color:#ffffff; font-weight:500; padding: 4px 10px; border-radius: 4px; font-size: 1rem;"></div>
         </div>
-        <div class="col-auto d-flex align-items-start gap-2 pt-1">
+        <div class="col-auto d-flex flex-wrap align-items-start gap-2 pt-1">
             <span><span class="led led-grey" id="picotuner-led"></span><small id="picotuner-status" class="text-muted">Picotuner</small></span>
             <span class="d-flex align-items-center gap-1" title="LNB PSU, Plug A - press the active button again to turn off. Amateur TV is always Horizontal (18V), labelled by voltage since some LNBs are physically mounted rotated 90 degrees.">
                 <small class="text-muted">LNB&nbsp;A</small>
@@ -5603,6 +10543,7 @@ def web_ui():
                 <button class="btn btn-sm" id="lnb-psu-b-tone" onclick="onLnbToneClick('b')" title="Hi-Band LO (22kHz tone) - almost never needed for Amateur TV, default is Lo-Band">Tone</button>
             </span>
             <span class="btn btn-sm" id="mode-badge" style="background:#3a4a63; color:#fff; cursor:default;">IDLE</span>
+            <a href="/config" class="btn btn-sm" id="locator-badge" style="background:#3a4a63; color:#fff;" title="Portable locator">&#x1F4CD; —</a>
             <a href="/diagnostics" class="btn btn-sm btn-outline-light" title="mpv restart/stop diagnostics" id="diagnostics-link">mpv: <span id="mpv-restart-count">0</span></a>
             <span class="btn btn-sm" id="version-badge" style="background:#3a4a63; color:#fff; cursor:default;" title="Current version">v?</span>
             <button class="btn btn-sm btn-outline-light" onclick="checkForUpdates()" id="update-check-btn" title="Check for updates now">&#x1F504; Check Updates</button>
@@ -5624,6 +10565,18 @@ def web_ui():
             <div class="card mt-2" id="diversity-panel-b" style="display:none">
                 <div class="card-header">&#x1F4E1; Tuner Rx 2 (Diversity)</div>
                 <div class="card-body" id="status-panel-b"></div>
+            </div>
+            <!-- tri_watch: the active stream's own info, shown independently
+                 of Rx1's panel above rather than sharing its slot - confirmed
+                 as a real, reported bug otherwise: Rx1 stays continuously,
+                 independently tuned in the background under tri_watch
+                 regardless of what's actually being displayed, but the main
+                 panel above used to switch entirely to stream info whenever
+                 a stream was on screen, hiding Rx1's own status completely
+                 until whichever one "came up first" lost that slot again. -->
+            <div class="card mt-2" id="tri-watch-stream-panel" style="display:none">
+                <div class="card-header">&#x1F4FA; Stream</div>
+                <div class="card-body" id="tri-watch-stream-status"></div>
             </div>
         </div>
 
@@ -5653,19 +10606,32 @@ def web_ui():
                     <div class="row g-2 mt-1">
                         <div class="col">
                             <select class="form-select form-select-sm bg-dark text-light border-secondary"
-                                    id="lnb-select" onchange="onLnbSelectChange()" title="LNB local oscillator — freq above is the real downlink frequency when set">
-                                <option value="0">No LNB (direct)</option>
+                                    id="lnb-select" onchange="onLnbSelectChange()" title="Converter local oscillator — the frequency above is then the real on-air frequency, whether the converter works up or down">
+                                <option value="0">None (direct)</option>
                                 <option value="9750000">Ku 9750 MHz (QO-100 std.)</option>
+                                <option value="9000000">Ku 9000 MHz (QO-100, 9-10GHz mod. LNB)</option>
                                 <option value="10600000">Ku 10600 MHz</option>
                                 <option value="10750000">Ku 10750 MHz</option>
                                 <option value="5150000">C-band 5150 MHz (3.4 GHz)</option>
-                                <option value="custom">Custom...</option>
+                                <option value="929000" data-nodc="1">Icom IC-9700 23cm IF (929 MHz) - plug B only</option>
+                                <option value="120000" data-nodc="1">Airspy SpyVerter up-conv. (120 MHz) - plug B only</option>
+                                <option value="custom">Custom LO...</option>
                             </select>
                         </div>
                         <div class="col" id="lnb-custom-col" style="display:none">
                             <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary"
-                                   id="lnb-custom-input" placeholder="LNB LO (kHz)">
+                                   id="lnb-custom-input" placeholder="Converter LO (kHz)">
                         </div>
+                    </div>
+                    <div class="text-muted small mt-1" style="color:#d98a1e !important">
+                        &#x26A0;&#xFE0F; <strong>Up-converters and IF outputs: never plug A.</strong>
+                        Plug A carries 13/18V LNB supply from the moment the PicoTuner powers
+                        up, before Lynx is running - it would destroy a SpyVerter (4.2-5.5V)
+                        or an IC-9700's IF output. Software cannot prevent this; remove the
+                        PicoTuner's LNB supply jumpers, or fit a DC block. The two presets
+                        above are offered only when plug B has no voltage generator fitted.
+                        A Custom LO gets the right maths but none of that protection - manage
+                        the supply yourself.
                     </div>
                     <div class="mt-2 d-flex gap-2">
                         <select class="form-select form-select-sm bg-dark text-light border-secondary" id="plug-select">
@@ -5785,6 +10751,8 @@ async function api(method, path, body) {
 }
 
 // ── Status polling ────────────────────────────────────────────
+let lastLnbPsuState = null;
+
 function renderLnbPsuButtons(lnbPsu) {
     // Green = on, grey = off - reads the Picotuner's own last-reported
     // state from /api/status (parsed from its real status broadcast,
@@ -5795,6 +10763,11 @@ function renderLnbPsuButtons(lnbPsu) {
     // Picotuner configuration), not just within one session's own
     // in-memory state.
     const lnbPsuState = lnbPsu || {plug_a: 'off', plug_a_tone: false, plug_b: 'off', plug_b_tone: false};
+    // Kept where applyNoDcPlugRules() can see it. Leaving it local meant
+    // a reference from outside silently read `undefined` and fell back
+    // to "plug B is free", so the plug-B-only rule appeared to work
+    // while never actually checking anything.
+    lastLnbPsuState = lnbPsuState;
     for (const plug of ['a', 'b']) {
         const current = lnbPsuState['plug_' + plug] || 'off';
         const tone = lnbPsuState['plug_' + plug + '_tone'] || false;
@@ -5902,11 +10875,72 @@ async function updateStatus() {
         badge.textContent = mode.toUpperCase();
         badge.style.background = mode === 'idle' ? '#3a4a63' : mode === 'rf' ? '#1a9850' : '#3b82c4';
 
+        // Locator badge - value AND provenance (GPS vs configured),
+        // per the task: the two must always be shown together, since
+        // a GPS-driven value and an operator-typed one carry very
+        // different confidence for anyone reading the display.
+        const loc = s.lynx?.portable_locator || '';
+        const provenance = s.lynx?.portable_locator_provenance || 'config';
+        const gnss = s.lynx?.gnss || {};
+        const locBadge = document.getElementById('locator-badge');
+        if (gnss.running && !gnss.connected) {
+            // Reader is meant to be talking to the HAT (mode isn't
+            // Off) but isn't - either no HAT is physically fitted (a
+            // fixed repeater site, exactly as expected) or the serial
+            // port isn't answering. Takes priority over the value/
+            // provenance display below: whatever locator is in use
+            // right now is necessarily the configured one, and that's
+            // secondary information to "there's no GPS talking to
+            // this receiver at all".
+            locBadge.textContent = '\U0001F4CD No GNSS Module';
+            locBadge.style.background = '#3a4a63';
+            locBadge.title = (gnss.last_error ? gnss.last_error + ' \u2014 ' : '') +
+                              (loc ? 'using configured locator ' + loc : 'no locator configured');
+        } else if (!loc) {
+            locBadge.textContent = '\U0001F4CD \u2014';
+            locBadge.style.background = '#3a4a63';
+            locBadge.title = 'Portable locator: not set';
+        } else if (provenance === 'gnss') {
+            locBadge.textContent = '\U0001F4CD ' + (gnss.locator_display || loc) + ' (GPS)';
+            locBadge.style.background = '#1a9850';
+            const sats = gnss.satellites != null ? gnss.satellites + ' sats' : 'sats \u2014';
+            const hdop = gnss.hdop != null ? 'HDOP ' + gnss.hdop : '';
+            locBadge.title = 'Confirmed GNSS fix - ' + sats + (hdop ? ', ' + hdop : '');
+        } else {
+            locBadge.textContent = '\U0001F4CD ' + loc + ' (config)';
+            locBadge.style.background = '#3a4a63';
+            if (gnss.mode === 'automatic' && gnss.pending_secs != null) {
+                locBadge.title = 'Configured value - GPS fix settling, ' +
+                                  Math.ceil(gnss.pending_secs) + 's to confirm';
+            } else if (gnss.mode === 'automatic') {
+                locBadge.title = 'Configured value - no GNSS fix (no HAT, or indoors)';
+            } else {
+                locBadge.title = 'Configured value - GNSS mode is Manual';
+            }
+        }
+
+        // Tri-watch (Stage 1) - status of every currently-enabled source
+        // (any mix of RF-A, RF-B, a stream) shown side by side. No
+        // priority/switching logic yet - this is purely informational.
+        const tw = s.tri_watch || {};
+        const twLine = document.getElementById('dual-watch-line');
+        if (tw.enabled && (tw.sources || []).length > 0) {
+            const parts = tw.sources.map(src => {
+                const icon = src.active ? '🟢' : (src.active === false ? '⚪' : '❓');
+                return `${icon} ${src.label}`;
+            });
+            twLine.textContent = `Tri-watch: ${parts.join('  |  ')}`;
+            twLine.style.display = 'block';
+        } else {
+            twLine.style.display = 'none';
+        }
+
         // mpv restart counter - links through to /diagnostics for detail
         const restartCount = s.lynx?.mpv_restarts_total ?? 0;
         document.getElementById('mpv-restart-count').textContent = restartCount;
 
         renderLnbPsuButtons(s.picotuner?.lnb_psu);
+        applyNoDcPlugRules();
         
         // Picotuner LED — in diversity mode, "locked" should mean
         // EITHER tuner is locked, since the combiner can produce a
@@ -5939,7 +10973,17 @@ async function updateStatus() {
         const locked = pt.locked;
         const lynxMode = s.lynx?.mode || 'idle';
 
-        if (lynxMode === 'stream') {
+        // tri_watch: Rx1 stays continuously, independently tuned in the
+        // background regardless of what's currently being displayed -
+        // its own panel should never be taken over by stream info in
+        // that case, same principle already proven correct for Tuner
+        // B's own panel below. Confirmed as a real, reported bug
+        // otherwise: whichever of Rx1/stream "came up first" took this
+        // shared slot, hiding the other's status entirely.
+        const triWatchUsesRx1 = tw.enabled && (tw.sources || []).some(src => src.type === 'rf' && src.rcv === 1);
+        const showStreamInMainPanel = (lynxMode === 'stream') && !triWatchUsesRx1;
+
+        if (showStreamInMainPanel) {
             const info = s.lynx?.stream_info || {};
             const bitrate = info.bitrate_kbps;
             const protocol = s.lynx?.stream_protocol;
@@ -5965,7 +11009,7 @@ async function updateStatus() {
             ];
             if (pt.lnb_lo_khz && pt.downlink_frequency != null) {
                 rows.push(['Downlink', pt.downlink_frequency.toFixed(3) + ' MHz']);
-                rows.push(['IF (L-band)', pt.frequency ? pt.frequency + ' MHz' : '—']);
+                rows.push(['IF', pt.frequency ? pt.frequency + ' MHz' : '—']);
                 rows.push(['LNB LO', (pt.lnb_lo_khz/1000).toFixed(3) + ' MHz']);
             } else {
                 rows.push(['Frequency', pt.frequency ? pt.frequency + ' MHz' : '—']);
@@ -5991,9 +11035,18 @@ async function updateStatus() {
                 '<div class="text-muted small text-center mt-2">Searching for signal...</div>';
         }
 
-        // Diversity: second tuner panel, only shown while diversity mode is active
+        // Diversity: second tuner panel, shown while diversity mode is
+        // active OR while tri_watch has an RF source configured for
+        // rcv=2 - picotuner_state_b is always correctly populated
+        // either way, but this panel used to be the ONLY place any of
+        // that data (callsign, MER, margin, etc.) was ever shown, and
+        // it was gated to diversity mode specifically. tri_watch users
+        // previously had no way to see Rx2's detailed lock info at all
+        // beyond the arbitrator's own simple green/grey indicator -
+        // confirmed as a real, reported gap.
+        const triWatchUsesRx2 = (s.tri_watch?.sources || []).some(src => src.type === 'rf' && src.rcv === 2);
         const panelB = document.getElementById('diversity-panel-b');
-        if (div.enabled) {
+        if (div.enabled || triWatchUsesRx2) {
             panelB.style.display = '';
             const b = div.tuner_b || {};
             const bodyB = document.getElementById('status-panel-b');
@@ -6021,24 +11074,53 @@ async function updateStatus() {
             } else {
                 bodyB.innerHTML = '<div class="text-danger small text-center mt-2">Offline</div>';
             }
-            // Live combining stats — the combiner's own rolling window,
-            // not a cumulative-since-start figure. Shown in place of
-            // the site-name line at the top while diversity is active.
-            const statsLine = document.getElementById('diversity-stats-line');
-            const siteName = document.getElementById('site-name');
-            statsLine.style.display = '';
-            siteName.style.display = 'none';
-            const st = div.stats;
-            if (st) {
-                statsLine.textContent =
-                    `Diversity: A ${st.window_pct_a?.toFixed(0) ?? '—'}% \u00b7 B ${st.window_pct_b?.toFixed(0) ?? '—'}% \u00b7 gaps ${st.window_pct_gap?.toFixed(1) ?? '—'}%`;
-            } else {
-                statsLine.textContent = 'Diversity: combiner starting...';
+            // Live combining stats - the combiner's own rolling window,
+            // not a cumulative-since-start figure. Diversity-only,
+            // deliberately not shown for tri_watch - there's no
+            // combiner running in that mode, so nothing to report here.
+            if (div.enabled) {
+                const statsLine = document.getElementById('diversity-stats-line');
+                const siteName = document.getElementById('site-name');
+                statsLine.style.display = '';
+                siteName.style.display = 'none';
+                const st = div.stats;
+                if (st) {
+                    statsLine.textContent =
+                        `Diversity: A ${st.window_pct_a?.toFixed(0) ?? '—'}% \u00b7 B ${st.window_pct_b?.toFixed(0) ?? '—'}% \u00b7 gaps ${st.window_pct_gap?.toFixed(1) ?? '—'}%`;
+                } else {
+                    statsLine.textContent = 'Diversity: combiner starting...';
+                }
             }
         } else {
             panelB.style.display = 'none';
             document.getElementById('diversity-stats-line').style.display = 'none';
             document.getElementById('site-name').style.display = '';
+        }
+
+        // tri_watch: the stream's own info, shown independently of Rx1's
+        // panel above - only needed when that panel is actually showing
+        // Rx1's own RF details instead (triWatchUsesRx1), since otherwise
+        // the stream info is already correctly shown there and showing it
+        // twice would just be a duplicate.
+        const streamPanel = document.getElementById('tri-watch-stream-panel');
+        if (tw.enabled && lynxMode === 'stream' && triWatchUsesRx1) {
+            streamPanel.style.display = '';
+            const info = s.lynx?.stream_info || {};
+            const bitrate = info.bitrate_kbps;
+            const protocol = s.lynx?.stream_protocol;
+            const streamRows = [
+                ['Stream',     s.lynx?.stream_name || '—'],
+                ['Protocol',   protocol || '—'],
+                ['Bitrate',    bitrate != null ? bitrate.toFixed(0) + ' kbps' : '—'],
+                ['Video',      info.video_codec || '—'],
+                ['Audio',      info.audio_codec || '—'],
+            ];
+            document.getElementById('tri-watch-stream-status').innerHTML = streamRows.map(r =>
+                '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;"><span>' + r[0] + '</span>' +
+                '<span class="status-value">' + r[1] + '</span></div>'
+            ).join('');
+        } else {
+            streamPanel.style.display = 'none';
         }
     } catch(e) {
         document.getElementById('status-panel').innerHTML = '<div class="text-danger small">Status unavailable</div>';
@@ -6074,9 +11156,59 @@ function getLnbLoKhz() {
     return parseInt(sel) || 0;
 }
 
+// Equipment that LNB supply voltage destroys: a SpyVerter expects
+// 4.2-5.5V on the pin an LNB gets 13 or 18V on, and an IC-9700's IF is
+// a receiver OUTPUT.
+//
+// The only real protection is that no voltage generator is fitted on
+// the plug it is connected to. Plug A always has one and is live from
+// the moment the board powers up - before Lynx runs - so nothing in
+// software can make plug A safe. Plug B has none as standard; one has
+// to be added by hand.
+//
+// So the rule is simply: these converters are plug B, and only when
+// plug B has no generator fitted. Anything else is not offered. That
+// is as far as software can honestly go.
+function applyNoDcPlugRules() {
+    const sel = document.getElementById('lnb-select');
+    const plugSel = document.getElementById('plug-select');
+    if (!sel || !plugSel) return;
+
+    // Only usable once the Picotuner has actually said plug B has no
+    // generator. Before the first status arrives the safe assumption is
+    // that it HAS one - offering the converter and withdrawing it a
+    // second later would be worse than a brief wait.
+    const bAbsent = !!(lastLnbPsuState && lastLnbPsuState['plug_b'] === 'absent');
+
+    for (const opt of sel.options) {
+        if (opt.dataset && opt.dataset.nodc === '1') {
+            opt.disabled = !bAbsent;
+            opt.title = bAbsent
+                ? 'Connect to plug B. Plug A carries LNB voltage from power-up and would destroy it.'
+                : 'Unavailable: a voltage generator is fitted on plug B. It has to be physically '
+                  + 'removed before this can be connected - LNB voltage destroys a SpyVerter or an '
+                  + "IC-9700's IF output, and plug A is live from power-up so it can never be used.";
+        }
+    }
+
+    const chosen = sel.options[sel.selectedIndex];
+    const noDc = !!(chosen && chosen.dataset && chosen.dataset.nodc === '1');
+    for (const opt of plugSel.options) {
+        if (opt.value === 'a' || opt.value === 'diversity') {
+            opt.disabled = noDc;
+            opt.title = noDc
+                ? 'Plug A carries LNB voltage from the moment the board powers up, before Lynx '
+                  + 'starts. The selected converter would be destroyed. Use plug B.'
+                : '';
+        }
+    }
+    if (noDc && plugSel.value !== 'b') plugSel.value = 'b';
+}
+
 function onLnbSelectChange() {
     const isCustom = document.getElementById('lnb-select').value === 'custom';
     document.getElementById('lnb-custom-col').style.display = isCustom ? '' : 'none';
+    applyNoDcPlugRules();
 }
 
 async function saveMemory() {
@@ -6191,13 +11323,33 @@ async function loadConfig() {
     } catch(e) {}
 }
 
+// Mirrors calc_tuner_freq() in the backend. This check previously did
+// a bare `freq - lnb_lo_khz`, which is only ever right for a low-side
+// Ku LNB: it made C-band look out of range, and it rejected every
+// up-converted frequency outright, since 71.5 MHz minus a 120 MHz LO
+// is negative. Nothing was sent to the tuner at all, so the entered
+// frequency simply appeared to be unusable.
+//
+// Kept deliberately identical to the Python, in the same order - the
+// up-conversion test first, because a frequency below what the tuner
+// can reach means something is up-converting however it compares to
+// the LO.
+const PICOTUNER_MIN_TUNE_KHZ_JS = 145000;
+
+function calcTunerFreqJs(freqKhz, loKhz) {
+    if (!loKhz) return freqKhz;
+    if (freqKhz < PICOTUNER_MIN_TUNE_KHZ_JS) return freqKhz + loKhz;  // up-converter
+    if (freqKhz >= loKhz) return freqKhz - loKhz;                     // low-side
+    return loKhz - freqKhz;                                            // high-side (C-band)
+}
+
 // ── Actions ───────────────────────────────────────────────────
 async function tuneTo() {
     const freq = parseInt(document.getElementById('freq-input').value);
     const sr = parseInt(document.getElementById('sr-input').value);
     const plug = document.getElementById('plug-select').value;
     const lnb_lo_khz = getLnbLoKhz();
-    const tunerFreq = freq - lnb_lo_khz;
+    const tunerFreq = calcTunerFreqJs(freq, lnb_lo_khz);
     if (tunerFreq < 50000 || tunerFreq > 2500000) {
         alert(`Calculated tuner frequency ${(tunerFreq/1000).toFixed(3)} MHz is out of range.\\n` +
               `Check the LNB LO selection matches the frequency entered — nothing was sent.`);
@@ -6219,8 +11371,40 @@ async function playCustom() {
     if (url) await playStream(url);
 }
 
-async function stopAll() {
-    await api('POST', '/api/stop');
+async function stopApp() {
+    if (!confirm('Stop Lynx? This closes the app and returns the Pi to its desktop - ' +
+                 'the receiver will be off the air until Lynx is started again.')) {
+        return;
+    }
+    try {
+        const result = await api('POST', '/api/app_stop');
+        if (result && result.detail) {
+            alert('Could not stop: ' + result.detail);
+            return;
+        }
+    } catch (e) {
+        // The server is expected to go down as part of this - not itself
+        // a sign anything went wrong.
+    }
+}
+
+async function shutdownPi() {
+    if (!confirm('Shut down the Pi completely? Unlike Reboot, it will NOT come back up on ' +
+                 'its own - you will need to physically power it back on (or use a remote ' +
+                 'power switch) to bring the receiver back.')) {
+        return;
+    }
+    try {
+        const result = await api('POST', '/api/shutdown');
+        if (result && result.detail) {
+            alert('Could not shut down: ' + result.detail);
+            return;
+        }
+    } catch (e) {
+        // The server is expected to go down as part of this - not itself
+        // a sign anything went wrong.
+    }
+    alert('Shutting down - the Pi will power off shortly.');
 }
 
 async function stopApp() {
@@ -6364,11 +11548,11 @@ function renderUpdateStatus(status) {
     const badge = document.getElementById('version-badge');
     const applyBtn = document.getElementById('update-apply-btn');
     const version = status.current_version || '?';
-    // Channel shown on ALL four branches below via versionText, so
-    // it's always visible next to the version regardless of update
-    // status - not just flagged when it happens to be Beta.
-    const channelTag = status.channel === 'beta' ? ' [BETA]' : ' [STABLE]';
-    const versionText = 'v' + version.replace(/^v/, '') + channelTag;
+    // Shown on ALL four branches below via versionText, rather than
+    // repeating it in each one separately - which channel is active
+    // matters regardless of whether an update check has ever run or
+    // what it found.
+    const versionText = 'v' + version.replace(/^v/, '') + (status.channel === 'beta' ? ' [BETA]' : '');
 
     if (status.check_error) {
         badge.textContent = versionText;
@@ -6484,6 +11668,56 @@ loadUpdateStatus();
 updateStatus();
 setInterval(updateStatus, 3000);
 setInterval(loadLiveStreams, 3600000);
+
+// ── QuickLynx button ─────────────────────────────────────────
+// Its own poll, deliberately not hooked into updateStatus(). Editing
+// the middle of that function is what broke this page once already;
+// keeping it separate means a fault here cannot stop the rest of the
+// page updating.
+// Bootstrap's .disabled class sets pointer-events:none, which stops the
+// browser registering a hover at all - so the title never appeared,
+// which defeated the point of greying the button rather than hiding it.
+// Pointer events are re-enabled inline; this handler then swallows the
+// click so a disabled button still does not navigate.
+document.addEventListener('DOMContentLoaded', () => {
+    const b = document.getElementById('quicklynx-btn');
+    if (b) b.addEventListener('click', (ev) => {
+        if (b.classList.contains('disabled')) {
+            ev.preventDefault();
+            ev.stopPropagation();
+        }
+    });
+});
+
+async function refreshQuickLynxButton() {
+    const btn = document.getElementById('quicklynx-btn');
+    if (!btn) return;
+    try {
+        const r = await fetch('/api/status');
+        const s = await r.json();
+        if (s.lynx && s.lynx.quicklynx_enabled) {
+            btn.classList.remove('disabled');
+            btn.removeAttribute('aria-disabled');
+            btn.title = 'Open QuickLynx - the QO-100 wideband spectrum, '
+                      + 'click a signal to tune this receiver to it.';
+            btn.style.cursor = 'pointer';
+        } else {
+            btn.classList.add('disabled');
+            btn.setAttribute('aria-disabled', 'true');
+            btn.title = 'QuickLynx is switched off. It shows the QO-100 '
+                      + 'wideband spectrum and lets you click a signal to '
+                      + 'tune this receiver to it. Turn it on in Config to use it.';
+            btn.style.cursor = 'help';
+        }
+    } catch (e) {
+        // Silent: the status poll elsewhere already reports connection
+        // trouble, and a second complaint about the same thing helps
+        // nobody.
+    }
+}
+refreshQuickLynxButton();
+setInterval(refreshQuickLynxButton, 5000);
+
 </script>
 </body>
 </html>"""
@@ -6497,6 +11731,14 @@ if __name__ == "__main__":
     # are reliably online, sometimes running RF-only with no internet
     # at all, and this must never touch the network unless a user
     # explicitly asks it to.
+    # GNSS (portable locator) - started unconditionally, like the
+    # Picotuner monitor threads just below. There is no mode that
+    # stops the reader itself anymore (see _apply_gnss_mode's own
+    # docstring) - a site with no HAT fails quietly regardless, and a
+    # site with one fitted should keep the option of GPS time sync
+    # even while Manual mode keeps GPS out of the locator.
+    gnss_reader.start()
+    _apply_gnss_mode()
     # Start Picotuner monitor background threads
     monitor = threading.Thread(target=picotuner_monitor, daemon=True)
     monitor.start()
@@ -6506,12 +11748,6 @@ if __name__ == "__main__":
     quality_b.start()
     freshness = threading.Thread(target=rf_mpv_lifecycle_monitor, daemon=True)
     freshness.start()
-    # Picotuner tuning watchdog - catches the tuner losing its tuning
-    # for ANY reason (its own reboot, a lost command, static), which
-    # otherwise leaves a repeater deaf and reporting itself healthy.
-    picotuner_watchdog_thread = threading.Thread(
-        target=picotuner_tuning_watchdog, daemon=True)
-    picotuner_watchdog_thread.start()
     diversity_stuck = threading.Thread(target=diversity_stuck_lock_monitor, daemon=True)
     diversity_stuck.start()
     mer_pub = threading.Thread(target=mer_publisher, daemon=True)
@@ -6522,12 +11758,76 @@ if __name__ == "__main__":
     connectivity.start()
     modcod_monitor = threading.Thread(target=picotuner_modcod_monitor, daemon=True)
     modcod_monitor.start()
+    # Before any consumer thread exists. The notifications manager can
+    # submit a contact within seconds of startup, and _resume_on_startup()
+    # does not run for another seven - see init_converter_state().
+    init_converter_state()
     drift_monitor = threading.Thread(target=mpv_drift_monitor, daemon=True)
     drift_monitor.start()
     rss_monitor = threading.Thread(target=memory_rss_monitor, daemon=True)
     rss_monitor.start()
     dial_discovery = threading.Thread(target=dial_discovery_responder, daemon=True)
     dial_discovery.start()
+    # Tri-watch (up to 3 sources, Stage 1) - probes for any enabled
+    # stream sources are started here, once, rather than lazily on
+    # first use, so their connect/handshake/reconnect cycle is already
+    # warmed up and settled by the time anyone actually looks at their
+    # status, matching how the Picotuner's own monitoring threads work.
+    # RF sources need no separate startup step at all - their status is
+    # already tracked by the existing picotuner_state/picotuner_state_b
+    # globals, and this stage deliberately doesn't auto-tune them (see
+    # the tri_watch_enabled global's own docstring for why).
+    # NOT yet validated against the real BATC RTMP server for more than
+    # one simultaneous stream source - the single-stream case has been
+    # confirmed working directly against real hardware; a second,
+    # concurrent stream probe alongside it is untested.
+    _tw_cfg = config.get('tri_watch', {})
+    if _tw_cfg.get('enabled', False):
+        tri_watch_enabled = True
+        tri_watch_sources_cfg = _tw_cfg.get('sources', [])
+        for _tw_idx, _tw_src in enumerate(_tw_cfg.get('sources', [])):
+            if not _tw_src.get('enabled', False):
+                continue
+            _tw_type = _tw_src.get('type')
+            if _tw_type == 'rf':
+                if _tw_src.get('rcv') not in (1, 2):
+                    print(f"[tri_watch] source {_tw_idx}: type rf needs rcv 1 or 2 - skipping")
+                    continue
+                print(f"[tri_watch] source {_tw_idx}: RF Rx{_tw_src.get('rcv')} - status tracked, not auto-tuned (Stage 2)")
+            elif _tw_type == 'stream':
+                if _tw_src.get('domain') and _tw_src.get('app') and _tw_src.get('streamname'):
+                    _probe = lynx_rtmp_probe.RTMPStreamProbe(
+                        domain=_tw_src['domain'],
+                        app=_tw_src['app'],
+                        stream_name=_tw_src['streamname'],
+                        rtmp_port=_tw_src.get('port', 1935),
+                    )
+                    _probe.start()
+                    tri_watch_probes[_tw_idx] = _probe
+                    print(f"[tri_watch] source {_tw_idx}: stream probe started for {_tw_src['domain']}/{_tw_src['app']}/{_tw_src['streamname']}")
+                else:
+                    print(f"[tri_watch] source {_tw_idx}: type stream missing domain/app/streamname - skipping")
+            else:
+                print(f"[tri_watch] source {_tw_idx}: unknown type {_tw_type!r} - skipping")
+    # Started unconditionally, matching every other monitor thread here -
+    # the loop itself checks tri_watch_enabled before doing anything.
+    tri_watch_arbitrator_thread = threading.Thread(target=tri_watch_arbitrator_loop, daemon=True)
+    tri_watch_arbitrator_thread.start()
+    # End-of-contact station map - started unconditionally for the same
+    # reason as the arbitrator above; the loop checks whether the
+    # feature is enabled before doing anything, and works out for itself
+    # whether plain RF, diversity or tri_watch rules apply.
+    pathfinder_thread = threading.Thread(target=pathfinder_watcher, daemon=True)
+    pathfinder_thread.start()
+    # Auto-Squeak - see _start_squeak for why this is safe to call
+    # unconditionally even when the feature is off.
+    _start_squeak()
+    # Picotuner tuning watchdog - catches the tuner losing its tuning
+    # for ANY reason (its own reboot, a lost command, static), which
+    # otherwise leaves a repeater deaf and reporting itself healthy.
+    picotuner_watchdog_thread = threading.Thread(
+        target=picotuner_tuning_watchdog, daemon=True)
+    picotuner_watchdog_thread.start()
     # Repeater-activity notifications (QRZ/Slack/Companion/GPIO Tx) - its
     # own, independent monitor, deliberately not gated on current_mode the
     # way rf_mpv_lifecycle_monitor() is (see lynx_notifications.py's own
@@ -6538,8 +11838,19 @@ if __name__ == "__main__":
     notification_manager = lynx_notifications.NotificationManager(
         picotuner_state, picotuner_state_b, lambda: config,
         record_event=record_diagnostic_event,
-        get_lnb_state=lambda: (current_lnb_lo_khz, current_lnb_side),
-        get_stream_active=_stream_is_being_shown)
+        get_on_air_from_if=on_air_from_if,
+        get_tri_watch_displayed_rcv=lambda: tri_watch_target_rcv,
+        get_tri_watch_enabled=lambda: tri_watch_enabled,
+        get_stream_active=_stream_is_being_shown,
+        # Runtime diversity state, not the saved config. Turning
+        # diversity on by tuning sets a module global and does NOT write
+        # the config file, so the manager was reading a flag that stayed
+        # False - and tuner B's lock was therefore ignored for QRZ,
+        # Slack, Companion and GPIO Tx. Pathfinder, mpv and the OSD all
+        # read the tuner state directly, so they worked perfectly and
+        # hid the problem: a receiver could sit showing a picture from
+        # Rx2 while logging nothing at all.
+        get_diversity_enabled=lambda: diversity_enabled)
     notification_manager.start()
     print("Picotuner monitor started.")
 
@@ -6606,12 +11917,19 @@ if __name__ == "__main__":
     # Plug B skipped entirely when the Picotuner reports no generator
     # fitted - the usual case, since only one is populated as standard.
     if current_lnb_psu_b != 'absent':
-        picotuner_rcv2_cmd(f"[to@wh] vgy={_v_b if _v_b == 'off' else _v_b + ('t' if _t_b else '')}")
+        picotuner_rcv2_cmd(f"[to@wh] vgy={_v_b if _v_b == 'off' else _v_b + ('t' if _t_b else '')}",
+                           config['picotuner'])
 
     # A short pause for the LNB PSU voltage to physically stabilise
-    # before the very first tune attempt below - see this patch's own
-    # module docstring for the real-hardware evidence behind this.
-    # Only pauses if a PSU command was genuinely sent above.
+    # before the very first tune attempt below - confirmed directly on
+    # real hardware (main): a cold PoE power cycle with Plug A's PSU
+    # freshly turned on saw Rx A take roughly 4 minutes to lock on an
+    # otherwise genuinely good signal; follow-up testing found 2s
+    # wasn't quite enough margin, 5s resolved it reliably. Only pauses
+    # if a voltage was actually turned ON above - keyed off the CONFIG,
+    # not current_lnb_psu_a/b, which may already have been overwritten
+    # by the Picotuner reporting whatever it powered up with, and would
+    # then skip this pause in precisely the case it exists for.
     if _v_a != "off" or _v_b != "off":
         LNB_PSU_STARTUP_SETTLE_SECS = 5.0
         time.sleep(LNB_PSU_STARTUP_SETTLE_SECS)
@@ -6655,6 +11973,24 @@ if __name__ == "__main__":
 
     def _resume_on_startup():
         time.sleep(7)  # let mpv/overlay settle first
+
+        # tri_watch, when enabled, deliberately replaces the whole
+        # resume-last-state concept below - a dedicated repeater
+        # receiver should always come up on its configured inputs,
+        # not whatever a human happened to be doing before the last
+        # restart. Applies even with only one source enabled within
+        # tri_watch, not just 2 or 3 - the behavioural switch is
+        # tri_watch.enabled itself, not how many sources are in use.
+        if tri_watch_enabled:
+            print("[tri_watch] enabled - skipping resume-last-state, tuning configured RF sources instead")
+            tri_watch_startup_tune()
+            # Both receivers start transmitting TS data as soon as
+            # they're tuned, well before the arbitrator ever decides
+            # what to display - drain everything immediately so
+            # nothing goes unread even during this initial window.
+            _tri_watch_sync_drainers(None)
+            return
+
         state = load_last_state()
         if state and state.get("mode") == "rf":
             target_tuner_freq = calc_tuner_freq(state["freq"], state.get("lnb_lo_khz", 0))
@@ -6692,10 +12028,30 @@ if __name__ == "__main__":
                 # risk resuming with mpv still pointed at the raw
                 # single-tuner port instead of the combiner's output.
                 print(f"Already locked on {state['freq']} kHz / {state['sr']} kS/s — skipping resume tune.")
-                global current_mode, current_preset, current_lnb_lo_khz
+                global current_mode, current_preset
                 current_mode = "rf"
                 current_preset = f"{state['freq']/1000:.3f} MHz / {state['sr']} kS/s"
-                current_lnb_lo_khz = state.get("lnb_lo_khz", 0)
+                # Via set_converter_state() rather than assigning
+                # current_lnb_lo_khz directly, because the LO alone is
+                # not enough: current_lnb_side must be set with it, and
+                # this path used to set only the LO. Confirmed live -
+                # resuming on 71 MHz through a 120 MHz SpyVerter left the
+                # side at its "low" default, so the down-converter branch
+                # ADDED the LO and every consumer of these globals (OSD,
+                # Web UI Downlink, QRZ) showed 311.010 instead of 71.010.
+                #
+                # Also means this path finally logs a [converter] line.
+                # Its silence is why the fault looked like a value
+                # flipping at random: a manual retune set the side
+                # correctly and logged it, a restart quietly reverted it
+                # and logged nothing.
+                #
+                # rcv=1 deliberately - this branch is already gated on the
+                # non-diversity case, and the already-tuned check above
+                # only ever looks at rcv=1's own lock state.
+                set_converter_state(1, state["freq"],
+                                    state.get("lnb_lo_khz", 0),
+                                    'resume, already tuned')
                 return
 
             print(f"Resuming previous RF state: {state.get('freq')} kHz / {state.get('sr')} kS/s")

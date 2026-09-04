@@ -184,10 +184,168 @@ relay:
   enabled: false
   rtmp_url: ''
 
+# Tri-watch: watches up to 3 sources simultaneously - any mix of RF
+# receiver 1, RF receiver 2 (the Picotuner's two independent
+# demodulator circuits - NOT the same thing as the "A"/"B" antenna-
+# input plug selector, see rcv/fplug below), and one network stream
+# input - so this receiver can cover multiple repeater inputs at once
+# rather than needing separate hardware for each. Each source has its
+# own enabled: true/false, so use any 2, or all 3, in whatever
+# combination makes sense (e.g. two RF sources on the SAME frequency
+# but different symbol rates - a tuner given one specific, known rate
+# to lock onto, rather than scanning a range, does noticeably better
+# on weak signals). Disabled by default.
+#
+# STAGE 1: every enabled source's active/locked status is genuinely
+# tracked simultaneously (see /api/status' own "tri_watch" section),
+# and the Picotuner stays tuned/monitored continuously rather than
+# being retuned away whenever a stream plays. Confirmed directly
+# against the real BATC RTMP server and real hardware, including the
+# same-frequency/different-symbol-rate case (both receivers correctly,
+# independently reporting lock at different rates on the same
+# frequency).
+#
+# STAGE 2: when tri_watch is enabled, it REPLACES Lynx's normal
+# resume-last-state behaviour entirely (even with only one source
+# enabled) - every configured, enabled RF source is actively tuned at
+# startup instead, so a dedicated repeater receiver always comes up on
+# its correct, configured inputs regardless of what was happening
+# before the last restart. Simple arbitration: whichever source goes
+# active first holds the screen; if another source goes active while
+# it's still playing, it does NOT preempt - instead, an on-screen
+# notification pops up (see rf_notification_template below) saying
+# something else wants attention, and takes over automatically once
+# the currently-displayed source finishes. A 3-way split screen is a
+# deliberately-deferred future idea, not built.
+#
+# Tested directly: the core arbitration decision logic (7 scenarios -
+# handover, notification timing/expiry, no duplicate notifications,
+# everything-inactive) as an isolated, standalone class before ever
+# touching real hardware control, and the full startup-tuning path
+# with mock UDP listeners standing in for the Picotuner's own command
+# ports. NOT yet tested: the actual on-screen notification bubble
+# (visual design work, not yet built into the OSD) or the arbitrator's
+# live source-switching on real hardware end-to-end.
+tri_watch:
+  enabled: false
+  # How long a source must stay CONTINUOUSLY active before tri_watch
+  # shows a NOTIFICATION about it - deliberately does NOT delay the
+  # actual display switch itself, which always reacts immediately to
+  # the raw lock/active status. An earlier version applied this
+  # uniformly to both, which caused a real, reported bug: stacked on
+  # top of the separate, already-proven lock-stability debounce that
+  # exists further upstream, a flickering raw signal (which the OSD's
+  # own, already-smoothed lock indicator wouldn't show at all) could
+  # prevent a picture from ever appearing at all, despite the OSD
+  # showing a perfectly solid green light throughout. A source that
+  # drops out and comes back starts this timer over from scratch for
+  # notification purposes, rather than resuming where it left off.
+  settling_seconds: 15
+  # A SEPARATE, much SHORTER debounce (unlike settling_seconds above,
+  # which only affects notifications) - requires this many seconds of
+  # a SUSTAINED state change before the actual display switches at
+  # all, in either direction (becoming active or becoming inactive).
+  # Restores the same protection normal RF mode already gets from its
+  # own lock-anti-bounce logic, which tri_watch's arbitrator otherwise
+  # has none of at all. Confirmed live as genuinely necessary: without
+  # it, brief flicker in the raw lock signal (invisible on the OSD,
+  # which applies its own, separate smoothing before ever showing
+  # green) could repeatedly tear the picture down and re-establish it,
+  # sometimes never completing a full cycle at all - "solid lock, no
+  # picture" despite genuinely nothing being wrong with the signal
+  # itself.
+  lock_confirm_seconds: 3
+  # How long a "someone else wants in" notification stays on screen, in
+  # seconds, before disappearing on its own.
+  notification_duration_secs: 20
+  # Template for the on-screen notification when a WAITING RF source
+  # wants attention while something else is being displayed. Own,
+  # separate system from the existing Slack notification's own
+  # message_template (that one's built specifically around RF-lock
+  # events with fields - MER, margin, modcod - a stream source has no
+  # equivalent for; genuinely reusing the same template for both is a
+  # Stage 4 item, not this one). Available placeholders:
+  #   {callsign}            - whoever's actually, currently transmitting
+  #                            on the waiting source (live, from the
+  #                            Picotuner's own decode)
+  #   {configured_callsign} - this input's own identity (the "callsign"
+  #                            field set per-source below, e.g. the
+  #                            repeater's own callsign)
+  #   {frequency}            - the waiting source's configured frequency
+  rf_notification_template: '{callsign} is waiting to access {configured_callsign} on {frequency}'
+  sources:
+    - type: rf
+      enabled: false
+      rcv: 1                   # <-- 1 or 2 - which actual receiver circuit, NOT the antenna
+                                #     input (fplug below) - outside diversity mode, both
+                                #     "plug A" and "plug B" run through the SAME rcv=1
+                                #     circuit, so this is the field that actually matters
+                                #     for telling two RF sources apart
+      fplug: a                 # <-- a or b - which physical antenna input this receiver
+                                #     circuit reads from (independent of rcv - real wiring
+                                #     varies by site)
+      freq: 437000              # <-- kHz
+      sr: 333                   # <-- kS/s
+      lnb_lo_khz: 0
+      label: ''                  # <-- optional, shown in the Web UI - defaults to something sensible if left blank
+      callsign: ''                # <-- optional - this input's own callsign (e.g. the
+                                   #     repeater's), used as {configured_callsign} in the
+                                   #     notification template above. Falls back to label,
+                                   #     then a generic "this input", if left blank
+    - type: rf
+      enabled: false
+      rcv: 2
+      fplug: b
+      freq: 437000
+      sr: 1000
+      lnb_lo_khz: 0
+      label: ''
+      callsign: ''
+    - type: stream
+      enabled: false
+      domain: ''       # <-- e.g. rtmp.batc.org.uk
+      app: ''          # <-- e.g. live
+      streamname: ''   # <-- e.g. gb3jtinput
+      port: 1935
+      label: ''
+      waiting_message: ''   # <-- plain text shown when this source is waiting - no
+                             #     placeholders (unlike the RF template above), since
+                             #     there's no live "who's transmitting" data available
+                             #     for a stream the way there is for RF. Falls back to
+                             #     "<label> wants attention" if left blank
+
 ryde:
   enabled: false
   host: 192.168.XXX.XXX   # <-- your Ryde host's IP, if using Ryde
   port: 8765
+
+# IMPORTANT, AT A REPEATER SITE
+# The end-of-contact card appears AFTER the station has stopped
+# transmitting - by default 15s later, staying up for 30s, so the last
+# of it is on screen 45s after unlock. Anything that reacts to the
+# unlock transition can cut away before viewers ever see it:
+#
+#   * a repeater controller's hang/tail timer dropping the transmitter
+#   * a video switcher or Bitfocus Companion action changing source on
+#     the unlock webhook
+#   * any external "no signal, switch to test card" logic
+#
+# Give those a hold-off of at least delay_secs + duration_secs (32s
+# with the defaults below), or shorten the card to fit the hang time
+# you already have. Lynx's own gpio_tx keying needs no change - its
+# power_down_settle_secs is far longer than this window.
+pathfinder:
+  enabled: true
+  delay_secs: 2           # quiet gap after a station stops, before the card appears
+                          # (2s tested on air - long enough to read as a pause,
+                          #  short enough that nobody has drifted away yet)
+  duration_secs: 30       # how long the card stays on screen
+  min_span_km: 15         # closest zoom, so a local contact still shows context
+  max_span_km: 1000       # widest zoom - beyond this the frame stops growing
+  max_distance_km: 1200   # further than this, the locator is assumed stale
+                          # rather than the contact genuinely extraordinary,
+                          # and no card is drawn. Matches the extent of the
+                          # map data shipped in geo/.
 
 site:
   callsign: XXXXX          # <-- your callsign

@@ -10,6 +10,7 @@ A Raspberry Pi 5 based DATV receiver for the Picotuner (WinterHill firmware), wi
 - Web Control Portal for tuning, memory presets, live BATC stream browsing, and volume control
 - Optional two-tuner diversity combining, with automatic source switching based on signal quality
 - Repeater/receiver-activity notifications (QRZ Logbook, Slack, Bitfocus Companion, GPIO Tx control)
+- **Pathfinder** — an end-of-contact station map: a full-screen card showing where a station was, the path back to the receiver, and the signal figures from the contact, drawn from their QRZ locator
 - Resumes its previous state automatically after any restart, including a genuine power loss
 - Optional M5Dial ("Knobler") front-panel or remote control
 
@@ -17,7 +18,7 @@ A Raspberry Pi 5 based DATV receiver for the Picotuner (WinterHill firmware), wi
 
 See [`lynx_install_guide.docx`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/docs/lynx_install_guide.docx) for the full, step-by-step setup guide, from a blank SD card to a working receiver — or use the one-line installer described in that guide's Section 4.1.
 
-Copy [`lynx_config.example.yaml`](./lynx_config.example.yaml) to `config/lynx_config.yaml`, start Lynx, then set your Picotuner's IP address from the Web Control Portal's Configuration page (⚙️ Config → Picotuner Network Settings) — no need to hand-edit the config file for this.
+Copy [`config/lynx_config.example.yaml`](./config/lynx_config.example.yaml) to `config/lynx_config.yaml`, start Lynx, then set your Picotuner's IP address from the Web Control Portal's Configuration page (⚙️ Config → Picotuner Network Settings) — no need to hand-edit the config file for this.
 
 ## Documentation
 
@@ -31,7 +32,7 @@ Copy [`lynx_config.example.yaml`](./lynx_config.example.yaml) to `config/lynx_co
 
 - Raspberry Pi 5 (4GB or more), running Raspberry Pi OS with Desktop
 - A Picotuner (WinterHill firmware) on the same network
-- See the install guide for the full system/Python dependency list
+- See the install guide for the full system/Python dependency list (`pyshp` is required for the station map)
 - Recommended to disable Wi-Fi and Bluetooth and use just wired Ethernet
 
 ## Contributing

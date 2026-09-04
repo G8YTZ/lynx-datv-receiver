@@ -1,0 +1,27 @@
+[Unit]
+Description=Scheduled Lynx reboot, nightly
+
+[Timer]
+# 03:00 local, once a day. Deliberately NOT a rolling "every 24 hours
+# from boot" - that drifts, and a repeater rebooting at an unpredictable
+# hour is worse than one rebooting at a known quiet one. A fixed clock
+# time means every receiver on a network reboots at the same predictable
+# moment, and anyone watching knows why the picture went away.
+#
+# Was twice daily at 04:00 and 16:00. The afternoon one was dropped
+# because it fell in the middle of the day for anyone actually using the
+# repeater, and nothing needs clearing that often: the things a reboot
+# resets - the QRZ cache, discovered tuners, any file descriptor or
+# thread that has crept up - accumulate far too slowly to justify
+# interrupting an afternoon net.
+OnCalendar=*-*-* 03:00:00
+# If the Pi was off when a scheduled time passed, don't immediately
+# reboot the moment it comes back - just wait for the next one.
+Persistent=false
+# Up to 5 minutes of jitter, so several receivers on one site don't all
+# drop simultaneously and take the whole repeater off air at once.
+RandomizedDelaySec=300
+Unit=lynx-scheduled-reboot.service
+
+[Install]
+WantedBy=timers.target

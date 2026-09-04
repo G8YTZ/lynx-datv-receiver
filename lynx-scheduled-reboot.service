@@ -1,0 +1,13 @@
+[Unit]
+Description=Scheduled Lynx reboot
+# Deliberately depends on nothing. The whole value of a scheduled
+# reboot is that it recovers from states nobody has thought of yet -
+# so it must not be gated on any of those things still working.
+
+[Service]
+Type=oneshot
+# Logged before rebooting, so the journal shows this was deliberate
+# rather than a crash - which matters when someone is later trying to
+# work out why a repeater restarted at 4am.
+ExecStart=/usr/bin/logger -t lynx "Scheduled reboot (lynx-scheduled-reboot.timer)"
+ExecStart=/sbin/reboot

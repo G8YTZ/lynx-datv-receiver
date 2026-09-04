@@ -1,43 +1,77 @@
 [Unit]
 Description=Lynx DATV Receiver
-# mpv and the OSD overlay (gtk4-layer-shell) both need a running
-# Wayland compositor (labwc) to draw into, so this can't start any
-# earlier than the graphical session itself being ready.
-After=graphical-session.target
-Wants=graphical-session.target
+# mpv and the OSD overlay (gtk4-layer-shell) both need a running Wayland
+# compositor (labwc) to draw into, so this cannot start any earlier than
+# the compositor is ready.
+#
+# Deliberately NOT ordered against graphical-session.target. That target
+# is activated by a desktop session manager, and on a receiver with the
+# desktop stripped out nothing ever pulls it in - confirmed directly, it
+# sits "inactive (dead)" indefinitely while default.target is active, so
+# a unit waiting on it never starts at all and never logs a word to
+# explain why. The screen simply stays black.
+#
+# default.target is always reached by the user manager, and the
+# compositor is waited for explicitly below - which is better anyway,
+# because it waits for the thing Lynx actually needs rather than for a
+# target that may or may not be activated depending on how the session
+# happened to be started.
+After=default.target
 
 [Service]
 # Switched from Type=notify to Type=simple (2026-07-31) after a
-# confirmed, reproducible startup timeout: the script runs completely
-# correctly when launched directly (confirmed via full, successful
-# manual runs), but systemd's Type=notify specifically waits for a
-# systemd-notify --ready call before considering the service started
-# - and that wait was timing out when launched by systemd itself, for
-# reasons not fully pinned down. Type=simple removes that dependency
-# entirely: systemd just considers the service started as soon as the
-# process launches, without waiting on a signal that wasn't arriving
-# reliably. Restart=always is unaffected by this change - it doesn't
-# depend on Type at all, so auto-restart-on-crash/exit still works
-# exactly the same.
+# reproducible startup timeout: the script ran correctly when launched
+# by hand, but systemd's Type=notify waits for a readiness notification
+# that was never arriving. See NotifyAccess below - that was the actual
+# cause, identified only much later.
 Type=simple
-ExecStart=%h/lynx/lynx_start.sh
+
+# Without this, EVERY notification is silently discarded - including
+# every watchdog ping - and systemd kills the service every WatchdogSec
+# seconds however healthy it is. Confirmed directly on a receiver:
+# "Result: watchdog", "signal=ABRT", restarting on a loop while the
+# picture was perfectly fine.
+#
+# NotifyAccess defaults to "none". Type=notify sets it implicitly, which
+# is why this was never needed before the switch to Type=simple above -
+# and nothing replaced it at the time. "all" rather than "main" because
+# systemd-notify runs as a CHILD of the start script rather than as the
+# main process, so even "main" would reject it. That is also why the
+# original Type=notify readiness signal never arrived: the same cause,
+# and the reason Type=notify appeared not to work.
+NotifyAccess=all
+
+# Wait for the compositor's Wayland socket before starting. This is what
+# replaces the graphical-session.target ordering above: the socket
+# appearing is direct evidence labwc is up and accepting clients,
+# whereas the target only means a session manager believes it has
+# finished. Bounded at 60s so a genuinely broken session fails visibly
+# rather than hanging for ever.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do [ -S "$${XDG_RUNTIME_DIR}/$${WAYLAND_DISPLAY:-wayland-0}" ] && exit 0; sleep 1; done; echo "no Wayland socket after 60s - is the compositor running?" >&2; exit 1'
+
+# Invoked through bash rather than directly, so a missing execute bit
+# cannot stop the service starting. The bit is not preserved by every
+# route a file takes onto a receiver - SFTP drops it, and a file copied
+# by hand rather than pulled arrives without it - and the failure is
+# silent: systemd reports only "Permission denied" while the screen
+# stays black.
+ExecStart=/bin/bash %h/lynx/lynx_start.sh
+
 Restart=always
 RestartSec=5
 
-# The script's own watchdog loop pings roughly every 10s, with a
-# possible extra ~3s retry during a genuine tune transition - worst
-# case observed directly in the script is ~13-15s between pings.
-# 45s gives a safe ~3x margin above that, so ordinary timing jitter
-# never triggers a false-positive restart, while a genuine hang is
-# still caught reasonably promptly.
-# NOTE: WatchdogSec's underlying notification socket is set up by
-# systemd whenever WatchdogSec is configured, independent of Type= -
-# so this should keep working the same as before. Not independently
-# re-verified after the Type change though, given no reliable way to
-# test this specific piece remotely - worth confirming directly
-# (systemctl --user status lynx.service after it's been running a
-# while) rather than assumed.
-WatchdogSec=45
+# Raised from 45s. The script only reaches its ping loop after the
+# network wait, the clock wait, the web app (which fetches the BATC
+# stream list over the internet) and the overlay have all completed -
+# and WatchdogSec counts from the moment the process launches, there
+# being no separate startup grace for Type=simple. 45s comfortably
+# exceeded the ping interval but NOT a cold start, so the first ping
+# could arrive too late even with notifications working. 180s still
+# catches a genuine hang promptly while never firing on a slow boot.
+#
+# The script also pings during its startup waits now, so the clock is
+# fed from the beginning rather than only once everything is running.
+WatchdogSec=180
 
 # Give the script's own cleanup() trap (SIGTERM handler - sends the
 # Picotuner a "stream off" command and stops mpv cleanly) time to run
@@ -45,4 +79,4 @@ WatchdogSec=45
 TimeoutStopSec=15
 
 [Install]
-WantedBy=graphical-session.target
+WantedBy=default.target

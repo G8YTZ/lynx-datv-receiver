@@ -60,6 +60,8 @@ gi.require_version('Gtk4LayerShell', '1.0')
 gi.require_version('GdkPixbuf', '2.0')
 from gi.repository import Gtk, Gtk4LayerShell, GLib, Gdk, GdkPixbuf
 import cairo
+import lynx_map
+import glob
 import os
 import math
 
@@ -68,6 +70,7 @@ import json
 import threading
 import time
 import subprocess
+import re
 import struct
 import signal
 import faulthandler
@@ -129,6 +132,84 @@ def heartbeat_writer():
 LYNX_API = "http://localhost:8080/api/status"
 MPV_TRANSITION_MARKER = "/tmp/lynx_mpv_transitioning"
 POLL_SECS = 2
+
+# Longest the cover may stay up before the overlay stops honouring it,
+# however long the marker file itself persists: the configured
+# Pathfinder window, delay_secs + duration_secs, which is the same
+# total the config page already calls the Pathfinder window and warns
+# against setting too high. Not a separate number - a cover exists to
+# carry the screen until something replaces it, and there is nothing
+# left for it to carry once the card it was covering for would itself
+# have finished.
+#
+# A cap is needed at all because the cover is not always lowered by
+# whoever raised it. The tri_watch loss-of-lock path raises it and
+# deliberately never lowers it, leaving that to whatever displays next -
+# which is right when something does display next, and leaves the
+# screen covered for ever when nothing does. A transmission that simply
+# ends, with no follow-on and no other source waiting, is exactly that
+# case.
+#
+# Enforced here rather than in lynx_app.py on purpose: this way a
+# marker leaked by any path at all, including one nobody has thought of
+# yet, still recovers. Past the cap the overlay behaves as though no
+# transition were in progress - picture if there genuinely is one,
+# otherwise the normal idle screen, which is opaque either way, so
+# nothing underneath is ever exposed by giving up.
+def _cover_max_secs():
+    return state["pathfinder_delay_secs"] + state["pathfinder_duration_secs"]
+
+# tri_watch's "someone else wants in" notification sound - place the
+# actual audio file here yourself (not fetched/bundled by Claude - see
+# chat). Any format mpv can play (mp3, wav, etc) works, since mpv
+# itself is what plays it below.
+NOTIFICATION_SOUND_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "tri_watch_notification.mp3")
+
+# tri_watch source-switch placeholder - shown full-frame in place of
+# the plain "SWITCHING" caption whenever Pathfinder has nothing to
+# draw for the switch (a stream-only transition, or an RF station
+# with no resolved QRZ result). Built to the video frame size
+# (1920x1080) so it can be drawn edge-to-edge with no letterboxing.
+# Entirely optional - if no file is found, on_draw() falls back to the
+# original black slide with the "SWITCHING" caption.
+#
+# Two places are looked at, in order. config/ comes first and holds
+# whatever was uploaded from the config page; the repo root holds the
+# card shipped with Lynx. That split matters more than it looks:
+# lynx_testcard.png in the repo root is a TRACKED file, so writing an
+# upload over it would leave the receiver's working tree dirty and
+# every later `git pull` would refuse to fast-forward. config/ is
+# gitignored, so an uploaded card survives updates and never collides
+# with one.
+#
+# Any extension GdkPixbuf can read works - it sniffs the content
+# rather than trusting the name - so png, jpg and webp are all fine.
+def _find_switching_graphic():
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = sorted(glob.glob(os.path.join(here, "config", "lynx_testcard.*")))
+    candidates.append(os.path.join(here, "lynx_testcard.png"))
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
+
+def play_notification_sound():
+    """Fire-and-forget playback of the notification sound via a short-
+    lived, audio-only mpv process - completely separate from the main,
+    video-playing mpv instance, so it can never interfere with it.
+    Silently does nothing if the sound file isn't present, rather than
+    erroring - this feature is opt-in by placing the file, not
+    required for Lynx to run."""
+    if not os.path.exists(NOTIFICATION_SOUND_PATH):
+        return
+    try:
+        subprocess.Popen(
+            ["mpv", "--no-video", "--really-quiet", NOTIFICATION_SOUND_PATH],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except Exception as e:
+        print(f"Could not play notification sound: {e}")
 
 # ── Magic eye calibration ───────────────────────────────────────
 # Re-calibrated 2026-07-23 against the real dBm values now available
@@ -200,7 +281,9 @@ state = {
     "locked": False,
     "mpv_running_for_rf": False,
     "callsign": "",
+    "callsign_name": "",
     "frequency": "",
+    "downlink_frequency": None,
     "mer": "",
     "margin": "",
     "locked_a": False,
@@ -209,12 +292,19 @@ state = {
     "locked_b": False,
     "mer_b": "",
     "margin_b": "",
+    "frequency_b": "",
+    "downlink_frequency_b": None,
+    "sr_ks_b": "",
+    "tri_watch_show_searching_rx2": False,
+    "tri_watch_enabled": False,
     "dbm_a": "",
     "level_a": "",
     "dbm_b": "",
     "level_b": "",
     "level": "",
     "dbm": "",
+    "audio_device": "hdmi",           # which device mpv is sending audio to
+    "audio_device_resolved": "",      # what "hdmi" actually resolved to
     "ppm_position_l": None,   # set by audio_ppm_monitor() - None until the audio tap produces its first real reading
     "ppm_level_dbfs_l": None,
     "ppm_position_r": None,
@@ -234,6 +324,20 @@ state = {
     "stream_protocol": "",
     "mpv_transitioning": False,
     "portable_locator": "",
+    "tri_watch_notification": None,   # the current "someone else wants in" message text, or None
+    "pathfinder": None,              # end-of-contact card dict, or None if none is due
+    # How long the switch cover waits before drawing anything - the same
+    # configured value Pathfinder uses for its own appearance delay, sent
+    # by lynx_app.py so there is only ever one timer. Defaults to 2 if
+    # the API doesn't provide it (an older lynx_app.py).
+    "pathfinder_delay_secs": 2.0,
+    # The other half of the configured Pathfinder window - see
+    # _cover_max_secs(). Defaults to 30 if the API doesn't provide it
+    # (an older lynx_app.py).
+    "pathfinder_duration_secs": 30.0,
+    "squeak": None,                  # Auto-Squeak results card, or None
+    "site_locator": "",
+    "site_location": "",
     # Diversity mode — which tuner is actually the one supplying the
     # locked/displayed state.
     "diversity_enabled": False,
@@ -259,6 +363,111 @@ _raw_lock_history = []
 
 ONLINE_STABLE_POLLS = 3  # slightly more tolerant than lock, since "online" flapping is more visually jarring (whole zones disappear) than a lock badge changing colour
 _raw_online_history = []
+_last_notification_sound_played_for = None  # triggered_at of the last tri_watch
+                                              # notification a sound was played for -
+                                              # lets a genuinely new notification be
+                                              # distinguished from the same one still
+                                              # being displayed across multiple polls
+
+def _squash(text):
+    """Lowercase with punctuation removed, for comparing names the same
+    system spells differently in different places."""
+    return re.sub(r'[^a-z0-9]', '', str(text or "").lower())
+
+
+def _alsa_card_from_mpv_device(mpv_device):
+    """The ALSA card name inside an mpv --audio-device string, or None.
+
+    mpv reports ALSA devices as e.g. alsa/sysdefault:CARD=vc4hdmi0.
+    Only needed on systems without PipeWire - see ppm_monitor_target().
+    """
+    if not mpv_device:
+        return None
+    m = re.search(r'CARD=([A-Za-z0-9_\-]+)', mpv_device)
+    return m.group(1) if m else None
+
+
+def _pipewire_monitor_for_card(card_name):
+    """The PipeWire monitor source matching an ALSA card, or None.
+
+    Only used as a fallback: when mpv is on a pipewire/... device the
+    node name is already in the device string and no searching is
+    needed. This covers the case where mpv is on a raw ALSA device but
+    PipeWire is nonetheless running.
+    """
+    if not card_name:
+        return None
+    try:
+        r = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=10)
+        nodes = json.loads(r.stdout)
+    except Exception as e:
+        print(f"[ppm] could not read the PipeWire node list: {e}")
+        return None
+
+    for n in nodes:
+        try:
+            if n.get("type") != "PipeWire:Interface:Node":
+                continue
+            props = n.get("info", {}).get("props", {})
+            if props.get("media.class") != "Audio/Sink":
+                continue
+            haystack = " ".join(str(props.get(k, "")) for k in (
+                "alsa.card_name", "api.alsa.card.name", "alsa.long_card_name",
+                "api.alsa.path", "node.name", "device.name", "node.description"))
+            # Punctuation stripped from both sides: ALSA calls a card
+            # "vc4hdmi0" while PipeWire records it as "vc4-hdmi-0", so a
+            # plain substring test fails on the hyphens.
+            if _squash(card_name) and _squash(card_name) in _squash(haystack):
+                name = props.get("node.name")
+                if name:
+                    return name + ".monitor"
+        except Exception:
+            continue
+    return None
+
+
+def ppm_monitor_target():
+    """What pw-cat should listen to for the PPM.
+
+    The meter taps the system's audio output independently of mpv, which
+    is deliberate - mpv's own astats path is broken upstream. But that
+    independence became a problem once the output device was made
+    selectable: with mpv sent to HDMI while the default sink was a USB
+    dongle, the meter would sit watching a silent dongle and read
+    nothing, with no indication why.
+
+    So it follows mpv. On a PipeWire system that is exact rather than
+    inferred: mpv's device name is "pipewire/<node>", so the monitor is
+    simply "<node>.monitor". Falling back, in order, to searching
+    PipeWire for a matching ALSA card, then to the default sink.
+    """
+    fallback = "@DEFAULT_SINK@.monitor"
+    try:
+        dev = state.get("audio_device", "hdmi")
+        if not dev or str(dev).lower() == "auto":
+            return fallback
+
+        # "hdmi" is resolved by lynx_app and published in the status, so
+        # the overlay does not duplicate that logic.
+        resolved = state.get("audio_device_resolved") or dev
+
+        if str(resolved).startswith("pipewire/"):
+            return resolved.split("/", 1)[1] + ".monitor"
+
+        card = _alsa_card_from_mpv_device(resolved)
+        if not card:
+            return fallback
+        target = _pipewire_monitor_for_card(card)
+        if not target:
+            print(f"[ppm] no PipeWire sink found for ALSA card '{card}' - "
+                  f"falling back to the default sink. The meter may read "
+                  f"nothing if mpv is playing to a different device.")
+            return fallback
+        return target
+    except Exception as e:
+        print(f"[ppm] target resolution failed ({e}) - using the default sink")
+        return fallback
+
 
 def audio_ppm_monitor():
     """Background thread: drives the stereo PPM meter with real, live
@@ -299,12 +508,29 @@ def audio_ppm_monitor():
     meter_l = PpmBallistics()
     meter_r = PpmBallistics()
     proc = None
+    target = None
+    target_for_device = None
 
     while True:
         try:
+            # Re-resolve when the configured device changes, so altering
+            # it on the Config page moves the meter with it rather than
+            # needing a restart.
+            current_device = state.get("audio_device", "hdmi")
+            if target is None or current_device != target_for_device:
+                target = ppm_monitor_target()
+                target_for_device = current_device
+                print(f"[ppm] monitoring {target}")
+                if proc is not None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    proc = None
+
             if proc is None or proc.poll() is not None:
                 proc = subprocess.Popen(
-                    ["pw-cat", "-r", "--target=@DEFAULT_SINK@.monitor",
+                    ["pw-cat", "-r", f"--target={target}",
                      "--format=s16", "--rate", str(SAMPLE_RATE),
                      "--channels", str(CHANNELS), "-"],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
@@ -333,7 +559,7 @@ def audio_ppm_monitor():
             state["ppm_level_dbfs_r"] = meter_r.level_dbfs
 
         except FileNotFoundError:
-            print("[overlay] pw-cat not found - PPM meter unavailable (is pipewire-utils installed?)")
+            print("[overlay] pw-cat not found - PPM meter unavailable (is pipewire-bin installed?)")
             time.sleep(30)
         except Exception as e:
             print(f"[overlay] PPM audio tap error: {type(e).__name__}: {e}")
@@ -344,7 +570,7 @@ def audio_ppm_monitor():
 
 def poll_status():
     """Background thread — polls the Lynx API continuously."""
-    global _raw_lock_history, _raw_online_history
+    global _raw_lock_history, _raw_online_history, _last_notification_sound_played_for
     while True:
         raw_online = False
         try:
@@ -353,7 +579,7 @@ def poll_status():
             pt = data.get('picotuner', {})
             div = data.get('diversity', {})
             diversity_enabled = div.get('enabled', False)
-            tuner_b = div.get('tuner_b', {}) if diversity_enabled else {}
+            tuner_b = div.get('tuner_b', {})
 
             # Diversity mode: locked means EITHER tuner is locked, not
             # just tuner A — the combiner can produce a perfectly good
@@ -363,7 +589,44 @@ def poll_status():
             # output was playing completely fine.
             a_locked = pt.get('locked', False)
             b_locked = tuner_b.get('locked', False)
-            raw_locked = a_locked or (diversity_enabled and b_locked)
+
+            # tri_watch: which receiver (if any) is it currently
+            # displaying? Matched via the "idx" field each source entry
+            # carries, against tri_watch's own displayed_source_idx.
+            # Computed here, before raw_locked below, specifically so
+            # raw_locked (which drives the OSD's green/orange lock
+            # colour) can correctly account for it too - confirmed as
+            # the actual cause of a real, reported bug: the display
+            # stayed permanently orange while tri_watch showed Rx2, no
+            # matter how solidly locked Rx2 genuinely was, since the
+            # diversity-only formula below never considered b_locked at
+            # all outside diversity mode.
+            tri_watch = data.get('tri_watch') or {}
+            tri_watch_use_b = False
+            if tri_watch.get('enabled'):
+                displayed_idx = tri_watch.get('displayed_source_idx')
+                if displayed_idx is not None:
+                    for src in tri_watch.get('sources', []):
+                        if src.get('idx') == displayed_idx and src.get('type') == 'rf':
+                            tri_watch_use_b = (src.get('rcv') == 2)
+                            break
+
+            # Diversity mode: locked means EITHER tuner is locked, not
+            # just tuner A — the combiner can produce a perfectly good
+            # picture from just one healthy receiver. Without this,
+            # pulling A's antenna showed "SEARCHING" and covered the
+            # screen even while B alone was locked and the combined
+            # output was playing completely fine. tri_watch: locked
+            # means specifically whichever receiver it's currently
+            # displaying is locked - a genuinely different question
+            # from diversity's "is either one locked", so it needs its
+            # own branch here rather than reusing that formula.
+            if tri_watch_use_b:
+                raw_locked = b_locked
+            elif tri_watch.get('enabled') and tri_watch.get('displayed_source_idx') is not None:
+                raw_locked = a_locked
+            else:
+                raw_locked = a_locked or (diversity_enabled and b_locked)
 
             # Independent per-tuner MER/margin, for the diversity-mode
             # top-right display which shows both tuners at once -
@@ -376,6 +639,14 @@ def poll_status():
             state["locked_b"] = b_locked
             state["mer_b"] = tuner_b.get('mer', '')
             state["margin_b"] = tuner_b.get('margin', '')
+            state["frequency_b"] = tuner_b.get('frequency', '')
+            # Tuner B's real on-air frequency, the same as tuner A gets.
+            # Without this the second OSD line showed the IF - 170 MHz
+            # for a 6m source through a SpyVerter, where the first line
+            # was correctly showing 71 MHz for its own converter. Two
+            # lines, two different meanings, which is worse than either.
+            state["downlink_frequency_b"] = tuner_b.get('downlink_frequency')
+            state["sr_ks_b"] = tuner_b.get('symbol_rate', '')
             # Independent per-tuner dBm (ptwh0v3k+) / level fallback,
             # for the split magic eye - top half driven by A, bottom by B.
             state["dbm_a"] = pt.get('dbm', '')
@@ -395,16 +666,48 @@ def poll_status():
             state["diversity_enabled"] = diversity_enabled
 
             # Which tuner's data actually populates the display fields
-            # below — prefer A whenever it's genuinely locked, falling
-            # back to B only when A isn't locked but B is.
-            use_b = diversity_enabled and not a_locked and b_locked
+            # below — tri_watch's own choice takes priority when it
+            # applies; otherwise, in diversity mode, prefer A whenever
+            # it's genuinely locked, falling back to B only when A
+            # isn't locked but B is. tri_watch and diversity are
+            # mutually exclusive modes, so these two conditions never
+            # genuinely compete in practice.
+            use_b = tri_watch_use_b or (diversity_enabled and not a_locked and b_locked)
             source = tuner_b if use_b else pt
             state["locked_via"] = "b" if use_b else "a"
             state["tuner_b_pct_nul"] = tuner_b.get("pct_nul", "")
             state["diversity_stats"] = div.get("stats") or {}
 
+            # While tri_watch is enabled but hasn't selected anything to
+            # display yet (still "searching" - displayed_source_idx is
+            # None), also show Rx2's own frequency on a second line, if
+            # tri_watch has an Rx2 source configured at all - neither
+            # receiver is "winning" yet in this state, and there's no
+            # video underneath being obscured by showing both. Once
+            # something is actually selected, this reverts to showing
+            # only that one receiver, same as any other RF display.
+            state["tri_watch_show_searching_rx2"] = False
+            if tri_watch.get('enabled') and tri_watch.get('displayed_source_idx') is None:
+                for src in tri_watch.get('sources', []):
+                    if src.get('type') == 'rf' and src.get('rcv') == 2:
+                        state["tri_watch_show_searching_rx2"] = True
+                        break
+
             state["callsign"]  = source.get('callsign', '')
+            # Picked up from the same source dict as the callsign, so it
+            # follows whichever receiver is being displayed without any
+            # per-mode handling: tri_watch's choice, diversity's A/B
+            # fallback and plain single-receiver operation all populate
+            # `source` the same way.
+            state["callsign_name"] = source.get('callsign_name', '')
             state["frequency"] = source.get('frequency', '')
+            # The real on-air frequency where a converter is in use -
+            # what the station is actually transmitting on, rather than
+            # the IF the tuner happens to see it at. Ku, C-band and
+            # up-converters alike: with a SpyVerter on 6m the tuner is
+            # on 170 MHz, and 50 MHz is the number that means anything
+            # to anyone watching.
+            state["downlink_frequency"] = source.get('downlink_frequency')
             state["mer"]       = source.get('mer', '')
             state["margin"]    = source.get('margin', '')
             state["level"]     = source.get('level', '')
@@ -432,6 +735,31 @@ def poll_status():
             state["stream_protocol"] = lynx.get('stream_protocol') or ""
             state["mpv_transitioning"] = lynx.get('mpv_transitioning', False)
             state["portable_locator"] = lynx.get('portable_locator', '')
+            state["site_locator"] = lynx.get('site_locator', '')
+            state["audio_device"] = lynx.get('audio_device', 'hdmi')
+            state["audio_device_resolved"] = lynx.get('audio_device_resolved', '')
+            state["site_location"] = lynx.get('site_location', '')
+            # End-of-contact map. As with the tri_watch bubble, the
+            # backend has already decided whether a card is due - this
+            # side only ever checks presence.
+            state["pathfinder"] = lynx.get('pathfinder')
+            state["pathfinder_delay_secs"] = lynx.get('pathfinder_delay_secs', 2.0)
+            state["pathfinder_duration_secs"] = lynx.get('pathfinder_duration_secs', 30.0)
+            state["squeak"] = lynx.get('squeak')
+            # tri_watch's "someone else wants in" notification - the
+            # backend already handles its own expiry (get_notification()
+            # returns None once past the configured display window), so
+            # this side just needs to check presence, not compute timing.
+            tri_watch = data.get('tri_watch') or {}
+            notification = tri_watch.get('notification') if tri_watch.get('enabled') else None
+            state["tri_watch_notification"] = notification.get('message') if notification else None
+            state["tri_watch_enabled"] = bool(
+                (data.get('tri_watch') or {}).get('enabled', False))
+            if notification:
+                triggered_at = notification.get('triggered_at')
+                if triggered_at is not None and triggered_at != _last_notification_sound_played_for:
+                    _last_notification_sound_played_for = triggered_at
+                    play_notification_sound()
         except Exception:
             raw_online = False  # request itself failed (timeout, connection refused, etc) — treated the same as a genuine "not online" reading, fed into the same debounced history below rather than forcing the displayed state immediately
 
@@ -496,11 +824,63 @@ class LynxOverlay(Gtk.Window):
             except Exception as e:
                 print(f"Could not load logo: {e}")
 
+        # See _find_switching_graphic() - entirely optional, so finding
+        # nothing here is not an error, just a fall-through to the plain
+        # "SWITCHING" caption. Re-checked periodically rather than only
+        # here, so a card uploaded from the config page takes effect
+        # without restarting the overlay.
+        self.switching_pixbuf = None
+        self._switching_pixbuf_path = None
+        self._load_switching_graphic()
+
         GLib.timeout_add(100, self.tick)
+        # Deliberately its own, much slower timer rather than anything
+        # in tick()/on_draw(): those run ten times a second and must
+        # never touch the filesystem. Two seconds is far more often than
+        # anyone changes a test card and still costs only a stat().
+        GLib.timeout_add(2000, self._switching_graphic_tick)
+
+        self._pf_surface = None
+        self._pf_surface_key = None
+        self._pf_renderer = None
 
     def tick(self):
         self.drawing_area.queue_draw()
         return True
+
+    def _switching_graphic_tick(self):
+        self._load_switching_graphic()
+        return True
+
+    def _load_switching_graphic(self):
+        """Load the placeholder card, or reload it if the file on disk
+        has changed since last time.
+
+        Cheap enough to call repeatedly: it only touches the filesystem
+        to resolve the path and read the mtime, and only decodes the
+        image when one of those has actually changed.
+
+        Reloading at all is what lets a card uploaded from the config
+        page take effect without restarting the overlay.
+        """
+        path = _find_switching_graphic()
+        if path is None:
+            self.switching_pixbuf = None
+            self._switching_pixbuf_path = None
+            return
+        try:
+            key = (path, os.stat(path).st_mtime)
+        except OSError:
+            return
+        if key == self._switching_pixbuf_path:
+            return
+        try:
+            self.switching_pixbuf = GdkPixbuf.Pixbuf.new_from_file(path)
+            self._switching_pixbuf_path = key
+        except Exception as e:
+            print(f"Could not load tri_watch switching graphic {path}: {e}")
+            self.switching_pixbuf = None
+            self._switching_pixbuf_path = key   # don't retry a bad file every poll
 
     def on_draw(self, area, cr, width, height):
         # Proof a real render actually happened, not just that tick()
@@ -514,12 +894,153 @@ class LynxOverlay(Gtk.Window):
         # on_draw() runs or when.
         _overlay_last_render_time[0] = time.time()
 
-        mpv_transitioning = os.path.exists(MPV_TRANSITION_MARKER)
+        showing_map = False
+        # One stat rather than an exists() followed by a getmtime(): the
+        # marker's mtime IS the moment the switch began, because
+        # start_transition_cover() creates the file before anything else
+        # happens - before the old ffmpeg is killed, before the Picotuner
+        # is retuned. Nothing has to be remembered between frames, and a
+        # cover started mid-transition (overlay restarted, say) still
+        # gets the right age rather than starting its clock over.
+        try:
+            transition_age = time.time() - os.stat(MPV_TRANSITION_MARKER).st_mtime
+            # Capped rather than merely present - see COVER_MAX_SECS. A
+            # cover nobody ever lowers stops being honoured here, so the
+            # screen recovers on its own instead of staying covered for
+            # ever after a transmission that had nothing following it.
+            mpv_transitioning = transition_age < _cover_max_secs()
+        except OSError:
+            transition_age = 0.0
+            mpv_transitioning = False
         genuinely_locked = (state["locked"] and state["mpv_running_for_rf"]) or state["mode"] == "stream"
         showing_picture = genuinely_locked and not mpv_transitioning
 
-        if not showing_picture:
-            if mpv_transitioning and genuinely_locked:
+        # Auto-Squeak is drawn BEFORE the showing_picture branch and
+        # over the top of live video, which is the one place it differs
+        # from Pathfinder.
+        #
+        # Pathfinder deliberately never covers a picture: it appears
+        # only once a station has stopped, so there is nothing
+        # underneath worth protecting. Auto-Squeak is the opposite - the
+        # results are wanted DURING the transmission, in the gap between
+        # passes, precisely so an adjustment can be made and the next
+        # pass seen. Waiting for the signal to drop would defeat the
+        # purpose, and what it covers is a test card rather than
+        # anything anyone wants to watch.
+        #
+        # Where both fall due, Auto-Squeak goes first and Pathfinder
+        # QUEUES behind it rather than being suppressed - the waiting
+        # is done in lynx_app.py, which holds the Pathfinder card back
+        # until the squeak measurement has finished and its card has
+        # cleared, so the map still gets its full display window
+        # afterwards. This priority is only the last line of defence
+        # for the case where the two somehow overlap anyway; it decides
+        # which is drawn, never whether the other happens at all.
+        showing_squeak = self.draw_squeak(cr, width, height)
+        if showing_squeak:
+            showing_map = True          # suppress the corner OSD zones too
+        elif not showing_picture:
+            # In tri_watch, a source switch produces exactly this state -
+            # tuner locked, mpv restarting, no picture yet - and it is
+            # entirely normal rather than a fault. Showing "RECONNECTING"
+            # for it implies something has gone wrong when nothing has,
+            # so tri_watch gets a cover instead: a cut, which is what it
+            # actually is.
+            #
+            # The word is kept for the single-source case, where this
+            # state does mean a decoder or freeze recovery is underway
+            # and saying so is useful.
+            #
+            # Deliberately NOT gated on genuinely_locked, which it was
+            # originally and which made this fire in one direction only.
+            # Switching TO a stream sets mode="stream" immediately, so
+            # genuinely_locked was true and the cover appeared. Switching
+            # TO RF sets mode="rf" while mpv_running_for_rf is still
+            # false (mpv is being restarted - that is the whole point of
+            # the transition), so genuinely_locked was false, this branch
+            # was skipped entirely, and the switch fell through to the
+            # idle screen below - logo, no cover, no caption. Confirmed
+            # live: stream-to-RF showed a blank page where RF-to-stream
+            # showed the cover correctly.
+            #
+            # The marker file alone is the right test. It exists only
+            # between start_transition_cover() and end_transition_cover(),
+            # so its presence already means a real, bounded transition is
+            # underway; what the tuner happens to be doing partway
+            # through one does not change what should be on screen.
+            if mpv_transitioning and state["tri_watch_enabled"]:
+                # Fill the gap with something to look at rather than a
+                # plain caption, where there's something valid to show.
+                #
+                # Pathfinder is tried IMMEDIATELY, with no delay applied
+                # here at all. It already has its own, measured from the
+                # moment the station stopped rather than from the moment
+                # the switch began, and enforced in get_card() before the
+                # card is ever sent. Gating it again on the cover's age
+                # applies the same wait twice, to a card that has already
+                # served it - and confirmed live as a real fault: the map
+                # appeared on the idle screen when the contact ended,
+                # then vanished into black the instant the cover went up,
+                # then came back a couple of seconds later. One cover
+                # throughout, one card, taken off the screen in the
+                # middle for no reason. If Pathfinder says a card is due,
+                # it is due, and a cover starting underneath it changes
+                # nothing about that.
+                #
+                # The placeholder is different: it has no timer of its
+                # own, so the delay is applied to it here. Same reason
+                # Pathfinder has one - a signal that drops for a moment
+                # may be a fade rather than an ending, and throwing a
+                # full-screen card up over it is a worse mistake than
+                # showing nothing for a second or two. The arbitrator's
+                # own lock_confirm_seconds already declines to switch on
+                # a brief drop; the placeholder has no business being
+                # quicker to draw a conclusion than the thing that
+                # decides.
+                #
+                # draw_pathfinder() decides for itself whether it has
+                # anything, so nothing here needs to know about QRZ at
+                # all. The placeholder follows where it declines (a
+                # stream-only transition, or an RF station with no QRZ
+                # result), and the caption remains the last resort for
+                # when no placeholder image has been supplied.
+                showing_map = self.draw_pathfinder(cr, width, height)
+                if not showing_map and \
+                        transition_age >= state["pathfinder_delay_secs"]:
+                    showing_map = self.draw_switching_graphic(cr, width, height)
+                if not showing_map:
+                    cr.set_source_rgba(0, 0, 0, 1.0)
+                    cr.set_operator(cairo.OPERATOR_SOURCE)
+                    cr.paint()
+                    cr.set_operator(cairo.OPERATOR_OVER)
+                    # Only once the delay has passed and nothing else
+                    # drew. During the delay the screen stays plain black
+                    # and says nothing, which is the point: a fade that
+                    # recovers should leave no trace of having been
+                    # noticed.
+                    #
+                    # Smaller and quieter than RECONNECTING: this is a normal
+                    # source change, not a fault, and the wording should not
+                    # suggest otherwise. Sized so it reads as a caption rather
+                    # than an alarm.
+                    if transition_age >= state["pathfinder_delay_secs"]:
+                        self.draw_text(cr, width / 2, height / 2, "SWITCHING",
+                                       size=32, align="center")
+                # Suppress the corner OSD zones for the WHOLE cover, not
+                # just the part of it where a card happens to be drawn.
+                # They were previously left on during the delay, and the
+                # result was reported as a distinct screen in its own
+                # right - "showing RF not locked" - when it was really
+                # this same cover with the frequency block, SEARCHING
+                # flag and magic eye still painted over the top of it.
+                #
+                # Nothing they report means anything mid-switch: the old
+                # source has gone and the new one has not arrived, so
+                # SEARCHING is true but irrelevant and the frequency is
+                # whatever is being left behind. The cover exists to say
+                # "wait", and the OSD contradicted it.
+                showing_map = True
+            elif mpv_transitioning and genuinely_locked:
                 # mpv is being restarted (decoder/freeze recovery)
                 # while the tuner itself remains genuinely locked - a
                 # plain black slide reads as a brief, minor interruption
@@ -535,8 +1056,13 @@ class LynxOverlay(Gtk.Window):
                 cr.set_operator(cairo.OPERATOR_SOURCE)
                 cr.paint()
                 cr.set_operator(cairo.OPERATOR_OVER)
-                if self.logo_pixbuf:
-                    self.draw_centered_logo(cr, width, height)
+                # The end-of-contact map replaces the logo screen when
+                # one is due; if it declines to draw (no card, no site
+                # locator, render failure) the logo appears as normal.
+                showing_map = self.draw_pathfinder(cr, width, height)
+                if not showing_map:
+                    if self.logo_pixbuf:
+                        self.draw_centered_logo(cr, width, height)
         else:
             cr.set_source_rgba(0, 0, 0, 0)
             cr.set_operator(cairo.OPERATOR_SOURCE)
@@ -545,10 +1071,21 @@ class LynxOverlay(Gtk.Window):
 
         cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
 
-        self.draw_top_right(cr, width, height)
-        self.draw_top_left(cr, width, height)
-        self.draw_bottom_left(cr, width, height)
-        self.draw_bottom_right(cr, width, height)
+        # The end-of-contact map is a full-screen card with its own
+        # header and data strip, so the normal corner-anchored OSD zones
+        # are suppressed while it is up - otherwise the frequency block,
+        # SEARCHING flag, PPM and magic eye all land straight on top of
+        # it. They are meaningless at that moment anyway: the contact is
+        # over and the tuner is back to searching.
+        if not showing_map:
+            self.draw_top_right(cr, width, height)
+            self.draw_top_left(cr, width, height)
+            self.draw_bottom_left(cr, width, height)
+            self.draw_bottom_right(cr, width, height)
+        # The tri_watch bubble is NOT suppressed - someone waiting to
+        # get in matters more than finishing the card, and it is drawn
+        # over the middle-right where the card has no text of its own.
+        self.draw_waiting_bubble(cr, width, height)
 
     def draw_text(self, cr, x, y, text, size=30, align="left", colour=(0.0, 1.0, 0.25)):
         cr.set_font_size(size)
@@ -564,6 +1101,259 @@ class LynxOverlay(Gtk.Window):
         cr.move_to(x, y)
         cr.show_text(text)
         cr.new_path()  # show_text() advances the current point rather than clearing it (unlike fill()) - without this, whatever draws next inherits a stray point and gets an unintended connector line on its first arc()/line_to()
+
+    def _wrap_text(self, cr, text, max_width):
+        """Balanced word-wrap: rather than greedily filling each line
+        all the way to max_width (which can leave an awkward, near-
+        empty final line, e.g. a single word by itself), finds the
+        narrowest width that still only needs as many lines as filling
+        to the true max_width would - a standard technique for more
+        evenly-distributed line lengths. Assumes the font/size are
+        already set on cr before calling."""
+        words = text.split()
+        if not words:
+            return []
+
+        def wrap_at(width):
+            lines = []
+            current = ""
+            for word in words:
+                candidate = (current + " " + word).strip()
+                if cr.text_extents(candidate).width <= width or not current:
+                    current = candidate
+                else:
+                    lines.append(current)
+                    current = word
+            if current:
+                lines.append(current)
+            return lines
+
+        lines_at_max = wrap_at(max_width)
+        if len(lines_at_max) <= 1:
+            return lines_at_max
+
+        target_line_count = len(lines_at_max)
+        lo = max(cr.text_extents(w).width for w in words)  # can't go narrower than the single widest word
+        hi = max_width
+        for _ in range(20):  # plenty of precision for pixel-level text
+            mid = (lo + hi) / 2
+            if len(wrap_at(mid)) <= target_line_count:
+                hi = mid
+            else:
+                lo = mid
+        return wrap_at(hi)
+
+    def _rounded_rect_path(self, cr, x, y, w, h, r):
+        """Traces a rounded-rectangle path on cr - does not fill/stroke
+        itself, so the caller can do either (or both, for a border)."""
+        cr.new_path()
+        cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
+        cr.arc(x + w - r, y + r, r, 3 * math.pi / 2, 2 * math.pi)
+        cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
+        cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
+        cr.close_path()
+
+    def draw_squeak(self, cr, width, height):
+        """Auto-Squeak results card - full screen, drawn over whatever
+        is on air.
+
+        Cached on the measurement timestamp like Pathfinder's, because
+        rendering the response plot takes long enough that repeating it
+        every frame would be wasteful on a Pi that may also be encoding
+        a stream."""
+        card = state.get("squeak")
+        if not card:
+            self._sq_surface = None
+            self._sq_key = None
+            return False
+        key = (card.get('measured_at'), int(width), int(height))
+        if key != getattr(self, '_sq_key', None):
+            try:
+                import lynx_squeak
+                self._sq_surface = lynx_squeak.render_card(
+                    card, int(width), int(height),
+                    seq_name=card.get('seq_name', ''),
+                    duration_s=card.get('duration_s'))
+            except Exception as e:
+                print(f"[overlay] Auto-Squeak render failed: {e}")
+                self._sq_surface = None
+            self._sq_key = key
+        if not self._sq_surface:
+            return False
+        # SOURCE rather than OVER: this replaces the frame outright,
+        # including where live video would otherwise show through the
+        # transparent overlay. With OVER, anything left in the surface
+        # from the previous frame could remain visible around the card.
+        cr.set_source_surface(self._sq_surface, 0, 0)
+        cr.set_operator(cairo.OPERATOR_SOURCE)
+        cr.paint()
+        cr.set_operator(cairo.OPERATOR_OVER)
+        return True
+
+    def draw_pathfinder(self, cr, width, height):
+        """End-of-contact card - full screen, drawn INSTEAD of the idle
+        logo rather than over the top of live video.
+
+        The card only ever appears once a station has stopped
+        transmitting, so there is no picture underneath worth
+        protecting, and using the whole frame lets the map be read at a
+        glance from across a room.
+
+        Rendering takes a few tenths of a second, so the surface is
+        built once when the card first appears and cached for the rest
+        of its display window - redrawing identical geography 60 times a
+        second would be pointless work on a Pi that may also be decoding
+        video for the web stream.
+        """
+        card = state.get("pathfinder")
+        if not card:
+            self._pf_surface = None
+            self._pf_surface_key = None
+            return False
+
+        home = state.get("site_locator") or ""
+        if not home:
+            return False
+
+        key = (card.get('callsign'), card.get('locator'),
+               card.get('unlocked_at'), int(width), int(height))
+        if key != getattr(self, '_pf_surface_key', None):
+            if getattr(self, '_pf_renderer', None) is None or \
+                    self._pf_renderer.home_locator != home.upper():
+                self._pf_renderer = lynx_map.MapRenderer(home)
+            try:
+                self._pf_surface = self._pf_renderer.render(
+                    int(width), int(height),
+                    card.get('callsign', ''), card.get('locator', ''),
+                    name=card.get('name'), mer=card.get('mer'),
+                    modcod=card.get('modcod'),
+                    symbol_rate=card.get('symbol_rate'),
+                    frequency=card.get('frequency'),
+                    site_name=state.get("site_location") or "",
+                    via_qo100=bool(card.get('via_qo100')))
+            except Exception as e:
+                # A map that will not draw must never take the OSD down -
+                # fall back silently to the normal idle screen.
+                print(f"[overlay] station map render failed: {e}")
+                self._pf_surface = None
+            self._pf_surface_key = key
+
+        if self._pf_surface is None:
+            return False
+
+        cr.set_source_surface(self._pf_surface, 0, 0)
+        cr.paint()
+        return True
+
+    def draw_switching_graphic(self, cr, width, height):
+        """tri_watch source-switch placeholder - full-frame, drawn only
+        when draw_pathfinder() has already declined (nothing to show).
+        See TRI_WATCH_SWITCHING_GRAPHIC_PATH's own comment for what this
+        is and why it's optional.
+
+        Unlike draw_centered_logo() this scales to fill the frame
+        exactly rather than fitting within it - the asset is built to
+        the video frame size for precisely that reason, so there is no
+        letterboxing to avoid and no aspect ratio to preserve against a
+        differently-shaped source.
+        """
+        pb = self.switching_pixbuf
+        if pb is None:
+            return False
+        pw, ph = pb.get_width(), pb.get_height()
+        if not pw or not ph:
+            return False
+
+        cr.save()
+        cr.scale(width / pw, height / ph)
+        Gdk.cairo_set_source_pixbuf(cr, pb, 0, 0)
+        cr.paint()
+        cr.restore()
+        return True
+
+    def draw_waiting_bubble(self, cr, width, height):
+        """tri_watch's "someone else wants in" notification - an
+        iMessage-style speech bubble, positioned middle-right so it's
+        clearly visible without overlapping any of the existing
+        corner-anchored OSD elements. The backend already handles
+        timing/expiry (state["tri_watch_notification"] is simply None
+        once the notification's display window has passed), so this
+        only ever needs to check presence, not compute anything
+        time-based itself."""
+        message = state.get("tri_watch_notification")
+        if not message:
+            return
+
+        font_size = 26
+        line_height = font_size * 1.35
+        padding_x = 24
+        padding_y = 20
+        tail_size = 30  # made longer per feedback (was 18)
+        max_text_width = width * 0.32  # keeps the bubble from dominating the screen, since it sits over live video
+
+        cr.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(font_size)
+        lines = self._wrap_text(cr, message, max_text_width)
+        text_width = max((cr.text_extents(line).width for line in lines), default=0)
+        cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)  # restored immediately after measuring, so nothing else drawn this frame is affected
+
+        bubble_w = text_width + padding_x * 2
+        bubble_h = line_height * len(lines) + padding_y * 2
+
+        # Middle-right placement, with margin from the screen edge and
+        # room for the tail pointing left toward the video content.
+        right_margin = 40
+        bubble_x = width - right_margin - bubble_w - tail_size
+        bubble_y = height / 2 - bubble_h / 2
+
+        corner_radius = 18
+        bubble_colour = (0.0, 0.478, 1.0)  # Apple's system blue, #007AFF - the actual iMessage outgoing-bubble colour, confirmed rather than approximated
+
+        # Drop shadow first, offset slightly, so the bubble reads clearly against any video content behind it
+        cr.set_source_rgba(0, 0, 0, 0.35)
+        self._rounded_rect_path(cr, bubble_x + 4, bubble_y + 4, bubble_w, bubble_h, corner_radius)
+        cr.fill()
+
+        # Main bubble body
+        cr.set_source_rgba(*bubble_colour, 0.92)
+        self._rounded_rect_path(cr, bubble_x, bubble_y, bubble_w, bubble_h, corner_radius)
+        cr.fill()
+
+        # Tail - emerges from the lower-left corner area, pointing
+        # down and further left, matching Apple's own bubble style
+        # (moved from the middle of the left edge per feedback). Three
+        # points: one attachment higher up the left edge (past where
+        # the rounded corner starts), the outward-pointing tip below
+        # and to the left of the bubble, and a second attachment along
+        # the bottom edge (past where the rounded corner ends) - this
+        # triangle reads as a tail emerging from the corner rather than
+        # a fin sticking out of a flat edge.
+        tail_attach_top_y = bubble_y + bubble_h - corner_radius - 6
+        tail_attach_bottom_x = bubble_x + corner_radius + 12
+        cr.new_path()
+        cr.move_to(bubble_x, tail_attach_top_y)
+        cr.line_to(bubble_x - tail_size, bubble_y + bubble_h + tail_size * 0.45)
+        cr.line_to(tail_attach_bottom_x, bubble_y + bubble_h)
+        cr.close_path()
+        cr.set_source_rgba(*bubble_colour, 0.92)
+        cr.fill()
+
+        # Text, left-aligned within the bubble (matching the
+        # conventional messaging-app look, and avoiding each line
+        # appearing to float at a different horizontal position when
+        # line lengths vary, even with the balanced wrap above)
+        cr.select_font_face("sans-serif", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        cr.set_font_size(font_size)
+        text_block_h = line_height * len(lines)
+        first_line_y = bubble_y + (bubble_h - text_block_h) / 2 + font_size
+        for i, line in enumerate(lines):
+            line_x = bubble_x + padding_x
+            line_y = first_line_y + i * line_height
+            cr.set_source_rgba(1, 1, 1, 0.98)
+            cr.move_to(line_x, line_y)
+            cr.show_text(line)
+        cr.new_path()
+        cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)  # restore the OSD's normal font for anything drawn after this
 
     def draw_top_right(self, cr, width, height):
         if not state["online"] and state["mode"] != "stream":
@@ -605,7 +1395,21 @@ class LynxOverlay(Gtk.Window):
             # less visual real estate than the MER/margin rows above it.
             if state["locked"]:
                 if state["callsign"]:
+                    # "Justin - G8YTZ" when QRZ has told us a name, the
+                    # bare callsign otherwise. A callsign is a licence;
+                    # a name is a person, and the whole point of the
+                    # display is that someone is on the air.
+                    #
+                    # Only ever from cache (see qrz_first_name), so it
+                    # appears a moment after the callsign rather than
+                    # with it, and simply never appears for anyone not
+                    # on QRZ - which must look deliberate rather than
+                    # broken, hence falling straight back to the
+                    # callsign alone.
                     label = state["callsign"]
+                    name = (state.get("callsign_name") or "").strip()
+                    if name:
+                        label = f"{name} - {label}"
                     if state["diversity_enabled"] and state["locked_via"] == "b":
                         label += " (B)"
                     lines.append(label)
@@ -614,6 +1418,16 @@ class LynxOverlay(Gtk.Window):
                     lines.append(f">> {state['callsign']} <<")
                 else:
                     lines.append("SEARCHING")
+
+            # tri_watch, still "searching" (nothing selected/displayed
+            # yet): Rx2 gets its own "SEARCHING" indicator too, right
+            # below Rx1's - by definition of this state, Rx2 hasn't
+            # been confirmed locked and selected yet either (otherwise
+            # tri_watch would have already picked it), so this is
+            # always exactly "SEARCHING", mirroring the top-left zone's
+            # own two-line pattern for the same state.
+            if state["tri_watch_show_searching_rx2"]:
+                lines.append("SEARCHING")
 
         for i, line in enumerate(lines):
             y = margin + size + (i * line_h)
@@ -651,8 +1465,29 @@ class LynxOverlay(Gtk.Window):
         margin = LEFT_MARGIN
         size = 30
         line_h = size * 1.3
-        freq = state["frequency"] or f"{state['freq_khz']/1000:.3f}"
+        # Prefer the real on-air frequency over the IF - see where this
+        # is populated. Falls back to the IF when no converter is in
+        # use, which is when the two are the same thing anyway.
+        dl = state.get("downlink_frequency")
+        if dl:
+            freq = f"{float(dl):.3f}"
+        else:
+            freq = state["frequency"] or f"{state['freq_khz']/1000:.3f}"
         lines = [f"{freq} MHz  {state['sr_ks']} kS/s"]
+
+        # tri_watch, still "searching" (nothing selected/displayed yet):
+        # also show Rx2's own frequency on the line right below Rx1's -
+        # no naming/labelling needed, the frequency itself already
+        # tells the audience which input it is. Reverts to the normal,
+        # single-receiver view automatically once something locks and
+        # gets selected (state["tri_watch_show_searching_rx2"] goes
+        # False the moment tri_watch's own displayed_source_idx is set).
+        if state["tri_watch_show_searching_rx2"] and state["frequency_b"]:
+            sr_b = f"  {state['sr_ks_b']} kS/s" if state["sr_ks_b"] else ""
+            dl_b = state.get("downlink_frequency_b")
+            freq_b = f"{float(dl_b):.3f}" if dl_b else state['frequency_b']
+            lines.append(f"{freq_b} MHz{sr_b}")
+
         if state["modcod"]:
             modcod_line = state["modcod"]
             if state["codec"]:
@@ -877,8 +1712,14 @@ class LynxOverlay(Gtk.Window):
         eye_radius = 75
 
         def dbm_to_fraction(dbm_str, level_str):
+            # A literal "0" is a confirmed, documented Picotuner firmware
+            # quirk (seen consistently for tuner B) rather than a genuine
+            # reading - a real dBm value is always meaningfully negative.
+            # Treated the same as "no reading" here, same fix as the Web
+            # UI's own equivalent logic.
+            dbm_valid = bool(dbm_str) and dbm_str != "0"
             try:
-                if dbm_str:
+                if dbm_valid:
                     # ptwh0v3k+ (2026-07-23): real dBm from the firmware's
                     # own look-up table - already correctly signed.
                     dbm = float(dbm_str)
@@ -891,7 +1732,7 @@ class LynxOverlay(Gtk.Window):
             frac = (dbm - EYE_DBM_MIN) / (EYE_DBM_MAX - EYE_DBM_MIN)
             frac = max(0.0, min(1.0, frac))
             frac = frac ** 0.5
-            text = f"{dbm:.0f} dBm" if (dbm_str or level_str) else "--"
+            text = f"{dbm:.0f} dBm" if (dbm_valid or level_str) else "--"
             return frac, text
 
         if state["mode"] == "stream":

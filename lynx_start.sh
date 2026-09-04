@@ -15,12 +15,12 @@
 
 # Explicitly guarantee the standard system directories are always
 # searched, regardless of what PATH (if any) the launching environment
-# provided - a reasonable defensive change given this script's own
-# top-of-file comment already notes NTP "has been observed to NEVER
-# succeed at all when this script is launched via labwc's autostart"
-# versus working fine from a manual SSH-triggered launch. Prepended,
-# not replaced - anything already present in an inherited PATH is
-# still searched too.
+# provided - confirmed directly as a real, plausible cause of commands
+# like ping/ip silently failing (command not found, indistinguishable
+# from a genuine timeout inside a redirected `if` check) specifically
+# when launched via labwc's autostart, versus working fine from a
+# manual SSH-triggered launch. Prepended, not replaced - anything
+# already present in an inherited PATH is still searched too.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 LYNX_DIR="$(cd "$(dirname $0)" && pwd)"
@@ -54,6 +54,36 @@ cleanup() {
 }
 trap cleanup SIGINT SIGTERM
 
+# Preserves the last part of lynx_app.py's own live log to persistent
+# storage - see this file's own patch history / CHANGELOG for the
+# full rationale on why this is only ever done here, at the moment a
+# real problem is detected, rather than continuously. Best-effort:
+# never anything this script depends on succeeding, so failing
+# quietly is correct if /var/log/lynx isn't writable (an install that
+# predates this feature, or genuinely out of space).
+save_log_tail() {
+    if [ -w /var/log/lynx ] 2>/dev/null; then
+        tail -200 /tmp/lynx_app.log > "/var/log/lynx/lynx_app_$(date -u +%Y%m%dT%H%M%SZ).log" 2>/dev/null || true
+        # Keep only the 10 most recent - each incident is small, but
+        # nothing here should be left to accumulate unbounded forever.
+        ls -t /var/log/lynx/lynx_app_*.log 2>/dev/null | tail -n +11 | xargs -r rm -- 2>/dev/null || true
+    fi
+}
+
+# ── systemd watchdog ────────────────────────────────────────────
+# Pinged during startup as well as from the health-check loop at the
+# bottom of this script. WatchdogSec counts from the moment the process
+# launches - there is no separate startup grace for Type=simple - and
+# the loop is not reached until the network wait, the clock wait, the
+# web app and the overlay have all completed. Feeding the clock from
+# the beginning means a slow cold start can never be mistaken for a
+# hang.
+#
+# Silent no-op when not running under systemd: systemd-notify simply
+# has no socket to talk to, and this script must run identically either
+# way.
+wd() { systemd-notify WATCHDOG=1 2>/dev/null || true; }
+
 echo -e "${BLUE}╔══════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║       Lynx DATV Receiver             ║${NC}"
 echo -e "${BLUE}║       G8YTZ / EI3IOB  2026           ║${NC}"
@@ -67,6 +97,7 @@ echo -e "${BLUE}╚════════════════════�
 # launch, but has been observed to NEVER succeed at all when this
 # script is launched via labwc's autostart. A genuine reachability
 # check (not just "interface has an IP") catches this properly.
+wd
 echo -ne "Waiting for network... "
 for i in $(seq 1 45); do
     GATEWAY=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
@@ -113,17 +144,18 @@ iw wlan0 set power_save off 2>/dev/null || true
 #
 # Capped at 45s - extended from an original 10s cap per Justin's own
 # request (a future use case). Confirmed directly this cap can
-# genuinely matter: NTP sync was observed taking around 30s on the
-# beta receiver's hardware on at least one real boot, most likely tied
-# to the same WiFi instability investigated elsewhere this session -
-# the original 10s cap would have given up and proceeded before that
-# sync actually completed. Still capped, not indefinite: a genuinely
+# genuinely matter: NTP sync was observed taking around 30s on this
+# exact hardware on at least one real boot, most likely tied to the
+# same WiFi instability investigated elsewhere this session - the
+# original 10s cap would have given up and proceeded before that sync
+# actually completed. Still capped, not indefinite: a genuinely
 # offline site (no internet at the repeater location, isolated
 # network, etc) would otherwise pay this full cost on every single
 # boot for nothing. Offline sites are actually fine either way — if
 # NTP can never reach a server, the clock never jumps at all, which is
 # exactly the condition this wait exists to protect against in the
 # first place.
+wd
 echo -ne "Waiting for system time sync... "
 for i in $(seq 1 45); do
     if [ "$(timedatectl show --property=NTPSynchronized --value 2>/dev/null)" = "yes" ]; then
@@ -136,6 +168,90 @@ for i in $(seq 1 45); do
     fi
 done
 
+
+# ── Cap the display height ──────────────────────────────────────
+# A 4K output is more than this hardware can sustain alongside decoding
+# a live DATV stream. Confirmed directly on a Pi 5 with 16 GB free and
+# 88% idle CPU - so neither memory nor compute: at 3840x2160 the picture
+# glitches and the audio drops out, both markedly worse on fast-moving
+# pictures, and the OSD overlay stops appearing at all. The same
+# receiver on the same transmission is perfectly clean at 1080.
+#
+# Nothing is lost by capping. DATV video is far below 1080 anyway - a
+# typical stream here is 1024x576 - so a 3840x2160 framebuffer buys no
+# detail whatever, it only asks the display pipeline to composite four
+# times the pixels for an identical image. The monitor scales to its own
+# panel either way.
+#
+# Runtime only, via wlr-randr, never config.txt. Lynx deliberately does
+# not touch boot configuration - the same reasoning as leaving the UART
+# settings to raspi-config - because a wrong value there is recoverable
+# only with a card reader, whereas this is undone by a reboot.
+#
+# Applied BEFORE mpv and the overlay start, so they size themselves to
+# the final mode. Changing it underneath them is the very thing that
+# breaks them.
+#
+# Values come from display.refresh_hz / display.max_height in the config
+# file, read with python3 rather than by grepping the YAML: they are
+# nested, and a regex that works today would quietly return the wrong
+# thing the first time someone reorders or comments a line. python3 is
+# already a hard dependency, and a missing, malformed or nonsensical
+# config falls back to the defaults rather than failing to start.
+#
+# 50 Hz by default because Lynx is a European product and 25 fps is what
+# it will almost always be shown: each frame then occupies exactly two
+# refreshes. At 60 Hz a 25 fps source needs 3:2 pulldown - frames held
+# alternately for two refreshes and three - which shows as judder on any
+# horizontal pan.
+_cfg_display() {
+    python3 - "$1" "$2" <<'PYEOF' 2>/dev/null
+import sys, yaml, os
+key, default = sys.argv[1], sys.argv[2]
+try:
+    p = os.path.expanduser('~/lynx/config/lynx_config.yaml')
+    v = (yaml.safe_load(open(p)) or {}).get('display', {}).get(key)
+    print(int(v) if v is not None else default)
+except Exception:
+    print(default)
+PYEOF
+}
+LYNX_MAX_HEIGHT="${LYNX_MAX_HEIGHT:-$(_cfg_display max_height 1080)}"
+LYNX_REFRESH_HZ="${LYNX_REFRESH_HZ:-$(_cfg_display refresh_hz 50)}"
+[ -n "$LYNX_MAX_HEIGHT" ] || LYNX_MAX_HEIGHT=1080
+[ -n "$LYNX_REFRESH_HZ" ] || LYNX_REFRESH_HZ=50
+
+if command -v wlr-randr > /dev/null 2>&1; then
+    _out=$(wlr-randr 2>/dev/null | awk '/^[A-Za-z]/ {print $1; exit}')
+    _cur=$(wlr-randr 2>/dev/null | awk '/current/ {print $1; exit}')
+    _curh=${_cur##*x}
+    if [ -n "$_out" ] && [ -n "$_curh" ] && [ "$_curh" -gt "$LYNX_MAX_HEIGHT" ] 2>/dev/null; then
+        echo -ne "Display is ${_cur} - capping to ${LYNX_MAX_HEIGHT}p... "
+        # Prefer the configured rate; fall back to the highest the output
+        # actually offers at that height. A screen with no mode at the
+        # wanted rate must not be left stuck at 4K, which is the fault
+        # this exists to fix - some panels, and most in 60 Hz regions,
+        # list no 50 Hz mode at all.
+        _want=$(wlr-randr 2>/dev/null \
+            | awk -v h="$LYNX_MAX_HEIGHT" -v r="$LYNX_REFRESH_HZ" '
+                $2 == "px," {
+                    split($1, d, "x")
+                    if (d[2] != h) next
+                    hz = $3 + 0
+                    if (int(hz + 0.5) == r) exact = $1 "@" hz
+                    if (hz > best) { best = hz; bestmode = $1 "@" hz }
+                }
+                END { print (exact != "" ? exact : bestmode) }')
+        if [ -n "$_want" ] && wlr-randr --output "$_out" --mode "$_want" > /dev/null 2>&1; then
+            echo -e "${GREEN}${_want}${NC}"
+            sleep 2   # let the compositor settle before anything draws
+        else
+            echo -e "${AMBER}no usable ${LYNX_MAX_HEIGHT}p mode - leaving as-is${NC}"
+        fi
+    fi
+else
+    echo "wlr-randr not found - display height not capped."
+fi
 
 # ── Kill existing processes ───────────────────────────────────
 # Uses -9 and waits for confirmation — a previous lynx_app.py instance
@@ -174,19 +290,38 @@ sleep 1
 # that rely on APP_PID genuinely being the Python process itself —
 # confirmed directly before deploying this.
 #
-# Also written to /var/log/lynx when that directory is writable. /tmp
-# alone is erased by a reboot - which is precisely the event most worth
-# having a log of, and the reason a refusing Reboot button took two days
-# to diagnose: every attempt destroyed its own evidence.
+# The log is written to /var/log/lynx as well as /tmp, when that
+# directory is writable. /tmp alone is erased by a reboot - which is
+# precisely the event most worth having a log of, and the reason a
+# refusing Reboot button took two days to diagnose: every attempt
+# destroyed its own evidence. save_log_tail() above covers the cases the
+# watchdog itself detects, but not a reboot Lynx asked for deliberately.
 #
 # Appended, not truncated, so it survives across boots; rotated on size
 # here rather than via logrotate, so an install needs no extra package
-# and no root-owned config to keep it bounded. Still process
-# substitution, so $! remains lynx_app.py's own PID - see above.
+# and no root-owned config to keep it bounded.
+wd
 echo -ne "Starting Lynx web app... "
 APP_LOG_TARGETS=(/tmp/lynx_app.log)
 rm -f /tmp/lynx_app.log
 if [ -w /var/log/lynx ] 2>/dev/null; then
+    # Rotate the stack-trace logs on the same principle as the app log
+    # below. These are opened for APPEND by faulthandler in both
+    # lynx_app.py and lynx_overlay.py, and written to again by this
+    # script's own watchdog - so unlike everything else in
+    # /var/log/lynx they had no cap at all and grew across reboots
+    # forever. Each incident is only about a kilobyte, which is why it
+    # went unnoticed, but a fault that recurs on an unattended site
+    # writes one every time it happens: the HDMI hotplug case alone
+    # produced three inside a quarter of an hour. Small threshold,
+    # because these are diagnostic breadcrumbs rather than a log
+    # anyone reads in bulk, and the recent ones are the useful ones.
+    for _st in /var/log/lynx/stacktrace.log /var/log/lynx/stacktrace_overlay.log; do
+        if [ -f "$_st" ] && \
+           [ "$(stat -c %s "$_st" 2>/dev/null || echo 0)" -gt 2000000 ]; then
+            mv -f "$_st" "${_st}.1" 2>/dev/null || true
+        fi
+    done
     PERSIST_LOG=/var/log/lynx/lynx_app.log
     if [ -f "$PERSIST_LOG" ] && \
        [ "$(stat -c %s "$PERSIST_LOG" 2>/dev/null || echo 0)" -gt 20000000 ]; then
@@ -233,6 +368,7 @@ wpctl set-volume @DEFAULT_AUDIO_SINK@ 1.0 2>/dev/null || true
 # Confirmed live as a real, intermittent failure - removed entirely.
 
 # ── Start OSD overlay — shows logo when unlocked, OSD always ──────
+wd
 echo -ne "Starting OSD overlay... "
 LD_PRELOAD=${LAYER_SHELL_LIB} python3 ${LYNX_DIR}/lynx_overlay.py > /tmp/lynx_overlay.log 2>&1 &
 OVERLAY_PID=$!
@@ -379,11 +515,13 @@ while true; do
             : # resolved itself — was a normal transition, not a crash
         else
             echo -e "${RED}mpv has died — exiting for restart.${NC}"
+            save_log_tail
             break
         fi
     fi
     if ! kill -0 ${APP_PID} 2>/dev/null; then
         echo -e "${RED}Web app process has died — exiting for restart.${NC}"
+        save_log_tail
         break
     fi
 
@@ -403,7 +541,7 @@ while true; do
     if [ -f "$OVERLAY_HEARTBEAT_FILE" ]; then
         heartbeat_age=$(( $(date +%s) - $(stat -c %Y "$OVERLAY_HEARTBEAT_FILE" 2>/dev/null || echo 0) ))
         if [ "$heartbeat_age" -gt 30 ]; then
-            echo -e "${RED}Overlay heartbeat stale (${heartbeat_age}s) — not actually rendering, exiting for restart.${NC}"
+            echo -e "${RED}Overlay heartbeat stale (${heartbeat_age}s) — not actually rendering.${NC}"
             # Same idea as the web-app stack dump above: capture what
             # every overlay thread is actually doing right now, before
             # it gets killed and replaced - the one chance to catch
@@ -413,7 +551,43 @@ while true; do
             [ -w /var/log/lynx ] 2>/dev/null && OVERLAY_STACKTRACE_LOG="/var/log/lynx/stacktrace_overlay.log"
             echo "=== $(date -u +%Y-%m-%dT%H:%M:%SZ) - overlay heartbeat stale, dumping stacks ===" >> "$OVERLAY_STACKTRACE_LOG"
             kill -USR1 "$OVERLAY_PID" 2>/dev/null || true
-            sleep 1  # give it a moment to actually write before the kill below
+            sleep 1  # give it a moment to actually write before rebooting/exiting
+            save_log_tail
+
+            # A plain process-level restart alone is confirmed NOT
+            # sufficient for this specific failure - see this file's
+            # own top-of-file comment (the section on this patch) for
+            # the full rationale. Rate-limited via a PERSISTENT marker
+            # (surviving the very reboot this triggers, unlike /tmp)
+            # so a genuinely bad case - this recurring immediately
+            # after every reboot - can never turn into a tight loop.
+            REBOOT_MARKER="/var/log/lynx/last_overlay_reboot"
+            [ ! -w /var/log/lynx ] 2>/dev/null && REBOOT_MARKER="/tmp/lynx_last_overlay_reboot"
+            now=$(date +%s)
+            last_attempt=$(cat "$REBOOT_MARKER" 2>/dev/null || echo 0)
+            if [ $(( now - last_attempt )) -gt 900 ] && sudo -n true 2>/dev/null; then
+                echo "$now" > "$REBOOT_MARKER"
+                echo -e "${RED}Rebooting the Pi — a process-level restart alone has not been sufficient for this.${NC}"
+                # Genuine hard reset via SysRq, not a plain `sudo
+                # reboot` - see this script's own patch history /
+                # CHANGELOG for the full rationale: a plain reboot did
+                # NOT reliably clear this overnight, while a full
+                # physical power cycle did. Sync first (SysRq's own
+                # 's') to avoid needless SD card corruption, then the
+                # actual hard reboot ('b').
+                echo 1 | sudo tee /proc/sys/kernel/sysrq > /dev/null 2>&1
+                sync
+                echo s | sudo tee /proc/sysrq-trigger > /dev/null 2>&1
+                sleep 2
+                echo b | sudo tee /proc/sysrq-trigger > /dev/null 2>&1
+                sleep 5
+                # Fallback if SysRq wasn't available/didn't take effect -
+                # harmless no-op if the system already went down above.
+                sudo reboot
+                sleep 30  # the reboot itself takes a few seconds to actually happen - avoid racing ahead into cleanup below
+            else
+                echo -e "${AMBER}Not triggering a recovery reboot (attempted recently, or passwordless sudo unavailable) — exiting for restart instead.${NC}"
+            fi
             break
         fi
     fi

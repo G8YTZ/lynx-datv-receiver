@@ -1,0 +1,977 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QuickLynx — QO-100 Click-to-Tune</title>
+<style>
+  :root {
+    --bg: #0a0d12;
+    --panel: #12161d;
+    --panel-border: #232a35;
+    --trace: #39ff6a;
+    --trace-dim: rgba(57, 255, 106, 0.15);
+    --amber: #e8a33d;
+    --cyan: #4fc3f7;
+    --red: #ff5a5a;
+    --text: #d7dde5;
+    /* Raised from #6b7684, which measured 4.2:1 against the darkest
+       background - below the 4.5:1 minimum for small text, and reported
+       as hard to read. #9aa7b8 gives 8.0:1 on the dark panels and 7.4:1
+       on the lighter ones, comfortable without losing the distinction
+       from --text. */
+    --text-dim: #9aa7b8;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 13px;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── Header ───────────────────────────────────────────── */
+  header {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 10px 16px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--panel-border);
+    flex-shrink: 0;
+  }
+  .logo {
+    font-weight: 700;
+    font-size: 16px;
+    letter-spacing: 0.5px;
+    color: var(--trace);
+  }
+  .logo span { color: var(--text-dim); font-weight: 400; }
+  /* Top row enlarged by half again - it carries the two things you
+     glance at from across the room (is the feed up, is Lynx there), and
+     at the old size that was a squint. */
+  .status-group { display: flex; gap: 20px; margin-left: auto; align-items: center; font-size: 1.5em; }
+  .status-item { display: flex; align-items: center; gap: 9px; color: var(--text-dim); }
+  .dot {
+    width: 12px; height: 12px; border-radius: 50%;
+    /* Kept at the old, dimmer value: this is an "inactive" indicator,
+       and brightening it would make an idle dot look lit. */
+    background: #6b7684;
+    transition: background 0.2s;
+  }
+  .dot.ok { background: var(--trace); box-shadow: 0 0 6px var(--trace); }
+  .dot.bad { background: var(--red); box-shadow: 0 0 6px var(--red); }
+  .dot.pending { background: var(--amber); box-shadow: 0 0 6px var(--amber); }
+  button.icon-btn {
+    background: transparent;
+    border: 1px solid var(--panel-border);
+    color: var(--text-dim);
+    border-radius: 4px;
+    padding: 6px 10px;
+    cursor: pointer;
+    font-family: var(--mono);
+    /* Matches the status items beside it. Those were enlarged to 1.5em
+       and this was left at 12px, which made the button look shrunken
+       next to them. */
+    font-size: 1.5em;
+    color: var(--text);
+  }
+  button.icon-btn:hover { border-color: var(--cyan); color: var(--cyan); }
+
+  /* ── Settings panel ───────────────────────────────────── */
+  #settings {
+    display: none;
+    background: var(--panel);
+    border-bottom: 1px solid var(--panel-border);
+    padding: 14px 16px;
+    gap: 18px;
+    flex-wrap: wrap;
+    flex-shrink: 0;
+  }
+  #settings.open { display: flex; }
+  .field { display: flex; flex-direction: column; gap: 4px; min-width: 190px; }
+  /* Settings labels and hints were both --text-dim (#6b7684), which
+     measures 4.2:1 against the panel - just under the 4.5:1 minimum for
+     small text, and genuinely hard to read. Labels are now near-white
+     and hints a lighter grey (8:1), which keeps the hierarchy without
+     making either a strain. */
+  .field label { font-size: 13px; color: var(--text); text-transform: uppercase; letter-spacing: 0.5px; }
+  .field input, .field select {
+    background: #0a0d12;
+    border: 1px solid var(--panel-border);
+    color: var(--text);
+    padding: 6px 8px;
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 15px;
+  }
+  .field input:focus, .field select:focus { outline: none; border-color: var(--cyan); }
+  .field .hint { font-size: 13px; color: #9aa7b8; max-width: 300px; line-height: 1.5; }
+  #settings .save-btn {
+    align-self: flex-end;
+    background: var(--trace);
+    color: #04180a;
+    border: none;
+    padding: 7px 16px;
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-weight: 700;
+    font-size: 12px;
+    cursor: pointer;
+    height: 32px;
+  }
+
+  /* ── Main area: spectrum (left) + chat (right) ──────────── */
+  main {
+    flex: 1;
+    position: relative;
+    padding: 12px 16px 0 16px;
+    min-height: 0;
+    display: flex;
+    flex-direction: row;
+    gap: 12px;
+  }
+  #spectrumColumn {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  #chatColumn {
+    /* Set from settings at runtime - see applyChatWidth(). 300px is a
+       sensible minimum but looks cramped on a 1920-wide display, where
+       around 600px reads much better (reported by G8GKQ). */
+    width: var(--chat-width, 500px);
+    flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    padding-bottom: 12px;
+  }
+  #chatColumn iframe {
+    flex: 1;
+    width: 100%;
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    background: #ffffff;
+  }
+  #chatColumn .chat-label {
+    font-size: 11px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    margin-bottom: 6px;
+  }
+  #canvasWrap { position: relative; flex: 1; min-height: 0; }
+  canvas { width: 100%; height: 100%; display: block; cursor: crosshair; }
+
+  #hoverReadout {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    background: rgba(10, 13, 18, 0.85);
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    padding: 6px 10px;
+    font-size: 12px;
+    pointer-events: none;
+    display: none;
+  }
+  #hoverReadout .freq { color: var(--cyan); font-weight: 700; }
+
+  /* Symbol-rate reference legend */
+  #srLegend {
+    display: flex;
+    align-items: flex-end;
+    gap: 18px;
+    padding: 26px 4px 14px 4px;
+    flex-shrink: 0;
+    overflow-x: auto;
+  }
+  .sr-item { display: flex; flex-direction: column; align-items: center; gap: 4px; flex-shrink: 0; }
+  .sr-bar { height: 4px; background: var(--amber); border-radius: 2px; opacity: 0.75; }
+  .sr-label { font-size: 10px; color: var(--text-dim); white-space: nowrap; }
+
+  /* ── Tune confirmation popover ────────────────────────── */
+  #tunePopover {
+    display: none;
+    position: absolute;
+    background: var(--panel);
+    border: 1px solid var(--cyan);
+    border-radius: 6px;
+    padding: 14px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.5);
+    z-index: 20;
+    min-width: 240px;
+  }
+  #tunePopover .freq-big { font-size: 20px; color: var(--cyan); font-weight: 700; margin-bottom: 10px; }
+  #tunePopover .row { display: flex; gap: 8px; margin-bottom: 10px; }
+  #tunePopover .row > div { flex: 1; display: flex; flex-direction: column; gap: 4px; }
+  #tunePopover label { font-size: 10px; color: var(--text-dim); text-transform: uppercase; }
+  #tunePopover select, #tunePopover input {
+    background: #0a0d12; border: 1px solid var(--panel-border); color: var(--text);
+    padding: 5px 6px; border-radius: 4px; font-family: var(--mono); font-size: 13px;
+  }
+  #tunePopover .btns { display: flex; gap: 8px; }
+  #tunePopover button {
+    flex: 1; padding: 8px; border-radius: 4px; border: none;
+    font-family: var(--mono); font-weight: 700; font-size: 12px; cursor: pointer;
+  }
+  #tunePopover .tune-go { background: var(--trace); color: #04180a; }
+  #tunePopover .tune-cancel { background: transparent; color: var(--text-dim); border: 1px solid var(--panel-border) !important; }
+
+  /* ── Footer / log ─────────────────────────────────────── */
+  footer {
+    flex-shrink: 0;
+    padding: 8px 16px;
+    background: var(--panel);
+    border-top: 1px solid var(--panel-border);
+    font-size: 11px;
+    color: var(--text-dim);
+    display: flex;
+    justify-content: space-between;
+  }
+  #lastAction.ok { color: var(--trace); }
+  #lastAction.bad { color: var(--red); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">QUICK<span>LYNX</span></div>
+  <div class="status-group">
+    <div class="status-item"><span class="dot" id="wsDot"></span> BATC feed</div>
+    <div class="status-item"><span class="dot" id="lynxDot"></span> Lynx</div>
+  </div>
+  <button class="icon-btn" onclick="toggleSettings()">⚙ Settings</button>
+</header>
+
+<div id="settings">
+  <div class="field">
+    <label>Lynx host</label>
+    <input id="lynxHost" placeholder="192.168.0.50:8080">
+    <div class="hint">IP:port of your Lynx receiver's web interface.</div>
+  </div>
+  <div class="field">
+    <label>Your LNB's local oscillator (kHz)</label>
+    <input id="lnbOffset" type="number" value="9750000">
+    <div class="hint">
+      Nominal 9750000 for a standard Ku-band LNB. If yours has drifted, put its
+      actual LO here — it is used only when tuning your receiver, to land on the
+      real signal. The spectrum display is unaffected: it comes from a receiver
+      with a locked LNB, so its frequencies are already correct.
+    </div>
+
+    <label>Chat column width (px)</label>
+    <input id="chatWidth" type="number" min="200" max="900" step="10" value="500">
+    <div class="hint">500 by default. Narrower suits a small window; around 600 reads well on a 1920-wide display.</div>
+  </div>
+  <div class="field">
+    <label>Default tuner</label>
+    <select id="defaultTuner">
+      <option value="a">A</option>
+      <option value="b">B</option>
+    </select>
+  </div>
+  <div class="field">
+    <label>BATC spectrum feed URL <a href="#" onclick="resetWsUrlToDefault(); return false;" style="color:var(--cyan); text-transform:none; font-size:10px;">(reset to default)</a></label>
+    <input id="wsUrl" value="wss://eshail.batc.org.uk/wb/fft">
+    <div class="hint">Confirmed working via live browser testing (2026-07-30) - the public feed is proxied
+      through nginx at this path, not the internal server's own port 7681.</div>
+  </div>
+  <button class="save-btn" onclick="saveSettings()">Save &amp; reconnect</button>
+</div>
+
+<main>
+  <div id="spectrumColumn">
+    <div id="canvasWrap">
+      <canvas id="spectrum"></canvas>
+      <div id="hoverReadout"><span class="freq"></span></div>
+      <div id="tunePopover">
+        <div class="freq-big"></div>
+        <div id="srEstimateNote" style="display:none; font-size:10px; color:var(--amber); margin-bottom:8px; line-height:1.4;"></div>
+        <div class="row">
+          <div>
+            <label>Symbol rate (kS/s)</label>
+            <select id="srSelect">
+              <option value="1500">1500</option>
+              <option value="1000">1000</option>
+              <option value="500">500</option>
+              <option value="333" selected>333</option>
+              <option value="250">250</option>
+              <option value="125">125</option>
+              <option value="66">66</option>
+              <option value="33">33</option>
+              <option value="custom">Custom…</option>
+            </select>
+          </div>
+          <div>
+            <label>Tuner</label>
+            <select id="plugSelect">
+              <option value="a">A</option>
+              <option value="b">B</option>
+            </select>
+          </div>
+        </div>
+        <div class="row" id="srCustomRow" style="display:none">
+          <div>
+            <label>Custom symbol rate (kS/s)</label>
+            <input id="srCustom" type="number" value="333">
+          </div>
+        </div>
+        <div class="btns">
+          <button class="tune-go" onclick="confirmTune()">Tune</button>
+          <button class="tune-cancel" onclick="closeTunePopover()">Cancel</button>
+        </div>
+      </div>
+    </div>
+    <div id="srLegend"></div>
+  </div>
+  <div id="chatColumn">
+    <div class="chat-label" style="display:flex; justify-content:space-between; align-items:center;">
+      <span>BATC WB Chat</span>
+      <a href="https://eshail.batc.org.uk/wb/chat/" target="_blank" style="color:var(--cyan); text-transform:none; font-size:11px;">Open in new tab &#8599;</a>
+    </div>
+    <iframe src="" data-chat-src="auto" title="BATC Wideband Chat"></iframe>
+  </div>
+</main>
+
+<footer>
+  <span id="lastAction">Ready.</span>
+  <span id="feedInfo"></span>
+</footer>
+
+<script>
+// ── Constants derived directly from BATC's own server source
+// (eshail-ghy-wb-fft-airspy/main.c) - not guessed. ────────────
+const FFT_SIZE = 1024;
+// The BATC wideband receiver's LNB is locked, so the spectrum it sends
+// is referenced to a known, correct LO and its frequency scale is
+// absolute. The DISPLAY must therefore use this fixed value and never
+// the local LNB setting - confirmed by G8GKQ, who reported the scale
+// sliding when the offset was changed. Only the LOCAL receiver needs
+// compensating for its own LNB's drift, and that is done at tune time.
+const SPECTRUM_LO_KHZ = 9750000;
+
+const AIRSPY_FREQ_HZ = 745000000;      // SDR's tuned IF centre
+const AIRSPY_SAMPLE_HZ = 10000000;     // total captured span
+const BIN_HZ = AIRSPY_SAMPLE_HZ / FFT_SIZE;
+const TRIM_LO = Math.trunc(FFT_SIZE * 0.05);   // 51 - matches the server's own C truncation
+const TRIM_HI = Math.trunc(FFT_SIZE * 0.95);   // 972 (exclusive)
+const N_BINS = TRIM_HI - TRIM_LO;              // 921 bins actually sent
+
+// IF frequency (Hz) of the original, full-FFT bin index i (0..1023),
+// after the server's own fftshift (DC/centre placed in the middle).
+function ifFreqForOrigBin(i) {
+    return AIRSPY_FREQ_HZ - (AIRSPY_SAMPLE_HZ / 2) + i * BIN_HZ;
+}
+// IF frequency (Hz) of received-array index k (0..920)
+function ifFreqForArrayIndex(k) {
+    return ifFreqForOrigBin(TRIM_LO + k);
+}
+
+// Genuine defaults, kept separate from the live `settings` object so
+// they can be restored even after localStorage has an old value
+// saved - updating this file's own default alone can't override
+// something already saved in a user's browser, discovered directly
+// (2026-07-30): after updating the WebSocket URL default here,
+// Justin's own saved settings kept using the old one until reset,
+// since loadSettings() below always prefers a saved value over this.
+const DEFAULT_SETTINGS = {
+    lynxHost: '',
+    lnbOffsetKhz: 9750000,
+    defaultTuner: 'a',
+    wsUrl: 'wss://eshail.batc.org.uk/wb/fft',
+    chatWidthPx: 500,
+};
+let settings = Object.assign({}, DEFAULT_SETTINGS);
+
+// This same file is served two ways: by QuickLynx's own local server,
+// and by Lynx itself when the feature is enabled there. The two mount
+// the chat proxy at different paths, and when served from Lynx the
+// receiver is simply this origin - so both are worked out here rather
+// than being configured.
+// When Lynx serves this page, talk to it with RELATIVE urls rather than
+// building "http://host/..." by hand. Relative is same-origin by
+// definition, so it follows whatever scheme and address you actually
+// arrived on - including https through a reverse proxy, where a
+// hardcoded http:// would be refused as mixed content. Only when running
+// under QuickLynx's own server is an absolute URL needed, because Lynx
+// is then genuinely elsewhere.
+function lynxUrl(path) {
+    if (window.__lynxHosted) return path;
+    return `http://${settings.lynxHost}${path}`;
+}
+
+function applyServingContext() {
+    const servedByLynx = !!window.__LYNX_HOSTED__
+        || document.querySelector('meta[name="lynx-hosted"]') !== null;
+    window.__lynxHosted = servedByLynx;
+
+    const chat = document.querySelector('iframe[data-chat-src="auto"]');
+    if (chat) {
+        chat.src = servedByLynx ? '/quicklynx/chat' : '/proxy/chat';
+    }
+
+    if (servedByLynx && !settings.lynxHost) {
+        // Same origin: no address to configure, and no cross-origin
+        // question either - which is the setting people most often get
+        // wrong when running QuickLynx separately.
+        settings.lynxHost = window.location.host;
+        const el = document.getElementById('lynxHost');
+        if (el) el.value = settings.lynxHost;
+    }
+}
+
+function loadSettings() {
+    try {
+        const saved = JSON.parse(localStorage.getItem('quicklynx-settings') || '{}');
+        Object.assign(settings, saved);
+    } catch (e) {}
+    document.getElementById('lynxHost').value = settings.lynxHost;
+    document.getElementById('lnbOffset').value = settings.lnbOffsetKhz;
+    document.getElementById('defaultTuner').value = settings.defaultTuner;
+    document.getElementById('wsUrl').value = settings.wsUrl;
+    document.getElementById('chatWidth').value = settings.chatWidthPx;
+    applyChatWidth();
+    applyServingContext();
+}
+
+function applyChatWidth() {
+    // Clamped rather than trusted: a stray keystroke in the settings box
+    // could otherwise leave the chat filling the window with no spectrum
+    // visible, and no obvious way back.
+    const w = Math.max(200, Math.min(900, parseInt(settings.chatWidthPx) || 500));
+    document.documentElement.style.setProperty('--chat-width', w + 'px');
+    if (typeof resizeCanvas === 'function') resizeCanvas();
+}
+
+function saveSettings() {
+    settings.lynxHost = document.getElementById('lynxHost').value.trim();
+    settings.lnbOffsetKhz = parseInt(document.getElementById('lnbOffset').value) || 9750000;
+    settings.defaultTuner = document.getElementById('defaultTuner').value;
+    settings.wsUrl = document.getElementById('wsUrl').value.trim();
+    settings.chatWidthPx = parseInt(document.getElementById('chatWidth').value) || 500;
+    applyChatWidth();
+    localStorage.setItem('quicklynx-settings', JSON.stringify(settings));
+    toggleSettings();
+    connectFeed();
+}
+
+function resetWsUrlToDefault() {
+    // Only the feed URL resets here, deliberately - Lynx host and
+    // default tuner are genuinely user-specific and shouldn't be
+    // touched by this.
+    document.getElementById('wsUrl').value = DEFAULT_SETTINGS.wsUrl;
+}
+
+function toggleSettings() {
+    document.getElementById('settings').classList.toggle('open');
+}
+
+// ── Real downlink frequency (MHz) for a received-array index ──
+// Uses SPECTRUM_LO_KHZ, not the local LNB setting: the incoming
+// spectrum is already referenced to a locked LNB, so these are true
+// downlink frequencies and must not move when the local offset changes.
+function realFreqMhzForArrayIndex(k) {
+    const ifHz = ifFreqForArrayIndex(k);
+    return (ifHz / 1000 + SPECTRUM_LO_KHZ) / 1000;
+}
+
+// ── Spectrum canvas ─────────────────────────────────────────
+const canvas = document.getElementById('spectrum');
+const ctx = canvas.getContext('2d');
+let latestData = null;   // Uint16Array, length N_BINS
+let canvasWidth = 0, canvasHeight = 0;
+
+function resizeCanvas() {
+    const wrap = document.getElementById('canvasWrap');
+    const dpr = window.devicePixelRatio || 1;
+    canvasWidth = wrap.clientWidth;
+    canvasHeight = wrap.clientHeight;
+    canvas.width = canvasWidth * dpr;
+    canvas.height = canvasHeight * dpr;
+    canvas.style.width = canvasWidth + 'px';
+    canvas.style.height = canvasHeight + 'px';
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    render();
+}
+window.addEventListener('resize', resizeCanvas);
+
+// The canvas sizes itself from its wrapper, so anything that changes the
+// layout has to trigger a resize - and calling resizeCanvas() directly
+// from those places is fragile, because the call often happens BEFORE
+// the browser has finished reflowing. Saving settings was the case that
+// showed it up: the resize ran while the settings panel was still open,
+// the panel then closed and freed up height, and the spectrum was left
+// drawn at the old size, halfway up the screen.
+//
+// A ResizeObserver watches the wrapper itself, so the canvas follows
+// whatever the layout actually ends up being, whatever caused it -
+// panel opening or closing, chat width changing, window resizing, or a
+// scrollbar appearing.
+if (typeof ResizeObserver !== 'undefined') {
+    const wrapEl = document.getElementById('canvasWrap');
+    if (wrapEl) {
+        let pending = null;
+        const ro = new ResizeObserver(() => {
+            // Coalesced into the next frame: a single layout change can
+            // fire the observer several times, and resizing the canvas
+            // clears it, so doing it per-callback makes it flicker.
+            if (pending) return;
+            pending = requestAnimationFrame(() => {
+                pending = null;
+                resizeCanvas();
+            });
+        });
+        ro.observe(wrapEl);
+    }
+}
+
+function render() {
+    ctx.fillStyle = '#0a0d12';
+    ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+
+    // Frequency axis gridlines every 1 MHz
+    const fLo = realFreqMhzForArrayIndex(0);
+    const fHi = realFreqMhzForArrayIndex(N_BINS - 1);
+    ctx.strokeStyle = '#1a2029';
+    ctx.fillStyle = '#ffffff';
+    ctx.font = '10px ' + getComputedStyle(document.body).fontFamily;
+    ctx.lineWidth = 1;
+    const startMhz = Math.ceil(fLo);
+    for (let m = startMhz; m <= fHi; m++) {
+        const x = ((m - fLo) / (fHi - fLo)) * canvasWidth;
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, canvasHeight - 16);
+        ctx.stroke();
+        ctx.fillText(m.toFixed(0), x + 3, canvasHeight - 4);
+    }
+
+    if (!latestData) return;
+
+    // Spectrum trace - filled area, classic analyzer look
+    ctx.beginPath();
+    ctx.moveTo(0, canvasHeight - 16);
+    const usableH = canvasHeight - 20;
+    for (let i = 0; i < N_BINS; i++) {
+        const x = (i / (N_BINS - 1)) * canvasWidth;
+        const v = latestData[i] / 65535;  // normalize uint16 -> 0..1
+        const y = (canvasHeight - 16) - v * usableH;
+        ctx.lineTo(x, y);
+    }
+    ctx.lineTo(canvasWidth, canvasHeight - 16);
+    ctx.closePath();
+    ctx.fillStyle = 'rgba(57, 255, 106, 0.15)';
+    ctx.fill();
+    ctx.strokeStyle = '#39ff6a';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // Diagnostic overlay - shows exactly what the symbol-rate
+    // estimator saw on the last click: the detected peak, the
+    // estimated noise floor, the threshold line, and each edge
+    // colour-coded by why the walk stopped there. Added specifically
+    // to diagnose real-world misreads without guessing blind against
+    // synthetic data - see estimateSymbolRateKsps().
+    if (lastDiagnostic) {
+        const d = lastDiagnostic;
+        const usableH2 = canvasHeight - 20;
+        const valueToY = (v) => (canvasHeight - 16) - (v / 65535) * usableH2;
+        const binToX = (i) => (i / (N_BINS - 1)) * canvasWidth;
+
+        ctx.setLineDash([4, 4]);
+        ctx.strokeStyle = 'rgba(150, 150, 150, 0.7)';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        ctx.moveTo(0, valueToY(d.floor));
+        ctx.lineTo(canvasWidth, valueToY(d.floor));
+        ctx.stroke();
+
+        ctx.strokeStyle = 'rgba(232, 163, 61, 0.8)';
+        ctx.beginPath();
+        ctx.moveTo(0, valueToY(d.threshold));
+        ctx.lineTo(canvasWidth, valueToY(d.threshold));
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        const reasonColour = (reason) => reason === 'threshold' ? '#39ff6a'
+            : reason === 'valley' ? '#4fc3f7' : '#ff5a5a';
+
+        // Peak marker
+        ctx.fillStyle = '#ffffff';
+        ctx.beginPath();
+        ctx.arc(binToX(d.peakIdx), valueToY(d.peakVal), 4, 0, 2 * Math.PI);
+        ctx.fill();
+
+        // Edge markers
+        for (const [idx, reason] of [[d.leftIdx, d.leftReason], [d.rightIdx, d.rightReason]]) {
+            const x = binToX(idx);
+            ctx.strokeStyle = reasonColour(reason);
+            ctx.lineWidth = 2;
+            ctx.beginPath();
+            ctx.moveTo(x, 0);
+            ctx.lineTo(x, canvasHeight - 16);
+            ctx.stroke();
+        }
+
+        // Readable summary, top-right - includes raw values so they
+        // can be read off and reported directly.
+        const lines = [
+            `peak=${d.peakVal} floor=${d.floor} thr=${Math.round(d.threshold)}`,
+            `left: bin ${d.leftIdx} (${d.leftReason})  right: bin ${d.rightIdx} (${d.rightReason})`,
+            `width=${d.widthBins} bins  raw est=${d.estimatedKsps ? d.estimatedKsps.toFixed(1) : '?'} kS/s`,
+        ];
+        ctx.font = '11px ' + getComputedStyle(document.body).fontFamily;
+        ctx.textAlign = 'right';
+        lines.forEach((line, i) => {
+            ctx.fillStyle = 'rgba(10,13,18,0.85)';
+            const w = ctx.measureText(line).width;
+            ctx.fillRect(canvasWidth - w - 14, 10 + i * 16, w + 10, 14);
+            ctx.fillStyle = '#d7dde5';
+            ctx.fillText(line, canvasWidth - 8, 20 + i * 16);
+        });
+        ctx.textAlign = 'left';
+    }
+}
+
+// ── Symbol-rate reference legend ───────────────────────────
+// Occupied bandwidth approximated at 1.2x symbol rate (typical
+// DVB-S2 with 0.20 roll-off, common for QO-100 amateur signals) -
+// an approximation, not a precise per-signal calculation, exactly
+// like Live Tune's own reference-bar approach this is modelled on.
+const REF_SYMBOL_RATES = [1500, 1000, 500, 333, 250, 125, 66, 33];
+function renderSrLegend() {
+    const legend = document.getElementById('srLegend');
+    legend.innerHTML = '';
+    const fLo = realFreqMhzForArrayIndex(0);
+    const fHi = realFreqMhzForArrayIndex(N_BINS - 1);
+    const mhzPerPixel = (fHi - fLo) / canvasWidth;
+    for (const sr of REF_SYMBOL_RATES) {
+        const occupiedMhz = (sr * 1.2) / 1000;
+        const widthPx = Math.max(4, occupiedMhz / mhzPerPixel);
+        const item = document.createElement('div');
+        item.className = 'sr-item';
+        item.innerHTML = `<div class="sr-bar" style="width:${widthPx}px"></div><div class="sr-label">${sr}</div>`;
+        legend.appendChild(item);
+    }
+}
+
+// ── Hover readout ───────────────────────────────────────────
+canvas.addEventListener('mousemove', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const fLo = realFreqMhzForArrayIndex(0);
+    const fHi = realFreqMhzForArrayIndex(N_BINS - 1);
+    const freq = fLo + (x / canvasWidth) * (fHi - fLo);
+    const readout = document.getElementById('hoverReadout');
+    readout.style.display = 'block';
+    readout.querySelector('.freq').textContent = freq.toFixed(3) + ' MHz';
+});
+canvas.addEventListener('mouseleave', () => {
+    document.getElementById('hoverReadout').style.display = 'none';
+});
+
+// ── Automatic symbol-rate estimation ────────────────────────
+// Estimates occupied bandwidth directly from the live spectrum shape
+// at the click point (peak-find, then walk outward to where power
+// drops to the local peak/floor midpoint), then converts to symbol
+// rate via the same 1.2x roll-off approximation used for the
+// reference bars. This is an estimate, not a precise per-signal
+// measurement - snapped to the nearest standard rate and always
+// left overridable, since edge-detection on a busy, noisy
+// transponder with adjacent signals won't always be clean.
+let lastDiagnostic = null; // set by estimateSymbolRateKsps() each click - drawn as an overlay by render()
+
+function estimateSymbolRateKsps(clickedArrayIndex) {
+    if (!latestData) return null;
+    lastDiagnostic = null;
+
+    // Find the true local peak near the click - the user may not
+    // have clicked exactly on it, but this should stay TIGHT. It was
+    // previously the same, much wider value used below for the edge
+    // walk (needed to be wide, to measure a full 1500+ kS/s signal's
+    // width) - conflating the two was a real bug: a +/-160 bin
+    // (~1.5MHz) peak search window meant that on a busy transponder,
+    // ANY stronger signal anywhere in that whole span would get
+    // snapped to instead of the one actually clicked, showing up
+    // exactly as reported: the detected signal sitting well to the
+    // right of the intended one.
+    const PEAK_SEARCH_RADIUS = 10; // ~98kHz - just enough for imprecise clicking, not enough to jump to a different signal
+    const EDGE_WALK_LIMIT = 160;   // ~1.5MHz - wide enough to measure a 1500+ kS/s signal's full width once the correct peak is found
+
+    let peakIdx = clickedArrayIndex;
+    let peakVal = latestData[clickedArrayIndex];
+    for (let d = -PEAK_SEARCH_RADIUS; d <= PEAK_SEARCH_RADIUS; d++) {
+        const idx = clickedArrayIndex + d;
+        if (idx < 0 || idx >= N_BINS) continue;
+        if (latestData[idx] > peakVal) {
+            peakVal = latestData[idx];
+            peakIdx = idx;
+        }
+    }
+
+    // Estimate local noise floor as the median of a wider window,
+    // excluding a margin around the peak itself - EDGE_WALK_LIMIT
+    // here deliberately, since the signal being measured could
+    // legitimately be that wide.
+    const FLOOR_WINDOW = 400;
+    const samples = [];
+    for (let d = -FLOOR_WINDOW; d <= FLOOR_WINDOW; d++) {
+        const idx = peakIdx + d;
+        if (idx < 0 || idx >= N_BINS) continue;
+        if (Math.abs(d) < EDGE_WALK_LIMIT) continue; // exclude the signal itself
+        samples.push(latestData[idx]);
+    }
+    if (samples.length < 10) return null;
+    samples.sort((a, b) => a - b);
+    const floor = samples[Math.floor(samples.length / 2)];
+
+    if (peakVal <= floor) return null; // no real peak found - flat/noise-only region
+
+    // Simplified (2026-07-30) to a straightforward 50%-of-peak-
+    // amplitude threshold, on Justin's own suggestion: below that
+    // level a real receiver won't lock anyway, so there's no
+    // practical value in trying to trace a signal's full, gradual
+    // taper all the way down to the noise floor - and the simpler,
+    // higher threshold is naturally far less likely to walk into a
+    // neighbouring signal on a busy transponder than the previous,
+    // much lower one was, which needed extra valley-detection logic
+    // specifically to compensate for that.
+    const threshold = floor + (peakVal - floor) * 0.5;
+
+    let leftIdx = peakIdx;
+    while (leftIdx > 0 && latestData[leftIdx] > threshold) leftIdx--;
+    let rightIdx = peakIdx;
+    while (rightIdx < N_BINS - 1 && latestData[rightIdx] > threshold) rightIdx++;
+
+    const widthBins = rightIdx - leftIdx;
+
+    lastDiagnostic = {
+        clickedArrayIndex, peakIdx, peakVal, floor, threshold,
+        leftIdx, rightIdx, leftReason: 'threshold', rightReason: 'threshold', widthBins,
+    };
+
+    if (widthBins < 2 || widthBins > EDGE_WALK_LIMIT * 2) return null; // implausible - don't guess wildly
+
+    const occupiedHz = widthBins * BIN_HZ;
+    // CALIBRATION: for a raised-cosine spectrum, the theoretical
+    // half-AMPLITUDE (not half-power) width equals the symbol rate
+    // itself (a raised-cosine filter's response is exactly 0.5 at the
+    // Nyquist frequency, regardless of roll-off) - but that's a
+    // linear-amplitude result, and this feed's displayed values are
+    // on a dB (logarithmic) scale, confirmed directly from BATC's own
+    // server source. The 50% point of a dB-scaled display isn't
+    // exactly the same point as 50% of linear amplitude, so this
+    // factor of 1.0 is a reasoned starting point, not yet an
+    // empirically confirmed one - flagged clearly here so it's easy
+    // to correct once calibrated against a known-correct signal (the
+    // beacon, genuinely fixed at 1500 kS/s) using the diagnostic
+    // overlay's own readout.
+    const WIDTH_TO_SYMBOL_RATE_FACTOR = 1.0;
+    const estimatedKsps = (occupiedHz * WIDTH_TO_SYMBOL_RATE_FACTOR) / 1000;
+    lastDiagnostic.estimatedKsps = estimatedKsps;
+
+    // Snap to the nearest standard rate if reasonably close (within
+    // 25%), otherwise leave as a genuine custom estimate.
+    let closest = null, closestDiff = Infinity;
+    for (const sr of REF_SYMBOL_RATES) {
+        const diff = Math.abs(sr - estimatedKsps) / sr;
+        if (diff < closestDiff) { closestDiff = diff; closest = sr; }
+    }
+    if (closestDiff < 0.25) return { value: closest, isEstimate: true, snapped: true };
+    return { value: Math.round(estimatedKsps), isEstimate: true, snapped: false };
+}
+
+// ── Click to tune ───────────────────────────────────────────
+let pendingFreqMhz = null;
+canvas.addEventListener('click', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
+    const fLo = realFreqMhzForArrayIndex(0);
+    const fHi = realFreqMhzForArrayIndex(N_BINS - 1);
+    pendingFreqMhz = fLo + (x / canvasWidth) * (fHi - fLo);
+    const clickedArrayIndex = Math.round((x / canvasWidth) * (N_BINS - 1));
+
+    const pop = document.getElementById('tunePopover');
+    pop.querySelector('.freq-big').textContent = pendingFreqMhz.toFixed(4) + ' MHz';
+    document.getElementById('plugSelect').value = settings.defaultTuner;
+
+    // Auto-estimate symbol rate from the live spectrum shape
+    const srSelect = document.getElementById('srSelect');
+    const estimate = estimateSymbolRateKsps(clickedArrayIndex);
+    const estimateNote = document.getElementById('srEstimateNote');
+    if (estimate && estimate.snapped) {
+        srSelect.value = String(estimate.value);
+        estimateNote.textContent = `Estimated from signal width (~${estimate.value} kS/s)`;
+        estimateNote.style.display = 'block';
+        document.getElementById('srCustomRow').style.display = 'none';
+    } else if (estimate) {
+        srSelect.value = 'custom';
+        document.getElementById('srCustom').value = estimate.value;
+        document.getElementById('srCustomRow').style.display = 'flex';
+        estimateNote.textContent = `Estimated from signal width (~${estimate.value} kS/s) - doesn't closely match a standard rate, check before tuning`;
+        estimateNote.style.display = 'block';
+    } else {
+        estimateNote.textContent = 'Could not estimate from spectrum shape - pick manually';
+        estimateNote.style.display = 'block';
+        document.getElementById('srCustomRow').style.display = 'none';
+    }
+    render(); // draw the diagnostic overlay for this click immediately
+
+    pop.style.left = Math.min(x, canvasWidth - 260) + 'px';
+    pop.style.top = Math.max(0, y - 10) + 'px';
+    pop.style.display = 'block';
+});
+
+document.getElementById('srSelect').addEventListener('change', (e) => {
+    document.getElementById('srCustomRow').style.display = e.target.value === 'custom' ? 'flex' : 'none';
+});
+
+function closeTunePopover() {
+    document.getElementById('tunePopover').style.display = 'none';
+}
+
+async function confirmTune() {
+    const srSel = document.getElementById('srSelect').value;
+    const sr = srSel === 'custom' ? parseInt(document.getElementById('srCustom').value) : parseInt(srSel);
+    const plug = document.getElementById('plugSelect').value;
+    const freqKhz = Math.round(pendingFreqMhz * 1000);
+
+    closeTunePopover();
+    setLastAction(`Tuning ${(freqKhz/1000).toFixed(4)} MHz, ${sr} kS/s, tuner ${plug.toUpperCase()}...`, null);
+
+    if (!settings.lynxHost) {
+        setLastAction('No Lynx host set — open Settings first.', false);
+        return;
+    }
+
+    try {
+        const resp = await fetch(lynxUrl('/api/tune'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                freq: freqKhz,
+                sr: sr,
+                plug: plug,
+                lnb_lo_khz: settings.lnbOffsetKhz,
+            }),
+        });
+        if (!resp.ok) {
+            const text = await resp.text();
+            throw new Error(`Lynx returned ${resp.status}: ${text}`);
+        }
+        setLastAction(`Tuned ${(freqKhz/1000).toFixed(4)} MHz, ${sr} kS/s, tuner ${plug.toUpperCase()}.`, true);
+        setLynxStatus(true);
+    } catch (err) {
+        setLastAction(`Tune failed: ${err.message}`, false);
+        setLynxStatus(false);
+    }
+}
+
+function setLastAction(text, ok) {
+    const el = document.getElementById('lastAction');
+    el.textContent = text;
+    el.className = ok === true ? 'ok' : (ok === false ? 'bad' : '');
+}
+
+// The Lynx dot was only ever set from confirmTune(), so it stayed dark
+// until you actually tuned something - even with Lynx running perfectly
+// well and reachable. Poll it instead, so the indicator means "Lynx is
+// there" rather than "a tune has succeeded at some point".
+async function pollLynxStatus() {
+    if (!settings.lynxHost) { setLynxStatus(false); return; }
+    try {
+        const c = new AbortController();
+        const t = setTimeout(() => c.abort(), 4000);
+        const r = await fetch(lynxUrl('/api/status'), { signal: c.signal });
+        clearTimeout(t);
+        setLynxStatus(r.ok);
+    } catch (e) {
+        setLynxStatus(false);
+    }
+}
+setInterval(pollLynxStatus, 5000);
+document.addEventListener('DOMContentLoaded', () => setTimeout(pollLynxStatus, 300));
+
+function setLynxStatus(ok) {
+    document.getElementById('lynxDot').className = 'dot ' + (ok ? 'ok' : 'bad');
+}
+
+// ── BATC WebSocket feed ─────────────────────────────────────
+let ws = null;
+let wsReconnectTimer = null;
+let framesReceived = 0;
+let lastFrameTime = 0;
+
+function setWsStatus(state) {
+    // state: 'ok' | 'bad' | 'pending'
+    document.getElementById('wsDot').className = 'dot ' + state;
+}
+
+function connectFeed() {
+    if (ws) {
+        try { ws.close(); } catch (e) {}
+    }
+    clearTimeout(wsReconnectTimer);
+    setWsStatus('pending');
+
+    try {
+        ws = new WebSocket(settings.wsUrl, 'fft');
+    } catch (err) {
+        setWsStatus('bad');
+        document.getElementById('feedInfo').textContent = 'Invalid WebSocket URL: ' + err.message;
+        return;
+    }
+    ws.binaryType = 'arraybuffer';
+
+    ws.onopen = () => {
+        setWsStatus('ok');
+        document.getElementById('feedInfo').textContent = 'Connected to ' + settings.wsUrl;
+    };
+    ws.onmessage = (event) => {
+        // Server sends a flat array of uint16 values, little-endian,
+        // one per FFT bin (confirmed directly from BATC's own
+        // server source - LWS_WRITE_BINARY of a uint16_t* buffer).
+        const arr = new Uint16Array(event.data);
+        latestData = arr;
+        framesReceived++;
+        lastFrameTime = Date.now();
+        render();
+    };
+    ws.onerror = () => {
+        setWsStatus('bad');
+    };
+    ws.onclose = () => {
+        setWsStatus('bad');
+        document.getElementById('feedInfo').textContent = 'Disconnected — retrying in 3s...';
+        wsReconnectTimer = setTimeout(connectFeed, 3000);
+    };
+}
+
+// Watchdog: if we haven't seen a frame in a while despite an "open"
+// socket, something upstream has gone quiet - flag it rather than
+// silently show a stale spectrum.
+setInterval(() => {
+    if (ws && ws.readyState === WebSocket.OPEN && lastFrameTime && Date.now() - lastFrameTime > 5000) {
+        setWsStatus('bad');
+        document.getElementById('feedInfo').textContent = 'No data received for 5s+ — feed may be stalled.';
+    }
+}, 2000);
+
+// ── Init ──────────────────────────────────────────────────
+loadSettings();
+resizeCanvas();
+renderSrLegend();
+connectFeed();
+</script>
+</body>
+</html>
