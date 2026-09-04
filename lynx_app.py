@@ -11175,45 +11175,18 @@ async function updateStatus() {
         // otherwise: whichever of Rx1/stream "came up first" took this
         // shared slot, hiding the other's status entirely.
         const triWatchUsesRx1 = tw.enabled && (tw.sources || []).some(src => src.type === 'rf' && src.rcv === 1);
-        const showStreamInMainPanel = (lynxMode === 'stream') && !triWatchUsesRx1;
+        // Rx 1's panel always shows Rx 1. It used to be taken over by
+        // stream information whenever a stream played outside Tri-Watch,
+        // which made Rx 1 and Rx 2 vanish from the page entirely rather
+        // than sitting collapsed with their badges - and put an RTMP feed
+        // from another repeater under a heading claiming it was this
+        // receiver's own tuner. The stream has its own panel further
+        // down; it was simply gated to Tri-Watch until now.
+        setPanelState('status-panel-header', 'status-panel',
+                      '&#x1F4E1; Tuner Rx 1',
+                      !pt.online ? 'offline' : (locked ? 'locked' : 'idle'));
 
-        // The heading follows the body. This panel is headed "Tuner Rx 1"
-        // but shows stream information whenever showStreamInMainPanel is
-        // set, which put an RTMP feed from another repeater under a
-        // heading claiming it was this receiver's own tuner - with a
-        // bitrate and codecs no tuner reports. Driven from the same flag
-        // that chooses the body rather than a second test of its own, so
-        // the two cannot disagree.
-        const mainLabel = showStreamInMainPanel
-            ? '&#x1F4FA; Stream'
-            : '&#x1F4E1; Tuner Rx 1';
-        let mainState;
-        if (showStreamInMainPanel) {
-            mainState = 'locked';          // a playing stream is the working input
-        } else if (!pt.online) {
-            mainState = 'offline';
-        } else {
-            mainState = locked ? 'locked' : 'idle';
-        }
-        setPanelState('status-panel-header', 'status-panel', mainLabel, mainState);
-
-        if (showStreamInMainPanel) {
-            const info = s.lynx?.stream_info || {};
-            const bitrate = info.bitrate_kbps;
-            const protocol = s.lynx?.stream_protocol;
-            const rows = [
-                ['Mode',       '<span class="badge bg-info">STREAMING</span>'],
-                ['Stream',     s.lynx?.stream_name || '—'],
-                ['Protocol',   protocol || '—'],
-                ['Bitrate',    bitrate != null ? bitrate.toFixed(0) + ' kbps' : '—'],
-                ['Video',      info.video_codec || '—'],
-                ['Audio',      info.audio_codec || '—'],
-            ];
-            panel.innerHTML = rows.map(r =>
-                '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;"><span>' + r[0] + '</span>' +
-                '<span class="status-value">' + r[1] + '</span></div>'
-            ).join('');
-        } else if (!pt.online) {
+        if (!pt.online) {
             panel.innerHTML = '<div class="text-danger small text-center mt-2">Picotuner offline</div>';
         } else if (locked) {
             const rows = [
@@ -11319,7 +11292,10 @@ async function updateStatus() {
         // the stream info is already correctly shown there and showing it
         // twice would just be a duplicate.
         const streamPanel = document.getElementById('tri-watch-stream-panel');
-        if (tw.enabled && lynxMode === 'stream' && triWatchUsesRx1) {
+        // Whenever a stream is playing, in any mode. Previously gated to
+        // Tri-Watch, which is the only reason ordinary stream mode had to
+        // borrow Rx 1's panel at all.
+        if (lynxMode === 'stream') {
             streamPanel.style.display = '';
             const info = s.lynx?.stream_info || {};
             const bitrate = info.bitrate_kbps;
