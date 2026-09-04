@@ -3287,6 +3287,121 @@ def picotuner_table_monitor_b():
                 sock = None
             time.sleep(1)
 
+# ── Remote source (Slave Rx) state ───────────────────────────
+# A Slave Rx is a receiver at another site - a converted MiniTiouner
+# and a Pi - forwarding its tuner status here over the network, so a
+# repeater can have an RF input somewhere it has no antenna. See the
+# Lynx-Slave-Rx repository for the remote end.
+#
+# Shaped as a subset of picotuner_state deliberately: the same field
+# names, so anything downstream that already reads a tuner's state can
+# read this one without a second shape to handle. Fields that only a
+# richer status port can fill (MER, margin, modcod) are absent rather
+# than present-and-empty, so their absence is visible rather than
+# looking like a tuner reporting zeros.
+remote_state = {
+    "locked": False,
+    "callsign": "",
+    "frequency": "",
+    "rx1_raw": "",
+    "last_seen": 0,
+}
+
+# How long without a packet before a Slave counts as gone. The sender's
+# default heartbeat is every 2s, so this allows several to be missed
+# before anything is said - a single dropped UDP packet on a WAN hop is
+# ordinary and should not make a receiver appear to come and go.
+REMOTE_OFFLINE_AFTER_SECS = 15.0
+
+# Not 9997: picotuner_monitor() binds that on all interfaces for the
+# LOCAL Picotuner, and a Slave sending there would collide with the
+# receiver's own tuner status. The Slave's sender refuses 9997 for the
+# same reason at its own end.
+REMOTE_DEFAULT_STATUS_PORT = 10997
+
+
+def remote_source_cfg():
+    """The remote_source config section, or an empty dict if there
+    isn't one. Absent means disabled - a receiver with no Slave should
+    need no configuration at all to carry on exactly as before."""
+    return config.get('remote_source') or {}
+
+
+def remote_source_enabled() -> bool:
+    return bool(remote_source_cfg().get('enabled'))
+
+
+def remote_online() -> bool:
+    """Derived from last_seen rather than stored. A Slave that stops
+    sending must stop appearing present, and a flag set True on receipt
+    has no way back to False on its own."""
+    last = remote_state["last_seen"]
+    return bool(last) and (time.time() - last) < REMOTE_OFFLINE_AFTER_SECS
+
+
+def remote_source_monitor():
+    """Background thread: reads a Slave Rx's status on its own port.
+
+    The parsing is deliberately identical to picotuner_monitor()'s RX1
+    handling, because the Slave sends that exact format - the whole
+    point of the remote end speaking WinterHill rather than inventing
+    something is that no new parser is needed here. Kept as its own
+    function rather than shared with picotuner_monitor(), which also
+    handles RX2, firmware and diversity state that a Slave does not
+    send; a single function serving both would need to know which
+    caller it was answering, which is how one function becomes two
+    again with extra steps.
+
+    Same socket handling as the local monitors: REUSEADDR/REUSEPORT, a
+    timeout so the loop can notice a closed socket, and a rebuild on
+    any error rather than dying. This runs unattended for months.
+    """
+    global remote_state
+    sock = None
+    port = int(remote_source_cfg().get('status_port', REMOTE_DEFAULT_STATUS_PORT))
+    print(f"[remote] listening for a Slave Rx on port {port}")
+    while True:
+        try:
+            if sock is None:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                sock.settimeout(5)
+                sock.bind(('', port))
+
+            data, addr = sock.recvfrom(4096)
+            remote_state["last_seen"] = time.time()
+
+            for line in data.decode(errors='replace').splitlines():
+                line = line.strip()
+                if not line.startswith("RX1"):
+                    continue
+                rx1 = line.replace("RX1", "").strip()
+                remote_state["rx1_raw"] = rx1
+                parts = rx1.split()
+                # "search" and "lost" both mean not locked - same set
+                # picotuner_monitor() uses, for the same reason.
+                unlocked_states = {"search", "lost", ""}
+                if len(parts) >= 2 and parts[-1] not in unlocked_states:
+                    remote_state["locked"] = True
+                    remote_state["callsign"] = parts[-1]
+                    remote_state["frequency"] = parts[0].rstrip("TB")
+                else:
+                    remote_state["locked"] = False
+                    remote_state["callsign"] = ""
+                    if parts:
+                        remote_state["frequency"] = parts[0].rstrip("TB")
+        except socket.timeout:
+            pass
+        except Exception as e:
+            print(f"[remote] monitor error: {type(e).__name__}: {e}")
+            if sock:
+                try: sock.close()
+                except Exception: pass
+                sock = None
+            time.sleep(1)
+
+
 # ── Diversity combiner process management ────────────────────
 diversity_enabled: bool = False
 
@@ -5778,6 +5893,20 @@ def get_status():
                 "plug_a": current_lnb_psu_a, "plug_a_tone": current_lnb_tone_a,
                 "plug_b": current_lnb_psu_b, "plug_b_tone": current_lnb_tone_b,
             },
+        },
+        # Remote source (Slave Rx). Always present in the response
+        # rather than appearing only when configured, so a consumer
+        # can read remote.enabled once instead of testing whether the
+        # key exists at all - the same reason the diversity block
+        # below is always present even when idle.
+        "remote": {
+            "enabled": remote_source_enabled(),
+            "online": remote_online(),
+            "locked": remote_state["locked"],
+            "callsign": remote_state["callsign"],
+            "frequency": remote_state["frequency"],
+            "rx1": remote_state["rx1_raw"],
+            "last_seen": remote_state["last_seen"],
         },
         "diversity": {
             "enabled": diversity_enabled,
@@ -11646,6 +11775,13 @@ if __name__ == "__main__":
     rss_monitor.start()
     dial_discovery = threading.Thread(target=dial_discovery_responder, daemon=True)
     dial_discovery.start()
+    # Only started when a remote_source section exists and is enabled.
+    # A receiver with no Slave binds no extra port and runs no extra
+    # thread - absent configuration means absent behaviour, not a
+    # default that has to be turned off.
+    if remote_source_enabled():
+        remote_monitor = threading.Thread(target=remote_source_monitor, daemon=True)
+        remote_monitor.start()
     # Tri-watch (up to 3 sources, Stage 1) - probes for any enabled
     # stream sources are started here, once, rather than lazily on
     # first use, so their connect/handshake/reconnect cycle is already
