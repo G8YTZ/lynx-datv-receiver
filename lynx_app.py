@@ -8168,31 +8168,6 @@ async function saveRemoteSource() {
     }
 }
 
-function setPanelState(headerId, bodyId, label, state) {
-    // One place sets the header, its badge and whether the body is shown,
-    // so a header can never disagree with what is underneath it - which
-    // is precisely how the Rx 1 panel came to be headed "Tuner Rx 1"
-    // above an RTMP stream.
-    //
-    // Three states, not two: "present but hearing nothing" (amber) and
-    // "not there at all" (red) are different things, and on an input at
-    // another site that difference is the whole point.
-    const badges = {
-        locked:  ['bg-success', 'LOCKED'],
-        idle:    ['bg-warning text-dark', 'NO LOCK'],
-        offline: ['bg-danger', 'OFFLINE'],
-    };
-    const [cls, text] = badges[state] || badges.offline;
-    const h = document.getElementById(headerId);
-    if (h) {
-        h.innerHTML = label +
-            '<span class="badge ' + cls + '" style="float:right; font-size:0.75em;">' +
-            text + '</span>';
-    }
-    const b = document.getElementById(bodyId);
-    if (b) b.style.display = (state === 'locked') ? '' : 'none';
-}
-
 async function savePathfinder() {
     const statusEl = document.getElementById('pf-status');
     statusEl.textContent = 'Saving...';
@@ -11057,6 +11032,31 @@ async function onLnbToneClick(plug) {
     if (result.success) {
         toneBtn.className = 'btn btn-sm ' + (newTone ? 'btn-success' : 'btn-outline-secondary');
     }
+}
+
+function setPanelState(headerId, bodyId, label, state) {
+    // One place sets the header, its badge and whether the body is shown,
+    // so a header can never disagree with what is underneath it - which
+    // is precisely how the Rx 1 panel came to be headed "Tuner Rx 1"
+    // above an RTMP stream.
+    //
+    // Three states, not two: "present but hearing nothing" (amber) and
+    // "not there at all" (red) are different things, and on an input at
+    // another site that difference is the whole point.
+    const badges = {
+        locked:  ['bg-success', 'LOCKED'],
+        idle:    ['bg-warning text-dark', 'NO LOCK'],
+        offline: ['bg-danger', 'OFFLINE'],
+    };
+    const [cls, text] = badges[state] || badges.offline;
+    const h = document.getElementById(headerId);
+    if (h) {
+        h.innerHTML = label +
+            '<span class="badge ' + cls + '" style="float:right; font-size:0.75em;">' +
+            text + '</span>';
+    }
+    const b = document.getElementById(bodyId);
+    if (b) b.style.display = (state === 'locked') ? '' : 'none';
 }
 
 async function updateStatus() {
