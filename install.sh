@@ -262,10 +262,21 @@ sudo chown "$(id -un)":"$(id -gn)" /var/log/lynx
 # nothing - a stream that connects but delivers no data, for instance -
 # what is on the HDMI output is a desktop, a taskbar and a terminal
 # full of HTTP logs. At a repeater that goes out on air.
-echo "--- Setting up the systemd user service ---"
-mkdir -p ~/.config/systemd/user
-cp ~/lynx/lynx.service ~/.config/systemd/user/lynx.service
-systemctl --user daemon-reload
+# Defined here, called in two places: immediately below when the
+# clone already exists (an existing receiver being retro-fitted via
+# Update Now, which is why this section is above the --deps-only exit
+# at all), and again after the clone for a fresh install, where ~/lynx
+# does not exist yet. The first version of this ran the cp
+# unconditionally above the exit, which with `set -e` aborted a fresh
+# install outright, before anything was even cloned - invisible in
+# testing, because every test was an Update Now on a machine that
+# already had the clone.
+LYNX_SERVICE_DONE=0
+setup_startup_service() {
+  echo "--- Setting up the systemd user service ---"
+  mkdir -p ~/.config/systemd/user
+  cp ~/lynx/lynx.service ~/.config/systemd/user/lynx.service
+  systemctl --user daemon-reload
 # reenable, NOT enable. `enable` adds the symlink for the unit's
 # current [Install] section but does NOT remove one left by a previous
 # version of that unit. A receiver carrying an older lynx.service -
@@ -276,7 +287,13 @@ systemctl --user daemon-reload
 # receiver migrated from stable. `reenable` removes every existing
 # link and recreates from the unit as it stands now, which is also why
 # the cp above must come first.
-systemctl --user reenable lynx.service
+  systemctl --user reenable lynx.service
+  LYNX_SERVICE_DONE=1
+}
+
+if [ -f ~/lynx/lynx.service ]; then
+  setup_startup_service
+fi
 
 # --- Serial UART for the GNSS HAT ------------------------------
 # Two separate things are needed before lynx_gnss.py can read the
@@ -351,24 +368,38 @@ else
   echo "GNSS serial port permissions configured."
 fi
 
-# --- Desktop shell (--kiosk only, OPT-IN) ----------------------
+# --- Desktop shell ---------------------------------------------
 # labwc is required - the overlay is a GTK4 layer-shell client and
 # needs a wlroots compositor - but the Pi desktop shell running on top
 # of it is not. With it, anything that leaves mpv showing nothing puts
 # a wallpaper, a taskbar and whatever windows are open on the HDMI
 # output. At a repeater that goes out on air.
 #
-# Opt-in deliberately. /etc/xdg/labwc/autostart is a system file Lynx
-# has never managed, and a receiver may well be a Pi someone also uses
-# normally. Silently removing their taskbar is not this script's
-# business unless asked.
+# Default on a FRESH install, opt-in on an existing one. A machine
+# with no ~/lynx is a machine being turned into a receiver, and a
+# dedicated receiver has no use for a taskbar it will spend its life
+# hiding. An existing machine may well be a Pi someone also uses
+# normally, and silently removing their desktop is not this script's
+# business unless asked - so there it still needs --kiosk.
+#
+# --keep-desktop opts out of the fresh-install default, for anyone
+# setting Lynx up on a Pi they also intend to use.
 #
 # Commented rather than deleted, with a .bak alongside: reversible by
 # hand, and visible to whoever reads the file next. A Pi OS update may
 # restore the file, in which case run with --kiosk again.
-if [ "$1" = "--kiosk" ] && [ -f /etc/xdg/labwc/autostart ]; then
+LYNX_WANT_KIOSK=0
+if [ "$1" = "--kiosk" ]; then
+  LYNX_WANT_KIOSK=1
+elif [ ! -d ~/lynx ] && [ "$1" != "--keep-desktop" ]; then
+  LYNX_WANT_KIOSK=1
+  echo "Fresh install - the desktop shell will be suppressed."
+  echo "(Re-run with --keep-desktop if this Pi is also used normally.)"
+fi
+
+if [ "$LYNX_WANT_KIOSK" = "1" ] && [ -f /etc/xdg/labwc/autostart ]; then
   if grep -q "^/usr/bin/lwrespawn" /etc/xdg/labwc/autostart; then
-    echo "--- Suppressing the desktop shell (--kiosk) ---"
+    echo "--- Suppressing the desktop shell ---"
     sudo cp /etc/xdg/labwc/autostart /etc/xdg/labwc/autostart.lynx.bak
     sudo sed -i \
       -e "s|^\(/usr/bin/lwrespawn.*\)$|#\1|" \
@@ -425,6 +456,12 @@ if [ -d ~/lynx ]; then
   fi
 else
   git clone -b "$BRANCH" "$REPO_URL" ~/lynx
+fi
+
+# Fresh install: the clone did not exist when the startup service was
+# set up above, so do it now that it does.
+if [ "$LYNX_SERVICE_DONE" = "0" ]; then
+  setup_startup_service
 fi
 
 # --- Configuration ------------------------------------------
