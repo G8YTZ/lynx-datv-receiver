@@ -10724,7 +10724,7 @@ def web_ui():
             </div>
             <!-- Diversity: second tuner's own native status, shown only when diversity mode is active -->
             <div class="card mt-2" id="diversity-panel-b" style="display:none">
-                <div class="card-header">&#x1F4E1; Tuner Rx 2 (Diversity)</div>
+                <div class="card-header">&#x1F4E1; Tuner Rx 2</div>
                 <div class="card-body" id="status-panel-b"></div>
             </div>
             <!-- tri_watch: the active stream's own info, shown independently
