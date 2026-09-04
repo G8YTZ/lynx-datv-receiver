@@ -10700,7 +10700,7 @@ def web_ui():
         <!-- Status Panel -->
         <div class="col-md-4">
             <div class="card">
-                <div class="card-header">&#x1F4E1; Tuner Rx 1</div>
+                <div class="card-header" id="status-panel-header">&#x1F4E1; Tuner Rx 1</div>
                 <div class="card-body" id="status-panel">
                     <div class="text-center text-muted py-3">Loading...</div>
                 </div>
@@ -11126,6 +11126,20 @@ async function updateStatus() {
         // shared slot, hiding the other's status entirely.
         const triWatchUsesRx1 = tw.enabled && (tw.sources || []).some(src => src.type === 'rf' && src.rcv === 1);
         const showStreamInMainPanel = (lynxMode === 'stream') && !triWatchUsesRx1;
+
+        // The heading follows the body. This panel is headed "Tuner Rx 1"
+        // but shows stream information whenever showStreamInMainPanel is
+        // set, which put an RTMP feed from another repeater under a
+        // heading claiming it was this receiver's own tuner - with a
+        // bitrate and codecs no tuner reports. Driven from the same flag
+        // that chooses the body rather than a second test of its own, so
+        // the two cannot disagree.
+        const panelHeader = document.getElementById('status-panel-header');
+        if (panelHeader) {
+            panelHeader.innerHTML = showStreamInMainPanel
+                ? '&#x1F4FA; Stream'
+                : '&#x1F4E1; Tuner Rx 1';
+        }
 
         if (showStreamInMainPanel) {
             const info = s.lynx?.stream_info || {};
