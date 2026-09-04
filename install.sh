@@ -244,13 +244,6 @@ echo "--- Setting up persistent log directory ---"
 sudo mkdir -p /var/log/lynx
 sudo chown "$(id -un)":"$(id -gn)" /var/log/lynx
 
-# --deps-only stops here - used by "Update Now" (lynx_app.py) to
-# re-confirm every OS/apt/pip dependency above, AND the GPS time-sync
-# setup just above (equally safe to redo), is genuinely present on an
-# existing install - without touching the repo clone, config, or
-# anything else below that would be genuinely unsafe to redo on an
-# already-configured system. See this section's own comment further
-# up (near the apt install list) for the full rationale.
 # --- Startup mechanism: systemd user service -------------------
 # Lynx starts from a systemd user service, NOT the labwc autostart
 # line this script used to write. lynx.service waits for the
@@ -273,7 +266,94 @@ echo "--- Setting up the systemd user service ---"
 mkdir -p ~/.config/systemd/user
 cp ~/lynx/lynx.service ~/.config/systemd/user/lynx.service
 systemctl --user daemon-reload
-systemctl --user enable lynx.service
+# reenable, NOT enable. `enable` adds the symlink for the unit's
+# current [Install] section but does NOT remove one left by a previous
+# version of that unit. A receiver carrying an older lynx.service -
+# which said WantedBy=graphical-session.target, the target labwc does
+# not reliably activate - keeps that stale link forever: systemctl
+# reports "enabled", nothing is wrong anywhere, and the service simply
+# never starts at boot. Confirmed on real hardware (2026-09-04) on a
+# receiver migrated from stable. `reenable` removes every existing
+# link and recreates from the unit as it stands now, which is also why
+# the cp above must come first.
+systemctl --user reenable lynx.service
+
+# --- Serial UART for the GNSS HAT ------------------------------
+# Two separate things are needed before lynx_gnss.py can read the
+# Waveshare L76K on the GPIO header, and NEITHER is true by default on
+# a Pi 5. Both were confirmed the hard way (2026-09-04) on a receiver
+# where the HAT was fitted, correctly wired, and completely silent.
+#
+# First, the device has to exist. Without enable_uart=1 there is no
+# /dev/ttyAMA0 at all - /dev/serial0 points at ttyAMA10 instead - and
+# every read fails with ENOENT, which reads like a missing HAT rather
+# than a missing setting.
+#
+# Second, it has to be openable. On a Pi 5 this UART sits behind the
+# PCIe bridge and comes up root:root 0600, with nothing assigning it a
+# group, so being in dialout achieves precisely nothing. The chrony
+# socket permissions and the gpsshare group set up further down have
+# always assumed the port itself was readable; it is not.
+#
+# Both are skipped silently where already present, so this is safe on
+# every run and on receivers with no HAT fitted - an enabled UART and a
+# udev rule cost a machine without one nothing at all.
+#
+# NOT sufficient on a Pi 4: there /dev/ttyAMA0 is the Bluetooth UART,
+# not the header, so a HAT would additionally need
+# dtoverlay=disable-bt. lynx_gnss.py opens ttyAMA0 by name, so a Pi 4
+# would read the wrong port even once it exists. Deliberately left
+# alone rather than guessed at without the hardware to test on.
+if [ -f /boot/firmware/config.txt ]; then
+  if grep -q "^enable_uart=1" /boot/firmware/config.txt; then
+    echo "Serial UART already enabled - leaving config.txt untouched."
+  else
+    echo "--- Enabling the serial UART (GNSS HAT) ---"
+    sudo cp /boot/firmware/config.txt /boot/firmware/config.txt.lynx.bak
+    echo "enable_uart=1" | sudo tee -a /boot/firmware/config.txt > /dev/null
+    echo "Added enable_uart=1 to config.txt - takes effect at next reboot."
+  fi
+fi
+
+if [ -f /etc/udev/rules.d/60-lynx-gnss.rules ]; then
+  echo "GNSS serial permissions rule already present."
+else
+  echo "--- Setting up GNSS serial port permissions ---"
+  echo 'KERNEL=="ttyAMA[0-9]*", GROUP="dialout", MODE="0660"' \
+      | sudo tee /etc/udev/rules.d/60-lynx-gnss.rules > /dev/null
+  sudo udevadm control --reload-rules 2>/dev/null || true
+  sudo udevadm trigger --subsystem-match=tty 2>/dev/null || true
+  echo "GNSS serial port permissions configured."
+fi
+
+# --- Desktop shell (--kiosk only, OPT-IN) ----------------------
+# labwc is required - the overlay is a GTK4 layer-shell client and
+# needs a wlroots compositor - but the Pi desktop shell running on top
+# of it is not. With it, anything that leaves mpv showing nothing puts
+# a wallpaper, a taskbar and whatever windows are open on the HDMI
+# output. At a repeater that goes out on air.
+#
+# Opt-in deliberately. /etc/xdg/labwc/autostart is a system file Lynx
+# has never managed, and a receiver may well be a Pi someone also uses
+# normally. Silently removing their taskbar is not this script's
+# business unless asked.
+#
+# Commented rather than deleted, with a .bak alongside: reversible by
+# hand, and visible to whoever reads the file next. A Pi OS update may
+# restore the file, in which case run with --kiosk again.
+if [ "$1" = "--kiosk" ] && [ -f /etc/xdg/labwc/autostart ]; then
+  if grep -q "^/usr/bin/lwrespawn" /etc/xdg/labwc/autostart; then
+    echo "--- Suppressing the desktop shell (--kiosk) ---"
+    sudo cp /etc/xdg/labwc/autostart /etc/xdg/labwc/autostart.lynx.bak
+    sudo sed -i \
+      -e "s|^\(/usr/bin/lwrespawn.*\)$|#\1|" \
+      -e "s|^\(/usr/bin/lxsession-xdg-autostart.*\)$|#\1|" \
+      /etc/xdg/labwc/autostart
+    echo "Desktop shell suppressed - labwc will run bare from next boot."
+  else
+    echo "Desktop shell already suppressed - leaving it untouched."
+  fi
+fi
 
 # Retire the old labwc autostart line if one is present. Commented out
 # rather than deleted: reversible by hand, and it leaves visible
@@ -288,8 +368,17 @@ if [ -f ~/.config/labwc/autostart ] \
   echo "Retired the old labwc autostart line - Lynx starts from lynx.service now."
 fi
 
-if [ "$1" = "--deps-only" ]; then
-  echo "--- Dependencies confirmed (--deps-only) ---"
+# --deps-only stops here - used by "Update Now" (lynx_app.py) to
+# re-confirm every OS/apt/pip dependency above, AND the GPS time-sync
+# setup just above (equally safe to redo), is genuinely present on an
+# existing install - without touching the repo clone, config, or
+# anything else below that would be genuinely unsafe to redo on an
+# already-configured system. See this section's own comment further
+# up (near the apt install list) for the full rationale.
+# --kiosk implies --deps-only: it is a one-off toggle run against an
+# already-working receiver, not a reason to redo the whole install.
+if [ "$1" = "--deps-only" ] || [ "$1" = "--kiosk" ]; then
+  echo "--- Dependencies confirmed ($1) ---"
   exit 0
 fi
 
