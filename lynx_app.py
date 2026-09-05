@@ -3352,6 +3352,12 @@ remote_state = {
     "callsign": "",
     "frequency": "",
     "rx1_raw": "",
+    # What the Slave calls itself, from its own SITE line. Held here
+    # rather than in config: the Slave is the only thing that knows,
+    # and a name typed in at this end would be one more copy to go out
+    # of date. Empty until the first packet arrives.
+    "name": "",
+    "locator": "",
     "last_seen": 0,
 }
 
@@ -3377,6 +3383,17 @@ def remote_source_cfg():
 
 def remote_source_enabled() -> bool:
     return bool(remote_source_cfg().get('enabled'))
+
+
+def remote_display_name() -> str:
+    """What to call the Slave on screen.
+
+    Its own announced name when it has sent one, "Slave Rx" otherwise -
+    an older sender, or the first couple of seconds before the first
+    packet lands. A blank label would look broken; a generic one only
+    looks generic.
+    """
+    return remote_state["name"] or "Slave Rx"
 
 
 def remote_online() -> bool:
@@ -3422,6 +3439,19 @@ def remote_source_monitor():
 
             for line in data.decode(errors='replace').splitlines():
                 line = line.strip()
+                if line.startswith("SITE"):
+                    # "SITE <locator> <name>" - locator first because a
+                    # name contains spaces and a locator does not, so
+                    # name-first cannot be split reliably. "-" means no
+                    # locator given; the field is always present so the
+                    # parser never has to guess whether the first token
+                    # is a locator or the start of a name.
+                    parts = line.split(None, 2)
+                    if len(parts) >= 2:
+                        loc = parts[1]
+                        remote_state["locator"] = "" if loc == "-" else loc
+                    remote_state["name"] = parts[2].strip() if len(parts) >= 3 else ""
+                    continue
                 if not line.startswith("RX1"):
                     continue
                 rx1 = line.replace("RX1", "").strip()
@@ -5977,6 +6007,8 @@ def get_status():
             "callsign": remote_state["callsign"],
             "frequency": remote_state["frequency"],
             "rx1": remote_state["rx1_raw"],
+            "name": remote_display_name(),
+            "locator": remote_state["locator"],
             "last_seen": remote_state["last_seen"],
         },
         "diversity": {
@@ -11406,11 +11438,12 @@ async function updateStatus() {
             remotePanel.style.display = '';
             const remState = !rem.online ? 'offline' : (rem.locked ? 'locked' : 'idle');
             setPanelState('remote-panel-header', 'remote-panel-status',
-                          '&#x1F4E1; Slave Rx', remState);
+                          '&#x1F4E1; ' + (rem.name || 'Slave Rx'), remState);
             const remRows = [
                 ['Callsign',  rem.callsign || '—'],
                 ['Frequency', rem.frequency ? rem.frequency + ' MHz' : '—'],
             ];
+            if (rem.locator) remRows.push(['Locator', rem.locator]);
             document.getElementById('remote-panel-status').innerHTML = remRows.map(r =>
                 '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;"><span>' + r[0] + '</span>' +
                 '<span class="status-value">' + r[1] + '</span></div>'

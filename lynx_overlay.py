@@ -351,6 +351,9 @@ state = {
     "remote_online": False,
     "remote_locked": False,
     "remote_callsign": "",
+    # What the Slave calls itself, from its own announcement rather
+    # than anything configured here - see lynx_app.py's SITE parsing.
+    "remote_name": "",
     "remote_frequency": "",
     "locked_via": "a",  # "a" or "b" — which tuner's data populated the fields above
     # Tuner B's %NUL — an interim signal-quality proxy until Brian
@@ -687,6 +690,7 @@ def poll_status():
             state["remote_online"] = bool(rem.get('online'))
             state["remote_locked"] = bool(rem.get('locked'))
             state["remote_callsign"] = rem.get('callsign') or ""
+            state["remote_name"] = rem.get('name') or ""
             state["remote_frequency"] = rem.get('frequency') or ""
 
             # Which tuner's data actually populates the display fields
@@ -1463,13 +1467,18 @@ class LynxOverlay(Gtk.Window):
         # state to a local tuner's, which is exactly the confusion the
         # three states exist to prevent.
         if state["remote_enabled"]:
+            # The Slave's own name, upper-cased to match everything else
+            # in this zone. "SLAVE" only while none has arrived, which
+            # is an older sender or the first couple of seconds after a
+            # restart - never a blank label.
+            slave_label = (state["remote_name"] or "SLAVE").upper()
             if not state["remote_online"]:
-                slave_text, slave_colour = "SLAVE: OFFLINE", (0.9, 0.2, 0.2)
+                slave_text, slave_colour = f"{slave_label}: OFFLINE", (0.9, 0.2, 0.2)
             elif state["remote_locked"]:
-                slave_text = f"SLAVE: {state['remote_callsign'] or 'LOCKED'}"
+                slave_text = f"{slave_label}: {state['remote_callsign'] or 'LOCKED'}"
                 slave_colour = (0.0, 1.0, 0.25)
             else:
-                slave_text, slave_colour = "SLAVE: NO LOCK", (0.9, 0.5, 0.1)
+                slave_text, slave_colour = f"{slave_label}: NO LOCK", (0.9, 0.5, 0.1)
             self.draw_text(cr, width - margin,
                            margin + size + (len(lines) * line_h),
                            slave_text, size=size, align="right",
