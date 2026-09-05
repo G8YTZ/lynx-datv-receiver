@@ -341,6 +341,17 @@ state = {
     # Diversity mode — which tuner is actually the one supplying the
     # locked/displayed state.
     "diversity_enabled": False,
+    # Slave Rx - a receiver at another site, reporting over the
+    # network. Kept separate from the tuner fields above rather than
+    # swapped into them: a Slave is an additional source, not an
+    # alternative reading of the same one, and nothing downstream
+    # should mistake its callsign for something this receiver heard
+    # on its own antenna.
+    "remote_enabled": False,
+    "remote_online": False,
+    "remote_locked": False,
+    "remote_callsign": "",
+    "remote_frequency": "",
     "locked_via": "a",  # "a" or "b" — which tuner's data populated the fields above
     # Tuner B's %NUL — an interim signal-quality proxy until Brian
     # adds proper $15-equivalent level data for rcv=2 to the
@@ -664,6 +675,19 @@ def poll_status():
 
             raw_online = pt.get('online', False) or (diversity_enabled and tuner_b.get('online', False))
             state["diversity_enabled"] = diversity_enabled
+
+            # Read straight across, with no lock-stability smoothing.
+            # The Slave's own heartbeat is already slow (2s) and its
+            # offline threshold generous (15s), so the value arriving
+            # here has been debounced at source - smoothing it again
+            # would only add delay to a state that is already
+            # deliberately unhurried.
+            rem = data.get('remote', {}) or {}
+            state["remote_enabled"] = bool(rem.get('enabled'))
+            state["remote_online"] = bool(rem.get('online'))
+            state["remote_locked"] = bool(rem.get('locked'))
+            state["remote_callsign"] = rem.get('callsign') or ""
+            state["remote_frequency"] = rem.get('frequency') or ""
 
             # Which tuner's data actually populates the display fields
             # below — tri_watch's own choice takes priority when it
@@ -1432,6 +1456,25 @@ class LynxOverlay(Gtk.Window):
         for i, line in enumerate(lines):
             y = margin + size + (i * line_h)
             self.draw_text(cr, width - margin, y, line, size=size, align="right", colour=colour)
+
+        # Slave Rx, below this receiver's own figures and in its own
+        # colour: green locked, amber present but hearing nothing, red
+        # gone. Sharing the stack's colour would tie a remote site's
+        # state to a local tuner's, which is exactly the confusion the
+        # three states exist to prevent.
+        if state["remote_enabled"]:
+            if not state["remote_online"]:
+                slave_text, slave_colour = "SLAVE: OFFLINE", (0.9, 0.2, 0.2)
+            elif state["remote_locked"]:
+                slave_text = f"SLAVE: {state['remote_callsign'] or 'LOCKED'}"
+                slave_colour = (0.0, 1.0, 0.25)
+            else:
+                slave_text, slave_colour = "SLAVE: NO LOCK", (0.9, 0.5, 0.1)
+            self.draw_text(cr, width - margin,
+                           margin + size + (len(lines) * line_h),
+                           slave_text, size=size, align="right",
+                           colour=slave_colour)
+
 
     def draw_top_left(self, cr, width, height):
         LEFT_MARGIN = 16  # ~1 character in from the screen edge at size=30
