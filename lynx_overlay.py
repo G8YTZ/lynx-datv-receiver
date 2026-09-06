@@ -1461,28 +1461,12 @@ class LynxOverlay(Gtk.Window):
             y = margin + size + (i * line_h)
             self.draw_text(cr, width - margin, y, line, size=size, align="right", colour=colour)
 
-        # Slave Rx, below this receiver's own figures and in its own
-        # colour: green locked, amber present but hearing nothing, red
-        # gone. Sharing the stack's colour would tie a remote site's
-        # state to a local tuner's, which is exactly the confusion the
-        # three states exist to prevent.
-        if state["remote_enabled"]:
-            # The Slave's own name, upper-cased to match everything else
-            # in this zone. "SLAVE" only while none has arrived, which
-            # is an older sender or the first couple of seconds after a
-            # restart - never a blank label.
-            slave_label = (state["remote_name"] or "SLAVE").upper()
-            if not state["remote_online"]:
-                slave_text, slave_colour = f"{slave_label}: OFFLINE", (0.9, 0.2, 0.2)
-            elif state["remote_locked"]:
-                slave_text = f"{slave_label}: {state['remote_callsign'] or 'LOCKED'}"
-                slave_colour = (0.0, 1.0, 0.25)
-            else:
-                slave_text, slave_colour = f"{slave_label}: NO LOCK", (0.9, 0.5, 0.1)
-            self.draw_text(cr, width - margin,
-                           margin + size + (len(lines) * line_h),
-                           slave_text, size=size, align="right",
-                           colour=slave_colour)
+        # No Slave line here. The OSD shows the source being received,
+        # not an inventory of every source configured - four Slaves
+        # would mean four permanent lines on air. A Slave appears on
+        # screen when it IS the source, drawn in the zones above like
+        # any other receiver. Seeing every source's state at once is
+        # the web page's job.
 
 
     def draw_top_left(self, cr, width, height):
