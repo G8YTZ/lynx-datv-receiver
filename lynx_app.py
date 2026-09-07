@@ -6026,6 +6026,14 @@ def get_status():
             "mode": current_mode,
             "preset": current_preset,
             "stream_name": current_stream_name,
+            # True when what is playing is a Slave rather than a real
+            # stream. Derived from the URL rather than stored: the relay
+            # output port is the only thing a Slave is ever played from,
+            # so this cannot disagree with reality the way a separate
+            # flag set in one place and cleared in three eventually
+            # would. The Stream panel uses it to stand down.
+            "stream_is_remote": (current_mode == "stream"
+                                 and current_stream_url == f"udp://@:{REMOTE_VIDEO_OUT_PORT}"),
             "stream_info": get_live_stream_info() if current_mode == "stream" else None,
             "stream_protocol": get_stream_protocol(current_stream_url) if current_mode == "stream" and current_stream_url else None,
             "mpv_transitioning": mpv_transitioning,
@@ -11615,7 +11623,12 @@ async function updateStatus() {
         // Always shown, for the same reason as Rx 2 above: red OFFLINE
         // when nothing is playing rather than absent from the page.
         streamPanel.style.display = '';
-        if (lynxMode === 'stream') {
+        // A Slave plays through the stream path but is not a stream,
+        // and showing it in both panels leaves no way to tell which
+        // input is actually on screen once there is more than one of
+        // either. Its own panel reports it; this one stays idle.
+        const streamIsRemote = s.lynx?.stream_is_remote === true;
+        if (lynxMode === 'stream' && !streamIsRemote) {
             streamPanel.style.display = '';
             const info = s.lynx?.stream_info || {};
             const bitrate = info.bitrate_kbps;
