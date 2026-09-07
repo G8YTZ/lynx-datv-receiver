@@ -3347,19 +3347,18 @@ def batc_health_monitor():
 # richer status port can fill (MER, margin, modcod) are absent rather
 # than present-and-empty, so their absence is visible rather than
 # looking like a tuner reporting zeros.
-remote_state = {
-    "locked": False,
-    "callsign": "",
-    "frequency": "",
-    "rx1_raw": "",
-    # What the Slave calls itself, from its own SITE line. Held here
-    # rather than in config: the Slave is the only thing that knows,
-    # and a name typed in at this end would be one more copy to go out
-    # of date. Empty until the first packet arrives.
-    "name": "",
-    "locator": "",
-    "last_seen": 0,
-}
+# ── Remote sources (Slave Rx) ────────────────────────────────
+# A Slave Rx is a receiver at another site - a converted MiniTiouner
+# and a Pi, or a camera, or anything else that can send a transport
+# stream and say whether it has a signal - forwarding its status here
+# over the network. See the Lynx-Slave-Rx repository for the remote
+# end.
+#
+# A LIST, not a single source. A repeater whose coverage is the union
+# of several receive sites is the entire point of the feature, so one
+# Slave was only ever the first case. Making this a list before there
+# are several is far cheaper than retrofitting it afterwards, when
+# every consumer would have to change at once.
 
 # How long without a packet before a Slave counts as gone. The sender's
 # default heartbeat is every 2s, so this allows several to be missed
@@ -3370,61 +3369,117 @@ REMOTE_OFFLINE_AFTER_SECS = 15.0
 # Not 9997: picotuner_monitor() binds that on all interfaces for the
 # LOCAL Picotuner, and a Slave sending there would collide with the
 # receiver's own tuner status. The Slave's sender refuses 9997 for the
-# same reason at its own end.
+# same reason at its own end. Subsequent Slaves get their own ports,
+# which is why the config carries one per source rather than deriving
+# them - a derived scheme looks tidy until somebody needs a gap in it.
 REMOTE_DEFAULT_STATUS_PORT = 10997
 
-
-def remote_source_cfg():
-    """The remote_source config section, or an empty dict if there
-    isn't one. Absent means disabled - a receiver with no Slave should
-    need no configuration at all to carry on exactly as before."""
-    return config.get('remote_source') or {}
-
-
-def remote_source_enabled() -> bool:
-    return bool(remote_source_cfg().get('enabled'))
+# One state record per configured Slave, built at startup and indexed
+# in step with remote_sources_cfg(). Built once rather than created on
+# demand so that a Slave which has never sent anything still has a
+# record, and still shows as offline rather than being absent - "not
+# there yet" and "not configured" are different things.
+remote_states: list = []
 
 
-def remote_display_name() -> str:
-    """What to call the Slave on screen.
+def remote_sources_cfg() -> list:
+    """The configured Slaves, as a list.
 
-    Its own announced name when it has sent one, "Slave Rx" otherwise -
-    an older sender, or the first couple of seconds before the first
-    packet lands. A blank label would look broken; a generic one only
-    looks generic.
+    Migrates the older single 'remote_source' section transparently, so
+    a receiver configured before this became a list carries on working
+    without anyone editing a file. Config written from here on uses
+    'remote_sources'.
     """
-    return remote_state["name"] or "Slave Rx"
+    srcs = config.get('remote_sources')
+    if isinstance(srcs, list):
+        return srcs
+    single = config.get('remote_source')
+    if isinstance(single, dict) and single:
+        return [single]
+    return []
 
 
-def remote_online() -> bool:
+def _blank_remote_state(cfg: dict) -> dict:
+    """A state record for one Slave.
+
+    Shaped as a subset of picotuner_state deliberately: the same field
+    names, so anything downstream that already reads a tuner's state
+    can read this one without a second shape to handle. Fields only a
+    richer status port can fill (MER, margin, modcod) are absent rather
+    than present-and-empty, so their absence is visible rather than
+    looking like a tuner reporting zeros.
+    """
+    return {
+        "status_port": int(cfg.get('status_port', REMOTE_DEFAULT_STATUS_PORT)),
+        "enabled": bool(cfg.get('enabled')),
+        "locked": False,
+        "callsign": "",
+        "frequency": "",
+        "rx1_raw": "",
+        # What the Slave calls itself, from its own SITE line. Held here
+        # rather than in config: the Slave is the only thing that knows,
+        # and a name typed in at this end would be one more copy to go
+        # out of date. Empty until the first packet arrives.
+        "name": "",
+        "locator": "",
+        "last_seen": 0,
+    }
+
+
+def init_remote_states():
+    """Build the state list from config. Called once at startup."""
+    global remote_states
+    remote_states = [_blank_remote_state(c) for c in remote_sources_cfg()]
+
+
+def remote_any_enabled() -> bool:
+    return any(s["enabled"] for s in remote_states)
+
+
+def remote_display_name(i: int) -> str:
+    """What to call a Slave on screen.
+
+    Its own announced name when it has sent one, otherwise a generic
+    label - an older sender, or the first couple of seconds before the
+    first packet lands. Numbered when there is more than one, so two
+    unnamed Slaves are still tellable apart. A blank label would look
+    broken; a generic one only looks generic.
+    """
+    st = remote_states[i]
+    if st["name"]:
+        return st["name"]
+    return "Slave Rx" if len(remote_states) == 1 else f"Slave Rx {i + 1}"
+
+
+def remote_online(i: int) -> bool:
     """Derived from last_seen rather than stored. A Slave that stops
     sending must stop appearing present, and a flag set True on receipt
     has no way back to False on its own."""
-    last = remote_state["last_seen"]
+    last = remote_states[i]["last_seen"]
     return bool(last) and (time.time() - last) < REMOTE_OFFLINE_AFTER_SECS
 
 
-def remote_source_monitor():
-    """Background thread: reads a Slave Rx's status on its own port.
+def remote_source_monitor(index: int):
+    """Background thread: reads one Slave Rx's status on its own port.
+
+    One thread per Slave, each with its own socket. They could have
+    been multiplexed with select(), but a thread that only ever deals
+    with one Slave cannot confuse two of them, and the cost is a
+    sleeping thread per remote site.
 
     The parsing is deliberately identical to picotuner_monitor()'s RX1
     handling, because the Slave sends that exact format - the whole
     point of the remote end speaking WinterHill rather than inventing
-    something is that no new parser is needed here. Kept as its own
-    function rather than shared with picotuner_monitor(), which also
-    handles RX2, firmware and diversity state that a Slave does not
-    send; a single function serving both would need to know which
-    caller it was answering, which is how one function becomes two
-    again with extra steps.
+    something is that no new parser is needed here.
 
     Same socket handling as the local monitors: REUSEADDR/REUSEPORT, a
     timeout so the loop can notice a closed socket, and a rebuild on
     any error rather than dying. This runs unattended for months.
     """
-    global remote_state
+    st = remote_states[index]
+    port = st["status_port"]
     sock = None
-    port = int(remote_source_cfg().get('status_port', REMOTE_DEFAULT_STATUS_PORT))
-    print(f"[remote] listening for a Slave Rx on port {port}")
+    print(f"[remote {index}] listening for a Slave Rx on port {port}")
     while True:
         try:
             if sock is None:
@@ -3435,7 +3490,7 @@ def remote_source_monitor():
                 sock.bind(('', port))
 
             data, addr = sock.recvfrom(4096)
-            remote_state["last_seen"] = time.time()
+            st["last_seen"] = time.time()
 
             for line in data.decode(errors='replace').splitlines():
                 line = line.strip()
@@ -3449,30 +3504,30 @@ def remote_source_monitor():
                     parts = line.split(None, 2)
                     if len(parts) >= 2:
                         loc = parts[1]
-                        remote_state["locator"] = "" if loc == "-" else loc
-                    remote_state["name"] = parts[2].strip() if len(parts) >= 3 else ""
+                        st["locator"] = "" if loc == "-" else loc
+                    st["name"] = parts[2].strip() if len(parts) >= 3 else ""
                     continue
                 if not line.startswith("RX1"):
                     continue
                 rx1 = line.replace("RX1", "").strip()
-                remote_state["rx1_raw"] = rx1
+                st["rx1_raw"] = rx1
                 parts = rx1.split()
                 # "search" and "lost" both mean not locked - same set
                 # picotuner_monitor() uses, for the same reason.
                 unlocked_states = {"search", "lost", ""}
                 if len(parts) >= 2 and parts[-1] not in unlocked_states:
-                    remote_state["locked"] = True
-                    remote_state["callsign"] = parts[-1]
-                    remote_state["frequency"] = parts[0].rstrip("TB")
+                    st["locked"] = True
+                    st["callsign"] = parts[-1]
+                    st["frequency"] = parts[0].rstrip("TB")
                 else:
-                    remote_state["locked"] = False
-                    remote_state["callsign"] = ""
+                    st["locked"] = False
+                    st["callsign"] = ""
                     if parts:
-                        remote_state["frequency"] = parts[0].rstrip("TB")
+                        st["frequency"] = parts[0].rstrip("TB")
         except socket.timeout:
             pass
         except Exception as e:
-            print(f"[remote] monitor error: {type(e).__name__}: {e}")
+            print(f"[remote {index}] monitor error: {type(e).__name__}: {e}")
             if sock:
                 try: sock.close()
                 except Exception: pass
@@ -6000,17 +6055,46 @@ def get_status():
             "online": batc_health["online"],
             "last_ok": batc_health["last_ok"],
         },
-        "remote": {
-            "enabled": remote_source_enabled(),
-            "online": remote_online(),
-            "locked": remote_state["locked"],
-            "callsign": remote_state["callsign"],
-            "frequency": remote_state["frequency"],
-            "rx1": remote_state["rx1_raw"],
-            "name": remote_display_name(),
-            "locator": remote_state["locator"],
-            "last_seen": remote_state["last_seen"],
-        },
+        # One entry per configured Slave, in config order. Always
+        # present even when empty, so a consumer can iterate without
+        # first testing whether the key exists.
+        "remotes": [
+            {
+                "index": i,
+                "enabled": st["enabled"],
+                "online": remote_online(i),
+                "locked": st["locked"],
+                "callsign": st["callsign"],
+                "frequency": st["frequency"],
+                "rx1": st["rx1_raw"],
+                "name": remote_display_name(i),
+                "locator": st["locator"],
+                "status_port": st["status_port"],
+                "last_seen": st["last_seen"],
+            }
+            for i, st in enumerate(remote_states)
+        ],
+        # The first Slave, for anything still expecting a single one -
+        # the overlay, at the time of writing. Goes when that learns
+        # about source selection; kept for now so both do not have to
+        # change in the same patch.
+        "remote": (
+            {
+                "enabled": remote_states[0]["enabled"],
+                "online": remote_online(0),
+                "locked": remote_states[0]["locked"],
+                "callsign": remote_states[0]["callsign"],
+                "frequency": remote_states[0]["frequency"],
+                "rx1": remote_states[0]["rx1_raw"],
+                "name": remote_display_name(0),
+                "locator": remote_states[0]["locator"],
+                "last_seen": remote_states[0]["last_seen"],
+            }
+            if remote_states else
+            {"enabled": False, "online": False, "locked": False,
+             "callsign": "", "frequency": "", "rx1": "",
+             "name": "Slave Rx", "locator": "", "last_seen": 0}
+        ),
         "diversity": {
             "enabled": diversity_enabled,
             # rcv=2's own native status — only meaningful while
@@ -10673,8 +10757,18 @@ def update_config(req: ConfigUpdateRequest):
         # is enabled, and it binds its port once at that moment -
         # rebinding a socket underneath a running thread is real work
         # for a setting that gets changed once.
+        # Writes the FIRST Slave, and migrates the config to list form
+        # while doing it. The card only edits one; the Slaves page will
+        # edit them all, and building a list editor here that is about
+        # to be replaced would be waste.
         if req.remote_source is not None:
-            on_disk.setdefault('remote_source', {}).update(req.remote_source.model_dump())
+            srcs = on_disk.get('remote_sources')
+            if not isinstance(srcs, list) or not srcs:
+                existing = on_disk.get('remote_source')
+                srcs = [dict(existing)] if isinstance(existing, dict) and existing else [{}]
+            srcs[0].update(req.remote_source.model_dump())
+            on_disk['remote_sources'] = srcs
+            on_disk.pop('remote_source', None)
 
         tmp_path = str(CONFIG_PATH) + ".tmp"
         with open(tmp_path, 'w') as f:
@@ -10827,10 +10921,13 @@ def web_ui():
                  status over the network. Shown only when one is configured -
                  a receiver with no Slave should not carry a permanently red
                  panel for hardware it does not have. -->
-            <div class="card mt-2" id="remote-panel" style="display:none">
-                <div class="card-header" id="remote-panel-header">&#x1F4E1; Slave Rx</div>
-                <div class="card-body" id="remote-panel-status"></div>
-            </div>
+            <!-- Slave panels are built here at runtime, one per
+                 configured Slave, because how many there are is not
+                 known until the page has asked. -->
+            <!-- Slave panels are built here at runtime, one per
+                 configured Slave, because how many there are is not
+                 known until the page has asked. -->
+            <div id="remote-panels"></div>
         </div>
 
         <!-- RF Tuning -->
@@ -11432,25 +11529,43 @@ async function updateStatus() {
         // exists so far, so there is no MER or margin to show: online,
         // lock state, frequency and callsign is genuinely all there is,
         // and the header carries most of it.
-        const rem = s.remote || {};
-        const remotePanel = document.getElementById('remote-panel');
-        if (rem.enabled) {
-            remotePanel.style.display = '';
-            const remState = !rem.online ? 'offline' : (rem.locked ? 'locked' : 'idle');
-            setPanelState('remote-panel-header', 'remote-panel-status',
-                          '&#x1F4E1; ' + (rem.name || 'Slave Rx'), remState);
-            const remRows = [
+        // One panel per Slave, built on first sight and updated in
+        // place thereafter. Rebuilding the markup on every poll would
+        // throw away and recreate DOM three times a second on a page
+        // somebody may be reading, and would fight any control added to
+        // these panels later by destroying it mid-click.
+        const remotes = s.remotes || [];
+        const remoteHost = document.getElementById('remote-panels');
+        remotes.forEach(function (rem) {
+            const id = 'remote-' + rem.index;
+            let panel = document.getElementById(id);
+            if (!panel) {
+                panel = document.createElement('div');
+                panel.className = 'card mt-2';
+                panel.id = id;
+                panel.innerHTML =
+                    '<div class="card-header" id="' + id + '-header">&#x1F4E1; Slave Rx</div>' +
+                    '<div class="card-body" id="' + id + '-status"></div>';
+                remoteHost.appendChild(panel);
+            }
+            // A configured but disabled Slave is hidden rather than
+            // shown as offline: it is switched off deliberately, which
+            // is not a fault and should not look like one.
+            if (!rem.enabled) { panel.style.display = 'none'; return; }
+            panel.style.display = '';
+            const st = !rem.online ? 'offline' : (rem.locked ? 'locked' : 'idle');
+            setPanelState(id + '-header', id + '-status',
+                          '&#x1F4E1; ' + (rem.name || 'Slave Rx'), st);
+            const rows = [
                 ['Callsign',  rem.callsign || '—'],
                 ['Frequency', rem.frequency ? rem.frequency + ' MHz' : '—'],
             ];
-            if (rem.locator) remRows.push(['Locator', rem.locator]);
-            document.getElementById('remote-panel-status').innerHTML = remRows.map(r =>
+            if (rem.locator) rows.push(['Locator', rem.locator]);
+            document.getElementById(id + '-status').innerHTML = rows.map(r =>
                 '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;"><span>' + r[0] + '</span>' +
                 '<span class="status-value">' + r[1] + '</span></div>'
             ).join('');
-        } else {
-            remotePanel.style.display = 'none';
-        }
+        });
     } catch(e) {
         document.getElementById('status-panel').innerHTML = '<div class="text-danger small">Status unavailable</div>';
     }
@@ -12061,13 +12176,17 @@ if __name__ == "__main__":
     rss_monitor.start()
     dial_discovery = threading.Thread(target=dial_discovery_responder, daemon=True)
     dial_discovery.start()
-    # Only started when a remote_source section exists and is enabled.
-    # A receiver with no Slave binds no extra port and runs no extra
-    # thread - absent configuration means absent behaviour, not a
-    # default that has to be turned off.
-    if remote_source_enabled():
-        remote_monitor = threading.Thread(target=remote_source_monitor, daemon=True)
-        remote_monitor.start()
+    # One thread per ENABLED Slave. A receiver with none binds no extra
+    # port and runs no extra thread - absent configuration means absent
+    # behaviour, not a default that has to be turned off. A configured
+    # but disabled Slave still has a state record, so it appears in the
+    # UI as switched off rather than vanishing.
+    init_remote_states()
+    for _i, _st in enumerate(remote_states):
+        if not _st["enabled"]:
+            continue
+        threading.Thread(target=remote_source_monitor, args=(_i,),
+                         daemon=True).start()
     # Always started: BATC reachability is not conditional on anything
     # being configured, and it is what tells "nothing playing" apart
     # from "no internet" on the Stream panel.
