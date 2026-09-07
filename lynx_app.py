@@ -3385,7 +3385,17 @@ REMOTE_VIDEO_INGRESS_PORT = 10998
 # until a later patch adds that path — so it currently receives, counts
 # and discards. Kept as a module-level singleton because the socket must
 # outlive any one request.
-slave_relay = lynx_relay.SlaveVideoRelay(ingress_port=REMOTE_VIDEO_INGRESS_PORT)
+# Where the relay puts the selected Slave, and the only thing mpv
+# is ever pointed at for a Slave. Its own port rather than sharing
+# one with the Picotuner or a stream: two writers on one port is
+# how you get a picture that is half one source and half another,
+# with nothing in the logs to say so.
+REMOTE_VIDEO_OUT_PORT = 10999
+
+slave_relay = lynx_relay.SlaveVideoRelay(
+    ingress_port=REMOTE_VIDEO_INGRESS_PORT,
+    mpv_port=REMOTE_VIDEO_OUT_PORT,
+)
 
 
 def relay_refresh_sources():
@@ -9971,6 +9981,38 @@ def list_live_streams():
         "cache_expires_seconds": max(0, BATC_CACHE_TTL - age)
     }
 
+@app.post("/api/remote/{index}/select", tags=["Streaming"],
+          summary="Display a Slave Rx",
+          description="Routes the chosen Slave's video to mpv. The Slave must be "
+                      "enabled and must have been heard from, since its video is "
+                      "identified by the address its status arrives from.")
+def select_remote_source(index: int):
+    if index < 0 or index >= len(remote_states):
+        raise HTTPException(status_code=404, detail=f"No Slave at index {index}")
+    st = remote_states[index]
+    if not st["enabled"]:
+        raise HTTPException(status_code=409, detail="That Slave is configured but not enabled")
+    # Refused rather than attempted: without an address the relay cannot
+    # tell this Slave's packets from any other's, so selecting it would
+    # produce a black screen with nothing to explain it.
+    if not st["addr"]:
+        raise HTTPException(status_code=409,
+                            detail="Nothing heard from that Slave yet — it must send status before its video can be identified")
+    if not slave_relay.stats()["running"]:
+        raise HTTPException(status_code=503,
+                            detail=f"Slave video relay is not running: {slave_relay.bind_error or 'not started'}")
+
+    slave_relay.select(index)
+    # Handing off to start_stream() rather than restarting mpv here: it
+    # already holds the lock discipline, the transition cover and the
+    # render confirmation, and a second copy of that sequence would be a
+    # second place for it to go wrong.
+    return start_stream(StreamRequest(
+        url=f"udp://@:{REMOTE_VIDEO_OUT_PORT}",
+        name=remote_display_name(index),
+    ))
+
+
 @app.post("/api/streams/refresh", tags=["Streaming"],
           summary="Force refresh of BATC live stream list",
           description="Fetches a fresh copy from the BATC API immediately. "
@@ -11063,6 +11105,16 @@ def web_ui():
                 </div>
             </div>
 
+            <!-- Slave Receivers -->
+            <div class="card mt-3">
+                <div class="card-header">&#x1F4E1; Slave Receivers</div>
+                <div class="card-body p-0">
+                    <div id="slave-list" style="max-height: 300px; overflow-y: auto;">
+                        <div class="text-muted small p-3">Loading Slaves...</div>
+                    </div>
+                </div>
+            </div>
+
             <!-- Streams -->
             <div class="card mt-3">
                 <div class="card-header d-flex justify-content-between align-items-center">
@@ -11821,6 +11873,54 @@ async function loadLiveStreams() {
     }
 }
 
+// ── Slave Receivers ──────────────────────────────────────────
+// Reads the same /api/status the panels read rather than its own
+// endpoint: the list and the panels then cannot disagree about which
+// Slaves exist or what they are called.
+async function loadSlaves() {
+    const el = document.getElementById('slave-list');
+    if (!el) return;
+    try {
+        const s = await api('GET', '/api/status');
+        const remotes = s.remotes || [];
+        if (!remotes.length) {
+            el.innerHTML = '<div class="text-muted small p-3">No Slaves configured</div>';
+            return;
+        }
+        el.innerHTML = remotes.map(function (r) {
+            // Three states, same meanings as the panel badges: video
+            // arriving, heard from but no video, nothing at all.
+            var live = r.video && r.video.live;
+            var badge = !r.online
+                ? '<span class="badge bg-danger" style="font-size:0.65em">OFFLINE</span>'
+                : (live
+                    ? '<span class="badge bg-success" style="font-size:0.65em">VIDEO</span>'
+                    : '<span class="badge bg-warning text-dark" style="font-size:0.65em">NO VIDEO</span>');
+            // Only a Slave that is actually sending video can be chosen —
+            // selecting one that is not would just black the screen.
+            var clickable = r.enabled && r.online && live;
+            var kbps = live ? (r.video.kbps + ' kbps') : '';
+            return '<div class="stream-item p-2 border-bottom border-secondary d-flex justify-content-between align-items-center"'
+                 + (clickable ? ' style="cursor:pointer" onclick="playSlave(' + r.index + ')"'
+                              : ' style="opacity:0.55"')
+                 + '><span class="small text-light">' + (r.name || ('Slave Rx ' + (r.index + 1)))
+                 + (r.callsign ? ' <span class="text-muted">' + r.callsign + '</span>' : '')
+                 + '</span><span class="d-flex align-items-center gap-2">'
+                 + '<span class="text-muted small">' + kbps + '</span>' + badge + '</span></div>';
+        }).join('');
+    } catch (e) {
+        el.innerHTML = '<div class="text-danger small p-3">Slave list unavailable</div>';
+    }
+}
+
+async function playSlave(index) {
+    try {
+        await api('POST', '/api/remote/' + index + '/select');
+    } catch (e) {
+        alert('Could not select that Slave: ' + e);
+    }
+}
+
 async function refreshLiveStreams() {
     try {
         await api('POST', '/api/streams/refresh');
@@ -12143,6 +12243,11 @@ async function applyUpdate() {
 loadConfig();
 loadPresets();
 loadLiveStreams();
+loadSlaves();
+// Its own interval rather than a call inside updateStatus(): the
+// comment on QuickLynx below applies for the same reason, and a
+// fault in this list must not be able to stop the status poll.
+setInterval(loadSlaves, 5000);
 loadVolume();
 loadBootDefault();
 loadUpdateStatus();
