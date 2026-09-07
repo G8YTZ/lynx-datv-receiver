@@ -11513,8 +11513,15 @@ async function updateStatus() {
                 '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;"><span>' + r[0] + '</span>' +
                 '<span class="status-value">' + r[1] + '</span></div>'
             ).join('');
+            // Green only if data is actually arriving. mpv reports a
+            // bitrate while a stream is flowing and nothing when it is
+            // not, so this is the honest signal - and it was already
+            // being displayed in the body, just not consulted for the
+            // badge. Amber here means the stream is selected but silent,
+            // which is a real and useful distinction from playing.
             setPanelState('tri-watch-stream-header', 'tri-watch-stream-status',
-                          '&#x1F4FA; Stream', 'locked');
+                          '&#x1F4FA; Stream',
+                          (bitrate != null && bitrate > 0) ? 'locked' : 'idle');
         } else {
             // Amber when BATC is reachable and nothing is simply playing;
             // red only when BATC itself cannot be reached. "Nothing on"
