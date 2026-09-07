@@ -57,6 +57,7 @@ from pydantic import BaseModel
 import lynx_notifications
 import lynx_gnss
 import lynx_map
+import lynx_relay
 
 # Auto-Squeak needs numpy, which older installs may not have - it was
 # added to install.sh at the same time as this feature, and anyone who
@@ -3374,6 +3375,37 @@ REMOTE_OFFLINE_AFTER_SECS = 15.0
 # them - a derived scheme looks tidy until somebody needs a gap in it.
 REMOTE_DEFAULT_STATUS_PORT = 10997
 
+# Every Slave sends its video to this one port, and the relay tells
+# them apart by source address — the same address that is already
+# sending that Slave's status, so identity comes free and there is no
+# per-Slave port to allocate, configure, or firewall.
+REMOTE_VIDEO_INGRESS_PORT = 10998
+
+# The relay forwards the selected Slave here, and nothing is selected
+# until a later patch adds that path — so it currently receives, counts
+# and discards. Kept as a module-level singleton because the socket must
+# outlive any one request.
+slave_relay = lynx_relay.SlaveVideoRelay(ingress_port=REMOTE_VIDEO_INGRESS_PORT)
+
+
+def relay_refresh_sources():
+    """Hand the relay the current address -> Slave index mapping.
+
+    Called whenever an address is learned or changes. Only Slaves that
+    have actually sent something appear, so an unheard-from Slave cannot
+    claim video, and a Slave that moves (DHCP) is followed automatically
+    on its next status packet.
+    """
+    try:
+        slave_relay.set_sources({
+            st["addr"]: i
+            for i, st in enumerate(remote_states)
+            if st.get("addr")
+        })
+    except Exception as e:
+        print(f"[relay] could not refresh sources: {type(e).__name__}: {e}")
+
+
 # One state record per configured Slave, built at startup and indexed
 # in step with remote_sources_cfg(). Built once rather than created on
 # demand so that a Slave which has never sent anything still has a
@@ -3422,6 +3454,11 @@ def _blank_remote_state(cfg: dict) -> dict:
         # out of date. Empty until the first packet arrives.
         "name": "",
         "locator": "",
+        # Where this Slave's packets come from, learned from its own
+        # status traffic rather than configured. The video relay uses
+        # it to tell one Slave's stream from another's. Empty until
+        # the first packet arrives.
+        "addr": "",
         "last_seen": 0,
     }
 
@@ -3449,6 +3486,22 @@ def remote_display_name(i: int) -> str:
     if st["name"]:
         return st["name"]
     return "Slave Rx" if len(remote_states) == 1 else f"Slave Rx {i + 1}"
+
+
+def _relay_video_for(i: int) -> dict:
+    """Per-Slave video counters, or a blank record if the relay is not
+    running. Always the same shape so a consumer never has to test
+    whether the key exists — the same reasoning as the remotes list
+    itself always being present."""
+    blank = {"live": False, "kbps": 0, "packets": 0}
+    try:
+        s = slave_relay.stats()
+        v = s.get("sources", {}).get(i)
+        if not v:
+            return blank
+        return {"live": v["live"], "kbps": v["kbps"], "packets": v["packets"]}
+    except Exception:
+        return blank
 
 
 def remote_online(i: int) -> bool:
@@ -3491,6 +3544,13 @@ def remote_source_monitor(index: int):
 
             data, addr = sock.recvfrom(4096)
             st["last_seen"] = time.time()
+            # Only on change: this runs on every heartbeat from every
+            # Slave, and rebuilding the relay map two or three times a
+            # second for no reason would take its lock needlessly.
+            if st["addr"] != addr[0]:
+                print(f"[remote {index}] source address {st['addr'] or '(none)'} -> {addr[0]}")
+                st["addr"] = addr[0]
+                relay_refresh_sources()
 
             for line in data.decode(errors='replace').splitlines():
                 line = line.strip()
@@ -6070,6 +6130,12 @@ def get_status():
                 "name": remote_display_name(i),
                 "locator": st["locator"],
                 "status_port": st["status_port"],
+                "addr": st["addr"],
+                # Video presence, deliberately separate from "locked":
+                # a Slave can be heartbeating happily while its own
+                # receiver is unlocked and no TS is flowing, and the
+                # two states need telling apart on the panel.
+                "video": _relay_video_for(i),
                 "last_seen": st["last_seen"],
             }
             for i, st in enumerate(remote_states)
@@ -12194,6 +12260,15 @@ if __name__ == "__main__":
             continue
         threading.Thread(target=remote_source_monitor, args=(_i,),
                          daemon=True).start()
+    # Started whenever any Slave is configured. A failed bind is not
+    # fatal — status, panels and every local source carry on exactly
+    # as before; only Slave video would be unavailable, and the reason
+    # is on the console and in /api/status rather than silent.
+    if remote_any_enabled():
+        if slave_relay.start():
+            print(f"[relay] Slave video ingress listening on {REMOTE_VIDEO_INGRESS_PORT}")
+        else:
+            print(f"[relay] NOT listening: {slave_relay.bind_error}")
     # Always started: BATC reachability is not conditional on anything
     # being configured, and it is what tells "nothing playing" apart
     # from "no internet" on the Stream panel.
