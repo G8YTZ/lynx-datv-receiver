@@ -3379,25 +3379,6 @@ REMOTE_DEFAULT_STATUS_PORT = 10997
 # them apart by source address — the same address that is already
 # sending that Slave's status, so identity comes free and there is no
 # per-Slave port to allocate, configure, or firewall.
-# A Slave's rich status arrives on its status port minus this, the
-# same relationship the Picotuner uses between 9997 and 9901. Derived
-# rather than configured: it has a natural answer, and a configurable
-# one would be a third port per Slave to keep in step at both ends.
-REMOTE_QUALITY_PORT_OFFSET = 96
-
-# Filled only from the quality port, and only once it has actually sent
-# something. Same names as picotuner_state so a panel or overlay that
-# already reads a tuner can read a Slave without a second shape.
-REMOTE_QUALITY_FIELDS = (
-    "mer", "margin", "symbol_rate", "modcod", "programme",
-    "dbm", "agc1", "agc2",
-)
-
-
-def remote_quality_port(i: int) -> int:
-    return remote_states[i]["status_port"] - REMOTE_QUALITY_PORT_OFFSET
-
-
 REMOTE_VIDEO_INGRESS_PORT = 10998
 
 # The relay forwards the selected Slave here, and nothing is selected
@@ -3539,88 +3520,6 @@ def remote_online(i: int) -> bool:
     has no way back to False on its own."""
     last = remote_states[i]["last_seen"]
     return bool(last) and (time.time() - last) < REMOTE_OFFLINE_AFTER_SECS
-
-
-def remote_quality_monitor(index: int):
-    """Background thread: rich status for one Slave, tagged $n,m only.
-
-    Deliberately the tagged format and never the 9904-style column
-    table. The comments on picotuner_quality_monitor() and its table
-    counterpart record a real, live-confirmed bug where a column shift
-    fed one receiver's MER and modcod into another receiver's display,
-    with nothing to indicate it. Tagged fields cannot drift: a value is
-    whatever its own tag says it is, and an unrecognised tag is ignored
-    rather than silently adopted as the next field along.
-
-    Values are stored exactly as sent, as strings. The Slave has already
-    done the arithmetic — margin against the modcod threshold, dBm from
-    the AGC table — and re-deriving either at this end would be a second
-    implementation to keep in step with the first.
-    """
-    sock = None
-    bound_port = None
-    while True:
-        try:
-            st = remote_states[index]
-            want_port = st["status_port"] - REMOTE_QUALITY_PORT_OFFSET
-            if sock is None or bound_port != want_port:
-                if sock is not None:
-                    try: sock.close()
-                    except Exception: pass
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                # No SO_REUSEADDR/SO_REUSEPORT here, unlike the Picotuner
-                # monitors. One Slave, one quality port, one reader: with
-                # them set a second process binds the same port and shares
-                # the packets silently, which is how a stray listener once
-                # ate Picotuner status. A clash should be loud.
-                sock.settimeout(5)
-                sock.bind(('', want_port))
-                bound_port = want_port
-                print(f"[remote {index}] quality monitor listening on {want_port}")
-
-            data, addr = sock.recvfrom(4096)
-
-            # Only from the address this Slave's own status comes from.
-            # Until that is known the packet cannot be attributed to
-            # anybody, and adopting it on the strength of the port alone
-            # is how one site's MER ends up on another site's panel.
-            if not st["addr"] or addr[0] != st["addr"]:
-                continue
-
-            fields = {}
-            for line in data.decode(errors='replace').splitlines():
-                line = line.strip()
-                if line.startswith('$'):
-                    parts = line.split(',', 1)
-                    if len(parts) == 2:
-                        fields[parts[0]] = parts[1].strip()
-            if not fields:
-                continue
-
-            # Each field written only if the sender actually included it,
-            # so a sender that emits a subset leaves the rest absent
-            # rather than blanking values it never mentioned.
-            if '$12' in fields: st["mer"]         = fields['$12']
-            if '$30' in fields: st["margin"]      = fields['$30']
-            if '$9'  in fields: st["symbol_rate"] = fields['$9']
-            if '$18' in fields: st["modcod"]      = fields['$18']
-            if '$14' in fields: st["programme"]   = fields['$14'].replace('_', ' ')
-            if '$85' in fields: st["dbm"]         = fields['$85']
-            if '$26' in fields: st["agc1"]        = fields['$26']
-            if '$27' in fields: st["agc2"]        = fields['$27']
-
-        except socket.timeout:
-            # Silence is normal and says nothing on its own: the status
-            # port decides online/offline, and duplicating that judgement
-            # here would give two answers to one question.
-            continue
-        except Exception as e:
-            print(f"[remote {index}] quality monitor: {type(e).__name__}: {e}")
-            if sock is not None:
-                try: sock.close()
-                except Exception: pass
-                sock = None
-            time.sleep(2)
 
 
 def remote_source_monitor(index: int):
@@ -6127,14 +6026,6 @@ def get_status():
             "mode": current_mode,
             "preset": current_preset,
             "stream_name": current_stream_name,
-            # True when what is playing is a Slave rather than a real
-            # stream. Derived from the URL rather than stored: the relay
-            # output port is the only thing a Slave is ever played from,
-            # so this cannot disagree with reality the way a separate
-            # flag set in one place and cleared in three eventually
-            # would. The Stream panel uses it to stand down.
-            "stream_is_remote": (current_mode == "stream"
-                                 and current_stream_url == f"udp://@:{REMOTE_VIDEO_OUT_PORT}"),
             "stream_info": get_live_stream_info() if current_mode == "stream" else None,
             "stream_protocol": get_stream_protocol(current_stream_url) if current_mode == "stream" and current_stream_url else None,
             "mpv_transitioning": mpv_transitioning,
@@ -6255,11 +6146,6 @@ def get_status():
                 # receiver is unlocked and no TS is flowing, and the
                 # two states need telling apart on the panel.
                 "video": _relay_video_for(i),
-                # Only the fields the Slave has actually sent. A
-                # Slave with no quality port simply has none of
-                # these, which reads differently from a Slave
-                # reporting zeros — and it should.
-                **{k: st[k] for k in REMOTE_QUALITY_FIELDS if k in st},
                 "last_seen": st["last_seen"],
             }
             for i, st in enumerate(remote_states)
@@ -11729,12 +11615,7 @@ async function updateStatus() {
         // Always shown, for the same reason as Rx 2 above: red OFFLINE
         // when nothing is playing rather than absent from the page.
         streamPanel.style.display = '';
-        // A Slave plays through the stream path but is not a stream,
-        // and showing it in both panels leaves no way to tell which
-        // input is actually on screen once there is more than one of
-        // either. Its own panel reports it; this one stays idle.
-        const streamIsRemote = s.lynx?.stream_is_remote === true;
-        if (lynxMode === 'stream' && !streamIsRemote) {
+        if (lynxMode === 'stream') {
             streamPanel.style.display = '';
             const info = s.lynx?.stream_info || {};
             const bitrate = info.bitrate_kbps;
@@ -12483,11 +12364,6 @@ if __name__ == "__main__":
         if not _st["enabled"]:
             continue
         threading.Thread(target=remote_source_monitor, args=(_i,),
-                         daemon=True).start()
-        # Separate thread rather than parsing both formats in one:
-        # the two ports update at different rates and a stall on
-        # either must not hold up the other.
-        threading.Thread(target=remote_quality_monitor, args=(_i,),
                          daemon=True).start()
     # Started whenever any Slave is configured. A failed bind is not
     # fatal — status, panels and every local source carry on exactly
