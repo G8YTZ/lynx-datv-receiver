@@ -3385,6 +3385,13 @@ REMOTE_DEFAULT_STATUS_PORT = 10997
 # one would be a third port per Slave to keep in step at both ends.
 REMOTE_QUALITY_PORT_OFFSET = 96
 
+# How long a resume waits for a saved Slave to report in before
+# giving up. It cannot be selected until its address is known, and
+# at boot nothing has been heard yet. Bounded rather than endless:
+# a site that is off the air should leave the receiver idle and
+# usable, not stuck waiting for it.
+REMOTE_RESUME_WAIT_SECS = 30
+
 # Filled only from the quality port, and only once it has actually sent
 # something. Same names as picotuner_state so a panel or overlay that
 # already reads a tuner can read a Slave without a second shape.
@@ -10126,14 +10133,25 @@ def select_remote_source(index: int):
                             detail=f"Slave video relay is not running: {slave_relay.bind_error or 'not started'}")
 
     slave_relay.select(index)
+    # start_stream() below saves the URL, which says where mpv
+    # should listen but not whose video belongs there. Saved after
+    # it returns, so this write is the one that survives.
+    _remote_resume_index = index
     # Handing off to start_stream() rather than restarting mpv here: it
     # already holds the lock discipline, the transition cover and the
     # render confirmation, and a second copy of that sequence would be a
     # second place for it to go wrong.
-    return start_stream(StreamRequest(
+    result = start_stream(StreamRequest(
         url=f"udp://@:{REMOTE_VIDEO_OUT_PORT}",
         name=remote_display_name(index),
     ))
+    save_last_state({
+        "mode": "stream",
+        "url": f"udp://@:{REMOTE_VIDEO_OUT_PORT}",
+        "name": remote_display_name(index),
+        "remote_index": _remote_resume_index,
+    })
+    return result
 
 
 @app.post("/api/streams/refresh", tags=["Streaming"],
@@ -12828,12 +12846,36 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"Could not resume previous RF state: {e}")
         elif state and state.get("mode") == "stream":
-            print(f"Resuming previous stream: {state.get('name')}")
-            try:
-                start_stream(StreamRequest(url=state["url"], name=state.get("name", "")))
-                return
-            except Exception as e:
-                print(f"Could not resume previous stream: {e}")
+            # A Slave is saved as a stream, because that is how it
+            # plays, plus the index of which Slave it was. Without
+            # telling the relay, resuming the URL alone points mpv
+            # at a port nothing is being forwarded to.
+            _rem_idx = state.get("remote_index")
+            if _rem_idx is not None:
+                print(f"Resuming Slave Rx {_rem_idx}: waiting for it to report")
+                for _ in range(REMOTE_RESUME_WAIT_SECS):
+                    if (0 <= _rem_idx < len(remote_states)
+                            and remote_states[_rem_idx]["enabled"]
+                            and remote_states[_rem_idx]["addr"]):
+                        break
+                    time.sleep(1)
+                try:
+                    select_remote_source(_rem_idx)
+                    print(f"Resumed Slave Rx {_rem_idx}")
+                    return
+                except Exception as e:
+                    # Left idle rather than falling through to the
+                    # plain stream resume: that would point mpv at
+                    # the relay output with nothing selected, which
+                    # is a black screen with no explanation.
+                    print(f"Could not resume Slave Rx {_rem_idx}: {e}")
+            else:
+                print(f"Resuming previous stream: {state.get('name')}")
+                try:
+                    start_stream(StreamRequest(url=state["url"], name=state.get("name", "")))
+                    return
+                except Exception as e:
+                    print(f"Could not resume previous stream: {e}")
 
         # No valid previous state — fall back to the explicit default
         # boot preset, if one has been configured.
