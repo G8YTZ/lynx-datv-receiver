@@ -587,6 +587,10 @@ def poll_status():
     global _raw_lock_history, _raw_online_history, _last_notification_sound_played_for
     while True:
         raw_online = False
+        # The Slave whose video is on screen, if it is a Slave.
+        # Reset every poll so a stale one cannot outlive the
+        # selection that produced it.
+        _remote_display = None
         try:
             with urllib.request.urlopen(LYNX_API, timeout=2) as r:
                 data = json.loads(r.read().decode())
@@ -754,6 +758,14 @@ def poll_status():
                 state["sr_ks"] = live_sr
             lynx = data.get('lynx', {})
             state["mode"]      = lynx.get('mode', 'idle')
+            # Matched on index rather than position in the list:
+            # a disabled Slave still has a record, so the two are
+            # not the same thing.
+            if lynx.get('stream_is_remote') and lynx.get('remote_selected') is not None:
+                for _rem in data.get('remotes', []):
+                    if _rem.get('index') == lynx.get('remote_selected'):
+                        _remote_display = _rem
+                        break
             state["mpv_running_for_rf"] = lynx.get('mpv_running_for_rf', False)
             state["stream_name"] = lynx.get('stream_name', '')
             stream_info = lynx.get('stream_info') or {}
@@ -804,6 +816,47 @@ def poll_status():
             state["online"] = True
         elif not any(_raw_online_history) and len(_raw_online_history) >= ONLINE_STABLE_POLLS:
             state["online"] = False
+
+        # ── A Slave is a receiver, so draw it as one ──────────
+        # Applied last, after online and lock have settled from
+        # the local tuner: those describe hardware in this box,
+        # and none of it is what is on screen right now.
+        if _remote_display is not None:
+            rem = _remote_display
+            state["mode"] = "rf"
+            # The Slave's own reachability, not the Picotuner's.
+            state["online"] = bool(rem.get('online'))
+            state["locked"] = bool(rem.get('locked'))
+            # mpv is running and playing the relay's output, which
+            # is what this flag means. False here would cover live
+            # video with the transition cover and leave it there.
+            state["mpv_running_for_rf"] = True
+            state["callsign"] = rem.get('callsign', '')
+            state["callsign_name"] = rem.get('callsign_name', '')
+            state["frequency"] = rem.get('frequency', '')
+            # A Slave reports what it is tuned to. Any converter
+            # at its end is its business, and inventing a downlink
+            # frequency from this end would be a guess.
+            state["downlink_frequency"] = None
+            state["mer"] = rem.get('mer', '')
+            state["margin"] = rem.get('margin', '')
+            # dBm arrives directly, so the level approximation the
+            # RF path falls back to is not wanted here.
+            state["level"] = ''
+            state["dbm"] = rem.get('dbm', '')
+            state["modcod"] = rem.get('modcod', '')
+            state["codec"] = rem.get('codec', '')
+            state["audio_codec"] = rem.get('audio_codec', '')
+            state["programme"] = rem.get('programme', '')
+            if rem.get('symbol_rate'):
+                state["sr_ks"] = rem['symbol_rate']
+            # Two local tuners' worth of state, describing hardware
+            # that is not the source. Left set, it would draw a
+            # diversity row or a tri_watch indicator over a Slave.
+            state["diversity_enabled"] = False
+            state["diversity_stats"] = {}
+            state["tri_watch_show_searching_rx2"] = False
+            state["locked_via"] = "a"
 
         time.sleep(POLL_SECS)
 

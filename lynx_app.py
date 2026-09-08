@@ -6137,6 +6137,11 @@ def get_status():
             # so this cannot disagree with reality the way a separate
             # flag set in one place and cleared in three eventually
             # would. The Stream panel uses it to stand down.
+            # Which Slave, not just that it is one. Read from the
+            # relay rather than stored: the relay is what decides
+            # whose packets reach mpv, so it cannot disagree with
+            # what is actually on screen.
+            "remote_selected": slave_relay.selected(),
             "stream_is_remote": (current_mode == "stream"
                                  and current_stream_url == f"udp://@:{REMOTE_VIDEO_OUT_PORT}"),
             "stream_info": get_live_stream_info() if current_mode == "stream" else None,
