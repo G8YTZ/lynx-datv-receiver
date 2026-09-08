@@ -3390,7 +3390,7 @@ REMOTE_QUALITY_PORT_OFFSET = 96
 # already reads a tuner can read a Slave without a second shape.
 REMOTE_QUALITY_FIELDS = (
     "mer", "margin", "symbol_rate", "modcod", "programme",
-    "dbm", "agc1", "agc2", "codec", "audio_codec",
+    "dbm", "agc1", "agc2",
 )
 
 
@@ -3608,10 +3608,6 @@ def remote_quality_monitor(index: int):
             if '$85' in fields: st["dbm"]         = fields['$85']
             if '$26' in fields: st["agc1"]        = fields['$26']
             if '$27' in fields: st["agc2"]        = fields['$27']
-            # Same tags the Picotuner uses, so a Slave and a local
-            # tuner fill these rows by the same route.
-            if '$31' in fields: st["codec"]       = fields['$31']
-            if '$34' in fields: st["audio_codec"] = fields['$34']
 
         except socket.timeout:
             # Silence is normal and says nothing on its own: the status
@@ -11802,32 +11798,13 @@ async function updateStatus() {
             if (!rem.enabled) { panel.style.display = 'none'; return; }
             panel.style.display = '';
             const st = !rem.online ? 'offline' : (rem.locked ? 'locked' : 'idle');
-            // Locator in the header rather than as a row: it is the one
-            // thing a Slave has that a local receiver does not, and putting
-            // it in the rows is what stopped the two panels looking alike.
-            const label = '&#x1F4E1; ' + (rem.name || 'Slave Rx')
-                        + (rem.locator ? ' — ' + rem.locator : '');
-            setPanelState(id + '-header', id + '-status', label, st);
-            // Deliberately the local receiver's row set, in its order and
-            // with its units. A Slave sends the same fields under the same
-            // tags, so anything that reads differently here is a fault
-            // rather than a difference worth preserving.
+            setPanelState(id + '-header', id + '-status',
+                          '&#x1F4E1; ' + (rem.name || 'Slave Rx'), st);
             const rows = [
-                ['Callsign',    rem.callsign || '—'],
-                ['Programme',   rem.programme || '—'],
-                ['Frequency',   rem.frequency ? rem.frequency + ' MHz' : '—'],
-                ['Symbol Rate', rem.symbol_rate ? rem.symbol_rate + ' kS/s' : '—'],
-                ['MER',         rem.mer ? rem.mer + ' dB' : '—'],
-                ['Margin',      rem.margin ? rem.margin + ' dB' : '—'],
-                ['Level',       (rem.dbm && rem.dbm !== '0') ? rem.dbm + ' dBm' : '—'],
-                ['Mode',        rem.modcod || '—'],
-                ['Codec',       rem.codec || '—'],
-                ['Audio Codec', rem.audio_codec || '—'],
-                // A Slave runs Longmynd on a Pico adaptor, not Picotuner
-                // firmware. There is no equivalent to report, and a dash
-                // says so more honestly than something invented.
-                ['Firmware',    '—'],
+                ['Callsign',  rem.callsign || '—'],
+                ['Frequency', rem.frequency ? rem.frequency + ' MHz' : '—'],
             ];
+            if (rem.locator) rows.push(['Locator', rem.locator]);
             document.getElementById(id + '-status').innerHTML = rows.map(r =>
                 '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;"><span>' + r[0] + '</span>' +
                 '<span class="status-value">' + r[1] + '</span></div>'
