@@ -3564,6 +3564,101 @@ def _relay_video_for(i: int) -> dict:
         return blank
 
 
+# ── Receiver registry ────────────────────────────────────────────
+#
+# Every receiver Lynx can display, under one numbering:
+#
+#     1, 2      local Picotuner receivers
+#     11 - 15   Slaves
+#
+# 3 to 10 are left free for a WinterHill, which presents its own
+# receivers 5 and 6 and would collide with anything numbered into that
+# range.
+REMOTE_RECEIVER_ID_BASE = 11
+MAX_REMOTE_RECEIVERS = 5
+
+
+def receiver_state(rid: int):
+    """The state record for one receiver, or None if there is no such
+    receiver.
+
+    Returns the live dict, not a copy — the monitor threads write to
+    these, and a caller holding a snapshot would be reading a receiver's
+    state from whenever it happened to ask. One record per receiver,
+    one place that hands it out.
+    """
+    if rid == 1:
+        return picotuner_state
+    if rid == 2:
+        return picotuner_state_b
+    if REMOTE_RECEIVER_ID_BASE <= rid < REMOTE_RECEIVER_ID_BASE + MAX_REMOTE_RECEIVERS:
+        i = rid - REMOTE_RECEIVER_ID_BASE
+        if 0 <= i < len(remote_states):
+            return remote_states[i]
+    return None
+
+
+def receiver_ids() -> list:
+    """Every receiver that exists, in display order.
+
+    Local receivers always exist, whether or not anything is connected
+    to them — the hardware is either there or it is a fault worth
+    showing. A Slave exists once it is configured, enabled or not, so a
+    disabled one appears switched off rather than vanishing.
+    """
+    ids = [1, 2]
+    for i in range(min(len(remote_states), MAX_REMOTE_RECEIVERS)):
+        ids.append(REMOTE_RECEIVER_ID_BASE + i)
+    return ids
+
+
+def receiver_is_remote(rid: int) -> bool:
+    return rid >= REMOTE_RECEIVER_ID_BASE
+
+
+def active_receiver_id():
+    """Which receiver is on screen, or None if a stream is.
+
+    THE one derivation point. The port equivalent of this question,
+    current_rf_target_port(), already exists and its docstring records
+    what happened when it did not: the decision was duplicated across
+    call sites, two of them were never taught about tri_watch, and a
+    freeze recovery restarted mpv pointed at the wrong receiver's port
+    for the whole of a tri_watch session. Same question, same reason to
+    answer it in one place.
+
+    Order matters. A Slave is checked first because selecting one is an
+    explicit act by somebody at the front panel, where diversity and
+    tri_watch are modes the receiver puts itself into.
+    """
+    try:
+        sel = slave_relay.selected()
+    except Exception:
+        sel = None
+    if sel is not None and current_mode in ("rf", "stream"):
+        rid = REMOTE_RECEIVER_ID_BASE + sel
+        # Only if it is genuinely what mpv is being fed. The relay keeps
+        # its selection when the display moves to a local tuner, so the
+        # selection alone does not mean a Slave is on screen.
+        if current_stream_url == f"udp://@:{REMOTE_VIDEO_OUT_PORT}":
+            return rid if receiver_state(rid) is not None else None
+
+    if current_mode != "rf":
+        return None
+    if tri_watch_enabled and tri_watch_target_rcv == 2:
+        return 2
+    # Diversity combines both receivers into one output. Reported as 1
+    # because that is the receiver whose tuning and callsign describe
+    # what is being watched; rcv 2 is contributing, not being displayed.
+    return 1
+
+
+def active_receiver():
+    """The state record for whatever is on screen, or None."""
+    rid = active_receiver_id()
+    return receiver_state(rid) if rid is not None else None
+
+
 def remote_online(i: int) -> bool:
     """Derived from last_seen rather than stored. A Slave that stops
     sending must stop appearing present, and a flag set True on receipt
