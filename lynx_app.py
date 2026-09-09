@@ -752,6 +752,15 @@ def current_rf_target_port():
     already proven correct and tested, and touching genuinely-working
     code for its own sake adds risk without benefit."""
     cfg = config['picotuner']
+    # Checked before the local cases: a Slave being displayed is
+    # not a mode the receiver puts itself into, it is an explicit
+    # choice, and while it holds neither tri_watch nor diversity
+    # describes what is on screen. Getting this wrong would send
+    # a freeze recovery to a local tuner's port while a Slave is
+    # playing — the same shape of bug this function exists to
+    # prevent.
+    if receiver_is_remote(active_receiver_id() or 0):
+        return REMOTE_VIDEO_OUT_PORT
     if tri_watch_enabled and tri_watch_target_rcv == 2:
         return cfg['ts_port_b']
     elif diversity_enabled:
@@ -6268,6 +6277,12 @@ def get_status():
             # whose packets reach mpv, so it cannot disagree with
             # what is actually on screen.
             "remote_selected": slave_relay.selected(),
+            # Which receiver is on screen: 1 or 2 for the local
+            # Picotuner, 11+ for a Slave, null for a stream. The
+            # single answer, derived in one place, for anything
+            # that needs to know — panels, overlay, and whatever
+            # comes next.
+            "active_receiver": active_receiver_id(),
             "stream_is_remote": (current_mode == "stream"
                                  and current_stream_url == f"udp://@:{REMOTE_VIDEO_OUT_PORT}"),
             "stream_info": get_live_stream_info() if current_mode == "stream" else None,
@@ -10281,6 +10296,17 @@ def select_remote_source(index: int):
         "name": remote_display_name(index),
         "remote_index": _remote_resume_index,
     })
+    # start_stream() sets the mode to "stream" because that is
+    # what it does. A Slave is a receiver, so the mode is
+    # corrected here, once the machinery that actually needed
+    # borrowing — the lock hand-off and the transition cover —
+    # has done its work.
+    #
+    # Safe after the call: _start_stream_impl sets the mode
+    # before handing off to its background thread, and nothing
+    # in that thread touches it again.
+    global current_mode
+    current_mode = "rf"
     return result
 
 

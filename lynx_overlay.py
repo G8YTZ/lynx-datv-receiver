@@ -761,9 +761,15 @@ def poll_status():
             # Matched on index rather than position in the list:
             # a disabled Slave still has a record, so the two are
             # not the same thing.
-            if lynx.get('stream_is_remote') and lynx.get('remote_selected') is not None:
+            # Keyed on which receiver is on screen rather than on
+            # the mode. A displayed Slave is now mode "rf" like any
+            # other receiver, so the old stream_is_remote test
+            # would never fire and the OSD would quietly show a
+            # Slave using Rx 1's callsign and MER.
+            _active = lynx.get('active_receiver')
+            if _active is not None and _active >= 11:
                 for _rem in data.get('remotes', []):
-                    if _rem.get('index') == lynx.get('remote_selected'):
+                    if _rem.get('index') == _active - 11:
                         _remote_display = _rem
                         break
             state["mpv_running_for_rf"] = lynx.get('mpv_running_for_rf', False)
