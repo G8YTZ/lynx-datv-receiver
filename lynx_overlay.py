@@ -854,6 +854,14 @@ def poll_status():
             state["codec"] = rem.get('codec', '')
             state["audio_codec"] = rem.get('audio_codec', '')
             state["programme"] = rem.get('programme', '')
+            # The receiver on screen is at the Slave's site, so the
+            # locator shown should be the Slave's. The local one is
+            # right only when both happen to be in the same place,
+            # which is a coincidence of the bench rather than a
+            # design. Blank when the Slave has not reported one:
+            # the line is then dropped, which beats confidently
+            # showing somewhere else.
+            state["portable_locator"] = rem.get('locator', '')
             if rem.get('symbol_rate'):
                 state["sr_ks"] = rem['symbol_rate']
             # Two local tuners' worth of state, describing hardware

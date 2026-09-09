@@ -6438,6 +6438,12 @@ def get_status():
                 # receiver is unlocked and no TS is flowing, and the
                 # two states need telling apart on the panel.
                 "video": _relay_video_for(i),
+                # Same call the local receivers get. Asking is also
+                # what warms the cache, so a station heard on a
+                # Slave gets its name on the first contact rather
+                # than the second — or never, which is what
+                # happened while nothing asked.
+                "callsign_name": qrz_first_name(st["callsign"]),
                 # Only the fields the Slave has actually sent. A
                 # Slave with no quality port simply has none of
                 # these, which reads differently from a Slave
