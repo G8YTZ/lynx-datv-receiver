@@ -2576,7 +2576,19 @@ def rf_mpv_lifecycle_monitor():
                 mpv_running_for_rf = False  # streaming/idle modes manage mpv themselves
                 continue
 
-            raw_locked = picotuner_state.get("locked", False) or \
+            # Whichever receiver is actually on screen. Reading the
+            # local tuner here would stop mpv when IT lost lock while
+            # a Slave was playing quite happily, and restart it onto
+            # the wrong source when it came back.
+            #
+            # This is also what gives a Slave a clean restart when a
+            # transmission ends. Without it nothing tells mpv the
+            # source went away: it holds reference frames from a
+            # stream that stopped and smears them over the new one
+            # until a keyframe arrives.
+            _lifecycle_active = active_receiver()
+            raw_locked = (_lifecycle_active.get("locked", False)
+                          if _lifecycle_active else False) or \
                          (diversity_enabled and picotuner_state_b.get("locked", False))
 
             if raw_locked:
@@ -2587,12 +2599,14 @@ def rf_mpv_lifecycle_monitor():
                         try:
                             print(f"[rf_mpv_lifecycle] Confirmed lock after "
                                   f"{lock_streak * POLL_SECS}s - starting mpv")
-                            if diversity_enabled:
-                                div_cfg = config['diversity']
-                                restart_mpv(f"udp://@:{div_cfg['combiner_out_port']}")
-                            else:
-                                cfg = config['picotuner']
-                                restart_mpv(f"udp://@:{picotuner_ts_port('a', cfg)}")
+                            # Same answer as before for diversity and
+                            # for receiver A, and the right one for a
+                            # Slave. Asking beats deciding again:
+                            # current_rf_target_port() exists because
+                            # call sites making this choice themselves
+                            # is how one of them ended up recovering
+                            # onto the wrong receiver's port.
+                            restart_mpv(f"udp://@:{current_rf_target_port()}")
                             rendering_confirmed = wait_for_mpv_rendering()  # real rendering, not a guess
                             if rendering_confirmed:
                                 # Same safety margin as the other two RF
