@@ -855,15 +855,6 @@ def restart_mpv(target_url: str, is_rf: bool = True):
         f"--cursor-autohide=always --force-window=yes --vo=gpu --hwdec=drm-copy --mute=yes "
         f"{audio_device_flag()}"
         f"--audio-pitch-correction=no --script={DRIFT_SCRIPT_PATH} "
-        # Video presents on its own clock and never waits for audio. A
-        # transmitter that declares an audio PID and sends nothing on it
-        # otherwise leaves mpv syncing to a clock that never ticks, and
-        # video crawls — confirmed live on both a local tuner and a
-        # Slave, and cured on both by dropping the audio track.
-        #
-        # The track stays selected rather than disabled, so audio that
-        # starts partway through a transmission is still picked up.
-        f"--video-sync=desync "
         f"{source_flags}"
         f"--keep-open=yes --idle=yes "
         f"--input-ipc-server={MPV_SOCKET} "
