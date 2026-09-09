@@ -55,6 +55,22 @@ SAMPLE_INTERVAL = 1.0
 # Cap on unknown senders tracked, so a spray can't grow the dict forever.
 MAX_UNKNOWN = 32
 
+# Transport stream packet size, and the sync byte every one starts
+# with. Not negotiable — this is the MPEG-2 TS format itself.
+TS_PACKET_SIZE = 188
+TS_SYNC_BYTE = 0x47
+
+# Seven packets per datagram: 7 x 188 = 1316, which fits inside a
+# normal 1500-byte MTU and is what a Picotuner sends. Matching it means
+# mpv sees the same shape of stream whatever the source.
+TS_PACKETS_PER_DATAGRAM = 7
+TS_DATAGRAM_SIZE = TS_PACKET_SIZE * TS_PACKETS_PER_DATAGRAM
+
+# If this much arrives without a sync byte ever being found, the buffer
+# is discarded rather than grown forever. A source that never syncs is
+# not a transport stream, and holding its bytes helps nobody.
+TS_MAX_RESYNC_BYTES = TS_PACKET_SIZE * 16
+
 # Max TS datagram we expect (7 x 188 = 1316, plus headroom).
 RECV_SIZE = 2048
 
@@ -106,6 +122,11 @@ class SlaveVideoRelay:
         self._selected_ip = None  # resolved ip for the selected slave_id
         self._stats = {}          # slave_id -> _SourceStats
         self._unknown = {}        # ip -> packet count, for diagnosis only
+        # Bytes received from the selected source that have not yet
+        # made up a whole group of TS packets. Only the selected one
+        # is buffered: alignment exists for mpv's benefit, and
+        # nothing else is being sent anywhere.
+        self._align_buf = bytearray()
 
         self.bind_error = None    # human-readable reason if the bind failed
 
@@ -197,6 +218,10 @@ class SlaveVideoRelay:
         with self._lock:
             self._selected = slave_id
             self._selected_ip = self._resolve_locked(slave_id)
+            # Dropped on every switch: leftover bytes belong to the
+            # previous source and splicing them onto the next one
+            # would hand mpv a packet made of two streams.
+            self._align_buf.clear()
         log.info("relay selection -> %s", slave_id or "(none)")
 
     def _resolve_locked(self, slave_id):
@@ -285,16 +310,74 @@ class SlaveVideoRelay:
                     self._unknown[ip] = self._unknown.get(ip, 0) + 1
 
             if forward:
-                try:
-                    out.sendto(data, self.mpv_addr)
-                except OSError as exc:
-                    log.debug("forward to mpv failed: %s", exc)
+                for datagram in self._align(data):
+                    try:
+                        out.sendto(datagram, self.mpv_addr)
+                    except OSError as exc:
+                        log.debug("forward to mpv failed: %s", exc)
 
             if now >= next_sample:
                 self._maybe_sample(next_sample)
                 next_sample = self._advance(next_sample)
 
         log.info("relay thread exiting")
+
+    def _align(self, data):
+        """Turn arbitrary-length chunks into whole, sync-aligned TS
+        datagrams.
+
+        Longmynd sends 510-byte pieces because that is what is left
+        after stripping the FTDI chip's framing, and 510 is not a
+        multiple of 188 — so every datagram it sends straddles TS packet
+        boundaries. A Picotuner sends 1316 bytes starting on a sync
+        byte. This makes the first look like the second.
+
+        Yields complete datagrams; incomplete tails stay buffered for
+        the next chunk rather than being sent short.
+        """
+        buf = self._align_buf
+        buf.extend(data)
+
+        # Find the first sync byte. Anything before it is a fragment of
+        # a packet whose beginning was never seen, so it cannot be
+        # reconstructed and is dropped rather than passed on.
+        if not buf or buf[0] != TS_SYNC_BYTE:
+            idx = buf.find(TS_SYNC_BYTE)
+            if idx < 0:
+                # Nothing usable. Keep a bounded tail in case a sync
+                # byte is the very next thing to arrive.
+                if len(buf) > TS_MAX_RESYNC_BYTES:
+                    del buf[:-TS_PACKET_SIZE]
+                return
+            del buf[:idx]
+
+        while len(buf) >= TS_DATAGRAM_SIZE:
+            # Every packet in the group is checked before any of it is
+            # sent. Checking only the first would let a byte lost
+            # upstream put six misaligned packets into mpv before
+            # anything noticed — measured, not hypothetical.
+            first_bad = None
+            for off in range(0, TS_DATAGRAM_SIZE, TS_PACKET_SIZE):
+                if buf[off] != TS_SYNC_BYTE:
+                    first_bad = off
+                    break
+
+            if first_bad is None:
+                yield bytes(buf[:TS_DATAGRAM_SIZE])
+                del buf[:TS_DATAGRAM_SIZE]
+                continue
+
+            # Sync was lost partway through. Emit the whole packets that
+            # came before it, then hunt for the next sync byte and carry
+            # on from there rather than sending anything doubtful.
+            if first_bad >= TS_PACKET_SIZE:
+                yield bytes(buf[:first_bad])
+            del buf[:first_bad + 1]
+            idx = buf.find(TS_SYNC_BYTE)
+            if idx < 0:
+                buf.clear()
+                return
+            del buf[:idx]
 
     def _advance(self, next_sample):
         now = time.time()
