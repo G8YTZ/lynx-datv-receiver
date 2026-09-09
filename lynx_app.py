@@ -864,6 +864,17 @@ def restart_mpv(target_url: str, is_rf: bool = True):
         # The track stays selected rather than disabled, so audio that
         # starts partway through a transmission is still picked up.
         f"--video-sync=desync "
+        # mpv aligns video to audio at the start of playback by
+        # default. A stream declaring an audio PID that never
+        # carries anything gives it nothing to align to, and video
+        # is held back waiting — twenty seconds of stale frames on
+        # a transmitter with its sound switched off, against an
+        # instant picture when the sound was on.
+        #
+        # Audio still plays when it is there. Only the alignment at
+        # start is skipped, which is the part that cannot work when
+        # one side of it is missing.
+        f"--no-initial-audio-sync "
         f"{source_flags}"
         f"--keep-open=yes --idle=yes "
         f"--input-ipc-server={MPV_SOCKET} "
