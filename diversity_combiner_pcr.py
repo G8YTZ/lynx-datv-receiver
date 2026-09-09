@@ -755,6 +755,19 @@ def combine(port_a: int, port_b: int, out_ip: str, out_port: int, stats: Stats, 
     stall_last_logged = 0
     last_backlog_log = 0
 
+    # Packets left over when a pass does not produce a whole
+    # multiple of seven. Carried to the next pass rather than sent
+    # short, so every datagram leaving here is the same size a
+    # Picotuner sends. Lives outside the loop because out_buf is
+    # rebuilt on every iteration.
+    out_tail = bytearray()
+    tail_since = 0.0
+    TAIL_MAX_HOLD_SECS = 0.25   # never hold a partial datagram longer
+                                # than this: at the end of a
+                                # transmission nothing arrives to
+                                # complete it, and those packets
+                                # would otherwise sit here for good.
+
     while not stop_event.is_set():
         time.sleep(0.005)
         out_buf = bytearray()
@@ -783,10 +796,29 @@ def combine(port_a: int, port_b: int, out_ip: str, out_port: int, stats: Stats, 
                       f"completed[A]={len(decider.completed['A'])} completed[B]={len(decider.completed['B'])}")
                 last_backlog_log = now
 
-        if out_buf:
+        if out_buf or out_tail:
             CHUNK = TS_PACKET_SIZE * 7
-            for i in range(0, len(out_buf), CHUNK):
-                out_sock.sendto(bytes(out_buf[i:i + CHUNK]), (out_ip, out_port))
+            if out_buf:
+                if not out_tail:
+                    tail_since = now
+                out_tail += out_buf
+
+            sent = 0
+            while len(out_tail) - sent >= CHUNK:
+                out_sock.sendto(bytes(out_tail[sent:sent + CHUNK]),
+                                (out_ip, out_port))
+                sent += CHUNK
+            if sent:
+                del out_tail[:sent]
+                tail_since = now
+
+            # Whatever is left is a partial datagram. Held for the
+            # next pass to complete — unless nothing has, in which
+            # case the transmission has probably ended and it goes
+            # as it is rather than being lost.
+            if out_tail and (now - tail_since) >= TAIL_MAX_HOLD_SECS:
+                out_sock.sendto(bytes(out_tail), (out_ip, out_port))
+                out_tail.clear()
 
     sock_a.close()
     sock_b.close()
