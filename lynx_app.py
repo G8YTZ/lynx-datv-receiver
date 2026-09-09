@@ -1688,7 +1688,20 @@ def mpv_decoder_health_monitor():
                               # the freeze length rather than mpv's own recovery time. Halved to
                               # reduce worst-case detection latency, now paired with the raised
                               # 10-error threshold above rather than the original 3.
-    DELAY_THRESHOLD_SECS = 3.0   # gap between playback and buffered position...
+    DELAY_THRESHOLD_SECS = 6.0   # gap between playback and buffered position...
+                                 # Was 3.0, which a healthy stream could reach on its own:
+                                 # a Slave in good health measures 2.6-2.7s of cache with
+                                 # no underrun and the clock advancing normally, so routine
+                                 # variation crossed the line and restarted mpv for no
+                                 # reason. Observed as fifteen restarts in a few minutes,
+                                 # each rendering successfully before being restarted again,
+                                 # until the circuit breaker below backed off and let a
+                                 # picture settle. The restart is also counterproductive: it
+                                 # discards the buffer and forces a fresh acquisition, which
+                                 # on a five-second GOP costs more delay than it recovers.
+                                 # 6.0 is about double a healthy working delay and still far
+                                 # below the 20s emergency threshold that catches a gap
+                                 # genuinely running away...
     DELAY_CONSECUTIVE_CHECKS = 2  # ...persisting for this many consecutive checks triggers a restart.
                                     # Was 3 - reduced given this trigger was already confirmed (via
                                     # direct diagnostic testing) to catch a genuine, non-self-recovering
