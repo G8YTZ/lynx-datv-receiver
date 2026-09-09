@@ -3586,6 +3586,18 @@ def _relay_video_for(i: int) -> dict:
 REMOTE_RECEIVER_ID_BASE = 11
 MAX_REMOTE_RECEIVERS = 5
 
+# Which receiver is on screen, when it is one that had to be
+# chosen rather than one the receiver arrived at by itself.
+# None means a local tuner, and which local tuner is then a
+# question tri_watch and diversity already answer.
+#
+# Real state, deliberately. This was originally inferred from
+# current_stream_url still holding the relay's port, which is
+# true when a Slave is displayed and stays true afterwards,
+# because nothing clears it when tuning back to RF. The result
+# was a local tuner on the panel and a Slave on the screen.
+displayed_receiver_id = None
+
 
 def receiver_state(rid: int):
     """The state record for one receiver, or None if there is no such
@@ -3640,17 +3652,16 @@ def active_receiver_id():
     explicit act by somebody at the front panel, where diversity and
     tri_watch are modes the receiver puts itself into.
     """
-    try:
-        sel = slave_relay.selected()
-    except Exception:
-        sel = None
-    if sel is not None and current_mode in ("rf", "stream"):
-        rid = REMOTE_RECEIVER_ID_BASE + sel
-        # Only if it is genuinely what mpv is being fed. The relay keeps
-        # its selection when the display moves to a local tuner, so the
-        # selection alone does not mean a Slave is on screen.
-        if current_stream_url == f"udp://@:{REMOTE_VIDEO_OUT_PORT}":
-            return rid if receiver_state(rid) is not None else None
+    # Set when a Slave is chosen, cleared when anything tunes to
+    # RF. The relay keeps its own selection across a switch to a
+    # local tuner, so what the relay is forwarding and what is on
+    # screen are different questions.
+    if displayed_receiver_id is not None:
+        if receiver_state(displayed_receiver_id) is not None:
+            return displayed_receiver_id
+        # Configured away underneath us — a Slave that no longer
+        # exists is not on screen, whatever was chosen earlier.
+        return None
 
     if current_mode != "rf":
         return None
@@ -4951,6 +4962,7 @@ def _kick_off_qrz_notification_lookup(idx, live_callsign, qrz_cfg, src_cfg):
 
 
 def _tri_watch_display_source(idx, src_cfg):
+    global displayed_receiver_id
     """The arbitrator's display_callback - actually switches to show
     the given source. Reuses the exact same, proven tune()/
     start_stream() paths a manual memory/preset selection would use,
@@ -5042,6 +5054,9 @@ def _tri_watch_display_source(idx, src_cfg):
         if commanded_tune_matches(rcv, src_cfg['freq'], src_cfg['sr'],
                                   _lo, _fplug):
             current_mode = "rf"
+            # A local tuner is being displayed now, whatever was
+            # chosen before.
+            displayed_receiver_id = None
             set_converter_state(rcv, src_cfg['freq'], _lo,
                                 'tri_watch display, already tuned')
             print(f"[tri_watch] now displaying source {idx}: RF Rx{rcv} "
@@ -9622,6 +9637,7 @@ def tune(req: TuneRequest):
     # the actual tune is fully complete, not just accepted.
 
 def _tune_impl(req: TuneRequest):
+    global displayed_receiver_id
     global current_mode, current_preset, diversity_enabled, _tune_lock_handed_off
     cfg = config['picotuner']
     is_diversity = req.plug.lower() == "diversity"
@@ -9790,6 +9806,7 @@ def _tune_impl(req: TuneRequest):
         diversity_enabled = False
     
     current_mode = "rf"
+    displayed_receiver_id = None
     if req.lnb_lo_khz:
         current_preset = f"{req.freq/1000:.3f} MHz (LNB LO {req.lnb_lo_khz/1000:.3f} MHz) / {req.sr} kS/s"
     else:
@@ -10305,8 +10322,9 @@ def select_remote_source(index: int):
     # Safe after the call: _start_stream_impl sets the mode
     # before handing off to its background thread, and nothing
     # in that thread touches it again.
-    global current_mode
+    global current_mode, displayed_receiver_id
     current_mode = "rf"
+    displayed_receiver_id = REMOTE_RECEIVER_ID_BASE + index
     return result
 
 
@@ -12965,8 +12983,9 @@ if __name__ == "__main__":
                 # risk resuming with mpv still pointed at the raw
                 # single-tuner port instead of the combiner's output.
                 print(f"Already locked on {state['freq']} kHz / {state['sr']} kS/s — skipping resume tune.")
-                global current_mode, current_preset
+                global current_mode, current_preset, displayed_receiver_id
                 current_mode = "rf"
+                displayed_receiver_id = None
                 current_preset = f"{state['freq']/1000:.3f} MHz / {state['sr']} kS/s"
                 # Via set_converter_state() rather than assigning
                 # current_lnb_lo_khz directly, because the LO alone is
