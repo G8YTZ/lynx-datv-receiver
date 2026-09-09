@@ -10019,7 +10019,18 @@ def _start_stream_impl(req: StreamRequest):
     def _kick_mpv():
         try:
             time.sleep(1)
-            restart_mpv(req.url, is_rf=False)
+            # A Slave sends genuine MPEG-TS over UDP, exactly what the
+            # RF flags exist for, and only reaches this path because it
+            # borrows start_stream()'s lock and cover handling. Without
+            # the mpegts hint mpv probes instead of being told, and on a
+            # sparse feed it infers a bogus finite duration and parks
+            # itself paused at position zero.
+            #
+            # Derived from the URL rather than passed in: the relay's
+            # output port is the only source a Slave is ever played
+            # from, so there is nothing to set and nothing to clear.
+            _is_slave = req.url == f"udp://@:{REMOTE_VIDEO_OUT_PORT}"
+            restart_mpv(req.url, is_rf=_is_slave)
             # Confirms real rendering rather than guessing with a fixed
             # delay - a weak/low-bandwidth stream source can genuinely
             # take longer to start producing a real picture than RF
