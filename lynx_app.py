@@ -1261,87 +1261,6 @@ def mpv_query(cmd: dict):
     except Exception:
         return None
 
-def mpv_dead_audio_monitor():
-    """Deselect an audio track that is declared but never carries data.
-
-    mpv will not settle into normal playback while waiting on a
-    selected track that never identifies, and an encoder with its sound
-    switched off produces exactly that: an AAC PID in the PMT with
-    nothing on it. Measured at roughly twenty seconds of stale, smeared
-    video before it recovered, against an immediate picture when the
-    transmitter had audio.
-
-    Evaluated once per mpv launch. Once the track is deselected mpv
-    stops reporting on it, so noticing audio appearing later would mean
-    re-enabling it to look — which flaps. mpv is relaunched on every
-    source switch and whenever lock is regained, so a transmission that
-    has audio from the start gets audio.
-    """
-    POLL_SECS = 2.0
-    START_GRACE_SECS = 3.0   # let mpv open the stream before judging it
-    CONFIRM_CHECKS = 3       # ...and see it fail to identify audio this often
-
-    evaluated_for = 0.0      # which mpv launch this has already decided about
-    last_seen_start = 0.0    # ...and which one the current tally belongs to
-    silent_checks = 0
-
-    while True:
-        try:
-            time.sleep(POLL_SECS)
-
-            started = mpv_last_started_at
-            if started != last_seen_start:
-                # A new mpv. Anything learned about the last one is void.
-                # Compared against its own variable rather than against
-                # evaluated_for: that one stays behind until a decision is
-                # made, so testing it here reset the tally on every pass
-                # and the count never reached the threshold.
-                last_seen_start = started
-                silent_checks = 0
-
-            if started <= 0 or started == evaluated_for:
-                continue
-            if time.time() - started < START_GRACE_SECS:
-                continue
-
-            tracks = mpv_query({"command": ["get_property", "track-list"]})
-            if not tracks or tracks.get("error") != "success":
-                continue
-            audio_selected = any(t.get("type") == "audio" and t.get("selected")
-                                 for t in (tracks.get("data") or []))
-            if not audio_selected:
-                # Nothing to do, and nothing to keep watching for on this
-                # launch — a track that was never selected will not
-                # select itself.
-                evaluated_for = started
-                continue
-
-            # "Unavailable" is mpv's way of saying it has no idea, which
-            # is exactly the state a track with no packets produces. A
-            # genuinely silent programme still reports a bitrate.
-            br = mpv_query({"command": ["get_property", "audio-bitrate"]})
-            has_audio_data = bool(br and br.get("error") == "success"
-                                  and br.get("data"))
-
-            if has_audio_data:
-                evaluated_for = started
-                silent_checks = 0
-                continue
-
-            silent_checks += 1
-            if silent_checks >= CONFIRM_CHECKS:
-                print("[mpv_audio] audio track declared but carrying no data "
-                      "after %.0fs - deselecting it so video can run"
-                      % (time.time() - started))
-                mpv_cmd({"command": ["set_property", "aid", "no"]})
-                evaluated_for = started
-                silent_checks = 0
-
-        except Exception as e:
-            print(f"[mpv_audio] {type(e).__name__}: {e}")
-            time.sleep(2)
-
-
 def _kill_process_reliably(proc, pkill_pattern=None):
     """Reliably terminate a subprocess started with shell=True.
     proc.terminate() alone sends SIGTERM to the shell wrapper, not
@@ -12785,7 +12704,6 @@ if __name__ == "__main__":
     diversity_stuck.start()
     mer_pub = threading.Thread(target=mer_publisher, daemon=True)
     mer_pub.start()
-    threading.Thread(target=mpv_dead_audio_monitor, daemon=True).start()
     decoder_health = threading.Thread(target=mpv_decoder_health_monitor, daemon=True)
     decoder_health.start()
     connectivity = threading.Thread(target=picotuner_connectivity_monitor, daemon=True)
