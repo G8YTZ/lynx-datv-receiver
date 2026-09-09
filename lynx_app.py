@@ -814,6 +814,21 @@ def restart_mpv(target_url: str, is_rf: bool = True):
             "--demuxer=lavf --demuxer-lavf-format=mpegts "
             "--demuxer-max-bytes=512KiB --demuxer-max-back-bytes=128KiB "
             "--profile=low-latency --cache-pause=no "
+            # low-latency sets analyzeduration to zero, which means mpv
+            # decides what the stream contains from whatever bytes turn
+            # up first. Joining a live stream lands mid-GOP, so it
+            # starts decoding slices before it has the PPS describing
+            # them — "non-existing PPS 0 referenced", then no picture
+            # until the next keyframe. It also leaves a sparse audio
+            # track unidentified: "0 channels: unspecified sample
+            # format".
+            #
+            # A second is enough to find a keyframe at any sane GOP
+            # length and to identify both tracks properly. It is spent
+            # once per source switch, behind a transition cover that
+            # already waits far longer than that for rendering, and
+            # adds nothing to running latency.
+            "--demuxer-lavf-analyzeduration=1 "
         )
     else:
         # No format-forcing (let mpv auto-detect the real container —
