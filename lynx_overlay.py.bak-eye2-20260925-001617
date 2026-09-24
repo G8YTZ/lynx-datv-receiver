@@ -1902,8 +1902,7 @@ class LynxOverlay(Gtk.Window):
         cr.stroke()
 
     def draw_bottom_right(self, cr, width, height):
-        if (not state["online"] and state["mode"] != "stream"
-                and state["mode"] != "dvbt"):
+        if not state["online"] and state["mode"] != "stream":
             return
 
         eye_cx = width - 95
@@ -1934,23 +1933,7 @@ class LynxOverlay(Gtk.Window):
             text = f"{dbm:.0f} dBm" if (dbm_valid or level_str) else "--"
             return frac, text
 
-        if state["mode"] == "dvbt":
-            # The device reports level as 0-100, not dBm. Shown as the
-            # percentage it is rather than converted into a dBm figure
-            # it never measured - the same choice stream mode makes
-            # with its bitrate. Both halves show the same reading:
-            # there is one tuner, so there is one answer.
-            lvl = state.get("hdhr_level")
-            if lvl in ("", None):
-                text = "--"
-                frac = 0.0
-            else:
-                text = f"{float(lvl):.0f}%"
-                frac = min(1.0, float(lvl) / 100.0) ** 0.5
-            fraction_a = fraction_b = frac
-            value_text_a = value_text_b = text
-            locked_a = locked_b = state.get("hdhr_locked", False)
-        elif state["mode"] == "stream":
+        if state["mode"] == "stream":
             # No independent tuners in stream mode - both halves show
             # the same bitrate-derived value, per "otherwise both
             # segments show the single tuner that's being displayed".
