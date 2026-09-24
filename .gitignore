@@ -35,3 +35,5 @@ __pycache__/
 *.bak
 *.bak_*
 __pycache__/
+*.bak-*
+*.bak*
