@@ -3636,33 +3636,6 @@ def hdhr_default_device_id():
     return None
 
 
-def hdhr_local_address(device_address: str) -> str:
-    """Which of OUR addresses the device should stream to.
-
-    Asked of the kernel rather than configured, and asked again on
-    every tune rather than remembered. A UDP connect() sends nothing -
-    it only consults the routing table - so this costs nothing and is
-    correct on a multi-homed receiver, after a DHCP change, and after
-    a move between Ethernet and Wi-Fi.
-
-    This exists because the first version passed "127.0.0.1", which
-    the device accepted and reported back perfectly while sending the
-    stream to its OWN loopback. Nothing arrived, and nothing said why:
-    status showed locked and streaming, pps was non-zero, and tcpdump
-    on every interface here saw nothing at all. A wrong address that
-    the far end cheerfully confirms is worth guarding against properly.
-    """
-    family = socket.AF_INET6 if ":" in device_address else socket.AF_INET
-    s = socket.socket(family, socket.SOCK_DGRAM)
-    try:
-        # Port 1 is arbitrary: no packet is sent, and the device is
-        # never contacted. Only the routing decision is wanted.
-        s.connect((device_address, 1))
-        return s.getsockname()[0]
-    finally:
-        s.close()
-
-
 def hdhr_source(device_id=None):
     """A source object for the named device, or the default one."""
     device_id = device_id or hdhr_default_device_id()
@@ -3677,7 +3650,7 @@ def hdhr_source(device_id=None):
             detail=f"HDHomeRun {device_id} not found on the network")
     return lynx_hdhomerun.HDHomeRunSource(
         device_id=device_id,
-        lynx_host=hdhr_local_address(st.get("address") or device_id),
+        lynx_host="127.0.0.1",     # device streams here; mpv reads locally
         tuner=st.get("tuner", 0),
         udp_port=HDHR_VIDEO_PORT,
     )
@@ -6573,22 +6546,6 @@ def get_status():
     status = {
         "lynx": {
             "mode": current_mode,
-            # The overlay polls this endpoint and only this
-            # endpoint, so a source it has to draw has to be here.
-            # None when no device was found at startup, which the
-            # overlay treats as "not this receiver's problem" rather
-            # than as a fault.
-            "hdhomerun": (lambda d: {
-                "online": d["online"],
-                "locked": d["locked"],
-                "lock_mode": d["lock_mode"],
-                "level": d["signal_strength"],
-                "snq": d["signal_quality"],
-                "seq": d["symbol_quality"],
-                "bitrate_bps": d["bitrate_bps"],
-                "frequency_hz": d["frequency_hz"],
-            } if d else None)(next(iter(hdhr_devices()), None)),
-
             "preset": current_preset,
             "stream_name": current_stream_name,
             # True when what is playing is a Slave rather than a real
@@ -10271,24 +10228,8 @@ def _tune_dvbt_impl(req: DvbtTuneRequest):
         global mpv_running_for_rf
         try:
             time.sleep(1)
-            # is_rf=False despite this being a raw MPEG-TS over UDP.
-            # is_rf=True forces --demuxer-lavf-format=mpegts, which
-            # skips lavf's own probe - and that probe is what finds
-            # the AAC LATM audio in a broadcast multiplex. With the
-            # flag on, mpv listed video and subtitles only and played
-            # in silence; with it off, the audio track appears. The
-            # Picotuner's own TS carries simpler audio and does not
-            # need the probe, which is why the flag was right there
-            # and wrong here.
-            restart_mpv(f"udp://@:{HDHR_VIDEO_PORT}", is_rf=False)
+            restart_mpv(f"udp://@:{HDHR_VIDEO_PORT}", is_rf=True)
             mpv_running_for_rf = True
-            # Lower it here rather than leaving it to the cap. The RF
-            # path lowers it from rf_mpv_lifecycle_monitor() once a
-            # Picotuner lock is confirmed - a confirmation that never
-            # arrives on a receiver with no Picotuner, so the cover
-            # would sit over live video, with its sound, until the
-            # timeout expired.
-            end_transition_cover()
         finally:
             tune_lock.release()
 

@@ -10271,16 +10271,7 @@ def _tune_dvbt_impl(req: DvbtTuneRequest):
         global mpv_running_for_rf
         try:
             time.sleep(1)
-            # is_rf=False despite this being a raw MPEG-TS over UDP.
-            # is_rf=True forces --demuxer-lavf-format=mpegts, which
-            # skips lavf's own probe - and that probe is what finds
-            # the AAC LATM audio in a broadcast multiplex. With the
-            # flag on, mpv listed video and subtitles only and played
-            # in silence; with it off, the audio track appears. The
-            # Picotuner's own TS carries simpler audio and does not
-            # need the probe, which is why the flag was right there
-            # and wrong here.
-            restart_mpv(f"udp://@:{HDHR_VIDEO_PORT}", is_rf=False)
+            restart_mpv(f"udp://@:{HDHR_VIDEO_PORT}", is_rf=True)
             mpv_running_for_rf = True
             # Lower it here rather than leaving it to the cap. The RF
             # path lowers it from rf_mpv_lifecycle_monitor() once a

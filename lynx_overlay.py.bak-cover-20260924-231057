@@ -1038,15 +1038,7 @@ class LynxOverlay(Gtk.Window):
         except OSError:
             transition_age = 0.0
             mpv_transitioning = False
-        # dvbt has its own lock, reported by the device itself, so it
-        # can answer this properly rather than taking the blanket
-        # exemption "stream" needs. state["locked"] describes the
-        # PICOTUNER, which on a receiver without one is correctly
-        # false - and left unqualified it covered live DVB-T2 video
-        # with the logo screen while mpv decoded away underneath.
-        genuinely_locked = ((state["locked"] and state["mpv_running_for_rf"])
-                            or state["mode"] == "stream"
-                            or (state["mode"] == "dvbt" and state["hdhr_locked"]))
+        genuinely_locked = (state["locked"] and state["mpv_running_for_rf"]) or state["mode"] == "stream"
         showing_picture = genuinely_locked and not mpv_transitioning
 
         # Auto-Squeak is drawn BEFORE the showing_picture branch and
@@ -1599,11 +1591,6 @@ class LynxOverlay(Gtk.Window):
             return
 
         if state["mode"] == "dvbt":
-            # Same reason as the Slave block above: mpv IS running and
-            # playing this source, which is what the flag means. Left
-            # False, the transition cover stays up over live video and
-            # takes the sound with it.
-            state["mpv_running_for_rf"] = True
             # Its own branch, returning before the Picotuner check
             # below. Without this it fell through to the DVB-S2 path,
             # which reads state["online"] - the PICOTUNER's status, not

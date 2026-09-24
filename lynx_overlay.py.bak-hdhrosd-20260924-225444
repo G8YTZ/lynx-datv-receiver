@@ -314,18 +314,6 @@ state = {
     "codec": "",
     "audio_codec": "",
     "programme": "",
-    # HDHomeRun (DVB-T/T2/C). Deliberately their own keys rather than
-    # reusing mer/margin: those are DVB-S2 measurements, and a 0-100
-    # quality percentage drawn under "MER" would invite exactly the
-    # comparison it is not valid to make.
-    "hdhr_online": False,
-    "hdhr_locked": False,
-    "hdhr_lock_mode": "",
-    "hdhr_level": "",
-    "hdhr_snq": "",
-    "hdhr_seq": "",
-    "hdhr_bitrate_bps": 0,
-    "hdhr_frequency_hz": None,
     "mode": "idle",
     "freq_khz": 437000,
     "sr_ks": 333,
@@ -607,25 +595,6 @@ def poll_status():
             with urllib.request.urlopen(LYNX_API, timeout=2) as r:
                 data = json.loads(r.read().decode())
             pt = data.get('picotuner', {})
-
-            # Absent on an older lynx_app.py, and absent on a receiver
-            # with no device found - both are "nothing to draw", not an
-            # error, so .get() with a default rather than a branch.
-            # Nested under 'lynx' alongside mode and preset,
-            # which is where the status dict actually builds it.
-            # Top level checked too, so a future move does not
-            # silently empty the panel.
-            hh = ((data.get('lynx') or {}).get('hdhomerun')
-                  or data.get('hdhomerun') or {})
-            state["hdhr_online"] = bool(hh.get('online', False))
-            state["hdhr_locked"] = bool(hh.get('locked', False))
-            state["hdhr_lock_mode"] = hh.get('lock_mode', "") or ""
-            state["hdhr_level"] = hh.get('level', "")
-            state["hdhr_snq"] = hh.get('snq', "")
-            state["hdhr_seq"] = hh.get('seq', "")
-            state["hdhr_bitrate_bps"] = hh.get('bitrate_bps', 0) or 0
-            state["hdhr_frequency_hz"] = hh.get('frequency_hz')
-
             div = data.get('diversity', {})
             diversity_enabled = div.get('enabled', False)
             tuner_b = div.get('tuner_b', {})
@@ -1038,15 +1007,7 @@ class LynxOverlay(Gtk.Window):
         except OSError:
             transition_age = 0.0
             mpv_transitioning = False
-        # dvbt has its own lock, reported by the device itself, so it
-        # can answer this properly rather than taking the blanket
-        # exemption "stream" needs. state["locked"] describes the
-        # PICOTUNER, which on a receiver without one is correctly
-        # false - and left unqualified it covered live DVB-T2 video
-        # with the logo screen while mpv decoded away underneath.
-        genuinely_locked = ((state["locked"] and state["mpv_running_for_rf"])
-                            or state["mode"] == "stream"
-                            or (state["mode"] == "dvbt" and state["hdhr_locked"]))
+        genuinely_locked = (state["locked"] and state["mpv_running_for_rf"]) or state["mode"] == "stream"
         showing_picture = genuinely_locked and not mpv_transitioning
 
         # Auto-Squeak is drawn BEFORE the showing_picture branch and
@@ -1596,61 +1557,6 @@ class LynxOverlay(Gtk.Window):
             for i, line in enumerate(lines):
                 y = margin + size + (i * line_h)
                 self.draw_text(cr, margin, y, line, size=size)
-            return
-
-        if state["mode"] == "dvbt":
-            # Same reason as the Slave block above: mpv IS running and
-            # playing this source, which is what the flag means. Left
-            # False, the transition cover stays up over live video and
-            # takes the sound with it.
-            state["mpv_running_for_rf"] = True
-            # Its own branch, returning before the Picotuner check
-            # below. Without this it fell through to the DVB-S2 path,
-            # which reads state["online"] - the PICOTUNER's status, not
-            # this tuner's - and drew "Picotuner offline" across a
-            # picture that was decoding perfectly underneath.
-            DVBT_NOT_LOCKED = (0.9, 0.5, 0.1)
-            DVBT_LOCKED = (0.0, 1.0, 0.25)
-            margin = LEFT_MARGIN
-            size = 30
-            line_h = size * 1.3
-            colour = DVBT_LOCKED if state["hdhr_locked"] else DVBT_NOT_LOCKED
-
-            lines = []
-            freq_hz = state.get("hdhr_frequency_hz")
-            mode_name = state.get("hdhr_lock_mode") or ""
-            if freq_hz:
-                # MHz on screen, Hz in the API: the device works in Hz
-                # and nobody reads a nine-digit frequency.
-                lines.append(f"{freq_hz / 1e6:.3f} MHz")
-            if mode_name:
-                # t8dvbt2 -> DVB-T2 8 MHz, which is what an operator
-                # would say out loud.
-                try:
-                    bw = mode_name[1]
-                    std = "DVB-T2" if mode_name.endswith("dvbt2") else "DVB-T"
-                    lines.append(f"{std} {bw} MHz")
-                except Exception:
-                    lines.append(mode_name)
-            elif not state["hdhr_locked"]:
-                lines.append("SEARCHING")
-
-            if state["hdhr_locked"]:
-                # SNQ and SEQ by name. They are the device's own terms
-                # and they are not MER and margin.
-                lines.append(f"SNQ {state['hdhr_snq']}%  "
-                             f"SEQ {state['hdhr_seq']}%")
-                lines.append(f"LEVEL {state['hdhr_level']}%")
-                bps = state.get("hdhr_bitrate_bps") or 0
-                if bps:
-                    lines.append(f"{bps / 1e6:.2f} Mb/s")
-
-            if not lines:
-                lines = ["--"]
-            for i, line in enumerate(lines):
-                y = margin + size + (i * line_h)
-                self.draw_text(cr, margin, y, line, size=size,
-                               colour=colour)
             return
 
         NOT_LOCKED_COLOUR = (0.9, 0.5, 0.1)
