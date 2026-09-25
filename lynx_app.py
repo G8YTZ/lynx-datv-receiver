@@ -13655,6 +13655,58 @@ if __name__ == "__main__":
                 except Exception as e:
                     print(f"Could not resume previous stream: {e}")
 
+        if state and state.get("mode") == "dvbt":
+            # Discovery has normally finished by now - it runs at
+            # startup and this is seven seconds later - but a device
+            # slow to answer, or a switch still bringing its port up,
+            # would leave nothing found. Bounded wait rather than an
+            # immediate failure, same principle as REMOTE_RESUME_WAIT_SECS.
+            _waited = 0
+            while not hdhr_devices() and _waited < 20:
+                time.sleep(2)
+                _waited += 2
+                hdhr_discover_once()
+
+            _dev = state.get("device_id") or hdhr_default_device_id()
+            if not _dev:
+                print("Could not resume DVB-T2: no HDHomeRun found")
+            else:
+                try:
+                    # Already tuned? An HDHomeRun keeps its channel and
+                    # its stream target across a Lynx restart - it is a
+                    # separate box on the network and has no idea we
+                    # went away. Confirmed live: after a reboot it was
+                    # still locked and still streaming. So retuning is
+                    # usually unnecessary; mpv is the part that needs
+                    # restarting, and the tune route does both.
+                    _st = None
+                    for _d in hdhr_devices():
+                        if _d["device_id"] == _dev:
+                            _st = _d
+                            break
+                    _same = bool(_st and _st.get("locked")
+                                 and _st.get("frequency_hz") == state["freq"])
+
+                    print(f"Resuming previous DVB-T2: "
+                          f"{state['freq']/1e6:.3f} MHz / "
+                          f"{state.get('modulation')}"
+                          f"{' (already locked)' if _same else ''}")
+
+                    tune_dvbt(DvbtTuneRequest(
+                        freq=state["freq"],
+                        modulation=state.get("modulation", "t8dvbt2"),
+                        program=state.get("program"),
+                        device_id=state.get("device_id"),
+                    ))
+                    return
+                except Exception as e:
+                    # Left idle rather than falling through to the
+                    # default boot preset: that is a Picotuner preset,
+                    # and tuning a tuner this receiver may not even
+                    # have is not a useful recovery.
+                    print(f"Could not resume DVB-T2: {type(e).__name__}: {e}")
+                    return
+
         # No valid previous state — fall back to the explicit default
         # boot preset, if one has been configured.
         default_preset = config.get('default_boot_preset')
