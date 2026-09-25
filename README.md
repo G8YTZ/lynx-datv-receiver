@@ -2,7 +2,7 @@
 
 A Raspberry Pi 5 based DATV receiver for the Picotuner (WinterHill firmware), with a transparent on-screen display, a full web control portal, and optional diversity reception (the two picotuner receivers combined for improved resilience against fades).
 
-**Status: Alpha.** Actively developed and in trial use. Expect rough edges — feedback and bug reports welcome.
+**Status: Stable.** In use at active sites. Feedback and bug reports welcome.
 
 ## Features
 
