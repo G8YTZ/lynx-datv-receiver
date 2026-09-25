@@ -6707,7 +6707,13 @@ def get_status():
             "active_receiver": active_receiver_id(),
             "stream_is_remote": (current_mode == "stream"
                                  and current_stream_url == f"udp://@:{REMOTE_VIDEO_OUT_PORT}"),
-            "stream_info": get_live_stream_info() if current_mode == "stream" else None,
+            # Called for dvbt too: it reads the codecs from mpv, which
+            # is the only thing that knows them - the HDHomeRun reports
+            # bitrate and quality but nothing about what is inside the
+            # multiplex. One function, both sources, rather than a
+            # second copy that drifts.
+            "stream_info": (get_live_stream_info()
+                            if current_mode in ("stream", "dvbt") else None),
             "stream_protocol": get_stream_protocol(current_stream_url) if current_mode == "stream" and current_stream_url else None,
             "mpv_transitioning": mpv_transitioning,
             "mpv_running_for_rf": mpv_running_for_rf,

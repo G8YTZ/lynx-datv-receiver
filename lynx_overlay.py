@@ -634,9 +634,13 @@ def poll_status():
             # by design - lynx_app.py gates it on the band.
             hdhr_call = hh.get('callsign', "") or ""
             state["hdhr_callsign"] = hdhr_call
-            if state.get("mode") == "dvbt" and hdhr_call:
-                state["callsign"] = hdhr_call
-                state["callsign_name"] = hh.get('callsign_name', "") or ""
+            # Its own key, set unconditionally. The earlier version
+            # gated this on state["mode"] == "dvbt", but mode is not
+            # assigned until later in this same function, so it was
+            # reading the previous poll's value and usually skipping.
+            # The draw code only looks at it inside the dvbt branch
+            # anyway, so there is nothing to guard against here.
+            state["hdhr_callsign_name"] = hh.get('callsign_name', "") or ""
 
             div = data.get('diversity', {})
             diversity_enabled = div.get('enabled', False)
@@ -1534,7 +1538,7 @@ class LynxOverlay(Gtk.Window):
             # refuses to call "BBC ONE Lon HD" a callsign.
             call = (state.get("hdhr_callsign") or "").strip()
             if call:
-                qrz_name = (state.get("callsign_name") or "").strip()
+                qrz_name = (state.get("hdhr_callsign_name") or "").strip()
                 lines.append(f"{qrz_name} - {call}" if qrz_name else call)
             else:
                 svc = (state.get("hdhr_service_name") or "").strip()
@@ -1676,15 +1680,29 @@ class LynxOverlay(Gtk.Window):
                 except Exception:
                     std = mode_name
 
+            # Line 1 is the RF: where it is, how wide, which standard.
+            # Line 2 is the payload: how much of it, in what codec.
+            # A cleaner division than putting the standard with the
+            # bitrate, and it leaves the two lines about the same
+            # length rather than one short and one long.
             line1 = f"{freq_hz / 1e6:.3f} MHz" if freq_hz else "--"
             if bw:
-                line1 += f"   {bw}"
+                line1 += f"  {bw}"
+            if std and state["hdhr_locked"]:
+                line1 += f"  {std}"
 
             if state["hdhr_locked"]:
-                line2 = std or "--"
                 bps = state.get("hdhr_bitrate_bps") or 0
-                if bps:
-                    line2 += f"   {bps / 1e6:.2f} Mb/s"
+                line2 = f"{bps / 1e6:.2f} Mb/s" if bps else "--"
+                # Codecs from the same fields the stream branch uses,
+                # filled by poll_status() from stream_info - which the
+                # API now provides for dvbt as well. The tuner knows
+                # nothing about what is inside the multiplex; mpv does.
+                codecs = [c.upper() for c in
+                          (state.get("stream_video_codec") or "",
+                           state.get("stream_audio_codec") or "") if c]
+                if codecs:
+                    line2 += f"   {'/'.join(codecs)}"
             else:
                 line2 = "SEARCHING"
 
