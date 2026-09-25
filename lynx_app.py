@@ -3614,6 +3614,42 @@ def hdhr_discover_once() -> int:
                 st["address"] = address        # prefer IPv4
         count = len(hdhr_states)
 
+    # A configured address, asked directly. Discovery is a broadcast
+    # and stops at the first router, so a device on another subnet can
+    # never answer it - but it is perfectly reachable once named, and
+    # everything after this point is ordinary unicast.
+    #
+    # Additive rather than exclusive: a receiver may have one tuner on
+    # the local segment and another at a site across a link, and there
+    # is no reason to make it choose.
+    _manual = (config.get('hdhomerun') or {}).get('address', '')
+    if _manual:
+        try:
+            info = lynx_hdhomerun.discover_http(_manual)
+            _did = (info.get('DeviceID') or '').upper()
+            if _did:
+                with hdhr_lock:
+                    st = hdhr_states.setdefault(_did, {
+                        "device_id": _did,
+                        "name": info.get('FriendlyName') or f"HDHomeRun {_did}",
+                        "tuner": 0,
+                        "address": _manual,
+                        "online": False,
+                        "locked": False,
+                        "streaming": False,
+                        "last_seen": 0.0,
+                        "last_error": "",
+                        **{field: None for field in HDHR_QUALITY_FIELDS},
+                    })
+                    # A configured address wins over a discovered one
+                    # for the same device: somebody typed it, which is
+                    # a stronger statement than a broadcast reply.
+                    st["address"] = _manual
+                    st["configured"] = True
+                count = len(hdhr_states)
+        except lynx_hdhomerun.HDHomeRunError as e:
+            print(f"[hdhr] configured address {_manual}: {e}")
+
     if count:
         for st in hdhr_devices():
             print(f"[hdhr] found {st['device_id']} at {st['address']}")
@@ -3780,6 +3816,29 @@ def hdhomerun_monitor():
                             # about every two seconds for ever.
                             live["pending_program"] = None
 
+                    # A callsign, on an amateur frequency, not already
+                    # logged for this transmission: that is a contact.
+                    # Armed here rather than at lock, because at lock
+                    # there is no callsign yet - it arrives with the
+                    # service name a moment later.
+                    _new_call = call.upper() if hdhr_is_amateur_band(
+                        pending_freq) else ""
+                    if (_new_call and current_mode == "dvbt"
+                            and notification_manager is not None):
+                        with hdhr_lock:
+                            _l = hdhr_states.get(device_id)
+                            _already = _l.get("logged_callsign") if _l else ""
+                            if _l is not None:
+                                _l["logged_callsign"] = _new_call
+                        if _already != _new_call:
+                            try:
+                                notification_manager.arm_external_contact(
+                                    _hdhr_contact_source(device_id),
+                                    key="dvbt")
+                            except Exception as e:
+                                print(f"[hdhr] logging: "
+                                      f"{type(e).__name__}: {e}")
+
                 # A station has keyed up. mpv will happily sit there
                 # showing the last frame of whoever was on before -
                 # confirmed on air, and the same stuck-output behaviour
@@ -3794,6 +3853,14 @@ def hdhomerun_monitor():
                     # Non-blocking: a tune in progress is already
                     # restarting mpv itself, and two restarts racing
                     # gives you a dead player rather than a fresh one.
+                    # Ask for the service name again. A different
+                    # station may be on now, and keeping the previous
+                    # one's callsign would log the wrong contact.
+                    with hdhr_lock:
+                        _live = hdhr_states.get(device_id)
+                        if _live is not None:
+                            _live["pending_program"] = _live.get("last_program")
+                            _live["logged_callsign"] = ""
                     if tune_lock.acquire(blocking=False):
                         try:
                             print(f"[hdhr] {device_id} re-locked - "
@@ -3819,6 +3886,58 @@ def hdhomerun_monitor():
                             live["streaming"] = False
                         live["last_error"] = str(e)
         time.sleep(HDHR_POLL_INTERVAL_SECS)
+
+
+def _hdhr_contact_source(device_id):
+    """A picotuner_state-shaped source dict for a DVB-T2 contact.
+
+    The notifications module reads a fixed set of field names, so the
+    honest ones are filled and the rest left empty rather than
+    approximated. mer and margin stay None: SNQ is the closest thing
+    this tuner reports and it is still not MER.
+
+    mode_name, comment and rst carry what DVB-T2 actually measures.
+    The comment field is free text, which is where a percentage can go
+    without being mistaken for a dB figure.
+    """
+    st = None
+    for d in hdhr_devices():
+        if d["device_id"] == device_id:
+            st = d
+            break
+    if not st:
+        return {}
+
+    lm = st.get("lock_mode") or ""
+    std = "DVB-T2" if lm.endswith("dvbt2") else ("DVB-T" if "dvbt" in lm else "")
+    bw = lm[1:2]
+    mode_name = f"{std} {bw} MHz" if (std and bw) else (std or "DVB-T2")
+    freq_hz = st.get("frequency_hz") or 0
+
+    snq = st.get("signal_quality")
+    seq = st.get("symbol_quality")
+    lvl = st.get("signal_strength")
+
+    return {
+        "rx_callsign": st.get("callsign", ""),
+        # kHz, matching the module's own convention - it divides by
+        # 1000 again for the ADIF frequency, and a value in the wrong
+        # unit here once put a 437 MHz contact outside every defined
+        # band and had the whole submission rejected.
+        "frequency_khz": freq_hz / 1000.0,
+        "mer": None,
+        "margin": None,
+        "modcod": mode_name,
+        "symbol_rate": "",
+        "mode_name": mode_name,
+        # The mode is already in the MODE column, so repeating it here
+        # just crowds the comment.
+        "comment": f"SNQ {snq}% | SEQ {seq}% | LVL {lvl}%",
+        # RST_SENT is a signal report, and level is the closest thing
+        # this tuner has to one. SNQ and SEQ describe how well the
+        # demodulator coped, which is what the comment is for.
+        "rst": f"{lvl}%",
+    }
 
 
 def hdhr_stop_all():
@@ -5711,16 +5830,36 @@ def _pathfinder_current_source():
     if tw.get('enabled') and tri_watch_arbitrator is not None:
         idx = tri_watch_arbitrator.displayed_idx
         if idx is None:
-            return (False, 1)
+            return (False, 1, picotuner_state)
         try:
             src = tri_watch_sources_cfg[idx]
         except (IndexError, TypeError):
-            return (False, 1)
+            return (False, 1, picotuner_state)
         if src.get('type') != 'rf':
-            return (False, 1)          # a stream is showing - no card
+            return (False, 1, picotuner_state)   # a stream - no card
         rcv = src.get('rcv', 1)
         st = picotuner_state_b if rcv == 2 else picotuner_state
-        return (bool(st.get('locked')), rcv)
+        return (bool(st.get('locked')), rcv, st)
+
+    # DVB-T2. Checked before the Picotuner branches because when this
+    # is what is on screen, the Picotuner's own lock state is not
+    # merely irrelevant - on a receiver without one it is permanently
+    # false, which is why Pathfinder never drew a card for a DVB-T2
+    # contact while the OSD showed it perfectly.
+    if current_mode == "dvbt":
+        return (_pathfinder_dvbt_state(), None, _pathfinder_dvbt_state.last)
+
+    # A Slave: a receiver at another site, whose telemetry already
+    # arrives in the same field names a local tuner uses, so nothing
+    # here has to translate anything.
+    if displayed_receiver_id is not None:
+        try:
+            _idx = displayed_receiver_id - REMOTE_RECEIVER_ID_BASE
+            if 0 <= _idx < len(remote_states):
+                _rst = remote_states[_idx]
+                return (bool(_rst.get('locked')), None, _rst)
+        except (TypeError, ValueError):
+            pass
 
     # The RUNTIME flag, not config['diversity']['enabled']. Turning
     # diversity on by tuning sets the global and does not write the
@@ -5736,12 +5875,12 @@ def _pathfinder_current_source():
         a = bool(picotuner_state.get('locked'))
         b = bool(picotuner_state_b.get('locked'))
         if a:
-            return (True, 1)
+            return (True, 1, picotuner_state)
         if b:
-            return (True, 2)
-        return (False, 1)
+            return (True, 2, picotuner_state_b)
+        return (False, 1, picotuner_state)
 
-    return (bool(picotuner_state.get('locked')), 1)
+    return (bool(picotuner_state.get('locked')), 1, picotuner_state)
 
 
 def pathfinder_watcher():
@@ -5758,11 +5897,14 @@ def pathfinder_watcher():
         try:
             if not pathfinder_tracker.enabled:
                 continue
-            receiving, rcv = _pathfinder_current_source()
+            # The state comes back with the answer now: with four kinds
+            # of source and only two of them Picotuner receivers, "which
+            # state does rcv mean" stopped being a question this loop
+            # could answer.
+            receiving, rcv, st = _pathfinder_current_source()
             prev = _pathfinder_prev
 
             if receiving:
-                st = picotuner_state_b if rcv == 2 else picotuner_state
                 cs = st.get('callsign', '')
                 if cs:
                     prev['callsign'] = cs
@@ -5890,6 +6032,54 @@ def _pathfinder_via_qo100(rcv, telemetry):
         return False
 
 
+def _pathfinder_dvbt_state():
+    """Is the DVB-T2 tuner locked, and what is it hearing?
+
+    Returns a bool, and leaves the state dict on .last for the caller -
+    an unusual shape, but it keeps _pathfinder_current_source()'s two
+    lines readable and avoids building the dict twice.
+
+    The dict uses the same field names the watcher caches for a local
+    tuner, so the watcher needs no branch of its own. Fields this tuner
+    genuinely does not report are left EMPTY rather than filled with an
+    approximation: there is no symbol rate, and SNQ is not MER however
+    similar it looks on a meter.
+    """
+    _dev = hdhr_default_device_id()
+    _st = None
+    if _dev:
+        for _d in hdhr_devices():
+            if _d["device_id"] == _dev:
+                _st = _d
+                break
+    if not _st:
+        _pathfinder_dvbt_state.last = {}
+        return False
+
+    _lm = _st.get("lock_mode") or ""
+    _std = "DVB-T2" if _lm.endswith("dvbt2") else ("DVB-T" if "dvbt" in _lm else "")
+    _bw = _lm[1:2]
+    _freq = _st.get("frequency_hz")
+
+    _pathfinder_dvbt_state.last = {
+        "locked": bool(_st.get("locked")),
+        "callsign": _st.get("callsign", ""),
+        # Standard and channel width together, which is what an
+        # operator would say out loud and what Portsdown writes in a
+        # log entry. The card's symbol-rate row appends kS/s, so the
+        # bandwidth cannot go there instead.
+        "modcod": (f"{_std} {_bw} MHz" if _std and _bw else _std),
+        "symbol_rate": "",
+        "frequency": (f"{_freq / 1e6:.3f}" if _freq else ""),
+        "mer": "",
+        "margin": "",
+    }
+    return bool(_st.get("locked"))
+
+
+_pathfinder_dvbt_state.last = {}
+
+
 def _pathfinder_on_air_frequency(rcv, reported_mhz):
     """The card's frequency: the on-air one, not the IF.
 
@@ -5908,6 +6098,14 @@ def _pathfinder_on_air_frequency(rcv, reported_mhz):
     """
     raw = str(reported_mhz or '').strip()
     if not raw:
+        return reported_mhz
+    # rcv None means the source is not a local Picotuner receiver - a
+    # Slave, or the DVB-T2 tuner. Neither goes through a converter at
+    # this end: a Slave's is its own business and reported as such,
+    # and the DVB-T2 tuner is fed from an aerial. Applying Rx1's LNB LO
+    # to either would be wrong by construction, even where the LO is
+    # currently zero and the answer happens to come out right.
+    if rcv is None:
         return reported_mhz
     on_air = on_air_from_if(rcv, raw)
     return reported_mhz if on_air is None else f"{on_air:.3f}"
@@ -8105,6 +8303,41 @@ def config_page():
                     </div>
                 </div>
                 <div class="card mb-3">
+                    <div class="card-header">&#x1F4FA; DVB-T2 Tuner (HDHomeRun)</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            A SiliconDust HDHomeRun on the network, used as a
+                            DVB-T/T2/C receiver. Found automatically on the
+                            same subnet - nothing needs configuring for one
+                            plugged into the local network.
+                        </p>
+                        <div class="alert alert-warning py-2 small mb-3">
+                            Auto-discovery is a broadcast, so it does not cross
+                            a router. A tuner on another subnet - at a repeater
+                            site, say - works perfectly once its address is
+                            given here, but will never be found on its own.
+                        </div>
+                        <label class="small">Discovered</label>
+                        <div class="mb-3">
+                            <span class="status-value" id="hdhr-discovered">-</span>
+                        </div>
+                        <label class="small">Address (optional)</label>
+                        <input type="text" class="form-control mb-2"
+                               id="hdhr-address-input"
+                               placeholder="e.g. 10.20.30.40">
+                        <p class="text-muted small">
+                            Leave empty unless the tuner is on another subnet.
+                            An address given here is asked directly rather than
+                            broadcast for, and is used in addition to anything
+                            discovered locally.
+                        </p>
+                        <div class="mt-3 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveHdhr()">Save HDHomeRun settings</button>
+                            <span class="save-status" id="hdhr-status"></span>
+                        </div>
+                    </div>
+                </div>
+                <div class="card mb-3">
                     <div class="card-header">&#x1F3E0; Site Information</div>
                     <div class="card-body">
                         <div class="row g-3">
@@ -8597,6 +8830,29 @@ async function loadCurrentConfig() {
         document.getElementById('site-location-input').value = cfg.site?.location || '';
         document.getElementById('site-locator-input').value = cfg.site?.locator || '';
 
+        const hdhrCfg = cfg.hdhomerun || {};
+        const hdhrAddr = document.getElementById('hdhr-address-input');
+        if (hdhrAddr) { hdhrAddr.value = hdhrCfg.address || ''; }
+        // What was actually found, from the live endpoint rather than
+        // the config: the whole point of the field is to cover the case
+        // where discovery found nothing, so showing the configured
+        // value back as "discovered" would be worse than useless.
+        try {
+            const hr = await fetch('/api/hdhomerun');
+            const hd = await hr.json();
+            const el = document.getElementById('hdhr-discovered');
+            if (el) {
+                const devs = (hd && hd.devices) || [];
+                if (!devs.length) {
+                    el.textContent = 'none found';
+                } else {
+                    el.textContent = devs.map(function (d) {
+                        return d.device_id + ' at ' + (d.address || '?');
+                    }).join(', ');
+                }
+            }
+        } catch (e) { /* the card still works without it */ }
+
         const rs = cfg.remote_source || {};
         document.getElementById('rs-enabled').checked = rs.enabled === true;
         document.getElementById('rs-status-port').value = rs.status_port ?? 10997;
@@ -9085,6 +9341,30 @@ function updateRemoteSourceWarning() {
         el.style.display = '';
     } else {
         el.style.display = 'none';
+    }
+}
+
+async function saveHdhr() {
+    const statusEl = document.getElementById('hdhr-status');
+    statusEl.textContent = 'Saving...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const body = { hdhomerun: {
+            address: document.getElementById('hdhr-address-input').value.trim()
+        }};
+        const r = await fetch('/api/config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+        });
+        if (!r.ok) throw new Error(await r.text());
+        // Restart required: the address is read once, during the single
+        // discovery sweep at startup. A device is installed rather than
+        // plugged in and out, so there is no reason to poll for one.
+        statusEl.textContent = 'Saved - restart required.';
+        statusEl.className = 'save-status text-success';
+    } catch (e) {
+        statusEl.textContent = 'Save failed - see console.';
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
     }
 }
 
@@ -10380,6 +10660,11 @@ def _tune_dvbt_impl(req: DvbtTuneRequest):
             live["pending_program"] = (str(req.program)
                                        if req.program is not None else None)
             live["pending_freq_hz"] = req.freq
+            # Kept so a re-lock can ask again. Without it, a station
+            # keying up after a gap kept the previous contact's name
+            # and was never logged a second time.
+            live["last_program"] = live["pending_program"]
+            live["logged_callsign"] = ""
 
     current_mode = "dvbt"
     displayed_receiver_id = None

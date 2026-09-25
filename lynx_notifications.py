@@ -514,7 +514,8 @@ def _as_details(value):
 
 
 def submit_qrz_logbook(api_key, station_callsign, rx_callsign, freq_khz,
-                        mode, mer, margin, portable_locator="", comment_override=None):
+                        mode, mer, margin, portable_locator="", comment_override=None,
+                        rst_override=None):
     """Builds and submits one QRZ logbook entry. freq_khz matches Lynx's
     own convention throughout (presets, tuning) - converted to MHz here,
     which is what QRZ's freq field expects (confirmed against the
@@ -547,6 +548,10 @@ def submit_qrz_logbook(api_key, station_callsign, rx_callsign, freq_khz,
     worked station's stale profile instead, which is a different thing
     this field does not attempt.
 
+    rst_override: replaces the "<margin>dB" report entirely. DVB-T2 has
+    no margin figure, so its caller supplies the signal quality figure
+    its own tuner reports instead.
+
     comment_override: replaces the normal, auto-built comment entirely
     when set - used by the /diagnostics test feature to mark its entries
     clearly as test data directly in the logbook itself, not just via the
@@ -567,7 +572,16 @@ def submit_qrz_logbook(api_key, station_callsign, rx_callsign, freq_khz,
     time_on = now.strftime("%H%M%S")
 
     comment = comment_override if comment_override is not None else f"{mode} | {mer}dB MER"
-    rst_sent = f"{margin}dB"
+    # "<margin>dB" is right for DVB-S2. With no margin - DVB-T2 does not
+    # report one - that becomes a bare "dB", which is worse than
+    # useless in a signal-report field. rst_override lets the caller
+    # supply what its own receiver actually measures instead.
+    if rst_override is not None:
+        rst_sent = rst_override
+    elif margin in (None, ""):
+        rst_sent = ""
+    else:
+        rst_sent = f"{margin}dB"
 
     payload = _build_qrz_adif(api_key, "INSERT", call_trunc, band, str(mode),
                                qso_date, time_on, station_callsign,
@@ -1291,6 +1305,55 @@ class NotificationManager:
                 self._cancel_action(f'tw_qrz_{rcv}')
                 self._cancel_action(f'tw_slack_{rcv}')
 
+    def arm_external_contact(self, src, key="external"):
+        """Log a contact from a source this manager does not poll.
+
+        Built for the DVB-T2 tuner, which is a separate device on the
+        network rather than a tuner this module watches. Everything
+        after the trigger is identical to a Picotuner contact, so the
+        settle timers, the QRZ de-duplication and the Slack path are
+        reused rather than reimplemented - the difference is only in
+        who noticed the station, not in what happens next.
+
+        src is a picotuner_state-shaped dict, optionally carrying
+        mode_name, comment and rst - see submit_qrz_logbook().
+
+        The settle delay still applies: a station that keys up and
+        immediately drops again should not reach the logbook, whatever
+        noticed it.
+        """
+        cfg = self.get_config()
+        notif_cfg = cfg.get('notifications', {})
+        site_callsign = notif_cfg.get('station_callsign', '')
+        qrz_cfg = notif_cfg.get('qrz', {})
+        slack_cfg = notif_cfg.get('slack', {})
+
+        if qrz_cfg.get('enabled', False):
+            delay = float(qrz_cfg.get('settle_secs', 15.0))
+            self._arm_action(
+                f'{key}_qrz', delay,
+                lambda: self._fire_qrz(qrz_cfg, site_callsign,
+                                       source_override=src),
+                f"QRZ ({key})")
+
+        if slack_cfg.get('enabled', False):
+            delay = float(slack_cfg.get('settle_secs', 15.0))
+            self._arm_action(
+                f'{key}_slack', delay,
+                lambda: self._fire_slack(slack_cfg, site_callsign,
+                                         source_override=src),
+                f"Slack ({key})")
+
+    def cancel_external_contact(self, key="external"):
+        """Cancel pending timers for an external source that has gone.
+
+        A station that stops before the settle time expires never
+        happened, as far as the logbook is concerned - the same rule
+        the polled sources follow.
+        """
+        self._cancel_action(f'{key}_qrz')
+        self._cancel_action(f'{key}_slack')
+
     def _fire_qrz(self, qrz_cfg, site_callsign, source_override=None):
         api_key = qrz_cfg.get('api_key', '')
         if not api_key:
@@ -1403,10 +1466,17 @@ class NotificationManager:
             # DVB-S2's variable-modulation notation, not DVB-S1's simpler,
             # fixed-QPSK one - so this should be safe unless the Picotuner
             # is ever used somewhere that genuinely receives DVB-S1.
-            adif_mode = f"DVB-S2 {src['modcod']}" if src["modcod"] else "DVB-S2"
+            # The assumption flagged above - that every contact is
+            # DVB-S2 - held while the Picotuner was the only source.
+            # A source that knows what it is says so, and this is the
+            # branch that comment anticipated.
+            adif_mode = src.get("mode_name") or (
+                f"DVB-S2 {src['modcod']}" if src["modcod"] else "DVB-S2")
             result = submit_qrz_logbook(api_key, site_callsign, call, src["frequency_khz"],
                                          adif_mode, src["mer"], src["margin"],
-                                         portable_locator=portable_locator)
+                                         portable_locator=portable_locator,
+                                         comment_override=src.get("comment"),
+                                         rst_override=src.get("rst"))
             self._qrz_last_logged[call] = now
             if result["result"] in ("OK", "REPLACE"):
                 self.record_event("qrz_logged",
