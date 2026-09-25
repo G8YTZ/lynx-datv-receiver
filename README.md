@@ -2,12 +2,13 @@
 
 A Raspberry Pi 5 based DATV receiver for the Picotuner (WinterHill firmware), with a transparent on-screen display, a full web control portal, and optional diversity reception (the two picotuner receivers combined for improved resilience against fades).
 
-**Status: Alpha.** Actively developed and in trial use. Expect rough edges — feedback and bug reports welcome.
+**Status: Beta.** Actively developed and in use at several sites. Feedback and bug reports welcome.
 
 ## Features
 
 - Full-screen live DATV picture with an on-screen overlay (callsign, MER, frequency, modcod, split-eye signal display for diversity mode)
 - Web Control Portal for tuning, memory presets, live BATC stream browsing, and volume control
+- DVB-T/T2/C reception via a SiliconDust HDHomeRun network tuner, found automatically on the local network — including narrowband DVB-T2 at 1 and 2 MHz on 2m and 70cm, as well as full-bandwidth broadcast multiplexes
 - Optional two-tuner diversity combining, with automatic source switching based on signal quality
 - Repeater/receiver-activity notifications (QRZ Logbook, Slack, Bitfocus Companion, GPIO Tx control)
 - **Pathfinder** — an end-of-contact station map: a full-screen card showing where a station was, the path back to the receiver, and the signal figures from the contact, drawn from their QRZ locator
@@ -32,9 +33,10 @@ Copy [`config/lynx_config.example.yaml`](./config/lynx_config.example.yaml) to `
 
 - Raspberry Pi 5 (4GB or more), running Raspberry Pi OS with Desktop
 - A Picotuner (WinterHill firmware) on the same network
+- Optionally, a SiliconDust HDHomeRun for DVB-T/T2/C. The narrow amateur bandwidths are available only on the **HDHR5-2DT** (two tuners) and **HDHR5-4DT** (four tuners) — other models do not have them in the demodulator
 - See the install guide for the full system/Python dependency list (`pyshp` is required for the station map)
 - Recommended to disable Wi-Fi and Bluetooth and use just wired Ethernet
 
 ## Contributing
 
-This project is under active development, with new features and fixes being added — issues and pull requests are welcome, particularly bug reports from alpha trial sites.
+This project is under active development, with new features and fixes being added — issues and pull requests are welcome, particularly bug reports from receivers in the field.
