@@ -10462,6 +10462,24 @@ def hdhomerun_status():
     }
 
 
+@app.get("/api/hdhomerun/programs", tags=["RF Reception"],
+         summary="Services in the currently tuned multiplex",
+         description="Read from the device's own streaminfo. Empty when "
+                     "the tuner is not locked, since an unlocked tuner "
+                     "has nothing to list.")
+def hdhomerun_programs(device_id: str = None):
+    # Read live rather than from the polled state: this is wanted when
+    # somebody opens the dropdown, which is rare, and there is no
+    # reason to fetch it every two seconds alongside the status.
+    try:
+        tuner = lynx_hdhomerun.HDHomeRunTuner(
+            device_id=device_id or hdhr_default_device_id() or "",
+            tuner=0)
+        return {"programs": tuner.stream_info()}
+    except lynx_hdhomerun.HDHomeRunError as e:
+        return {"programs": [], "error": str(e)}
+
+
 @app.post("/api/hdhomerun/stop", tags=["RF Reception"],
           summary="Stop all HDHomeRun streaming",
           description="Releases every tuner. Useful when a device has been "
@@ -11929,6 +11947,15 @@ def web_ui():
                  panel above used to switch entirely to stream info whenever
                  a stream was on screen, hiding Rx1's own status completely
                  until whichever one "came up first" lost that slot again. -->
+            <!-- DVB-T2 (HDHomeRun): a network tuner, so it may not be
+                 there at all. Hidden rather than shown red when none
+                 was discovered, the same as the Slave panels - a
+                 receiver without one should not carry a permanent
+                 fault indication for hardware it does not have. -->
+            <div class="card mt-2" id="dvbt-panel" style="display:none">
+                <div class="card-header" id="dvbt-header">&#x1F4FA; DVB-T2</div>
+                <div class="card-body" id="dvbt-status"></div>
+            </div>
             <div class="card mt-2" id="tri-watch-stream-panel" style="display:none">
                 <div class="card-header" id="tri-watch-stream-header">&#x1F4FA; Stream</div>
                 <div class="card-body" id="tri-watch-stream-status"></div>
@@ -12010,6 +12037,53 @@ def web_ui():
                         <button class="btn btn-outline-info btn-sm" onclick="saveBootDefault()" title="Use this as the fallback frequency on startup, if there's nothing to resume">&#x1F3E0;</button>
                     </div>
                     <div id="boot-default-note" class="text-muted small mt-1"></div>
+                </div>
+            </div>
+
+            <!-- DVB-T2 Reception (HDHomeRun) -->
+            <div class="card mt-3" id="dvbt-tune-card" style="display:none">
+                <div class="card-header">&#x1F4FA; DVB-T2 Reception (HDHomeRun)</div>
+                <div class="card-body">
+                    <h6 class="text-muted">Manual Tune</h6>
+                    <div class="row g-2 mb-2">
+                        <div class="col-7">
+                            <input type="number" step="0.001" class="form-control form-control-sm bg-dark text-light border-secondary"
+                                   id="dvbt-freq" placeholder="MHz" value="146.500">
+                        </div>
+                        <div class="col-5">
+                            <select class="form-select form-select-sm bg-dark text-light border-secondary" id="dvbt-bw">
+                                <option value="1">1 MHz</option>
+                                <option value="2">2 MHz</option>
+                                <option value="3">3 MHz</option>
+                                <option value="4">4 MHz</option>
+                                <option value="5">5 MHz</option>
+                                <option value="6">6 MHz</option>
+                                <option value="7">7 MHz</option>
+                                <option value="8" selected>8 MHz</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="row g-2 mb-2">
+                        <div class="col-7">
+                            <select class="form-select form-select-sm bg-dark text-light border-secondary" id="dvbt-std">
+                                <option value="dvbt2" selected>DVB-T2</option>
+                                <option value="dvbt">DVB-T</option>
+                            </select>
+                        </div>
+                        <div class="col-5">
+                            <select class="form-select form-select-sm bg-dark text-light border-secondary"
+                                    id="dvbt-program" onchange="switchDvbtProgram()">
+                                <option value="">Service...</option>
+                            </select>
+                        </div>
+                    </div>
+                    <button class="btn btn-danger w-100"
+                            onclick="tuneDvbtManual()">Tune</button>
+                    <div class="text-muted small mt-2">
+                        Frequency in MHz. Bandwidth is the channel width,
+                        not the bitrate - 1 and 2 MHz are the narrowband
+                        amateur modes, 7 and 8 MHz are broadcast.
+                    </div>
                 </div>
             </div>
 
@@ -12572,6 +12646,64 @@ async function updateStatus() {
         // throw away and recreate DOM three times a second on a page
         // somebody may be reading, and would fight any control added to
         // these panels later by destroying it mid-click.
+        // DVB-T2 (HDHomeRun). Looked up both ways: the status payload
+        // nests some blocks under "lynx" and exposes others at the top
+        // level, and this renderer is called with both shapes.
+        const hh = (s.lynx && s.lynx.hdhomerun) || s.hdhomerun || null;
+        const si = (s.lynx && s.lynx.stream_info) || s.stream_info || {};
+        const dvbtPanel = document.getElementById('dvbt-panel');
+        const dvbtCard = document.getElementById('dvbt-tune-card');
+        if (dvbtPanel) {
+            if (!hh) {
+                dvbtPanel.style.display = 'none';
+                if (dvbtCard) { dvbtCard.style.display = 'none'; }
+            } else {
+                dvbtPanel.style.display = '';
+                if (dvbtCard) { dvbtCard.style.display = ''; }
+                var dstate = 'offline';
+                if (hh.online) { dstate = hh.locked ? 'locked' : 'idle'; }
+                setPanelState('dvbt-header', 'dvbt-status',
+                              '&#x1F4FA; DVB-T2', dstate);
+                var dbody = document.getElementById('dvbt-status');
+                if (dbody) {
+                    if (!hh.online) {
+                        dbody.innerHTML = '<div class="text-danger small text-center mt-2">HDHomeRun offline</div>';
+                    } else if (hh.locked) {
+                        // t8dvbt2 gives "8 MHz" and "DVB-T2". The second
+                        // character is the nominal bandwidth in MHz and
+                        // the ladder is exact, so 1 really does mean 1.
+                        var lm = hh.lock_mode || '';
+                        var dbw = lm.charAt(1);
+                        var dstd = '-';
+                        if (lm.indexOf('dvbt2') >= 0) { dstd = 'DVB-T2'; }
+                        else if (lm.indexOf('dvbt') >= 0) { dstd = 'DVB-T'; }
+                        var drows = [
+                            ['Callsign', hh.callsign || '-'],
+                            ['Programme', hh.service_name || '-'],
+                            ['Frequency', hh.frequency_hz ? (hh.frequency_hz / 1e6).toFixed(3) + ' MHz' : '-'],
+                            ['Bandwidth', dbw ? dbw + ' MHz' : '-'],
+                            ['Standard', dstd],
+                            ['SNQ', (hh.snq !== null && hh.snq !== undefined) ? hh.snq + ' %' : '-'],
+                            ['SEQ', (hh.seq !== null && hh.seq !== undefined) ? hh.seq + ' %' : '-'],
+                            ['Level', (hh.level !== null && hh.level !== undefined) ? hh.level + ' %' : '-'],
+                            ['Bitrate', hh.bitrate_bps ? (hh.bitrate_bps / 1e6).toFixed(2) + ' Mb/s' : '-'],
+                            ['Codec', si.video_codec || '-'],
+                            ['Audio Codec', si.audio_codec || '-']
+                        ];
+                        var dhtml = '';
+                        for (var di = 0; di < drows.length; di++) {
+                            dhtml += '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;">';
+                            dhtml += '<span>' + drows[di][0] + '</span>';
+                            dhtml += '<span class="status-value">' + drows[di][1] + '</span></div>';
+                        }
+                        dbody.innerHTML = dhtml;
+                    } else {
+                        dbody.innerHTML = '<div class="text-muted small text-center mt-2">Searching for signal...</div>';
+                    }
+                }
+            }
+        }
+
         const remotes = s.remotes || [];
         const remoteHost = document.getElementById('remote-panels');
         remotes.forEach(function (rem) {
@@ -12905,6 +13037,84 @@ async function tuneTo() {
         return;
     }
     await api('POST', '/api/tune', {freq, sr, plug, lnb_lo_khz});
+}
+
+async function tuneDvbt(freqMhz, modulation, program) {
+    // MHz in the form, Hz on the wire: the device's own API works in
+    // Hz and nobody wants to type nine digits. Converted here, in one
+    // place, rather than at each caller.
+    await api('POST', '/api/tune_dvbt', {
+        freq: Math.round(parseFloat(freqMhz) * 1e6),
+        modulation: modulation,
+        program: program ? String(program) : null
+    });
+}
+
+async function loadDvbtPrograms() {
+    // Filled from the multiplex itself rather than typed. A number box
+    // let any number be entered, and the device would accept one that
+    // did not exist - a lock with no picture and nothing to say why.
+    var sel = document.getElementById('dvbt-program');
+    if (!sel) { return; }
+    var wanted = sel.value;
+    try {
+        var r = await api('GET', '/api/hdhomerun/programs');
+        var progs = (r && r.programs) || [];
+        // Rebuilt with DOM calls rather than innerHTML: service names
+        // come from the broadcaster and can contain anything at all,
+        // and concatenating them into markup is how a stray quote
+        // takes the whole page down.
+        while (sel.firstChild) { sel.removeChild(sel.firstChild); }
+        if (!progs.length) {
+            var none = document.createElement('option');
+            none.value = '';
+            none.textContent = 'No services';
+            sel.appendChild(none);
+            return;
+        }
+        for (var i = 0; i < progs.length; i++) {
+            var o = document.createElement('option');
+            o.value = progs[i].program;
+            o.textContent = progs[i].name || progs[i].program;
+            sel.appendChild(o);
+        }
+        // Keep the current selection if it survived the retune,
+        // otherwise take the first service - which is the right
+        // default for an amateur transmission carrying only one.
+        sel.value = wanted;
+        if (!sel.value) { sel.selectedIndex = 0; }
+    } catch (e) {
+        while (sel.firstChild) { sel.removeChild(sel.firstChild); }
+        var err = document.createElement('option');
+        err.value = '';
+        err.textContent = 'Unavailable';
+        sel.appendChild(err);
+    }
+}
+
+async function switchDvbtProgram() {
+    // No retune: the tuner is already locked on the multiplex, so this
+    // is a demultiplexer change and takes effect immediately. Sending
+    // a full tune here would drop the lock and reacquire it for no
+    // reason, with several seconds of black screen to show for it.
+    var sel = document.getElementById('dvbt-program');
+    if (!sel || !sel.value) { return; }
+    var f = document.getElementById('dvbt-freq').value;
+    var bw = document.getElementById('dvbt-bw').value;
+    var std = document.getElementById('dvbt-std').value;
+    await tuneDvbt(f, 't' + bw + std, sel.value);
+}
+
+async function tuneDvbtManual() {
+    var f = document.getElementById('dvbt-freq').value;
+    var bw = document.getElementById('dvbt-bw').value;
+    var std = document.getElementById('dvbt-std').value;
+    var prog = document.getElementById('dvbt-program').value;
+    if (!f) { return; }
+    await tuneDvbt(f, 't' + bw + std, prog);
+    // After the tune, not before: the list comes from the multiplex,
+    // and until the tuner has locked there is no multiplex to ask.
+    await loadDvbtPrograms();
 }
 
 async function tunePreset(name) {
