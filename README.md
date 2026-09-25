@@ -33,7 +33,7 @@ Copy [`config/lynx_config.example.yaml`](./config/lynx_config.example.yaml) to `
 
 - Raspberry Pi 5 (4GB or more), running Raspberry Pi OS with Desktop
 - A Picotuner (WinterHill firmware) on the same network
-- Optionally, a SiliconDust HDHomeRun for DVB-T/T2/C. The narrow amateur bandwidths are available only on the **HDHR5-2DT** (two tuners) and **HDHR5-4DT** (four tuners) — other models do not have them in the demodulator
+- Optionally, a SiliconDust HDHomeRun for DVB-T/T2/C. The narrow amateur bandwidths are available only on the **HDHR5-2DT** (two tuners) and **HDHR5-4DT** (four tuners), **both now discontinued** — second-hand only. No other model has them, and SiliconDust know of no other demodulator supporting anything narrower than 1.7 MHz as standard. They have said they would like to make a new model for this. Tuning range 44–866 MHz, so 2m and 70cm are usable and 23cm is out of reach
 - See the install guide for the full system/Python dependency list (`pyshp` is required for the station map)
 - Recommended to disable Wi-Fi and Bluetooth and use just wired Ethernet
 
