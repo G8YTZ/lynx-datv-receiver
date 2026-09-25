@@ -3789,10 +3789,15 @@ def hdhomerun_monitor():
                 # how a poller stops everything else in the process.
                 if pending_program and status.locked:
                     raw = ""
-                    for prog in tuner.stream_info():
-                        if prog.get("program") == pending_program:
-                            raw = prog.get("name", "")
-                            break
+                    try:
+                        for prog in tuner.stream_info():
+                            if prog.get("program") == pending_program:
+                                raw = prog.get("name", "")
+                                break
+                    except lynx_hdhomerun.HDHomeRunError:
+                        # Not ready yet, most likely. Left to the retry
+                        # below rather than treated as a failure.
+                        raw = ""
 
                     # Same truncation as Ryde's logbook code: keep
                     # characters up to the first non-alphanumeric one,
@@ -3811,10 +3816,20 @@ def hdhomerun_monitor():
                             live["callsign"] = (
                                 call.upper()
                                 if hdhr_is_amateur_band(pending_freq) else "")
-                            # Once only: a name that did not arrive is a
-                            # blank label, not something to keep asking
-                            # about every two seconds for ever.
-                            live["pending_program"] = None
+                            # Cleared on success only. The earlier version
+                            # cleared it either way, so an empty first
+                            # read - which is the usual case, since the
+                            # tables lag the lock - gave up permanently
+                            # and left the callsign blank until the next
+                            # tune. That is what "flaky, works after a
+                            # retune" was.
+                            if raw:
+                                live["pending_program"] = None
+                            else:
+                                _left = int(live.get("pending_attempts", 0)) - 1
+                                live["pending_attempts"] = _left
+                                if _left <= 0:
+                                    live["pending_program"] = None
 
                     # A callsign, on an amateur frequency, not already
                     # logged for this transmission: that is a contact.
@@ -10672,6 +10687,12 @@ def _tune_dvbt_impl(req: DvbtTuneRequest):
             # and was never logged a second time.
             live["last_program"] = live["pending_program"]
             live["logged_callsign"] = ""
+            # Attempts remaining. The device reports lock before its
+            # service tables can be read, so the first ask usually
+            # comes back empty - bounded rather than endless, since a
+            # multiplex that genuinely never names its services should
+            # not be interrogated about it every two seconds for ever.
+            live["pending_attempts"] = 10
 
     current_mode = "dvbt"
     displayed_receiver_id = None
@@ -13397,7 +13418,7 @@ async function tuneDvbt(freqMhz, modulation, program) {
     });
 }
 
-async function loadDvbtPrograms() {
+async function loadDvbtPrograms(retries) {
     // Filled from the multiplex itself rather than typed. A number box
     // let any number be entered, and the device would accept one that
     // did not exist - a lock with no picture and nothing to say why.
@@ -13407,6 +13428,14 @@ async function loadDvbtPrograms() {
     try {
         var r = await api('GET', '/api/hdhomerun/programs');
         var progs = (r && r.programs) || [];
+        // Nothing yet, and attempts left: the tables lag the lock, so
+        // an empty answer this soon means "not ready" rather than "no
+        // services". Stops as soon as there is something, so a device
+        // that answers immediately waits for nothing at all.
+        if (!progs.length && retries && retries > 0) {
+            await new Promise(function (r2) { setTimeout(r2, 500); });
+            return await loadDvbtPrograms(retries - 1);
+        }
         // Rebuilt with DOM calls rather than innerHTML: service names
         // come from the broadcaster and can contain anything at all,
         // and concatenating them into markup is how a stray quote
@@ -13579,13 +13608,12 @@ async function tuneDvbtManual() {
     // After the tune, not before: the list comes from the multiplex,
     // and until the tuner has locked there is no multiplex to ask.
     //
-    // And not immediately after either. The tune returns once the
-    // device reports lock, but streaminfo needs the service tables
-    // to have been read, which takes a moment longer - asking too
-    // early returned an empty list, and it took three tunes before
-    // the dropdown filled.
-    await new Promise(function (r) { setTimeout(r, 1500); });
-    await loadDvbtPrograms();
+    // Retried rather than delayed. The tune returns once the device
+    // reports lock, but streaminfo needs the service tables, which
+    // lag it by an amount nobody can predict - a fixed wait was
+    // either too short sometimes or too long always, and the one it
+    // replaces managed both.
+    await loadDvbtPrograms(8);
     await loadDvbtPresets();
     await loadDvbtBootDefault();
 }
