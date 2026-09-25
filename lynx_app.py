@@ -4512,6 +4512,13 @@ class PresetSaveRequest(BaseModel):
     lnb_lo_khz: int = 0
     # Stream field (type="stream")
     url: Optional[str] = None
+    # DVB-T2 fields (type="dvbt"). freq_hz rather than reusing freq:
+    # that one is kHz by long-standing convention throughout Lynx, and
+    # the device's own API works in Hz. Two units in one field is how a
+    # 437 MHz contact once got logged as 0.437 MHz.
+    freq_hz: Optional[int] = None
+    modulation: Optional[str] = None
+    program: Optional[str] = None
 
 class SiteConfigUpdate(BaseModel):
     name: str
@@ -10857,7 +10864,7 @@ def list_presets():
                       "is generated from the frequency (e.g. '437.025 MHz') "
                       "- a stream save always requires an explicit name.")
 def add_preset(req: PresetSaveRequest):
-    preset_type = req.type if req.type in ("rf", "stream") else "rf"
+    preset_type = req.type if req.type in ("rf", "stream", "dvbt") else "rf"
     config.setdefault('presets', [])
 
     if preset_type == "stream":
@@ -10866,6 +10873,12 @@ def add_preset(req: PresetSaveRequest):
         if not req.name.strip():
             raise HTTPException(status_code=400, detail="A stream memory needs a name")
         name = req.name.strip()
+    elif preset_type == "dvbt":
+        if req.freq_hz is None or not req.modulation:
+            raise HTTPException(status_code=400,
+                                detail="A DVB-T2 memory needs a frequency and modulation")
+        name = (req.name.strip() if req.name.strip()
+                else f"{req.freq_hz/1e6:.3f} MHz")
     else:
         if req.freq is None or req.sr is None:
             raise HTTPException(status_code=400, detail="An RF memory needs a frequency and symbol rate")
@@ -10885,6 +10898,10 @@ def add_preset(req: PresetSaveRequest):
                         "note": "name already used by a different memory type"}
             if preset_type == "stream":
                 same = (p.get('url') == req.url)
+            elif preset_type == "dvbt":
+                same = (p.get('freq_hz') == req.freq_hz
+                        and p.get('modulation') == req.modulation
+                        and p.get('program') == req.program)
             else:
                 same = (p.get('freq') == req.freq and p.get('sr') == req.sr
                         and p.get('plug', 'a') == req.plug
@@ -10899,6 +10916,15 @@ def add_preset(req: PresetSaveRequest):
             "type": "stream",
             "name": name,
             "url": req.url.strip(),
+            "note": "User saved via web UI"
+        })
+    elif preset_type == "dvbt":
+        config['presets'].append({
+            "type": "dvbt",
+            "name": name,
+            "freq_hz": req.freq_hz,
+            "modulation": req.modulation,
+            "program": req.program,
             "note": "User saved via web UI"
         })
     else:
@@ -11887,10 +11913,20 @@ def restore_wifi():
     return {"result": "ok", "message": "WiFi re-enabled."}
 
 class DefaultBootRequest(BaseModel):
-    freq: int
-    sr: int
+    # type tells the two kinds of fallback apart. Absent means "rf", so
+    # an existing config and every existing caller keep working.
+    type: str = "rf"
+    # Optional now: a DVB-T2 default has neither, and required fields
+    # would have the request rejected before the endpoint ever saw it.
+    freq: Optional[int] = None
+    sr: Optional[int] = None
     plug: str = "a"
     lnb_lo_khz: int = 0
+    # DVB-T2 (type="dvbt"). Hz rather than kHz, matching the device's
+    # own API and the dvbt preset type.
+    freq_hz: Optional[int] = None
+    modulation: Optional[str] = None
+    program: Optional[str] = None
 
 @app.post("/api/boot-default", tags=["Control"],
           summary="Set the default boot-time RF preset",
@@ -11902,6 +11938,19 @@ class DefaultBootRequest(BaseModel):
                       "what it was last doing — this is only the safety "
                       "net for when that isn't possible.")
 def set_boot_default(req: DefaultBootRequest):
+    # A type, because the fallback can now be either kind of tuner and
+    # the resume has to tell them apart. Absent means "rf", so an
+    # existing config file keeps working untouched.
+    if req.type == "dvbt":
+        config['default_boot_preset'] = {
+            "type": "dvbt",
+            "freq_hz": req.freq_hz,
+            "modulation": req.modulation,
+            "program": req.program,
+        }
+        save_config(config)
+        return {"success": True,
+                "default_boot_preset": config['default_boot_preset']}
     config['default_boot_preset'] = {
         "freq": req.freq, "sr": req.sr, "plug": req.plug, "lnb_lo_khz": req.lnb_lo_khz
     }
@@ -12329,6 +12378,12 @@ def web_ui():
             <div class="card mt-3" id="dvbt-tune-card" style="display:none">
                 <div class="card-header">&#x1F4FA; DVB-T2 Reception (HDHomeRun)</div>
                 <div class="card-body">
+                    <h6 class="text-muted">Presets</h6>
+                    <div id="dvbt-preset-list" class="mb-3"
+                         style="max-height: 180px; overflow-y: auto;">
+                        <div class="text-muted small">No presets</div>
+                    </div>
+                    <hr>
                     <h6 class="text-muted">Manual Tune</h6>
                     <div class="row g-2 mb-2">
                         <div class="col-7">
@@ -12348,26 +12403,26 @@ def web_ui():
                             </select>
                         </div>
                     </div>
-                    <div class="row g-2 mb-2">
-                        <div class="col-7">
-                            <select class="form-select form-select-sm bg-dark text-light border-secondary" id="dvbt-std">
-                                <option value="dvbt2" selected>DVB-T2</option>
-                                <option value="dvbt">DVB-T</option>
-                            </select>
-                        </div>
-                        <div class="col-5">
-                            <select class="form-select form-select-sm bg-dark text-light border-secondary"
-                                    id="dvbt-program" onchange="switchDvbtProgram()">
-                                <option value="">Service...</option>
-                            </select>
-                        </div>
+                    <div class="d-flex gap-2 align-items-center">
+                        <select class="form-select form-select-sm bg-dark text-light border-secondary"
+                                id="dvbt-program" onchange="switchDvbtProgram()">
+                            <option value="">Service...</option>
+                        </select>
+                        <button class="btn btn-danger btn-sm" onclick="tuneDvbtManual()">Tune</button>
+                        <button class="btn btn-outline-warning btn-sm"
+                                onclick="saveDvbtMemory()"
+                                title="Save this frequency and mode as a preset">&#x1F4BE;</button>
+                        <button class="btn btn-outline-info btn-sm"
+                                onclick="saveDvbtBootDefault()"
+                                title="Use this as the fallback on startup, if there's nothing to resume">&#x1F3E0;</button>
                     </div>
-                    <button class="btn btn-danger w-100"
-                            onclick="tuneDvbtManual()">Tune</button>
+                    <div id="dvbt-boot-note" class="text-muted small mt-1"></div>
                     <div class="text-muted small mt-2">
-                        Frequency in MHz. Bandwidth is the channel width,
-                        not the bitrate - 1 and 2 MHz are the narrowband
-                        amateur modes, 7 and 8 MHz are broadcast.
+                        Frequency in MHz. Bandwidth is the channel width, not
+                        the bitrate - 1 and 2 MHz are the narrowband amateur
+                        modes, 7 and 8 MHz are broadcast. DVB-T2 is tried
+                        first and DVB-T after it, so there is nothing to
+                        choose.
                     </div>
                 </div>
             </div>
@@ -12958,6 +13013,9 @@ async function updateStatus() {
                         // character is the nominal bandwidth in MHz and
                         // the ladder is exact, so 1 really does mean 1.
                         var lm = hh.lock_mode || '';
+                        // Kept so the form does not have to ask which
+                        // standard this is - the tuner has already said.
+                        if (lm) { window._dvbtLockMode = lm; }
                         var dbw = lm.charAt(1);
                         var dstd = '-';
                         if (lm.indexOf('dvbt2') >= 0) { dstd = 'DVB-T2'; }
@@ -13050,7 +13108,11 @@ async function loadPresets() {
     try {
         const data = await api('GET', '/api/presets');
         const local = (data.local || []).map(p => ({...p, _local: true}));
-        const all = [...local, ...(data.ryde || [])];
+        // DVB-T2 memories belong to their own card. Left in here they
+        // would tune the Picotuner to a frequency in kHz that was
+        // really MHz - a number it would accept without complaint.
+        const all = [...local, ...(data.ryde || [])]
+                        .filter(p => p.type !== 'dvbt');
         const el = document.getElementById('preset-list');
         if (!all.length) { el.innerHTML = '<div class="text-muted small">No presets</div>'; return; }
         el.innerHTML = all.map(p => `
@@ -13386,20 +13448,146 @@ async function switchDvbtProgram() {
     if (!sel || !sel.value) { return; }
     var f = document.getElementById('dvbt-freq').value;
     var bw = document.getElementById('dvbt-bw').value;
-    var std = document.getElementById('dvbt-std').value;
-    await tuneDvbt(f, 't' + bw + std, sel.value);
+    // Whatever is locked now - the tuner reports it, so there is no
+    // need to guess or retry here.
+    var lm = (window._dvbtLockMode || ('t' + bw + 'dvbt2'));
+    await tuneDvbt(f, lm, sel.value);
+}
+
+async function saveDvbtMemory() {
+    var f = document.getElementById('dvbt-freq').value;
+    var bw = document.getElementById('dvbt-bw').value;
+    var std = (window._dvbtLockMode || '').indexOf('dvbt2') >= 0 ? 'dvbt2'
+            : ((window._dvbtLockMode || '').indexOf('dvbt') >= 0 ? 'dvbt' : 'dvbt2');
+    var progSel = document.getElementById('dvbt-program');
+    if (!f) { return; }
+    var name = prompt('Name this preset:', parseFloat(f).toFixed(3) + ' MHz');
+    if (name === null) { return; }
+    var result = await api('POST', '/api/presets/add', {
+        type: 'dvbt',
+        name: name,
+        freq_hz: Math.round(parseFloat(f) * 1e6),
+        modulation: 't' + bw + std,
+        program: (progSel && progSel.value) ? progSel.value : null
+    });
+    if (result && result.note === 'already saved') {
+        alert('A preset with this exact name and tuning already exists.');
+    } else if (result && result.note === 'name already used') {
+        alert('A preset named "' + name + '" already exists with different tuning.');
+    }
+    await loadDvbtPresets();
+}
+
+async function saveDvbtBootDefault() {
+    var f = document.getElementById('dvbt-freq').value;
+    var bw = document.getElementById('dvbt-bw').value;
+    var progSel = document.getElementById('dvbt-program');
+    if (!f) { return; }
+    if (!confirm('Use ' + parseFloat(f).toFixed(3) + ' MHz as the fallback on '
+                 + 'startup, whenever there is nothing previous to resume?')) { return; }
+    var std = (window._dvbtLockMode || '').indexOf('dvbt2') >= 0 ? 'dvbt2'
+            : ((window._dvbtLockMode || '').indexOf('dvbt') >= 0 ? 'dvbt' : 'dvbt2');
+    await api('POST', '/api/boot-default', {
+        type: 'dvbt',
+        freq_hz: Math.round(parseFloat(f) * 1e6),
+        modulation: 't' + bw + std,
+        program: (progSel && progSel.value) ? progSel.value : null
+    });
+    await loadDvbtBootDefault();
+}
+
+async function loadDvbtBootDefault() {
+    var note = document.getElementById('dvbt-boot-note');
+    if (!note) { return; }
+    try {
+        var d = await api('GET', '/api/boot-default');
+        if (d && d.type === 'dvbt' && d.freq_hz) {
+            note.textContent = 'Default boot: '
+                + (d.freq_hz / 1e6).toFixed(3) + ' MHz';
+        } else {
+            note.textContent = '';
+        }
+    } catch (e) { note.textContent = ''; }
+}
+
+async function loadDvbtPresets() {
+    var el = document.getElementById('dvbt-preset-list');
+    if (!el) { return; }
+    try {
+        var data = await api('GET', '/api/presets');
+        var all = (data.local || []).filter(function (p) {
+            return p.type === 'dvbt';
+        });
+        // Rebuilt with DOM calls rather than innerHTML. A preset name
+        // is whatever somebody typed, and concatenating it into an
+        // onclick attribute means one apostrophe takes the page down.
+        while (el.firstChild) { el.removeChild(el.firstChild); }
+        if (!all.length) {
+            var none = document.createElement('div');
+            none.className = 'text-muted small';
+            none.textContent = 'No presets';
+            el.appendChild(none);
+            return;
+        }
+        all.forEach(function (p) {
+            var row = document.createElement('div');
+            row.className = 'd-flex align-items-center gap-1 mb-1';
+
+            var b = document.createElement('button');
+            b.className = 'btn btn-outline-secondary btn-sm flex-grow-1 text-start text-light';
+            b.textContent = p.name;
+            var mhz = document.createElement('small');
+            mhz.className = 'text-muted float-end';
+            mhz.textContent = (p.freq_hz / 1e6).toFixed(3) + ' MHz';
+            b.appendChild(mhz);
+            b.addEventListener('click', function () {
+                tuneDvbt(p.freq_hz / 1e6, p.modulation, p.program);
+            });
+            row.appendChild(b);
+
+            var d = document.createElement('button');
+            d.className = 'btn btn-outline-danger btn-sm';
+            d.title = 'Delete';
+            d.textContent = '\u00d7';
+            d.addEventListener('click', function () {
+                deletePreset(p.name);
+                setTimeout(loadDvbtPresets, 300);
+            });
+            row.appendChild(d);
+
+            el.appendChild(row);
+        });
+    } catch (e) { /* the card still tunes without its presets */ }
 }
 
 async function tuneDvbtManual() {
     var f = document.getElementById('dvbt-freq').value;
     var bw = document.getElementById('dvbt-bw').value;
-    var std = document.getElementById('dvbt-std').value;
     var prog = document.getElementById('dvbt-program').value;
     if (!f) { return; }
-    await tuneDvbt(f, 't' + bw + std, prog);
+    // DVB-T2 first, DVB-T if that does not lock. The device's own
+    // "auto" modulation exists but was confirmed unreliable - it
+    // repeatedly failed to lock a mux that locked within seconds when
+    // the modulation was named - so two explicit attempts it is. The
+    // second only runs when the first genuinely fails, which costs
+    // the lock timeout once and nothing thereafter.
+    try {
+        await tuneDvbt(f, 't' + bw + 'dvbt2', prog);
+    } catch (e) {
+        await tuneDvbt(f, 't' + bw + 'dvbt', prog);
+    }
     // After the tune, not before: the list comes from the multiplex,
     // and until the tuner has locked there is no multiplex to ask.
+    //
+    // And not immediately after either. The tune returns once the
+    // device reports lock, but streaminfo needs the service tables
+    // to have been read, which takes a moment longer - asking too
+    // early returned an empty list, and it took three tunes before
+    // the dropdown filled.
+    await new Promise(function (r) { setTimeout(r, 1500); });
     await loadDvbtPrograms();
+    await loadDvbtPresets();
+    await loadDvbtBootDefault();
 }
 
 async function tunePreset(name) {
@@ -14205,7 +14393,22 @@ if __name__ == "__main__":
         # No valid previous state — fall back to the explicit default
         # boot preset, if one has been configured.
         default_preset = config.get('default_boot_preset')
-        if default_preset:
+        if default_preset and default_preset.get('type') == 'dvbt':
+            # A DVB-T2 fallback. Handed to _resume_tune() it would ask
+            # a Picotuner - which this receiver may not even have - for
+            # a frequency in the wrong unit.
+            print(f"No previous state - using default boot preset: "
+                  f"{default_preset.get('freq_hz', 0)/1e6:.3f} MHz DVB-T2")
+            try:
+                tune_dvbt(DvbtTuneRequest(
+                    freq=default_preset["freq_hz"],
+                    modulation=default_preset.get("modulation", "t8dvbt2"),
+                    program=default_preset.get("program"),
+                ))
+            except Exception as e:
+                print(f"Could not apply default boot preset: "
+                      f"{type(e).__name__}: {e}")
+        elif default_preset:
             print(f"No previous state — using default boot preset: {default_preset}")
             try:
                 _resume_tune(
