@@ -12405,11 +12405,11 @@ def web_ui():
                         <div class="text-muted small">No presets</div>
                     </div>
                     <hr>
-                    <h6 class="text-muted">Manual Tune</h6>
+                    <h6 class="text-muted">Manual Tune (kHz)</h6>
                     <div class="row g-2 mb-2">
                         <div class="col-7">
-                            <input type="number" step="0.001" class="form-control form-control-sm bg-dark text-light border-secondary"
-                                   id="dvbt-freq" placeholder="MHz" value="146.500">
+                            <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary"
+                                   id="dvbt-freq" placeholder="Freq (kHz)" value="437000">
                         </div>
                         <div class="col-5">
                             <select class="form-select form-select-sm bg-dark text-light border-secondary" id="dvbt-bw">
@@ -12439,7 +12439,7 @@ def web_ui():
                     </div>
                     <div id="dvbt-boot-note" class="text-muted small mt-1"></div>
                     <div class="text-muted small mt-2">
-                        Frequency in MHz. Bandwidth is the channel width, not
+                        Frequency in kHz, as on the Picotuner card above. Bandwidth is the channel width, not
                         the bitrate - 1 and 2 MHz are the narrowband amateur
                         modes, 7 and 8 MHz are broadcast. DVB-T2 is tried
                         first and DVB-T after it, so there is nothing to
@@ -13412,7 +13412,10 @@ async function tuneDvbt(freqMhz, modulation, program) {
     // Hz and nobody wants to type nine digits. Converted here, in one
     // place, rather than at each caller.
     await api('POST', '/api/tune_dvbt', {
-        freq: Math.round(parseFloat(freqMhz) * 1e6),
+        // kHz in the form, Hz on the wire. kHz rather than MHz so
+        // both tuning cards on this page agree with each other and
+        // with Lynx's own convention everywhere else.
+        freq: Math.round(parseFloat(freqMhz) * 1000),
         modulation: modulation,
         program: program ? String(program) : null
     });
@@ -13490,12 +13493,12 @@ async function saveDvbtMemory() {
             : ((window._dvbtLockMode || '').indexOf('dvbt') >= 0 ? 'dvbt' : 'dvbt2');
     var progSel = document.getElementById('dvbt-program');
     if (!f) { return; }
-    var name = prompt('Name this preset:', parseFloat(f).toFixed(3) + ' MHz');
+    var name = prompt('Name this preset:', (parseFloat(f)/1000).toFixed(3) + ' MHz');
     if (name === null) { return; }
     var result = await api('POST', '/api/presets/add', {
         type: 'dvbt',
         name: name,
-        freq_hz: Math.round(parseFloat(f) * 1e6),
+        freq_hz: Math.round(parseFloat(f) * 1000),
         modulation: 't' + bw + std,
         program: (progSel && progSel.value) ? progSel.value : null
     });
@@ -13512,13 +13515,13 @@ async function saveDvbtBootDefault() {
     var bw = document.getElementById('dvbt-bw').value;
     var progSel = document.getElementById('dvbt-program');
     if (!f) { return; }
-    if (!confirm('Use ' + parseFloat(f).toFixed(3) + ' MHz as the fallback on '
+    if (!confirm('Use ' + (parseFloat(f)/1000).toFixed(3) + ' MHz as the fallback on '
                  + 'startup, whenever there is nothing previous to resume?')) { return; }
     var std = (window._dvbtLockMode || '').indexOf('dvbt2') >= 0 ? 'dvbt2'
             : ((window._dvbtLockMode || '').indexOf('dvbt') >= 0 ? 'dvbt' : 'dvbt2');
     await api('POST', '/api/boot-default', {
         type: 'dvbt',
-        freq_hz: Math.round(parseFloat(f) * 1e6),
+        freq_hz: Math.round(parseFloat(f) * 1000),
         modulation: 't' + bw + std,
         program: (progSel && progSel.value) ? progSel.value : null
     });
@@ -13569,8 +13572,16 @@ async function loadDvbtPresets() {
             mhz.className = 'text-muted float-end';
             mhz.textContent = (p.freq_hz / 1e6).toFixed(3) + ' MHz';
             b.appendChild(mhz);
-            b.addEventListener('click', function () {
-                tuneDvbt(p.freq_hz / 1e6, p.modulation, p.program);
+            b.addEventListener('click', async function () {
+                // The frequency box follows the preset, so a save or a
+                // service change afterwards works on what is actually
+                // tuned rather than whatever was typed last.
+                var f = document.getElementById('dvbt-freq');
+                if (f) { f.value = Math.round(p.freq_hz / 1000); }
+                await tuneDvbt(p.freq_hz / 1000, p.modulation, p.program);
+                // Same refresh the manual tune does: a preset changes
+                // multiplex, so the old service list is wrong.
+                await loadDvbtPrograms(8);
             });
             row.appendChild(b);
 
@@ -13885,6 +13896,8 @@ async function applyUpdate() {
 // ── Init ──────────────────────────────────────────────────────
 loadConfig();
 loadPresets();
+loadDvbtPresets();
+loadDvbtBootDefault();
 loadLiveStreams();
 loadSlaves();
 // Its own interval rather than a call inside updateStatus(): the
