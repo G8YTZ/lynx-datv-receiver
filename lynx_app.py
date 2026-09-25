@@ -3663,6 +3663,25 @@ def hdhr_local_address(device_address: str) -> str:
         s.close()
 
 
+def hdhr_is_amateur_band(freq_hz) -> bool:
+    """Is this frequency in an amateur band?
+
+    Broadcast Band III (174-230 MHz) and Bands IV/V (470-862 MHz) are
+    excluded by simply not being listed. A service name from a
+    broadcast multiplex is a channel name, not a callsign, and must
+    never reach QRZ as one.
+    """
+    try:
+        mhz = float(freq_hz) / 1e6
+    except (TypeError, ValueError):
+        return False
+    return (50 <= mhz <= 52          # 6m
+            or 70.0 <= mhz <= 70.5   # 4m
+            or 144 <= mhz <= 148     # 2m
+            or 430 <= mhz <= 440     # 70cm
+            or 1240 <= mhz <= 1325)  # 23cm
+
+
 def hdhr_source(device_id=None):
     """A source object for the named device, or the default one."""
     device_id = device_id or hdhr_default_device_id()
@@ -3703,6 +3722,12 @@ def hdhomerun_monitor():
                 tuner = lynx_hdhomerun.HDHomeRunTuner(
                     device_id=device_id, tuner=st.get("tuner", 0))
                 status = tuner.status()
+                pending_program = None
+                pending_freq = None
+                # Captured BEFORE the update below overwrites it: the
+                # transition from not-locked to locked is the whole
+                # signal this monitor acts on.
+                was_locked = bool(st.get("locked"))
                 with hdhr_lock:
                     live = hdhr_states.get(device_id)
                     if live is None:
@@ -3720,6 +3745,67 @@ def hdhomerun_monitor():
                         "bitrate_bps": status.bits_per_second,
                         "frequency_hz": status.frequency_hz,
                     })
+                    pending_program = live.get("pending_program")
+                    pending_freq = live.get("pending_freq_hz")
+
+                # Outside the lock deliberately: this makes a request to
+                # the device, and holding a lock across network I/O is
+                # how a poller stops everything else in the process.
+                if pending_program and status.locked:
+                    raw = ""
+                    for prog in tuner.stream_info():
+                        if prog.get("program") == pending_program:
+                            raw = prog.get("name", "")
+                            break
+
+                    # Same truncation as Ryde's logbook code: keep
+                    # characters up to the first non-alphanumeric one,
+                    # so "G8YTZ /P" becomes "G8YTZ".
+                    call = ""
+                    for ch in raw:
+                        if ch.isalnum():
+                            call += ch
+                        else:
+                            break
+
+                    with hdhr_lock:
+                        live = hdhr_states.get(device_id)
+                        if live is not None:
+                            live["service_name"] = raw
+                            live["callsign"] = (
+                                call.upper()
+                                if hdhr_is_amateur_band(pending_freq) else "")
+                            # Once only: a name that did not arrive is a
+                            # blank label, not something to keep asking
+                            # about every two seconds for ever.
+                            live["pending_program"] = None
+
+                # A station has keyed up. mpv will happily sit there
+                # showing the last frame of whoever was on before -
+                # confirmed on air, and the same stuck-output behaviour
+                # restart_mpv()'s docstring describes. A full restart is
+                # the only thing that reliably clears it.
+                #
+                # Without this, somebody has to re-tune by hand after
+                # every transmission, which is no use at a repeater.
+                if (status.locked and not was_locked
+                        and current_mode == "dvbt"
+                        and device_id == hdhr_default_device_id()):
+                    # Non-blocking: a tune in progress is already
+                    # restarting mpv itself, and two restarts racing
+                    # gives you a dead player rather than a fresh one.
+                    if tune_lock.acquire(blocking=False):
+                        try:
+                            print(f"[hdhr] {device_id} re-locked - "
+                                  "restarting mpv")
+                            restart_mpv(f"udp://@:{HDHR_VIDEO_PORT}",
+                                        is_rf=False)
+                            end_transition_cover()
+                        except Exception as e:
+                            print(f"[hdhr] restart failed: "
+                                  f"{type(e).__name__}: {e}")
+                        finally:
+                            tune_lock.release()
             except lynx_hdhomerun.HDHomeRunError as e:
                 # An unreachable device is ordinary - unplugged, or a
                 # site link down. Recorded, not logged every two seconds.
@@ -6587,6 +6673,17 @@ def get_status():
                 "seq": d["symbol_quality"],
                 "bitrate_bps": d["bitrate_bps"],
                 "frequency_hz": d["frequency_hz"],
+                "service_name": d.get("service_name", ""),
+                # Empty unless the tuned frequency was in an amateur
+                # band - see hdhr_is_amateur_band(). The overlay feeds
+                # this to the callsign field, which reaches QRZ and
+                # Pathfinder, so a broadcast channel name must never
+                # arrive here.
+                "callsign": d.get("callsign", ""),
+                # Same treatment the Picotuner and the Slaves get: the
+                # name from QRZ when it is cached, so a DVB-T2 station
+                # reads "Justin - G8YTZ" like any other contact.
+                "callsign_name": qrz_first_name(d.get("callsign", "")),
             } if d else None)(next(iter(hdhr_devices()), None)),
 
             "preset": current_preset,
@@ -10258,6 +10355,25 @@ def _tune_dvbt_impl(req: DvbtTuneRequest):
         raise HTTPException(status_code=504, detail=str(e))
     except lynx_hdhomerun.HDHomeRunError as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+    # Ask the poller to fetch the service name on its next pass rather
+    # than fetching it here. An earlier version called streaminfo
+    # inline and deadlocked the whole app - see this patch's own notes.
+    # A tune has no business waiting on a name lookup anyway.
+    #
+    # device_id resolved BEFORE the lock is taken: hdhr_default_device_id()
+    # takes hdhr_lock itself, and threading.Lock is not reentrant.
+    _dev = req.device_id or hdhr_default_device_id()
+    with hdhr_lock:
+        live = hdhr_states.get(_dev)
+        if live is not None:
+            # Cleared, not left stale: the previous service's name over
+            # a new one is worse than no name at all.
+            live["service_name"] = ""
+            live["callsign"] = ""
+            live["pending_program"] = (str(req.program)
+                                       if req.program is not None else None)
+            live["pending_freq_hz"] = req.freq
 
     current_mode = "dvbt"
     displayed_receiver_id = None

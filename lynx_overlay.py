@@ -326,6 +326,8 @@ state = {
     "hdhr_seq": "",
     "hdhr_bitrate_bps": 0,
     "hdhr_frequency_hz": None,
+    "hdhr_service_name": "",
+    "hdhr_callsign": "",
     "mode": "idle",
     "freq_khz": 437000,
     "sr_ks": 333,
@@ -625,6 +627,16 @@ def poll_status():
             state["hdhr_seq"] = hh.get('seq', "")
             state["hdhr_bitrate_bps"] = hh.get('bitrate_bps', 0) or 0
             state["hdhr_frequency_hz"] = hh.get('frequency_hz')
+            state["hdhr_service_name"] = hh.get('service_name', "") or ""
+            # Fed into the shared callsign field as well, so the QRZ
+            # lookup and Pathfinder treat a DVB-T2 station exactly as
+            # they treat a DVB-S2 one. Empty on a broadcast frequency,
+            # by design - lynx_app.py gates it on the band.
+            hdhr_call = hh.get('callsign', "") or ""
+            state["hdhr_callsign"] = hdhr_call
+            if state.get("mode") == "dvbt" and hdhr_call:
+                state["callsign"] = hdhr_call
+                state["callsign_name"] = hh.get('callsign_name', "") or ""
 
             div = data.get('diversity', {})
             diversity_enabled = div.get('enabled', False)
@@ -1490,14 +1502,45 @@ class LynxOverlay(Gtk.Window):
         cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)  # restore the OSD's normal font for anything drawn after this
 
     def draw_top_right(self, cr, width, height):
-        if not state["online"] and state["mode"] != "stream":
+        if (not state["online"] and state["mode"] != "stream"
+                and state["mode"] != "dvbt"):
             return
         margin = 16  # matches the bottom-left zone's margin
         size = 30
         line_h = size * 1.3
         lines = []
 
-        if state["mode"] == "stream":
+        if state["mode"] == "dvbt":
+            # Level here rather than on the eye: both halves of the eye
+            # are quality readings, so strength needs somewhere to live.
+            # The service name goes last, in the callsign's place - on
+            # an amateur transmission that is exactly what it is.
+            colour = ((0.0, 1.0, 0.25) if state["hdhr_locked"]
+                      else (0.9, 0.5, 0.1))
+            # SNQ/SEQ as a pair, where the DVB-S2 block shows MER/D.
+            # SNQ is the closest thing this tuner has to MER: the
+            # demodulator's view before error correction. SEQ is how
+            # well the FEC is coping, which behaves like margin - it
+            # sits at 100 until the correction starts struggling, and
+            # it is the one that warns you a picture is about to break.
+            snq = state.get("hdhr_snq")
+            seq = state.get("hdhr_seq")
+            if state["hdhr_locked"] and snq not in ("", None):
+                lines.append(f"SNQ/SEQ {float(snq):>4.0f}/{float(seq or 0):>4.0f} %")
+            # "Justin - G8YTZ" when QRZ has told us a name, the bare
+            # callsign otherwise, and the raw service name when there
+            # is no callsign at all - which is what a broadcast
+            # frequency gives, since the band gate in lynx_app.py
+            # refuses to call "BBC ONE Lon HD" a callsign.
+            call = (state.get("hdhr_callsign") or "").strip()
+            if call:
+                qrz_name = (state.get("callsign_name") or "").strip()
+                lines.append(f"{qrz_name} - {call}" if qrz_name else call)
+            else:
+                svc = (state.get("hdhr_service_name") or "").strip()
+                if svc:
+                    lines.append(svc)
+        elif state["mode"] == "stream":
             lines.append(state["stream_name"] or "STREAMING")
             colour = (0.0, 1.0, 0.25)
         else:
@@ -1616,37 +1659,36 @@ class LynxOverlay(Gtk.Window):
             line_h = size * 1.3
             colour = DVBT_LOCKED if state["hdhr_locked"] else DVBT_NOT_LOCKED
 
-            lines = []
+            # Two lines, the same shape as the DVB-S2 block above:
+            # what it is tuned to, then how it is coded and at what
+            # rate. Quality goes top right and the meters bottom, so
+            # neither belongs here - the first version put all five on
+            # one side and it read as a wall rather than a display.
             freq_hz = state.get("hdhr_frequency_hz")
             mode_name = state.get("hdhr_lock_mode") or ""
-            if freq_hz:
-                # MHz on screen, Hz in the API: the device works in Hz
-                # and nobody reads a nine-digit frequency.
-                lines.append(f"{freq_hz / 1e6:.3f} MHz")
+            std, bw = "", ""
             if mode_name:
-                # t8dvbt2 -> DVB-T2 8 MHz, which is what an operator
-                # would say out loud.
+                # t8dvbt2 -> "DVB-T2" and "8 MHz": what an operator
+                # would say out loud, not what the API calls it.
                 try:
-                    bw = mode_name[1]
+                    bw = f"{mode_name[1]} MHz"
                     std = "DVB-T2" if mode_name.endswith("dvbt2") else "DVB-T"
-                    lines.append(f"{std} {bw} MHz")
                 except Exception:
-                    lines.append(mode_name)
-            elif not state["hdhr_locked"]:
-                lines.append("SEARCHING")
+                    std = mode_name
+
+            line1 = f"{freq_hz / 1e6:.3f} MHz" if freq_hz else "--"
+            if bw:
+                line1 += f"   {bw}"
 
             if state["hdhr_locked"]:
-                # SNQ and SEQ by name. They are the device's own terms
-                # and they are not MER and margin.
-                lines.append(f"SNQ {state['hdhr_snq']}%  "
-                             f"SEQ {state['hdhr_seq']}%")
-                lines.append(f"LEVEL {state['hdhr_level']}%")
+                line2 = std or "--"
                 bps = state.get("hdhr_bitrate_bps") or 0
                 if bps:
-                    lines.append(f"{bps / 1e6:.2f} Mb/s")
+                    line2 += f"   {bps / 1e6:.2f} Mb/s"
+            else:
+                line2 = "SEARCHING"
 
-            if not lines:
-                lines = ["--"]
+            lines = [line1, line2]
             for i, line in enumerate(lines):
                 y = margin + size + (i * line_h)
                 self.draw_text(cr, margin, y, line, size=size,
@@ -1940,15 +1982,33 @@ class LynxOverlay(Gtk.Window):
             # it never measured - the same choice stream mode makes
             # with its bitrate. Both halves show the same reading:
             # there is one tuner, so there is one answer.
+            # EYE_DVBT: two halves, two readings - the same use the
+            # eye was built for in diversity mode, except that here
+            # they are two properties of one tuner rather than two
+            # tuners. Top: SEQ. Bottom: level.
+            #
+            # Both are 0-100 from the device, shown as the percentages
+            # they are rather than converted into a dBm figure it never
+            # measured. If a model is ever found that reports dBmV,
+            # that converts to dBm properly and the bottom half can
+            # become directly comparable with the DVB-S2 side.
+            seq = state.get("hdhr_seq")
+            if seq in ("", None):
+                value_text_a = "--"
+                fraction_a = 0.0
+            else:
+                value_text_a = f"SEQ {float(seq):.0f}%"
+                fraction_a = min(1.0, float(seq) / 100.0) ** 0.5
+
             lvl = state.get("hdhr_level")
             if lvl in ("", None):
-                text = "--"
-                frac = 0.0
+                value_text_b = "--"
+                fraction_b = 0.0
             else:
-                text = f"{float(lvl):.0f}%"
-                frac = min(1.0, float(lvl) / 100.0) ** 0.5
-            fraction_a = fraction_b = frac
-            value_text_a = value_text_b = text
+                value_text_b = f"LVL {float(lvl):.0f}%"
+                fraction_b = min(1.0, float(lvl) / 100.0) ** 0.5
+
+            # One tuner, so one lock state - both halves agree.
             locked_a = locked_b = state.get("hdhr_locked", False)
         elif state["mode"] == "stream":
             # No independent tuners in stream mode - both halves show
