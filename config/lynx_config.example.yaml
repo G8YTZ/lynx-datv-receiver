@@ -34,6 +34,17 @@ diversity:
   rcv1_plug: a
   rcv2_plug: b
 
+hdhomerun:                  # DVB-T/T2/C via a SiliconDust HDHomeRun on the
+                             # network. Nothing here is needed for one plugged
+                             # into the same subnet - it is found at startup.
+                             # Only the HDHR5-2DT and 4DT do the narrow amateur
+                             # bandwidths; other models are broadcast only.
+  address: ''                # <-- only for a tuner on ANOTHER subnet. Discovery
+                             # is a broadcast and stops at the first router, so
+                             # a device across a link has to be named. Asked
+                             # directly rather than broadcast for, and used in
+                             # addition to anything found locally.
+
 notifications:
   companion:
     enabled: false
@@ -104,6 +115,11 @@ presets:                    # Starting set for a fresh install - BATC's own netw
     name: GB3OO
     url: rtmp://rtmp.batc.org.uk/live/gb3oo
     note: BATC network relay
+  # - type: dvbt             # DVB-T2, saved from the Web UI's own button.
+  #   name: GB3OO 70cm       # freq_hz is in Hz, matching the device's own API;
+  #   freq_hz: 437000000     # the modulation's leading digit is the channel
+  #   modulation: t1dvbt2    # width in MHz, so t1 is a literal 1 MHz - not 1.7
+  #   program: '1'           # rounded down. program selects one service.
   - type: stream
     name: GB3HV
     url: rtmp://rtmp.batc.org.uk/live/gb3hv
