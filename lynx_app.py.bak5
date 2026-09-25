@@ -752,15 +752,6 @@ def current_rf_target_port():
     already proven correct and tested, and touching genuinely-working
     code for its own sake adds risk without benefit."""
     cfg = config['picotuner']
-    # Checked before the local cases: a Slave being displayed is
-    # not a mode the receiver puts itself into, it is an explicit
-    # choice, and while it holds neither tri_watch nor diversity
-    # describes what is on screen. Getting this wrong would send
-    # a freeze recovery to a local tuner's port while a Slave is
-    # playing — the same shape of bug this function exists to
-    # prevent.
-    if receiver_is_remote(active_receiver_id() or 0):
-        return REMOTE_VIDEO_OUT_PORT
     if tri_watch_enabled and tri_watch_target_rcv == 2:
         return cfg['ts_port_b']
     elif diversity_enabled:
@@ -823,21 +814,6 @@ def restart_mpv(target_url: str, is_rf: bool = True):
             "--demuxer=lavf --demuxer-lavf-format=mpegts "
             "--demuxer-max-bytes=512KiB --demuxer-max-back-bytes=128KiB "
             "--profile=low-latency --cache-pause=no "
-            # low-latency sets analyzeduration to zero, which means mpv
-            # decides what the stream contains from whatever bytes turn
-            # up first. Joining a live stream lands mid-GOP, so it
-            # starts decoding slices before it has the PPS describing
-            # them — "non-existing PPS 0 referenced", then no picture
-            # until the next keyframe. It also leaves a sparse audio
-            # track unidentified: "0 channels: unspecified sample
-            # format".
-            #
-            # A second is enough to find a keyframe at any sane GOP
-            # length and to identify both tracks properly. It is spent
-            # once per source switch, behind a transition cover that
-            # already waits far longer than that for rendering, and
-            # adds nothing to running latency.
-            "--demuxer-lavf-analyzeduration=1 "
         )
     else:
         # No format-forcing (let mpv auto-detect the real container —
@@ -1679,20 +1655,7 @@ def mpv_decoder_health_monitor():
                               # the freeze length rather than mpv's own recovery time. Halved to
                               # reduce worst-case detection latency, now paired with the raised
                               # 10-error threshold above rather than the original 3.
-    DELAY_THRESHOLD_SECS = 6.0   # gap between playback and buffered position...
-                                 # Was 3.0, which a healthy stream could reach on its own:
-                                 # a Slave in good health measures 2.6-2.7s of cache with
-                                 # no underrun and the clock advancing normally, so routine
-                                 # variation crossed the line and restarted mpv for no
-                                 # reason. Observed as fifteen restarts in a few minutes,
-                                 # each rendering successfully before being restarted again,
-                                 # until the circuit breaker below backed off and let a
-                                 # picture settle. The restart is also counterproductive: it
-                                 # discards the buffer and forces a fresh acquisition, which
-                                 # on a five-second GOP costs more delay than it recovers.
-                                 # 6.0 is about double a healthy working delay and still far
-                                 # below the 20s emergency threshold that catches a gap
-                                 # genuinely running away...
+    DELAY_THRESHOLD_SECS = 3.0   # gap between playback and buffered position...
     DELAY_CONSECUTIVE_CHECKS = 2  # ...persisting for this many consecutive checks triggers a restart.
                                     # Was 3 - reduced given this trigger was already confirmed (via
                                     # direct diagnostic testing) to catch a genuine, non-self-recovering
@@ -2567,19 +2530,7 @@ def rf_mpv_lifecycle_monitor():
                 mpv_running_for_rf = False  # streaming/idle modes manage mpv themselves
                 continue
 
-            # Whichever receiver is actually on screen. Reading the
-            # local tuner here would stop mpv when IT lost lock while
-            # a Slave was playing quite happily, and restart it onto
-            # the wrong source when it came back.
-            #
-            # This is also what gives a Slave a clean restart when a
-            # transmission ends. Without it nothing tells mpv the
-            # source went away: it holds reference frames from a
-            # stream that stopped and smears them over the new one
-            # until a keyframe arrives.
-            _lifecycle_active = active_receiver()
-            raw_locked = (_lifecycle_active.get("locked", False)
-                          if _lifecycle_active else False) or \
+            raw_locked = picotuner_state.get("locked", False) or \
                          (diversity_enabled and picotuner_state_b.get("locked", False))
 
             if raw_locked:
@@ -2590,14 +2541,12 @@ def rf_mpv_lifecycle_monitor():
                         try:
                             print(f"[rf_mpv_lifecycle] Confirmed lock after "
                                   f"{lock_streak * POLL_SECS}s - starting mpv")
-                            # Same answer as before for diversity and
-                            # for receiver A, and the right one for a
-                            # Slave. Asking beats deciding again:
-                            # current_rf_target_port() exists because
-                            # call sites making this choice themselves
-                            # is how one of them ended up recovering
-                            # onto the wrong receiver's port.
-                            restart_mpv(f"udp://@:{current_rf_target_port()}")
+                            if diversity_enabled:
+                                div_cfg = config['diversity']
+                                restart_mpv(f"udp://@:{div_cfg['combiner_out_port']}")
+                            else:
+                                cfg = config['picotuner']
+                                restart_mpv(f"udp://@:{picotuner_ts_port('a', cfg)}")
                             rendering_confirmed = wait_for_mpv_rendering()  # real rendering, not a guess
                             if rendering_confirmed:
                                 # Same safety margin as the other two RF
@@ -3430,32 +3379,6 @@ REMOTE_DEFAULT_STATUS_PORT = 10997
 # them apart by source address — the same address that is already
 # sending that Slave's status, so identity comes free and there is no
 # per-Slave port to allocate, configure, or firewall.
-# A Slave's rich status arrives on its status port minus this, the
-# same relationship the Picotuner uses between 9997 and 9901. Derived
-# rather than configured: it has a natural answer, and a configurable
-# one would be a third port per Slave to keep in step at both ends.
-REMOTE_QUALITY_PORT_OFFSET = 96
-
-# How long a resume waits for a saved Slave to report in before
-# giving up. It cannot be selected until its address is known, and
-# at boot nothing has been heard yet. Bounded rather than endless:
-# a site that is off the air should leave the receiver idle and
-# usable, not stuck waiting for it.
-REMOTE_RESUME_WAIT_SECS = 30
-
-# Filled only from the quality port, and only once it has actually sent
-# something. Same names as picotuner_state so a panel or overlay that
-# already reads a tuner can read a Slave without a second shape.
-REMOTE_QUALITY_FIELDS = (
-    "mer", "margin", "symbol_rate", "modcod", "programme",
-    "dbm", "agc1", "agc2", "codec", "audio_codec",
-)
-
-
-def remote_quality_port(i: int) -> int:
-    return remote_states[i]["status_port"] - REMOTE_QUALITY_PORT_OFFSET
-
-
 REMOTE_VIDEO_INGRESS_PORT = 10998
 
 # The relay forwards the selected Slave here, and nothing is selected
@@ -3498,464 +3421,6 @@ def relay_refresh_sources():
 # demand so that a Slave which has never sent anything still has a
 # record, and still shows as offline rather than being absent - "not
 # there yet" and "not configured" are different things.
-# --- HDHomeRun (DVB-T/T2/C) ------------------------------------------
-# Imported here rather than in the header block at the top: this is an
-# optional source whose module sits beside the Slave code it most
-# resembles, and keeping the two together means somebody reading one
-# finds the other.
-import lynx_hdhomerun
-
-# Its own port, not 9941. That port is already shared between the RF
-# direct-play path, stop_ffmpeg_bg()'s transcode and the diversity
-# combiner, and has already produced one "Address already in use"
-# crash when two of them overlapped. A third writer would be asking
-# for the same failure, and a tuner that can stay locked while another
-# source is on screen is worth having anyway.
-HDHR_VIDEO_PORT = 10996
-
-# How often each known device is asked for status. It does not
-# broadcast, so this is a request rather than a packet arriving:
-# often enough for the overlay to feel live, not so often that a busy
-# device is being interrogated for no reason.
-HDHR_POLL_INTERVAL_SECS = 2.0
-
-# How long without a successful status read before a device counts as
-# gone. Several polls, so one timeout on a busy network does not make
-# a tuner appear to come and go.
-HDHR_OFFLINE_AFTER_SECS = 15.0
-
-# Deliberately NOT the same names as REMOTE_QUALITY_FIELDS. Those are
-# DVB-S2 measurements; these are DVB-T/T2 ones. Presenting SNQ as MER
-# would make two different things look comparable on one overlay, and
-# somebody would eventually compare them.
-HDHR_QUALITY_FIELDS = (
-    "lock_mode",        # e.g. "t8dvbt2"; "" when unlocked
-    "signal_strength",  # ss,  0-100
-    "signal_quality",   # snq, 0-100
-    "symbol_quality",   # seq, 0-100
-    "bitrate_bps",      # bps
-    "frequency_hz",
-)
-
-# Discovered devices, keyed by device ID. Unlike remote_states this is
-# NOT built from config and NOT a list indexed in step with anything:
-# there is no configured set for a device to be absent from, so one
-# that has never been seen simply is not here. Keyed rather than
-# indexed because a device's identity is its ID, and discovery returns
-# them in whatever order they answer.
-hdhr_states: dict = {}
-hdhr_lock = threading.Lock()
-
-
-def hdhr_presets_cfg() -> list:
-    """The configured presets, as a list.
-
-    Presets are configured because which frequencies and services
-    matter is not discoverable. The devices themselves are not: they
-    announce themselves on the LAN, and anything that announces itself
-    should not also have to be declared.
-    """
-    presets = config.get('hdhomerun_presets')
-    return presets if isinstance(presets, list) else []
-
-
-def hdhr_devices() -> list:
-    """Known devices, newest state, as a list of records.
-
-    Sorted by device ID so the order on screen is stable: discovery
-    returns them in whatever order they answer, which is not an order
-    anybody wants to watch a list re-sort itself into.
-    """
-    with hdhr_lock:
-        return [dict(st) for _, st in sorted(hdhr_states.items())]
-
-
-def hdhr_discover_once() -> int:
-    """Sweep the network for HDHomeRun devices. Returns how many.
-
-    Called once at startup rather than from a background thread: an
-    HDHomeRun is installed once, not plugged in and out, and a
-    receiver with none should run no thread and send no broadcast -
-    absent hardware means absent behaviour, the same principle the
-    Slave threads follow for absent configuration. A device added
-    later is picked up on the next restart.
-
-    Discovery returns one row per ADDRESS, so a device reachable over
-    IPv4 and IPv6 answers three times (global v6, link-local v6, v4).
-    Keyed by device ID so those collapse to one record, and the IPv4
-    address is preferred because that is what the rest of the site is
-    addressed by.
-    """
-    try:
-        found = lynx_hdhomerun.discover()
-    except lynx_hdhomerun.HDHomeRunError as e:
-        # No devices, or hdhomerun_config not installed. Neither is an
-        # error: this source is optional.
-        print(f"[hdhr] discovery: {e}")
-        return 0
-
-    with hdhr_lock:
-        for device in found:
-            device_id = device["device_id"]
-            address = device["address"]
-            st = hdhr_states.setdefault(device_id, {
-                "device_id": device_id,
-                "name": f"HDHomeRun {device_id}",
-                "tuner": 0,
-                "address": address,
-                "online": False,
-                "locked": False,
-                "streaming": False,
-                "last_seen": 0.0,
-                "last_error": "",
-                **{field: None for field in HDHR_QUALITY_FIELDS},
-            })
-            if ":" not in address:
-                st["address"] = address        # prefer IPv4
-        count = len(hdhr_states)
-
-    # A configured address, asked directly. Discovery is a broadcast
-    # and stops at the first router, so a device on another subnet can
-    # never answer it - but it is perfectly reachable once named, and
-    # everything after this point is ordinary unicast.
-    #
-    # Additive rather than exclusive: a receiver may have one tuner on
-    # the local segment and another at a site across a link, and there
-    # is no reason to make it choose.
-    _manual = (config.get('hdhomerun') or {}).get('address', '')
-    if _manual:
-        try:
-            info = lynx_hdhomerun.discover_http(_manual)
-            _did = (info.get('DeviceID') or '').upper()
-            if _did:
-                with hdhr_lock:
-                    st = hdhr_states.setdefault(_did, {
-                        "device_id": _did,
-                        "name": info.get('FriendlyName') or f"HDHomeRun {_did}",
-                        "tuner": 0,
-                        "address": _manual,
-                        "online": False,
-                        "locked": False,
-                        "streaming": False,
-                        "last_seen": 0.0,
-                        "last_error": "",
-                        **{field: None for field in HDHR_QUALITY_FIELDS},
-                    })
-                    # A configured address wins over a discovered one
-                    # for the same device: somebody typed it, which is
-                    # a stronger statement than a broadcast reply.
-                    st["address"] = _manual
-                    st["configured"] = True
-                count = len(hdhr_states)
-        except lynx_hdhomerun.HDHomeRunError as e:
-            print(f"[hdhr] configured address {_manual}: {e}")
-
-    if count:
-        for st in hdhr_devices():
-            print(f"[hdhr] found {st['device_id']} at {st['address']}")
-    return count
-
-
-def hdhr_default_device_id():
-    """Which device a tune goes to when none is named.
-
-    A configured preference wins if that device is actually present;
-    otherwise the first one by ID. Returns None when nothing has been
-    found, which the caller reports rather than guessing.
-    """
-    preferred = (config.get('hdhomerun') or {}).get('prefer_device_id')
-    with hdhr_lock:
-        if preferred and preferred in hdhr_states:
-            return preferred
-        for device_id in sorted(hdhr_states):
-            return device_id
-    return None
-
-
-def hdhr_local_address(device_address: str) -> str:
-    """Which of OUR addresses the device should stream to.
-
-    Asked of the kernel rather than configured, and asked again on
-    every tune rather than remembered. A UDP connect() sends nothing -
-    it only consults the routing table - so this costs nothing and is
-    correct on a multi-homed receiver, after a DHCP change, and after
-    a move between Ethernet and Wi-Fi.
-
-    This exists because the first version passed "127.0.0.1", which
-    the device accepted and reported back perfectly while sending the
-    stream to its OWN loopback. Nothing arrived, and nothing said why:
-    status showed locked and streaming, pps was non-zero, and tcpdump
-    on every interface here saw nothing at all. A wrong address that
-    the far end cheerfully confirms is worth guarding against properly.
-    """
-    family = socket.AF_INET6 if ":" in device_address else socket.AF_INET
-    s = socket.socket(family, socket.SOCK_DGRAM)
-    try:
-        # Port 1 is arbitrary: no packet is sent, and the device is
-        # never contacted. Only the routing decision is wanted.
-        s.connect((device_address, 1))
-        return s.getsockname()[0]
-    finally:
-        s.close()
-
-
-def hdhr_is_amateur_band(freq_hz) -> bool:
-    """Is this frequency in an amateur band?
-
-    Broadcast Band III (174-230 MHz) and Bands IV/V (470-862 MHz) are
-    excluded by simply not being listed. A service name from a
-    broadcast multiplex is a channel name, not a callsign, and must
-    never reach QRZ as one.
-    """
-    try:
-        mhz = float(freq_hz) / 1e6
-    except (TypeError, ValueError):
-        return False
-    return (50 <= mhz <= 52          # 6m
-            or 70.0 <= mhz <= 70.5   # 4m
-            or 144 <= mhz <= 148     # 2m
-            or 430 <= mhz <= 440     # 70cm
-            or 1240 <= mhz <= 1325)  # 23cm
-
-
-def hdhr_source(device_id=None):
-    """A source object for the named device, or the default one."""
-    device_id = device_id or hdhr_default_device_id()
-    if not device_id:
-        raise HTTPException(status_code=404,
-                            detail="No HDHomeRun found on the network")
-    with hdhr_lock:
-        st = hdhr_states.get(device_id)
-    if not st:
-        raise HTTPException(
-            status_code=404,
-            detail=f"HDHomeRun {device_id} not found on the network")
-    return lynx_hdhomerun.HDHomeRunSource(
-        device_id=device_id,
-        lynx_host=hdhr_local_address(st.get("address") or device_id),
-        tuner=st.get("tuner", 0),
-        udp_port=HDHR_VIDEO_PORT,
-    )
-
-
-def hdhomerun_monitor():
-    """Background thread: polls each known HDHomeRun for status.
-
-    Polls rather than listens, because unlike the Picotuner and the
-    Slaves an HDHomeRun does not broadcast - it answers when asked.
-    That difference is the whole reason this is a separate monitor
-    rather than another branch inside an existing one.
-
-    Runs regardless of current_mode, deliberately: knowing whether a
-    tuner is locked BEFORE selecting it is more useful than finding
-    out afterwards, and the cost is one small request every couple of
-    seconds.
-    """
-    while True:
-        for st in hdhr_devices():
-            device_id = st["device_id"]
-            try:
-                tuner = lynx_hdhomerun.HDHomeRunTuner(
-                    device_id=device_id, tuner=st.get("tuner", 0))
-                status = tuner.status()
-                pending_program = None
-                pending_freq = None
-                # Captured BEFORE the update below overwrites it: the
-                # transition from not-locked to locked is the whole
-                # signal this monitor acts on.
-                was_locked = bool(st.get("locked"))
-                with hdhr_lock:
-                    live = hdhr_states.get(device_id)
-                    if live is None:
-                        continue
-                    live.update({
-                        "online": True,
-                        "last_error": "",
-                        "last_seen": time.time(),
-                        "locked": status.locked,
-                        "streaming": status.streaming,
-                        "lock_mode": status.lock if status.locked else "",
-                        "signal_strength": status.signal_strength,
-                        "signal_quality": status.signal_quality,
-                        "symbol_quality": status.symbol_quality,
-                        "bitrate_bps": status.bits_per_second,
-                        "frequency_hz": status.frequency_hz,
-                    })
-                    pending_program = live.get("pending_program")
-                    pending_freq = live.get("pending_freq_hz")
-
-                # Outside the lock deliberately: this makes a request to
-                # the device, and holding a lock across network I/O is
-                # how a poller stops everything else in the process.
-                if pending_program and status.locked:
-                    raw = ""
-                    for prog in tuner.stream_info():
-                        if prog.get("program") == pending_program:
-                            raw = prog.get("name", "")
-                            break
-
-                    # Same truncation as Ryde's logbook code: keep
-                    # characters up to the first non-alphanumeric one,
-                    # so "G8YTZ /P" becomes "G8YTZ".
-                    call = ""
-                    for ch in raw:
-                        if ch.isalnum():
-                            call += ch
-                        else:
-                            break
-
-                    with hdhr_lock:
-                        live = hdhr_states.get(device_id)
-                        if live is not None:
-                            live["service_name"] = raw
-                            live["callsign"] = (
-                                call.upper()
-                                if hdhr_is_amateur_band(pending_freq) else "")
-                            # Once only: a name that did not arrive is a
-                            # blank label, not something to keep asking
-                            # about every two seconds for ever.
-                            live["pending_program"] = None
-
-                    # A callsign, on an amateur frequency, not already
-                    # logged for this transmission: that is a contact.
-                    # Armed here rather than at lock, because at lock
-                    # there is no callsign yet - it arrives with the
-                    # service name a moment later.
-                    _new_call = call.upper() if hdhr_is_amateur_band(
-                        pending_freq) else ""
-                    if (_new_call and current_mode == "dvbt"
-                            and notification_manager is not None):
-                        with hdhr_lock:
-                            _l = hdhr_states.get(device_id)
-                            _already = _l.get("logged_callsign") if _l else ""
-                            if _l is not None:
-                                _l["logged_callsign"] = _new_call
-                        if _already != _new_call:
-                            try:
-                                notification_manager.arm_external_contact(
-                                    _hdhr_contact_source(device_id),
-                                    key="dvbt")
-                            except Exception as e:
-                                print(f"[hdhr] logging: "
-                                      f"{type(e).__name__}: {e}")
-
-                # A station has keyed up. mpv will happily sit there
-                # showing the last frame of whoever was on before -
-                # confirmed on air, and the same stuck-output behaviour
-                # restart_mpv()'s docstring describes. A full restart is
-                # the only thing that reliably clears it.
-                #
-                # Without this, somebody has to re-tune by hand after
-                # every transmission, which is no use at a repeater.
-                if (status.locked and not was_locked
-                        and current_mode == "dvbt"
-                        and device_id == hdhr_default_device_id()):
-                    # Non-blocking: a tune in progress is already
-                    # restarting mpv itself, and two restarts racing
-                    # gives you a dead player rather than a fresh one.
-                    # Ask for the service name again. A different
-                    # station may be on now, and keeping the previous
-                    # one's callsign would log the wrong contact.
-                    with hdhr_lock:
-                        _live = hdhr_states.get(device_id)
-                        if _live is not None:
-                            _live["pending_program"] = _live.get("last_program")
-                            _live["logged_callsign"] = ""
-                    if tune_lock.acquire(blocking=False):
-                        try:
-                            print(f"[hdhr] {device_id} re-locked - "
-                                  "restarting mpv")
-                            restart_mpv(f"udp://@:{HDHR_VIDEO_PORT}",
-                                        is_rf=False)
-                            end_transition_cover()
-                        except Exception as e:
-                            print(f"[hdhr] restart failed: "
-                                  f"{type(e).__name__}: {e}")
-                        finally:
-                            tune_lock.release()
-            except lynx_hdhomerun.HDHomeRunError as e:
-                # An unreachable device is ordinary - unplugged, or a
-                # site link down. Recorded, not logged every two seconds.
-                with hdhr_lock:
-                    live = hdhr_states.get(device_id)
-                    if live is not None:
-                        if (time.time() - live.get("last_seen", 0)
-                                > HDHR_OFFLINE_AFTER_SECS):
-                            live["online"] = False
-                            live["locked"] = False
-                            live["streaming"] = False
-                        live["last_error"] = str(e)
-        time.sleep(HDHR_POLL_INTERVAL_SECS)
-
-
-def _hdhr_contact_source(device_id):
-    """A picotuner_state-shaped source dict for a DVB-T2 contact.
-
-    The notifications module reads a fixed set of field names, so the
-    honest ones are filled and the rest left empty rather than
-    approximated. mer and margin stay None: SNQ is the closest thing
-    this tuner reports and it is still not MER.
-
-    mode_name, comment and rst carry what DVB-T2 actually measures.
-    The comment field is free text, which is where a percentage can go
-    without being mistaken for a dB figure.
-    """
-    st = None
-    for d in hdhr_devices():
-        if d["device_id"] == device_id:
-            st = d
-            break
-    if not st:
-        return {}
-
-    lm = st.get("lock_mode") or ""
-    std = "DVB-T2" if lm.endswith("dvbt2") else ("DVB-T" if "dvbt" in lm else "")
-    bw = lm[1:2]
-    mode_name = f"{std} {bw} MHz" if (std and bw) else (std or "DVB-T2")
-    freq_hz = st.get("frequency_hz") or 0
-
-    snq = st.get("signal_quality")
-    seq = st.get("symbol_quality")
-    lvl = st.get("signal_strength")
-
-    return {
-        "rx_callsign": st.get("callsign", ""),
-        # kHz, matching the module's own convention - it divides by
-        # 1000 again for the ADIF frequency, and a value in the wrong
-        # unit here once put a 437 MHz contact outside every defined
-        # band and had the whole submission rejected.
-        "frequency_khz": freq_hz / 1000.0,
-        "mer": None,
-        "margin": None,
-        "modcod": mode_name,
-        "symbol_rate": "",
-        "mode_name": mode_name,
-        # The mode is already in the MODE column, so repeating it here
-        # just crowds the comment.
-        "comment": f"SNQ {snq}% | SEQ {seq}% | LVL {lvl}%",
-        # RST_SENT is a signal report, and level is the closest thing
-        # this tuner has to one. SNQ and SEQ describe how well the
-        # demodulator coped, which is what the comment is for.
-        "rst": f"{lvl}%",
-    }
-
-
-def hdhr_stop_all():
-    """Stop every known device streaming.
-
-    The device keeps sending until told otherwise, so every path that
-    leaves this source must call this. Without it a tuner stays busy
-    and keeps pushing packets at a port nobody is reading - not
-    harmful, but exactly the kind of thing that stays invisible until
-    the day it matters.
-    """
-    for st in hdhr_devices():
-        try:
-            hdhr_source(st["device_id"]).stop()
-        except Exception as e:
-            print(f"[hdhr] stop failed: {type(e).__name__}: {e}")
-# --- end HDHomeRun ---------------------------------------------------
-
 remote_states: list = []
 
 
@@ -4049,204 +3514,12 @@ def _relay_video_for(i: int) -> dict:
         return blank
 
 
-# ── Receiver registry ────────────────────────────────────────────
-#
-# Every receiver Lynx can display, under one numbering:
-#
-#     1, 2      local Picotuner receivers
-#     11 - 15   Slaves
-#
-# 3 to 10 are left free for a WinterHill, which presents its own
-# receivers 5 and 6 and would collide with anything numbered into that
-# range.
-REMOTE_RECEIVER_ID_BASE = 11
-MAX_REMOTE_RECEIVERS = 5
-
-# Which receiver is on screen, when it is one that had to be
-# chosen rather than one the receiver arrived at by itself.
-# None means a local tuner, and which local tuner is then a
-# question tri_watch and diversity already answer.
-#
-# Real state, deliberately. This was originally inferred from
-# current_stream_url still holding the relay's port, which is
-# true when a Slave is displayed and stays true afterwards,
-# because nothing clears it when tuning back to RF. The result
-# was a local tuner on the panel and a Slave on the screen.
-displayed_receiver_id = None
-
-
-def receiver_state(rid: int):
-    """The state record for one receiver, or None if there is no such
-    receiver.
-
-    Returns the live dict, not a copy — the monitor threads write to
-    these, and a caller holding a snapshot would be reading a receiver's
-    state from whenever it happened to ask. One record per receiver,
-    one place that hands it out.
-    """
-    if rid == 1:
-        return picotuner_state
-    if rid == 2:
-        return picotuner_state_b
-    if REMOTE_RECEIVER_ID_BASE <= rid < REMOTE_RECEIVER_ID_BASE + MAX_REMOTE_RECEIVERS:
-        i = rid - REMOTE_RECEIVER_ID_BASE
-        if 0 <= i < len(remote_states):
-            return remote_states[i]
-    return None
-
-
-def receiver_ids() -> list:
-    """Every receiver that exists, in display order.
-
-    Local receivers always exist, whether or not anything is connected
-    to them — the hardware is either there or it is a fault worth
-    showing. A Slave exists once it is configured, enabled or not, so a
-    disabled one appears switched off rather than vanishing.
-    """
-    ids = [1, 2]
-    for i in range(min(len(remote_states), MAX_REMOTE_RECEIVERS)):
-        ids.append(REMOTE_RECEIVER_ID_BASE + i)
-    return ids
-
-
-def receiver_is_remote(rid: int) -> bool:
-    return rid >= REMOTE_RECEIVER_ID_BASE
-
-
-def active_receiver_id():
-    """Which receiver is on screen, or None if a stream is.
-
-    THE one derivation point. The port equivalent of this question,
-    current_rf_target_port(), already exists and its docstring records
-    what happened when it did not: the decision was duplicated across
-    call sites, two of them were never taught about tri_watch, and a
-    freeze recovery restarted mpv pointed at the wrong receiver's port
-    for the whole of a tri_watch session. Same question, same reason to
-    answer it in one place.
-
-    Order matters. A Slave is checked first because selecting one is an
-    explicit act by somebody at the front panel, where diversity and
-    tri_watch are modes the receiver puts itself into.
-    """
-    # Set when a Slave is chosen, cleared when anything tunes to
-    # RF. The relay keeps its own selection across a switch to a
-    # local tuner, so what the relay is forwarding and what is on
-    # screen are different questions.
-    if displayed_receiver_id is not None:
-        if receiver_state(displayed_receiver_id) is not None:
-            return displayed_receiver_id
-        # Configured away underneath us — a Slave that no longer
-        # exists is not on screen, whatever was chosen earlier.
-        return None
-
-    if current_mode != "rf":
-        return None
-    if tri_watch_enabled and tri_watch_target_rcv == 2:
-        return 2
-    # Diversity combines both receivers into one output. Reported as 1
-    # because that is the receiver whose tuning and callsign describe
-    # what is being watched; rcv 2 is contributing, not being displayed.
-    return 1
-
-
-def active_receiver():
-    """The state record for whatever is on screen, or None."""
-    rid = active_receiver_id()
-    return receiver_state(rid) if rid is not None else None
-
-
 def remote_online(i: int) -> bool:
     """Derived from last_seen rather than stored. A Slave that stops
     sending must stop appearing present, and a flag set True on receipt
     has no way back to False on its own."""
     last = remote_states[i]["last_seen"]
     return bool(last) and (time.time() - last) < REMOTE_OFFLINE_AFTER_SECS
-
-
-def remote_quality_monitor(index: int):
-    """Background thread: rich status for one Slave, tagged $n,m only.
-
-    Deliberately the tagged format and never the 9904-style column
-    table. The comments on picotuner_quality_monitor() and its table
-    counterpart record a real, live-confirmed bug where a column shift
-    fed one receiver's MER and modcod into another receiver's display,
-    with nothing to indicate it. Tagged fields cannot drift: a value is
-    whatever its own tag says it is, and an unrecognised tag is ignored
-    rather than silently adopted as the next field along.
-
-    Values are stored exactly as sent, as strings. The Slave has already
-    done the arithmetic — margin against the modcod threshold, dBm from
-    the AGC table — and re-deriving either at this end would be a second
-    implementation to keep in step with the first.
-    """
-    sock = None
-    bound_port = None
-    while True:
-        try:
-            st = remote_states[index]
-            want_port = st["status_port"] - REMOTE_QUALITY_PORT_OFFSET
-            if sock is None or bound_port != want_port:
-                if sock is not None:
-                    try: sock.close()
-                    except Exception: pass
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                # No SO_REUSEADDR/SO_REUSEPORT here, unlike the Picotuner
-                # monitors. One Slave, one quality port, one reader: with
-                # them set a second process binds the same port and shares
-                # the packets silently, which is how a stray listener once
-                # ate Picotuner status. A clash should be loud.
-                sock.settimeout(5)
-                sock.bind(('', want_port))
-                bound_port = want_port
-                print(f"[remote {index}] quality monitor listening on {want_port}")
-
-            data, addr = sock.recvfrom(4096)
-
-            # Only from the address this Slave's own status comes from.
-            # Until that is known the packet cannot be attributed to
-            # anybody, and adopting it on the strength of the port alone
-            # is how one site's MER ends up on another site's panel.
-            if not st["addr"] or addr[0] != st["addr"]:
-                continue
-
-            fields = {}
-            for line in data.decode(errors='replace').splitlines():
-                line = line.strip()
-                if line.startswith('$'):
-                    parts = line.split(',', 1)
-                    if len(parts) == 2:
-                        fields[parts[0]] = parts[1].strip()
-            if not fields:
-                continue
-
-            # Each field written only if the sender actually included it,
-            # so a sender that emits a subset leaves the rest absent
-            # rather than blanking values it never mentioned.
-            if '$12' in fields: st["mer"]         = fields['$12']
-            if '$30' in fields: st["margin"]      = fields['$30']
-            if '$9'  in fields: st["symbol_rate"] = fields['$9']
-            if '$18' in fields: st["modcod"]      = fields['$18']
-            if '$14' in fields: st["programme"]   = fields['$14'].replace('_', ' ')
-            if '$85' in fields: st["dbm"]         = fields['$85']
-            if '$26' in fields: st["agc1"]        = fields['$26']
-            if '$27' in fields: st["agc2"]        = fields['$27']
-            # Same tags the Picotuner uses, so a Slave and a local
-            # tuner fill these rows by the same route.
-            if '$31' in fields: st["codec"]       = fields['$31']
-            if '$34' in fields: st["audio_codec"] = fields['$34']
-
-        except socket.timeout:
-            # Silence is normal and says nothing on its own: the status
-            # port decides online/offline, and duplicating that judgement
-            # here would give two answers to one question.
-            continue
-        except Exception as e:
-            print(f"[remote {index}] quality monitor: {type(e).__name__}: {e}")
-            if sock is not None:
-                try: sock.close()
-                except Exception: pass
-                sock = None
-            time.sleep(2)
 
 
 def remote_source_monitor(index: int):
@@ -4470,29 +3743,6 @@ class TuneRequest(BaseModel):
                              # path for Rx2 too, rather than maintaining
                              # its own, separate reimplementation of it.
 
-class DvbtTuneRequest(BaseModel):
-    freq: int                 # Hz - the actual frequency. No LNB and no
-                              # transverter arithmetic: this tuner is on
-                              # an aerial, not behind a down-converter.
-                              # Hz rather than kHz because that is what
-                              # the device's own API takes, and a unit
-                              # converted at the edge is a unit somebody
-                              # eventually converts twice.
-    modulation: str = "t8dvbt2"
-                              # tNdvbt2 / tNdvbt / aNqamNNN, where N is the
-                              # nominal channel bandwidth in MHz. Explicit
-                              # rather than "auto": auto was confirmed to
-                              # fail repeatedly on a mux that locks within
-                              # seconds when the modulation is given.
-    program: Optional[str] = None
-                              # Program number within the multiplex. None
-                              # locks the mux without selecting a service,
-                              # which is useful for checking a signal.
-    device_id: Optional[str] = None
-                              # Which HDHomeRun. None uses the default -
-                              # the configured preference if present,
-                              # otherwise the first one found.
-
 class StreamRequest(BaseModel):
     url: str
     name: str = ""  # friendly display name, e.g. "GB3OO" — chosen by
@@ -4512,13 +3762,6 @@ class PresetSaveRequest(BaseModel):
     lnb_lo_khz: int = 0
     # Stream field (type="stream")
     url: Optional[str] = None
-    # DVB-T2 fields (type="dvbt"). freq_hz rather than reusing freq:
-    # that one is kHz by long-standing convention throughout Lynx, and
-    # the device's own API works in Hz. Two units in one field is how a
-    # 437 MHz contact once got logged as 0.437 MHz.
-    freq_hz: Optional[int] = None
-    modulation: Optional[str] = None
-    program: Optional[str] = None
 
 class SiteConfigUpdate(BaseModel):
     name: str
@@ -5468,7 +4711,6 @@ def _kick_off_qrz_notification_lookup(idx, live_callsign, qrz_cfg, src_cfg):
 
 
 def _tri_watch_display_source(idx, src_cfg):
-    global displayed_receiver_id
     """The arbitrator's display_callback - actually switches to show
     the given source. Reuses the exact same, proven tune()/
     start_stream() paths a manual memory/preset selection would use,
@@ -5560,9 +4802,6 @@ def _tri_watch_display_source(idx, src_cfg):
         if commanded_tune_matches(rcv, src_cfg['freq'], src_cfg['sr'],
                                   _lo, _fplug):
             current_mode = "rf"
-            # A local tuner is being displayed now, whatever was
-            # chosen before.
-            displayed_receiver_id = None
             set_converter_state(rcv, src_cfg['freq'], _lo,
                                 'tri_watch display, already tuned')
             print(f"[tri_watch] now displaying source {idx}: RF Rx{rcv} "
@@ -5837,36 +5076,16 @@ def _pathfinder_current_source():
     if tw.get('enabled') and tri_watch_arbitrator is not None:
         idx = tri_watch_arbitrator.displayed_idx
         if idx is None:
-            return (False, 1, picotuner_state)
+            return (False, 1)
         try:
             src = tri_watch_sources_cfg[idx]
         except (IndexError, TypeError):
-            return (False, 1, picotuner_state)
+            return (False, 1)
         if src.get('type') != 'rf':
-            return (False, 1, picotuner_state)   # a stream - no card
+            return (False, 1)          # a stream is showing - no card
         rcv = src.get('rcv', 1)
         st = picotuner_state_b if rcv == 2 else picotuner_state
-        return (bool(st.get('locked')), rcv, st)
-
-    # DVB-T2. Checked before the Picotuner branches because when this
-    # is what is on screen, the Picotuner's own lock state is not
-    # merely irrelevant - on a receiver without one it is permanently
-    # false, which is why Pathfinder never drew a card for a DVB-T2
-    # contact while the OSD showed it perfectly.
-    if current_mode == "dvbt":
-        return (_pathfinder_dvbt_state(), None, _pathfinder_dvbt_state.last)
-
-    # A Slave: a receiver at another site, whose telemetry already
-    # arrives in the same field names a local tuner uses, so nothing
-    # here has to translate anything.
-    if displayed_receiver_id is not None:
-        try:
-            _idx = displayed_receiver_id - REMOTE_RECEIVER_ID_BASE
-            if 0 <= _idx < len(remote_states):
-                _rst = remote_states[_idx]
-                return (bool(_rst.get('locked')), None, _rst)
-        except (TypeError, ValueError):
-            pass
+        return (bool(st.get('locked')), rcv)
 
     # The RUNTIME flag, not config['diversity']['enabled']. Turning
     # diversity on by tuning sets the global and does not write the
@@ -5882,12 +5101,12 @@ def _pathfinder_current_source():
         a = bool(picotuner_state.get('locked'))
         b = bool(picotuner_state_b.get('locked'))
         if a:
-            return (True, 1, picotuner_state)
+            return (True, 1)
         if b:
-            return (True, 2, picotuner_state_b)
-        return (False, 1, picotuner_state)
+            return (True, 2)
+        return (False, 1)
 
-    return (bool(picotuner_state.get('locked')), 1, picotuner_state)
+    return (bool(picotuner_state.get('locked')), 1)
 
 
 def pathfinder_watcher():
@@ -5904,14 +5123,11 @@ def pathfinder_watcher():
         try:
             if not pathfinder_tracker.enabled:
                 continue
-            # The state comes back with the answer now: with four kinds
-            # of source and only two of them Picotuner receivers, "which
-            # state does rcv mean" stopped being a question this loop
-            # could answer.
-            receiving, rcv, st = _pathfinder_current_source()
+            receiving, rcv = _pathfinder_current_source()
             prev = _pathfinder_prev
 
             if receiving:
+                st = picotuner_state_b if rcv == 2 else picotuner_state
                 cs = st.get('callsign', '')
                 if cs:
                     prev['callsign'] = cs
@@ -6039,54 +5255,6 @@ def _pathfinder_via_qo100(rcv, telemetry):
         return False
 
 
-def _pathfinder_dvbt_state():
-    """Is the DVB-T2 tuner locked, and what is it hearing?
-
-    Returns a bool, and leaves the state dict on .last for the caller -
-    an unusual shape, but it keeps _pathfinder_current_source()'s two
-    lines readable and avoids building the dict twice.
-
-    The dict uses the same field names the watcher caches for a local
-    tuner, so the watcher needs no branch of its own. Fields this tuner
-    genuinely does not report are left EMPTY rather than filled with an
-    approximation: there is no symbol rate, and SNQ is not MER however
-    similar it looks on a meter.
-    """
-    _dev = hdhr_default_device_id()
-    _st = None
-    if _dev:
-        for _d in hdhr_devices():
-            if _d["device_id"] == _dev:
-                _st = _d
-                break
-    if not _st:
-        _pathfinder_dvbt_state.last = {}
-        return False
-
-    _lm = _st.get("lock_mode") or ""
-    _std = "DVB-T2" if _lm.endswith("dvbt2") else ("DVB-T" if "dvbt" in _lm else "")
-    _bw = _lm[1:2]
-    _freq = _st.get("frequency_hz")
-
-    _pathfinder_dvbt_state.last = {
-        "locked": bool(_st.get("locked")),
-        "callsign": _st.get("callsign", ""),
-        # Standard and channel width together, which is what an
-        # operator would say out loud and what Portsdown writes in a
-        # log entry. The card's symbol-rate row appends kS/s, so the
-        # bandwidth cannot go there instead.
-        "modcod": (f"{_std} {_bw} MHz" if _std and _bw else _std),
-        "symbol_rate": "",
-        "frequency": (f"{_freq / 1e6:.3f}" if _freq else ""),
-        "mer": "",
-        "margin": "",
-    }
-    return bool(_st.get("locked"))
-
-
-_pathfinder_dvbt_state.last = {}
-
-
 def _pathfinder_on_air_frequency(rcv, reported_mhz):
     """The card's frequency: the on-air one, not the IF.
 
@@ -6105,14 +5273,6 @@ def _pathfinder_on_air_frequency(rcv, reported_mhz):
     """
     raw = str(reported_mhz or '').strip()
     if not raw:
-        return reported_mhz
-    # rcv None means the source is not a local Picotuner receiver - a
-    # Slave, or the DVB-T2 tuner. Neither goes through a converter at
-    # this end: a Slave's is its own business and reported as such,
-    # and the DVB-T2 tuner is fed from an aerial. Applying Rx1's LNB LO
-    # to either would be wrong by construction, even where the LO is
-    # currently zero and the answer happens to come out right.
-    if rcv is None:
         return reported_mhz
     on_air = on_air_from_if(rcv, raw)
     return reported_mhz if on_air is None else f"{on_air:.3f}"
@@ -6864,33 +6024,6 @@ def get_status():
     status = {
         "lynx": {
             "mode": current_mode,
-            # The overlay polls this endpoint and only this
-            # endpoint, so a source it has to draw has to be here.
-            # None when no device was found at startup, which the
-            # overlay treats as "not this receiver's problem" rather
-            # than as a fault.
-            "hdhomerun": (lambda d: {
-                "online": d["online"],
-                "locked": d["locked"],
-                "lock_mode": d["lock_mode"],
-                "level": d["signal_strength"],
-                "snq": d["signal_quality"],
-                "seq": d["symbol_quality"],
-                "bitrate_bps": d["bitrate_bps"],
-                "frequency_hz": d["frequency_hz"],
-                "service_name": d.get("service_name", ""),
-                # Empty unless the tuned frequency was in an amateur
-                # band - see hdhr_is_amateur_band(). The overlay feeds
-                # this to the callsign field, which reaches QRZ and
-                # Pathfinder, so a broadcast channel name must never
-                # arrive here.
-                "callsign": d.get("callsign", ""),
-                # Same treatment the Picotuner and the Slaves get: the
-                # name from QRZ when it is cached, so a DVB-T2 station
-                # reads "Justin - G8YTZ" like any other contact.
-                "callsign_name": qrz_first_name(d.get("callsign", "")),
-            } if d else None)(next(iter(hdhr_devices()), None)),
-
             "preset": current_preset,
             "stream_name": current_stream_name,
             # True when what is playing is a Slave rather than a real
@@ -6899,26 +6032,9 @@ def get_status():
             # so this cannot disagree with reality the way a separate
             # flag set in one place and cleared in three eventually
             # would. The Stream panel uses it to stand down.
-            # Which Slave, not just that it is one. Read from the
-            # relay rather than stored: the relay is what decides
-            # whose packets reach mpv, so it cannot disagree with
-            # what is actually on screen.
-            "remote_selected": slave_relay.selected(),
-            # Which receiver is on screen: 1 or 2 for the local
-            # Picotuner, 11+ for a Slave, null for a stream. The
-            # single answer, derived in one place, for anything
-            # that needs to know — panels, overlay, and whatever
-            # comes next.
-            "active_receiver": active_receiver_id(),
             "stream_is_remote": (current_mode == "stream"
                                  and current_stream_url == f"udp://@:{REMOTE_VIDEO_OUT_PORT}"),
-            # Called for dvbt too: it reads the codecs from mpv, which
-            # is the only thing that knows them - the HDHomeRun reports
-            # bitrate and quality but nothing about what is inside the
-            # multiplex. One function, both sources, rather than a
-            # second copy that drifts.
-            "stream_info": (get_live_stream_info()
-                            if current_mode in ("stream", "dvbt") else None),
+            "stream_info": get_live_stream_info() if current_mode == "stream" else None,
             "stream_protocol": get_stream_protocol(current_stream_url) if current_mode == "stream" and current_stream_url else None,
             "mpv_transitioning": mpv_transitioning,
             "mpv_running_for_rf": mpv_running_for_rf,
@@ -7038,17 +6154,6 @@ def get_status():
                 # receiver is unlocked and no TS is flowing, and the
                 # two states need telling apart on the panel.
                 "video": _relay_video_for(i),
-                # Same call the local receivers get. Asking is also
-                # what warms the cache, so a station heard on a
-                # Slave gets its name on the first contact rather
-                # than the second — or never, which is what
-                # happened while nothing asked.
-                "callsign_name": qrz_first_name(st["callsign"]),
-                # Only the fields the Slave has actually sent. A
-                # Slave with no quality port simply has none of
-                # these, which reads differently from a Slave
-                # reporting zeros — and it should.
-                **{k: st[k] for k in REMOTE_QUALITY_FIELDS if k in st},
                 "last_seen": st["last_seen"],
             }
             for i, st in enumerate(remote_states)
@@ -8310,41 +7415,6 @@ def config_page():
                     </div>
                 </div>
                 <div class="card mb-3">
-                    <div class="card-header">&#x1F4FA; DVB-T2 Tuner (HDHomeRun)</div>
-                    <div class="card-body">
-                        <p class="text-muted small">
-                            A SiliconDust HDHomeRun on the network, used as a
-                            DVB-T/T2/C receiver. Found automatically on the
-                            same subnet - nothing needs configuring for one
-                            plugged into the local network.
-                        </p>
-                        <div class="alert alert-warning py-2 small mb-3">
-                            Auto-discovery is a broadcast, so it does not cross
-                            a router. A tuner on another subnet - at a repeater
-                            site, say - works perfectly once its address is
-                            given here, but will never be found on its own.
-                        </div>
-                        <label class="small">Discovered</label>
-                        <div class="mb-3">
-                            <span class="status-value" id="hdhr-discovered">-</span>
-                        </div>
-                        <label class="small">Address (optional)</label>
-                        <input type="text" class="form-control mb-2"
-                               id="hdhr-address-input"
-                               placeholder="e.g. 10.20.30.40">
-                        <p class="text-muted small">
-                            Leave empty unless the tuner is on another subnet.
-                            An address given here is asked directly rather than
-                            broadcast for, and is used in addition to anything
-                            discovered locally.
-                        </p>
-                        <div class="mt-3 d-flex align-items-center gap-2">
-                            <button class="btn btn-save" onclick="saveHdhr()">Save HDHomeRun settings</button>
-                            <span class="save-status" id="hdhr-status"></span>
-                        </div>
-                    </div>
-                </div>
-                <div class="card mb-3">
                     <div class="card-header">&#x1F3E0; Site Information</div>
                     <div class="card-body">
                         <div class="row g-3">
@@ -8837,29 +7907,6 @@ async function loadCurrentConfig() {
         document.getElementById('site-location-input').value = cfg.site?.location || '';
         document.getElementById('site-locator-input').value = cfg.site?.locator || '';
 
-        const hdhrCfg = cfg.hdhomerun || {};
-        const hdhrAddr = document.getElementById('hdhr-address-input');
-        if (hdhrAddr) { hdhrAddr.value = hdhrCfg.address || ''; }
-        // What was actually found, from the live endpoint rather than
-        // the config: the whole point of the field is to cover the case
-        // where discovery found nothing, so showing the configured
-        // value back as "discovered" would be worse than useless.
-        try {
-            const hr = await fetch('/api/hdhomerun');
-            const hd = await hr.json();
-            const el = document.getElementById('hdhr-discovered');
-            if (el) {
-                const devs = (hd && hd.devices) || [];
-                if (!devs.length) {
-                    el.textContent = 'none found';
-                } else {
-                    el.textContent = devs.map(function (d) {
-                        return d.device_id + ' at ' + (d.address || '?');
-                    }).join(', ');
-                }
-            }
-        } catch (e) { /* the card still works without it */ }
-
         const rs = cfg.remote_source || {};
         document.getElementById('rs-enabled').checked = rs.enabled === true;
         document.getElementById('rs-status-port').value = rs.status_port ?? 10997;
@@ -9348,30 +8395,6 @@ function updateRemoteSourceWarning() {
         el.style.display = '';
     } else {
         el.style.display = 'none';
-    }
-}
-
-async function saveHdhr() {
-    const statusEl = document.getElementById('hdhr-status');
-    statusEl.textContent = 'Saving...';
-    statusEl.className = 'save-status text-muted';
-    try {
-        const body = { hdhomerun: {
-            address: document.getElementById('hdhr-address-input').value.trim()
-        }};
-        const r = await fetch('/api/config', {
-            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
-        });
-        if (!r.ok) throw new Error(await r.text());
-        // Restart required: the address is read once, during the single
-        // discovery sweep at startup. A device is installed rather than
-        // plugged in and out, so there is no reason to poll for one.
-        statusEl.textContent = 'Saved - restart required.';
-        statusEl.className = 'save-status text-success';
-    } catch (e) {
-        statusEl.textContent = 'Save failed - see console.';
-        statusEl.className = 'save-status text-danger';
-        console.error(e);
     }
 }
 
@@ -10343,7 +9366,6 @@ def tune(req: TuneRequest):
     # the actual tune is fully complete, not just accepted.
 
 def _tune_impl(req: TuneRequest):
-    global displayed_receiver_id
     global current_mode, current_preset, diversity_enabled, _tune_lock_handed_off
     cfg = config['picotuner']
     is_diversity = req.plug.lower() == "diversity"
@@ -10512,7 +9534,6 @@ def _tune_impl(req: TuneRequest):
         diversity_enabled = False
     
     current_mode = "rf"
-    displayed_receiver_id = None
     if req.lnb_lo_khz:
         current_preset = f"{req.freq/1000:.3f} MHz (LNB LO {req.lnb_lo_khz/1000:.3f} MHz) / {req.sr} kS/s"
     else:
@@ -10583,203 +9604,6 @@ def _tune_impl(req: TuneRequest):
         "sr_ks": req.sr,
         "plug": req.plug
     }
-
-@app.post("/api/tune_dvbt", tags=["RF Reception"],
-          summary="Tune an HDHomeRun to a DVB-T/T2/C frequency",
-          description="Tunes a network-attached HDHomeRun tuner and starts "
-                      "mpv playing its stream. Stops any current reception "
-                      "first.")
-def tune_dvbt(req: DvbtTuneRequest):
-    # Same thin-wrapper split as tune(), and for the same reason: a
-    # failure inside the implementation before the async thread starts
-    # must not leave tune_lock held, or every future tune returns 503
-    # while streaming carries on working and nothing says why.
-    global _tune_lock_handed_off
-    if not tune_lock.acquire(timeout=15):
-        raise HTTPException(
-            status_code=503,
-            detail="Another tune operation is already in progress - "
-                   "please try again shortly")
-    _tune_lock_handed_off = False
-    try:
-        return _tune_dvbt_impl(req)
-    except Exception:
-        if not _tune_lock_handed_off:
-            tune_lock.release()
-        raise
-
-
-def _tune_dvbt_impl(req: DvbtTuneRequest):
-    global current_mode, current_preset, displayed_receiver_id
-    global diversity_enabled, mpv_running_for_rf, _tune_lock_handed_off
-
-    source = hdhr_source(req.device_id)
-
-    # Lynx is changing source, so whatever was being received is no
-    # longer being listened to - same reason and same placement as in
-    # _tune_impl(), before anything is tuned, so the watcher's next
-    # poll already knows rather than racing.
-    try:
-        pathfinder_source_changed()
-    except Exception:
-        pass
-
-    # Tear down whatever owns the video path now. The HDHomeRun has its
-    # own port, so this is not about port contention - it is so that a
-    # Picotuner still pushing to 9941, or a combiner still running, is
-    # not left burning CPU and confusing the lifecycle monitor while a
-    # different source is on screen.
-    stop_ffmpeg_bg()
-    if diversity_enabled:
-        stop_diversity_combiner()
-        diversity_enabled = False
-
-    # Tune and wait for lock. Unlike the RF path - which defers mpv
-    # until rf_mpv_lifecycle_monitor() confirms a stable lock - the
-    # device reports its own lock and its own packet rate, so there is
-    # nothing to infer and no reason to wait twice.
-    try:
-        source.tune(
-            modulation=req.modulation,
-            frequency_hz=req.freq,
-            program=req.program,
-        )
-    except lynx_hdhomerun.HDHomeRunLockTimeout as e:
-        raise HTTPException(status_code=504, detail=str(e))
-    except lynx_hdhomerun.HDHomeRunError as e:
-        raise HTTPException(status_code=502, detail=str(e))
-
-    # Ask the poller to fetch the service name on its next pass rather
-    # than fetching it here. An earlier version called streaminfo
-    # inline and deadlocked the whole app - see this patch's own notes.
-    # A tune has no business waiting on a name lookup anyway.
-    #
-    # device_id resolved BEFORE the lock is taken: hdhr_default_device_id()
-    # takes hdhr_lock itself, and threading.Lock is not reentrant.
-    _dev = req.device_id or hdhr_default_device_id()
-    with hdhr_lock:
-        live = hdhr_states.get(_dev)
-        if live is not None:
-            # Cleared, not left stale: the previous service's name over
-            # a new one is worse than no name at all.
-            live["service_name"] = ""
-            live["callsign"] = ""
-            live["pending_program"] = (str(req.program)
-                                       if req.program is not None else None)
-            live["pending_freq_hz"] = req.freq
-            # Kept so a re-lock can ask again. Without it, a station
-            # keying up after a gap kept the previous contact's name
-            # and was never logged a second time.
-            live["last_program"] = live["pending_program"]
-            live["logged_callsign"] = ""
-
-    current_mode = "dvbt"
-    displayed_receiver_id = None
-    current_preset = f"{req.freq / 1e6:.3f} MHz / {req.modulation}"
-
-    # is_rf=True is correct here and is not a fudge: the device sends
-    # raw MPEG-TS over UDP, which is exactly what that flag set was
-    # written for. The RTMP-specific concerns in restart_mpv()'s own
-    # docstring do not apply to it.
-    def _kick_mpv():
-        global mpv_running_for_rf
-        try:
-            time.sleep(1)
-            # is_rf=False despite this being a raw MPEG-TS over UDP.
-            # is_rf=True forces --demuxer-lavf-format=mpegts, which
-            # skips lavf's own probe - and that probe is what finds
-            # the AAC LATM audio in a broadcast multiplex. With the
-            # flag on, mpv listed video and subtitles only and played
-            # in silence; with it off, the audio track appears. The
-            # Picotuner's own TS carries simpler audio and does not
-            # need the probe, which is why the flag was right there
-            # and wrong here.
-            restart_mpv(f"udp://@:{HDHR_VIDEO_PORT}", is_rf=False)
-            mpv_running_for_rf = True
-            # Lower it here rather than leaving it to the cap. The RF
-            # path lowers it from rf_mpv_lifecycle_monitor() once a
-            # Picotuner lock is confirmed - a confirmation that never
-            # arrives on a receiver with no Picotuner, so the cover
-            # would sit over live video, with its sound, until the
-            # timeout expired.
-            end_transition_cover()
-        finally:
-            tune_lock.release()
-
-    threading.Thread(target=_kick_mpv, daemon=True).start()
-    _tune_lock_handed_off = True
-
-    save_last_state({
-        "mode": "dvbt",
-        "freq": req.freq,
-        "modulation": req.modulation,
-        "program": req.program,
-        "device_id": req.device_id,
-    })
-
-    return {
-        "success": True,
-        "mode": "dvbt",
-        "freq_hz": req.freq,
-        "modulation": req.modulation,
-        "program": req.program,
-        "device_id": req.device_id or hdhr_default_device_id(),
-    }
-
-
-@app.get("/api/hdhomerun", tags=["RF Reception"],
-         summary="HDHomeRun tuners found on the network",
-         description="Devices discovered at startup, their current status, "
-                     "and the configured presets.")
-def hdhomerun_status():
-    return {
-        "devices": [
-            {
-                "device_id": st["device_id"],
-                "name": st["name"],
-                "address": st.get("address"),
-                "online": st["online"],
-                "locked": st["locked"],
-                "streaming": st["streaming"],
-                "lock_mode": st["lock_mode"],
-                "level": st["signal_strength"],      # ss
-                "quality": st["signal_quality"],     # snq - NOT MER
-                "errors": st["symbol_quality"],      # seq
-                "bitrate_bps": st["bitrate_bps"],
-                "frequency_hz": st["frequency_hz"],
-            }
-            for st in hdhr_devices()
-        ],
-        "presets": hdhr_presets_cfg(),
-    }
-
-
-@app.get("/api/hdhomerun/programs", tags=["RF Reception"],
-         summary="Services in the currently tuned multiplex",
-         description="Read from the device's own streaminfo. Empty when "
-                     "the tuner is not locked, since an unlocked tuner "
-                     "has nothing to list.")
-def hdhomerun_programs(device_id: str = None):
-    # Read live rather than from the polled state: this is wanted when
-    # somebody opens the dropdown, which is rare, and there is no
-    # reason to fetch it every two seconds alongside the status.
-    try:
-        tuner = lynx_hdhomerun.HDHomeRunTuner(
-            device_id=device_id or hdhr_default_device_id() or "",
-            tuner=0)
-        return {"programs": tuner.stream_info()}
-    except lynx_hdhomerun.HDHomeRunError as e:
-        return {"programs": [], "error": str(e)}
-
-
-@app.post("/api/hdhomerun/stop", tags=["RF Reception"],
-          summary="Stop all HDHomeRun streaming",
-          description="Releases every tuner. Useful when a device has been "
-                      "left streaming by an interrupted tune.")
-def hdhomerun_stop():
-    hdhr_stop_all()
-    return {"success": True}
-
 
 @app.get("/api/tune", tags=["RF Reception"],
          summary="Tune Picotuner to a frequency (URL/GET version)",
@@ -10864,7 +9688,7 @@ def list_presets():
                       "is generated from the frequency (e.g. '437.025 MHz') "
                       "- a stream save always requires an explicit name.")
 def add_preset(req: PresetSaveRequest):
-    preset_type = req.type if req.type in ("rf", "stream", "dvbt") else "rf"
+    preset_type = req.type if req.type in ("rf", "stream") else "rf"
     config.setdefault('presets', [])
 
     if preset_type == "stream":
@@ -10873,12 +9697,6 @@ def add_preset(req: PresetSaveRequest):
         if not req.name.strip():
             raise HTTPException(status_code=400, detail="A stream memory needs a name")
         name = req.name.strip()
-    elif preset_type == "dvbt":
-        if req.freq_hz is None or not req.modulation:
-            raise HTTPException(status_code=400,
-                                detail="A DVB-T2 memory needs a frequency and modulation")
-        name = (req.name.strip() if req.name.strip()
-                else f"{req.freq_hz/1e6:.3f} MHz")
     else:
         if req.freq is None or req.sr is None:
             raise HTTPException(status_code=400, detail="An RF memory needs a frequency and symbol rate")
@@ -10898,10 +9716,6 @@ def add_preset(req: PresetSaveRequest):
                         "note": "name already used by a different memory type"}
             if preset_type == "stream":
                 same = (p.get('url') == req.url)
-            elif preset_type == "dvbt":
-                same = (p.get('freq_hz') == req.freq_hz
-                        and p.get('modulation') == req.modulation
-                        and p.get('program') == req.program)
             else:
                 same = (p.get('freq') == req.freq and p.get('sr') == req.sr
                         and p.get('plug', 'a') == req.plug
@@ -10916,15 +9730,6 @@ def add_preset(req: PresetSaveRequest):
             "type": "stream",
             "name": name,
             "url": req.url.strip(),
-            "note": "User saved via web UI"
-        })
-    elif preset_type == "dvbt":
-        config['presets'].append({
-            "type": "dvbt",
-            "name": name,
-            "freq_hz": req.freq_hz,
-            "modulation": req.modulation,
-            "program": req.program,
             "note": "User saved via web UI"
         })
     else:
@@ -11092,18 +9897,7 @@ def _start_stream_impl(req: StreamRequest):
     def _kick_mpv():
         try:
             time.sleep(1)
-            # A Slave sends genuine MPEG-TS over UDP, exactly what the
-            # RF flags exist for, and only reaches this path because it
-            # borrows start_stream()'s lock and cover handling. Without
-            # the mpegts hint mpv probes instead of being told, and on a
-            # sparse feed it infers a bogus finite duration and parks
-            # itself paused at position zero.
-            #
-            # Derived from the URL rather than passed in: the relay's
-            # output port is the only source a Slave is ever played
-            # from, so there is nothing to set and nothing to clear.
-            _is_slave = req.url == f"udp://@:{REMOTE_VIDEO_OUT_PORT}"
-            restart_mpv(req.url, is_rf=_is_slave)
+            restart_mpv(req.url, is_rf=False)
             # Confirms real rendering rather than guessing with a fixed
             # delay - a weak/low-bandwidth stream source can genuinely
             # take longer to start producing a real picture than RF
@@ -11217,37 +10011,14 @@ def select_remote_source(index: int):
                             detail=f"Slave video relay is not running: {slave_relay.bind_error or 'not started'}")
 
     slave_relay.select(index)
-    # start_stream() below saves the URL, which says where mpv
-    # should listen but not whose video belongs there. Saved after
-    # it returns, so this write is the one that survives.
-    _remote_resume_index = index
     # Handing off to start_stream() rather than restarting mpv here: it
     # already holds the lock discipline, the transition cover and the
     # render confirmation, and a second copy of that sequence would be a
     # second place for it to go wrong.
-    result = start_stream(StreamRequest(
+    return start_stream(StreamRequest(
         url=f"udp://@:{REMOTE_VIDEO_OUT_PORT}",
         name=remote_display_name(index),
     ))
-    save_last_state({
-        "mode": "stream",
-        "url": f"udp://@:{REMOTE_VIDEO_OUT_PORT}",
-        "name": remote_display_name(index),
-        "remote_index": _remote_resume_index,
-    })
-    # start_stream() sets the mode to "stream" because that is
-    # what it does. A Slave is a receiver, so the mode is
-    # corrected here, once the machinery that actually needed
-    # borrowing — the lock hand-off and the transition cover —
-    # has done its work.
-    #
-    # Safe after the call: _start_stream_impl sets the mode
-    # before handing off to its background thread, and nothing
-    # in that thread touches it again.
-    global current_mode, displayed_receiver_id
-    current_mode = "rf"
-    displayed_receiver_id = REMOTE_RECEIVER_ID_BASE + index
-    return result
 
 
 @app.post("/api/streams/refresh", tags=["Streaming"],
@@ -11913,20 +10684,10 @@ def restore_wifi():
     return {"result": "ok", "message": "WiFi re-enabled."}
 
 class DefaultBootRequest(BaseModel):
-    # type tells the two kinds of fallback apart. Absent means "rf", so
-    # an existing config and every existing caller keep working.
-    type: str = "rf"
-    # Optional now: a DVB-T2 default has neither, and required fields
-    # would have the request rejected before the endpoint ever saw it.
-    freq: Optional[int] = None
-    sr: Optional[int] = None
+    freq: int
+    sr: int
     plug: str = "a"
     lnb_lo_khz: int = 0
-    # DVB-T2 (type="dvbt"). Hz rather than kHz, matching the device's
-    # own API and the dvbt preset type.
-    freq_hz: Optional[int] = None
-    modulation: Optional[str] = None
-    program: Optional[str] = None
 
 @app.post("/api/boot-default", tags=["Control"],
           summary="Set the default boot-time RF preset",
@@ -11938,19 +10699,6 @@ class DefaultBootRequest(BaseModel):
                       "what it was last doing — this is only the safety "
                       "net for when that isn't possible.")
 def set_boot_default(req: DefaultBootRequest):
-    # A type, because the fallback can now be either kind of tuner and
-    # the resume has to tell them apart. Absent means "rf", so an
-    # existing config file keeps working untouched.
-    if req.type == "dvbt":
-        config['default_boot_preset'] = {
-            "type": "dvbt",
-            "freq_hz": req.freq_hz,
-            "modulation": req.modulation,
-            "program": req.program,
-        }
-        save_config(config)
-        return {"success": True,
-                "default_boot_preset": config['default_boot_preset']}
     config['default_boot_preset'] = {
         "freq": req.freq, "sr": req.sr, "plug": req.plug, "lnb_lo_khz": req.lnb_lo_khz
     }
@@ -12281,15 +11029,6 @@ def web_ui():
                  panel above used to switch entirely to stream info whenever
                  a stream was on screen, hiding Rx1's own status completely
                  until whichever one "came up first" lost that slot again. -->
-            <!-- DVB-T2 (HDHomeRun): a network tuner, so it may not be
-                 there at all. Hidden rather than shown red when none
-                 was discovered, the same as the Slave panels - a
-                 receiver without one should not carry a permanent
-                 fault indication for hardware it does not have. -->
-            <div class="card mt-2" id="dvbt-panel" style="display:none">
-                <div class="card-header" id="dvbt-header">&#x1F4FA; DVB-T2</div>
-                <div class="card-body" id="dvbt-status"></div>
-            </div>
             <div class="card mt-2" id="tri-watch-stream-panel" style="display:none">
                 <div class="card-header" id="tri-watch-stream-header">&#x1F4FA; Stream</div>
                 <div class="card-body" id="tri-watch-stream-status"></div>
@@ -12371,59 +11110,6 @@ def web_ui():
                         <button class="btn btn-outline-info btn-sm" onclick="saveBootDefault()" title="Use this as the fallback frequency on startup, if there's nothing to resume">&#x1F3E0;</button>
                     </div>
                     <div id="boot-default-note" class="text-muted small mt-1"></div>
-                </div>
-            </div>
-
-            <!-- DVB-T2 Reception (HDHomeRun) -->
-            <div class="card mt-3" id="dvbt-tune-card" style="display:none">
-                <div class="card-header">&#x1F4FA; DVB-T2 Reception (HDHomeRun)</div>
-                <div class="card-body">
-                    <h6 class="text-muted">Presets</h6>
-                    <div id="dvbt-preset-list" class="mb-3"
-                         style="max-height: 180px; overflow-y: auto;">
-                        <div class="text-muted small">No presets</div>
-                    </div>
-                    <hr>
-                    <h6 class="text-muted">Manual Tune</h6>
-                    <div class="row g-2 mb-2">
-                        <div class="col-7">
-                            <input type="number" step="0.001" class="form-control form-control-sm bg-dark text-light border-secondary"
-                                   id="dvbt-freq" placeholder="MHz" value="146.500">
-                        </div>
-                        <div class="col-5">
-                            <select class="form-select form-select-sm bg-dark text-light border-secondary" id="dvbt-bw">
-                                <option value="1">1 MHz</option>
-                                <option value="2">2 MHz</option>
-                                <option value="3">3 MHz</option>
-                                <option value="4">4 MHz</option>
-                                <option value="5">5 MHz</option>
-                                <option value="6">6 MHz</option>
-                                <option value="7">7 MHz</option>
-                                <option value="8" selected>8 MHz</option>
-                            </select>
-                        </div>
-                    </div>
-                    <div class="d-flex gap-2 align-items-center">
-                        <select class="form-select form-select-sm bg-dark text-light border-secondary"
-                                id="dvbt-program" onchange="switchDvbtProgram()">
-                            <option value="">Service...</option>
-                        </select>
-                        <button class="btn btn-danger btn-sm" onclick="tuneDvbtManual()">Tune</button>
-                        <button class="btn btn-outline-warning btn-sm"
-                                onclick="saveDvbtMemory()"
-                                title="Save this frequency and mode as a preset">&#x1F4BE;</button>
-                        <button class="btn btn-outline-info btn-sm"
-                                onclick="saveDvbtBootDefault()"
-                                title="Use this as the fallback on startup, if there's nothing to resume">&#x1F3E0;</button>
-                    </div>
-                    <div id="dvbt-boot-note" class="text-muted small mt-1"></div>
-                    <div class="text-muted small mt-2">
-                        Frequency in MHz. Bandwidth is the channel width, not
-                        the bitrate - 1 and 2 MHz are the narrowband amateur
-                        modes, 7 and 8 MHz are broadcast. DVB-T2 is tried
-                        first and DVB-T after it, so there is nothing to
-                        choose.
-                    </div>
                 </div>
             </div>
 
@@ -12986,67 +11672,6 @@ async function updateStatus() {
         // throw away and recreate DOM three times a second on a page
         // somebody may be reading, and would fight any control added to
         // these panels later by destroying it mid-click.
-        // DVB-T2 (HDHomeRun). Looked up both ways: the status payload
-        // nests some blocks under "lynx" and exposes others at the top
-        // level, and this renderer is called with both shapes.
-        const hh = (s.lynx && s.lynx.hdhomerun) || s.hdhomerun || null;
-        const si = (s.lynx && s.lynx.stream_info) || s.stream_info || {};
-        const dvbtPanel = document.getElementById('dvbt-panel');
-        const dvbtCard = document.getElementById('dvbt-tune-card');
-        if (dvbtPanel) {
-            if (!hh) {
-                dvbtPanel.style.display = 'none';
-                if (dvbtCard) { dvbtCard.style.display = 'none'; }
-            } else {
-                dvbtPanel.style.display = '';
-                if (dvbtCard) { dvbtCard.style.display = ''; }
-                var dstate = 'offline';
-                if (hh.online) { dstate = hh.locked ? 'locked' : 'idle'; }
-                setPanelState('dvbt-header', 'dvbt-status',
-                              '&#x1F4FA; DVB-T2', dstate);
-                var dbody = document.getElementById('dvbt-status');
-                if (dbody) {
-                    if (!hh.online) {
-                        dbody.innerHTML = '<div class="text-danger small text-center mt-2">HDHomeRun offline</div>';
-                    } else if (hh.locked) {
-                        // t8dvbt2 gives "8 MHz" and "DVB-T2". The second
-                        // character is the nominal bandwidth in MHz and
-                        // the ladder is exact, so 1 really does mean 1.
-                        var lm = hh.lock_mode || '';
-                        // Kept so the form does not have to ask which
-                        // standard this is - the tuner has already said.
-                        if (lm) { window._dvbtLockMode = lm; }
-                        var dbw = lm.charAt(1);
-                        var dstd = '-';
-                        if (lm.indexOf('dvbt2') >= 0) { dstd = 'DVB-T2'; }
-                        else if (lm.indexOf('dvbt') >= 0) { dstd = 'DVB-T'; }
-                        var drows = [
-                            ['Callsign', hh.callsign || '-'],
-                            ['Programme', hh.service_name || '-'],
-                            ['Frequency', hh.frequency_hz ? (hh.frequency_hz / 1e6).toFixed(3) + ' MHz' : '-'],
-                            ['Bandwidth', dbw ? dbw + ' MHz' : '-'],
-                            ['Standard', dstd],
-                            ['SNQ', (hh.snq !== null && hh.snq !== undefined) ? hh.snq + ' %' : '-'],
-                            ['SEQ', (hh.seq !== null && hh.seq !== undefined) ? hh.seq + ' %' : '-'],
-                            ['Level', (hh.level !== null && hh.level !== undefined) ? hh.level + ' %' : '-'],
-                            ['Bitrate', hh.bitrate_bps ? (hh.bitrate_bps / 1e6).toFixed(2) + ' Mb/s' : '-'],
-                            ['Codec', si.video_codec || '-'],
-                            ['Audio Codec', si.audio_codec || '-']
-                        ];
-                        var dhtml = '';
-                        for (var di = 0; di < drows.length; di++) {
-                            dhtml += '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;">';
-                            dhtml += '<span>' + drows[di][0] + '</span>';
-                            dhtml += '<span class="status-value">' + drows[di][1] + '</span></div>';
-                        }
-                        dbody.innerHTML = dhtml;
-                    } else {
-                        dbody.innerHTML = '<div class="text-muted small text-center mt-2">Searching for signal...</div>';
-                    }
-                }
-            }
-        }
-
         const remotes = s.remotes || [];
         const remoteHost = document.getElementById('remote-panels');
         remotes.forEach(function (rem) {
@@ -13067,32 +11692,13 @@ async function updateStatus() {
             if (!rem.enabled) { panel.style.display = 'none'; return; }
             panel.style.display = '';
             const st = !rem.online ? 'offline' : (rem.locked ? 'locked' : 'idle');
-            // Locator in the header rather than as a row: it is the one
-            // thing a Slave has that a local receiver does not, and putting
-            // it in the rows is what stopped the two panels looking alike.
-            const label = '&#x1F4E1; ' + (rem.name || 'Slave Rx')
-                        + (rem.locator ? ' — ' + rem.locator : '');
-            setPanelState(id + '-header', id + '-status', label, st);
-            // Deliberately the local receiver's row set, in its order and
-            // with its units. A Slave sends the same fields under the same
-            // tags, so anything that reads differently here is a fault
-            // rather than a difference worth preserving.
+            setPanelState(id + '-header', id + '-status',
+                          '&#x1F4E1; ' + (rem.name || 'Slave Rx'), st);
             const rows = [
-                ['Callsign',    rem.callsign || '—'],
-                ['Programme',   rem.programme || '—'],
-                ['Frequency',   rem.frequency ? rem.frequency + ' MHz' : '—'],
-                ['Symbol Rate', rem.symbol_rate ? rem.symbol_rate + ' kS/s' : '—'],
-                ['MER',         rem.mer ? rem.mer + ' dB' : '—'],
-                ['Margin',      rem.margin ? rem.margin + ' dB' : '—'],
-                ['Level',       (rem.dbm && rem.dbm !== '0') ? rem.dbm + ' dBm' : '—'],
-                ['Mode',        rem.modcod || '—'],
-                ['Codec',       rem.codec || '—'],
-                ['Audio Codec', rem.audio_codec || '—'],
-                // A Slave runs Longmynd on a Pico adaptor, not Picotuner
-                // firmware. There is no equivalent to report, and a dash
-                // says so more honestly than something invented.
-                ['Firmware',    '—'],
+                ['Callsign',  rem.callsign || '—'],
+                ['Frequency', rem.frequency ? rem.frequency + ' MHz' : '—'],
             ];
+            if (rem.locator) rows.push(['Locator', rem.locator]);
             document.getElementById(id + '-status').innerHTML = rows.map(r =>
                 '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;"><span>' + r[0] + '</span>' +
                 '<span class="status-value">' + r[1] + '</span></div>'
@@ -13108,11 +11714,7 @@ async function loadPresets() {
     try {
         const data = await api('GET', '/api/presets');
         const local = (data.local || []).map(p => ({...p, _local: true}));
-        // DVB-T2 memories belong to their own card. Left in here they
-        // would tune the Picotuner to a frequency in kHz that was
-        // really MHz - a number it would accept without complaint.
-        const all = [...local, ...(data.ryde || [])]
-                        .filter(p => p.type !== 'dvbt');
+        const all = [...local, ...(data.ryde || [])];
         const el = document.getElementById('preset-list');
         if (!all.length) { el.innerHTML = '<div class="text-muted small">No presets</div>'; return; }
         el.innerHTML = all.map(p => `
@@ -13384,210 +11986,6 @@ async function tuneTo() {
         return;
     }
     await api('POST', '/api/tune', {freq, sr, plug, lnb_lo_khz});
-}
-
-async function tuneDvbt(freqMhz, modulation, program) {
-    // MHz in the form, Hz on the wire: the device's own API works in
-    // Hz and nobody wants to type nine digits. Converted here, in one
-    // place, rather than at each caller.
-    await api('POST', '/api/tune_dvbt', {
-        freq: Math.round(parseFloat(freqMhz) * 1e6),
-        modulation: modulation,
-        program: program ? String(program) : null
-    });
-}
-
-async function loadDvbtPrograms() {
-    // Filled from the multiplex itself rather than typed. A number box
-    // let any number be entered, and the device would accept one that
-    // did not exist - a lock with no picture and nothing to say why.
-    var sel = document.getElementById('dvbt-program');
-    if (!sel) { return; }
-    var wanted = sel.value;
-    try {
-        var r = await api('GET', '/api/hdhomerun/programs');
-        var progs = (r && r.programs) || [];
-        // Rebuilt with DOM calls rather than innerHTML: service names
-        // come from the broadcaster and can contain anything at all,
-        // and concatenating them into markup is how a stray quote
-        // takes the whole page down.
-        while (sel.firstChild) { sel.removeChild(sel.firstChild); }
-        if (!progs.length) {
-            var none = document.createElement('option');
-            none.value = '';
-            none.textContent = 'No services';
-            sel.appendChild(none);
-            return;
-        }
-        for (var i = 0; i < progs.length; i++) {
-            var o = document.createElement('option');
-            o.value = progs[i].program;
-            o.textContent = progs[i].name || progs[i].program;
-            sel.appendChild(o);
-        }
-        // Keep the current selection if it survived the retune,
-        // otherwise take the first service - which is the right
-        // default for an amateur transmission carrying only one.
-        sel.value = wanted;
-        if (!sel.value) { sel.selectedIndex = 0; }
-    } catch (e) {
-        while (sel.firstChild) { sel.removeChild(sel.firstChild); }
-        var err = document.createElement('option');
-        err.value = '';
-        err.textContent = 'Unavailable';
-        sel.appendChild(err);
-    }
-}
-
-async function switchDvbtProgram() {
-    // No retune: the tuner is already locked on the multiplex, so this
-    // is a demultiplexer change and takes effect immediately. Sending
-    // a full tune here would drop the lock and reacquire it for no
-    // reason, with several seconds of black screen to show for it.
-    var sel = document.getElementById('dvbt-program');
-    if (!sel || !sel.value) { return; }
-    var f = document.getElementById('dvbt-freq').value;
-    var bw = document.getElementById('dvbt-bw').value;
-    // Whatever is locked now - the tuner reports it, so there is no
-    // need to guess or retry here.
-    var lm = (window._dvbtLockMode || ('t' + bw + 'dvbt2'));
-    await tuneDvbt(f, lm, sel.value);
-}
-
-async function saveDvbtMemory() {
-    var f = document.getElementById('dvbt-freq').value;
-    var bw = document.getElementById('dvbt-bw').value;
-    var std = (window._dvbtLockMode || '').indexOf('dvbt2') >= 0 ? 'dvbt2'
-            : ((window._dvbtLockMode || '').indexOf('dvbt') >= 0 ? 'dvbt' : 'dvbt2');
-    var progSel = document.getElementById('dvbt-program');
-    if (!f) { return; }
-    var name = prompt('Name this preset:', parseFloat(f).toFixed(3) + ' MHz');
-    if (name === null) { return; }
-    var result = await api('POST', '/api/presets/add', {
-        type: 'dvbt',
-        name: name,
-        freq_hz: Math.round(parseFloat(f) * 1e6),
-        modulation: 't' + bw + std,
-        program: (progSel && progSel.value) ? progSel.value : null
-    });
-    if (result && result.note === 'already saved') {
-        alert('A preset with this exact name and tuning already exists.');
-    } else if (result && result.note === 'name already used') {
-        alert('A preset named "' + name + '" already exists with different tuning.');
-    }
-    await loadDvbtPresets();
-}
-
-async function saveDvbtBootDefault() {
-    var f = document.getElementById('dvbt-freq').value;
-    var bw = document.getElementById('dvbt-bw').value;
-    var progSel = document.getElementById('dvbt-program');
-    if (!f) { return; }
-    if (!confirm('Use ' + parseFloat(f).toFixed(3) + ' MHz as the fallback on '
-                 + 'startup, whenever there is nothing previous to resume?')) { return; }
-    var std = (window._dvbtLockMode || '').indexOf('dvbt2') >= 0 ? 'dvbt2'
-            : ((window._dvbtLockMode || '').indexOf('dvbt') >= 0 ? 'dvbt' : 'dvbt2');
-    await api('POST', '/api/boot-default', {
-        type: 'dvbt',
-        freq_hz: Math.round(parseFloat(f) * 1e6),
-        modulation: 't' + bw + std,
-        program: (progSel && progSel.value) ? progSel.value : null
-    });
-    await loadDvbtBootDefault();
-}
-
-async function loadDvbtBootDefault() {
-    var note = document.getElementById('dvbt-boot-note');
-    if (!note) { return; }
-    try {
-        var d = await api('GET', '/api/boot-default');
-        if (d && d.type === 'dvbt' && d.freq_hz) {
-            note.textContent = 'Default boot: '
-                + (d.freq_hz / 1e6).toFixed(3) + ' MHz';
-        } else {
-            note.textContent = '';
-        }
-    } catch (e) { note.textContent = ''; }
-}
-
-async function loadDvbtPresets() {
-    var el = document.getElementById('dvbt-preset-list');
-    if (!el) { return; }
-    try {
-        var data = await api('GET', '/api/presets');
-        var all = (data.local || []).filter(function (p) {
-            return p.type === 'dvbt';
-        });
-        // Rebuilt with DOM calls rather than innerHTML. A preset name
-        // is whatever somebody typed, and concatenating it into an
-        // onclick attribute means one apostrophe takes the page down.
-        while (el.firstChild) { el.removeChild(el.firstChild); }
-        if (!all.length) {
-            var none = document.createElement('div');
-            none.className = 'text-muted small';
-            none.textContent = 'No presets';
-            el.appendChild(none);
-            return;
-        }
-        all.forEach(function (p) {
-            var row = document.createElement('div');
-            row.className = 'd-flex align-items-center gap-1 mb-1';
-
-            var b = document.createElement('button');
-            b.className = 'btn btn-outline-secondary btn-sm flex-grow-1 text-start text-light';
-            b.textContent = p.name;
-            var mhz = document.createElement('small');
-            mhz.className = 'text-muted float-end';
-            mhz.textContent = (p.freq_hz / 1e6).toFixed(3) + ' MHz';
-            b.appendChild(mhz);
-            b.addEventListener('click', function () {
-                tuneDvbt(p.freq_hz / 1e6, p.modulation, p.program);
-            });
-            row.appendChild(b);
-
-            var d = document.createElement('button');
-            d.className = 'btn btn-outline-danger btn-sm';
-            d.title = 'Delete';
-            d.textContent = '\u00d7';
-            d.addEventListener('click', function () {
-                deletePreset(p.name);
-                setTimeout(loadDvbtPresets, 300);
-            });
-            row.appendChild(d);
-
-            el.appendChild(row);
-        });
-    } catch (e) { /* the card still tunes without its presets */ }
-}
-
-async function tuneDvbtManual() {
-    var f = document.getElementById('dvbt-freq').value;
-    var bw = document.getElementById('dvbt-bw').value;
-    var prog = document.getElementById('dvbt-program').value;
-    if (!f) { return; }
-    // DVB-T2 first, DVB-T if that does not lock. The device's own
-    // "auto" modulation exists but was confirmed unreliable - it
-    // repeatedly failed to lock a mux that locked within seconds when
-    // the modulation was named - so two explicit attempts it is. The
-    // second only runs when the first genuinely fails, which costs
-    // the lock timeout once and nothing thereafter.
-    try {
-        await tuneDvbt(f, 't' + bw + 'dvbt2', prog);
-    } catch (e) {
-        await tuneDvbt(f, 't' + bw + 'dvbt', prog);
-    }
-    // After the tune, not before: the list comes from the multiplex,
-    // and until the tuner has locked there is no multiplex to ask.
-    //
-    // And not immediately after either. The tune returns once the
-    // device reports lock, but streaminfo needs the service tables
-    // to have been read, which takes a moment longer - asking too
-    // early returned an empty list, and it took three tunes before
-    // the dropdown filled.
-    await new Promise(function (r) { setTimeout(r, 1500); });
-    await loadDvbtPrograms();
-    await loadDvbtPresets();
-    await loadDvbtBootDefault();
 }
 
 async function tunePreset(name) {
@@ -13980,21 +12378,6 @@ if __name__ == "__main__":
             continue
         threading.Thread(target=remote_source_monitor, args=(_i,),
                          daemon=True).start()
-    # One sweep rather than a background discovery thread: an HDHomeRun
-    # is installed once, not plugged in and out, and a receiver with
-    # none should run no thread and send no broadcast - absent hardware
-    # means absent behaviour, the same principle the Slave threads
-    # follow for absent configuration. A device added later is picked
-    # up on the next restart.
-    if hdhr_discover_once():
-        hdhr_monitor = threading.Thread(target=hdhomerun_monitor,
-                                        daemon=True)
-        hdhr_monitor.start()
-        # Separate thread rather than parsing both formats in one:
-        # the two ports update at different rates and a stall on
-        # either must not hold up the other.
-        threading.Thread(target=remote_quality_monitor, args=(_i,),
-                         daemon=True).start()
     # Started whenever any Slave is configured. A failed bind is not
     # fatal — status, panels and every local source carry on exactly
     # as before; only Slave video would be unavailable, and the reason
@@ -14269,9 +12652,8 @@ if __name__ == "__main__":
                 # risk resuming with mpv still pointed at the raw
                 # single-tuner port instead of the combiner's output.
                 print(f"Already locked on {state['freq']} kHz / {state['sr']} kS/s — skipping resume tune.")
-                global current_mode, current_preset, displayed_receiver_id
+                global current_mode, current_preset
                 current_mode = "rf"
-                displayed_receiver_id = None
                 current_preset = f"{state['freq']/1000:.3f} MHz / {state['sr']} kS/s"
                 # Via set_converter_state() rather than assigning
                 # current_lnb_lo_khz directly, because the LO alone is
@@ -14307,108 +12689,17 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"Could not resume previous RF state: {e}")
         elif state and state.get("mode") == "stream":
-            # A Slave is saved as a stream, because that is how it
-            # plays, plus the index of which Slave it was. Without
-            # telling the relay, resuming the URL alone points mpv
-            # at a port nothing is being forwarded to.
-            _rem_idx = state.get("remote_index")
-            if _rem_idx is not None:
-                print(f"Resuming Slave Rx {_rem_idx}: waiting for it to report")
-                for _ in range(REMOTE_RESUME_WAIT_SECS):
-                    if (0 <= _rem_idx < len(remote_states)
-                            and remote_states[_rem_idx]["enabled"]
-                            and remote_states[_rem_idx]["addr"]):
-                        break
-                    time.sleep(1)
-                try:
-                    select_remote_source(_rem_idx)
-                    print(f"Resumed Slave Rx {_rem_idx}")
-                    return
-                except Exception as e:
-                    # Left idle rather than falling through to the
-                    # plain stream resume: that would point mpv at
-                    # the relay output with nothing selected, which
-                    # is a black screen with no explanation.
-                    print(f"Could not resume Slave Rx {_rem_idx}: {e}")
-            else:
-                print(f"Resuming previous stream: {state.get('name')}")
-                try:
-                    start_stream(StreamRequest(url=state["url"], name=state.get("name", "")))
-                    return
-                except Exception as e:
-                    print(f"Could not resume previous stream: {e}")
-
-        if state and state.get("mode") == "dvbt":
-            # Discovery has normally finished by now - it runs at
-            # startup and this is seven seconds later - but a device
-            # slow to answer, or a switch still bringing its port up,
-            # would leave nothing found. Bounded wait rather than an
-            # immediate failure, same principle as REMOTE_RESUME_WAIT_SECS.
-            _waited = 0
-            while not hdhr_devices() and _waited < 20:
-                time.sleep(2)
-                _waited += 2
-                hdhr_discover_once()
-
-            _dev = state.get("device_id") or hdhr_default_device_id()
-            if not _dev:
-                print("Could not resume DVB-T2: no HDHomeRun found")
-            else:
-                try:
-                    # Already tuned? An HDHomeRun keeps its channel and
-                    # its stream target across a Lynx restart - it is a
-                    # separate box on the network and has no idea we
-                    # went away. Confirmed live: after a reboot it was
-                    # still locked and still streaming. So retuning is
-                    # usually unnecessary; mpv is the part that needs
-                    # restarting, and the tune route does both.
-                    _st = None
-                    for _d in hdhr_devices():
-                        if _d["device_id"] == _dev:
-                            _st = _d
-                            break
-                    _same = bool(_st and _st.get("locked")
-                                 and _st.get("frequency_hz") == state["freq"])
-
-                    print(f"Resuming previous DVB-T2: "
-                          f"{state['freq']/1e6:.3f} MHz / "
-                          f"{state.get('modulation')}"
-                          f"{' (already locked)' if _same else ''}")
-
-                    tune_dvbt(DvbtTuneRequest(
-                        freq=state["freq"],
-                        modulation=state.get("modulation", "t8dvbt2"),
-                        program=state.get("program"),
-                        device_id=state.get("device_id"),
-                    ))
-                    return
-                except Exception as e:
-                    # Left idle rather than falling through to the
-                    # default boot preset: that is a Picotuner preset,
-                    # and tuning a tuner this receiver may not even
-                    # have is not a useful recovery.
-                    print(f"Could not resume DVB-T2: {type(e).__name__}: {e}")
-                    return
+            print(f"Resuming previous stream: {state.get('name')}")
+            try:
+                start_stream(StreamRequest(url=state["url"], name=state.get("name", "")))
+                return
+            except Exception as e:
+                print(f"Could not resume previous stream: {e}")
 
         # No valid previous state — fall back to the explicit default
         # boot preset, if one has been configured.
         default_preset = config.get('default_boot_preset')
-        if default_preset and default_preset.get('type') == 'dvbt':
-            # A DVB-T2 fallback. Handed to _resume_tune() it would ask
-            # a Picotuner - which this receiver may not even have - for
-            # a frequency in the wrong unit.
-            print(f"No previous state - using default boot preset: "
-                  f"{default_preset.get('freq_hz', 0)/1e6:.3f} MHz DVB-T2")
-            try:
-                tune_dvbt(DvbtTuneRequest(
-                    freq=default_preset["freq_hz"],
-                    modulation=default_preset.get("modulation", "t8dvbt2"),
-                    program=default_preset.get("program"),
-                ))
-            except Exception as e:
-                print(f"Could not apply default boot preset: "
-                      f"{type(e).__name__}: {e}")
-        elif default_preset:
+        if default_preset:
             print(f"No previous state — using default boot preset: {default_preset}")
             try:
                 _resume_tune(

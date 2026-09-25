@@ -32,3 +32,8 @@ __pycache__/
 .DS_Store
 .vscode/
 .idea/
+*.bak
+*.bak_*
+__pycache__/
+*.bak-*
+*.bak*

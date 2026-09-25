@@ -314,6 +314,20 @@ state = {
     "codec": "",
     "audio_codec": "",
     "programme": "",
+    # HDHomeRun (DVB-T/T2/C). Deliberately their own keys rather than
+    # reusing mer/margin: those are DVB-S2 measurements, and a 0-100
+    # quality percentage drawn under "MER" would invite exactly the
+    # comparison it is not valid to make.
+    "hdhr_online": False,
+    "hdhr_locked": False,
+    "hdhr_lock_mode": "",
+    "hdhr_level": "",
+    "hdhr_snq": "",
+    "hdhr_seq": "",
+    "hdhr_bitrate_bps": 0,
+    "hdhr_frequency_hz": None,
+    "hdhr_service_name": "",
+    "hdhr_callsign": "",
     "mode": "idle",
     "freq_khz": 437000,
     "sr_ks": 333,
@@ -341,6 +355,20 @@ state = {
     # Diversity mode — which tuner is actually the one supplying the
     # locked/displayed state.
     "diversity_enabled": False,
+    # Slave Rx - a receiver at another site, reporting over the
+    # network. Kept separate from the tuner fields above rather than
+    # swapped into them: a Slave is an additional source, not an
+    # alternative reading of the same one, and nothing downstream
+    # should mistake its callsign for something this receiver heard
+    # on its own antenna.
+    "remote_enabled": False,
+    "remote_online": False,
+    "remote_locked": False,
+    "remote_callsign": "",
+    # What the Slave calls itself, from its own announcement rather
+    # than anything configured here - see lynx_app.py's SITE parsing.
+    "remote_name": "",
+    "remote_frequency": "",
     "locked_via": "a",  # "a" or "b" — which tuner's data populated the fields above
     # Tuner B's %NUL — an interim signal-quality proxy until Brian
     # adds proper $15-equivalent level data for rcv=2 to the
@@ -573,10 +601,47 @@ def poll_status():
     global _raw_lock_history, _raw_online_history, _last_notification_sound_played_for
     while True:
         raw_online = False
+        # The Slave whose video is on screen, if it is a Slave.
+        # Reset every poll so a stale one cannot outlive the
+        # selection that produced it.
+        _remote_display = None
         try:
             with urllib.request.urlopen(LYNX_API, timeout=2) as r:
                 data = json.loads(r.read().decode())
             pt = data.get('picotuner', {})
+
+            # Absent on an older lynx_app.py, and absent on a receiver
+            # with no device found - both are "nothing to draw", not an
+            # error, so .get() with a default rather than a branch.
+            # Nested under 'lynx' alongside mode and preset,
+            # which is where the status dict actually builds it.
+            # Top level checked too, so a future move does not
+            # silently empty the panel.
+            hh = ((data.get('lynx') or {}).get('hdhomerun')
+                  or data.get('hdhomerun') or {})
+            state["hdhr_online"] = bool(hh.get('online', False))
+            state["hdhr_locked"] = bool(hh.get('locked', False))
+            state["hdhr_lock_mode"] = hh.get('lock_mode', "") or ""
+            state["hdhr_level"] = hh.get('level', "")
+            state["hdhr_snq"] = hh.get('snq', "")
+            state["hdhr_seq"] = hh.get('seq', "")
+            state["hdhr_bitrate_bps"] = hh.get('bitrate_bps', 0) or 0
+            state["hdhr_frequency_hz"] = hh.get('frequency_hz')
+            state["hdhr_service_name"] = hh.get('service_name', "") or ""
+            # Fed into the shared callsign field as well, so the QRZ
+            # lookup and Pathfinder treat a DVB-T2 station exactly as
+            # they treat a DVB-S2 one. Empty on a broadcast frequency,
+            # by design - lynx_app.py gates it on the band.
+            hdhr_call = hh.get('callsign', "") or ""
+            state["hdhr_callsign"] = hdhr_call
+            # Its own key, set unconditionally. The earlier version
+            # gated this on state["mode"] == "dvbt", but mode is not
+            # assigned until later in this same function, so it was
+            # reading the previous poll's value and usually skipping.
+            # The draw code only looks at it inside the dvbt branch
+            # anyway, so there is nothing to guard against here.
+            state["hdhr_callsign_name"] = hh.get('callsign_name', "") or ""
+
             div = data.get('diversity', {})
             diversity_enabled = div.get('enabled', False)
             tuner_b = div.get('tuner_b', {})
@@ -665,6 +730,20 @@ def poll_status():
             raw_online = pt.get('online', False) or (diversity_enabled and tuner_b.get('online', False))
             state["diversity_enabled"] = diversity_enabled
 
+            # Read straight across, with no lock-stability smoothing.
+            # The Slave's own heartbeat is already slow (2s) and its
+            # offline threshold generous (15s), so the value arriving
+            # here has been debounced at source - smoothing it again
+            # would only add delay to a state that is already
+            # deliberately unhurried.
+            rem = data.get('remote', {}) or {}
+            state["remote_enabled"] = bool(rem.get('enabled'))
+            state["remote_online"] = bool(rem.get('online'))
+            state["remote_locked"] = bool(rem.get('locked'))
+            state["remote_callsign"] = rem.get('callsign') or ""
+            state["remote_name"] = rem.get('name') or ""
+            state["remote_frequency"] = rem.get('frequency') or ""
+
             # Which tuner's data actually populates the display fields
             # below — tri_watch's own choice takes priority when it
             # applies; otherwise, in diversity mode, prefer A whenever
@@ -726,6 +805,20 @@ def poll_status():
                 state["sr_ks"] = live_sr
             lynx = data.get('lynx', {})
             state["mode"]      = lynx.get('mode', 'idle')
+            # Matched on index rather than position in the list:
+            # a disabled Slave still has a record, so the two are
+            # not the same thing.
+            # Keyed on which receiver is on screen rather than on
+            # the mode. A displayed Slave is now mode "rf" like any
+            # other receiver, so the old stream_is_remote test
+            # would never fire and the OSD would quietly show a
+            # Slave using Rx 1's callsign and MER.
+            _active = lynx.get('active_receiver')
+            if _active is not None and _active >= 11:
+                for _rem in data.get('remotes', []):
+                    if _rem.get('index') == _active - 11:
+                        _remote_display = _rem
+                        break
             state["mpv_running_for_rf"] = lynx.get('mpv_running_for_rf', False)
             state["stream_name"] = lynx.get('stream_name', '')
             stream_info = lynx.get('stream_info') or {}
@@ -776,6 +869,55 @@ def poll_status():
             state["online"] = True
         elif not any(_raw_online_history) and len(_raw_online_history) >= ONLINE_STABLE_POLLS:
             state["online"] = False
+
+        # ── A Slave is a receiver, so draw it as one ──────────
+        # Applied last, after online and lock have settled from
+        # the local tuner: those describe hardware in this box,
+        # and none of it is what is on screen right now.
+        if _remote_display is not None:
+            rem = _remote_display
+            state["mode"] = "rf"
+            # The Slave's own reachability, not the Picotuner's.
+            state["online"] = bool(rem.get('online'))
+            state["locked"] = bool(rem.get('locked'))
+            # mpv is running and playing the relay's output, which
+            # is what this flag means. False here would cover live
+            # video with the transition cover and leave it there.
+            state["mpv_running_for_rf"] = True
+            state["callsign"] = rem.get('callsign', '')
+            state["callsign_name"] = rem.get('callsign_name', '')
+            state["frequency"] = rem.get('frequency', '')
+            # A Slave reports what it is tuned to. Any converter
+            # at its end is its business, and inventing a downlink
+            # frequency from this end would be a guess.
+            state["downlink_frequency"] = None
+            state["mer"] = rem.get('mer', '')
+            state["margin"] = rem.get('margin', '')
+            # dBm arrives directly, so the level approximation the
+            # RF path falls back to is not wanted here.
+            state["level"] = ''
+            state["dbm"] = rem.get('dbm', '')
+            state["modcod"] = rem.get('modcod', '')
+            state["codec"] = rem.get('codec', '')
+            state["audio_codec"] = rem.get('audio_codec', '')
+            state["programme"] = rem.get('programme', '')
+            # The receiver on screen is at the Slave's site, so the
+            # locator shown should be the Slave's. The local one is
+            # right only when both happen to be in the same place,
+            # which is a coincidence of the bench rather than a
+            # design. Blank when the Slave has not reported one:
+            # the line is then dropped, which beats confidently
+            # showing somewhere else.
+            state["portable_locator"] = rem.get('locator', '')
+            if rem.get('symbol_rate'):
+                state["sr_ks"] = rem['symbol_rate']
+            # Two local tuners' worth of state, describing hardware
+            # that is not the source. Left set, it would draw a
+            # diversity row or a tri_watch indicator over a Slave.
+            state["diversity_enabled"] = False
+            state["diversity_stats"] = {}
+            state["tri_watch_show_searching_rx2"] = False
+            state["locked_via"] = "a"
 
         time.sleep(POLL_SECS)
 
@@ -912,7 +1054,15 @@ class LynxOverlay(Gtk.Window):
         except OSError:
             transition_age = 0.0
             mpv_transitioning = False
-        genuinely_locked = (state["locked"] and state["mpv_running_for_rf"]) or state["mode"] == "stream"
+        # dvbt has its own lock, reported by the device itself, so it
+        # can answer this properly rather than taking the blanket
+        # exemption "stream" needs. state["locked"] describes the
+        # PICOTUNER, which on a receiver without one is correctly
+        # false - and left unqualified it covered live DVB-T2 video
+        # with the logo screen while mpv decoded away underneath.
+        genuinely_locked = ((state["locked"] and state["mpv_running_for_rf"])
+                            or state["mode"] == "stream"
+                            or (state["mode"] == "dvbt" and state["hdhr_locked"]))
         showing_picture = genuinely_locked and not mpv_transitioning
 
         # Auto-Squeak is drawn BEFORE the showing_picture branch and
@@ -1356,14 +1506,45 @@ class LynxOverlay(Gtk.Window):
         cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)  # restore the OSD's normal font for anything drawn after this
 
     def draw_top_right(self, cr, width, height):
-        if not state["online"] and state["mode"] != "stream":
+        if (not state["online"] and state["mode"] != "stream"
+                and state["mode"] != "dvbt"):
             return
         margin = 16  # matches the bottom-left zone's margin
         size = 30
         line_h = size * 1.3
         lines = []
 
-        if state["mode"] == "stream":
+        if state["mode"] == "dvbt":
+            # Level here rather than on the eye: both halves of the eye
+            # are quality readings, so strength needs somewhere to live.
+            # The service name goes last, in the callsign's place - on
+            # an amateur transmission that is exactly what it is.
+            colour = ((0.0, 1.0, 0.25) if state["hdhr_locked"]
+                      else (0.9, 0.5, 0.1))
+            # SNQ/SEQ as a pair, where the DVB-S2 block shows MER/D.
+            # SNQ is the closest thing this tuner has to MER: the
+            # demodulator's view before error correction. SEQ is how
+            # well the FEC is coping, which behaves like margin - it
+            # sits at 100 until the correction starts struggling, and
+            # it is the one that warns you a picture is about to break.
+            snq = state.get("hdhr_snq")
+            seq = state.get("hdhr_seq")
+            if state["hdhr_locked"] and snq not in ("", None):
+                lines.append(f"SNQ/SEQ {float(snq):>4.0f}/{float(seq or 0):>4.0f} %")
+            # "Justin - G8YTZ" when QRZ has told us a name, the bare
+            # callsign otherwise, and the raw service name when there
+            # is no callsign at all - which is what a broadcast
+            # frequency gives, since the band gate in lynx_app.py
+            # refuses to call "BBC ONE Lon HD" a callsign.
+            call = (state.get("hdhr_callsign") or "").strip()
+            if call:
+                qrz_name = (state.get("hdhr_callsign_name") or "").strip()
+                lines.append(f"{qrz_name} - {call}" if qrz_name else call)
+            else:
+                svc = (state.get("hdhr_service_name") or "").strip()
+                if svc:
+                    lines.append(svc)
+        elif state["mode"] == "stream":
             lines.append(state["stream_name"] or "STREAMING")
             colour = (0.0, 1.0, 0.25)
         else:
@@ -1433,6 +1614,14 @@ class LynxOverlay(Gtk.Window):
             y = margin + size + (i * line_h)
             self.draw_text(cr, width - margin, y, line, size=size, align="right", colour=colour)
 
+        # No Slave line here. The OSD shows the source being received,
+        # not an inventory of every source configured - four Slaves
+        # would mean four permanent lines on air. A Slave appears on
+        # screen when it IS the source, drawn in the zones above like
+        # any other receiver. Seeing every source's state at once is
+        # the web page's job.
+
+
     def draw_top_left(self, cr, width, height):
         LEFT_MARGIN = 16  # ~1 character in from the screen edge at size=30
         if state["mode"] == "stream":
@@ -1454,6 +1643,74 @@ class LynxOverlay(Gtk.Window):
             for i, line in enumerate(lines):
                 y = margin + size + (i * line_h)
                 self.draw_text(cr, margin, y, line, size=size)
+            return
+
+        if state["mode"] == "dvbt":
+            # Same reason as the Slave block above: mpv IS running and
+            # playing this source, which is what the flag means. Left
+            # False, the transition cover stays up over live video and
+            # takes the sound with it.
+            state["mpv_running_for_rf"] = True
+            # Its own branch, returning before the Picotuner check
+            # below. Without this it fell through to the DVB-S2 path,
+            # which reads state["online"] - the PICOTUNER's status, not
+            # this tuner's - and drew "Picotuner offline" across a
+            # picture that was decoding perfectly underneath.
+            DVBT_NOT_LOCKED = (0.9, 0.5, 0.1)
+            DVBT_LOCKED = (0.0, 1.0, 0.25)
+            margin = LEFT_MARGIN
+            size = 30
+            line_h = size * 1.3
+            colour = DVBT_LOCKED if state["hdhr_locked"] else DVBT_NOT_LOCKED
+
+            # Two lines, the same shape as the DVB-S2 block above:
+            # what it is tuned to, then how it is coded and at what
+            # rate. Quality goes top right and the meters bottom, so
+            # neither belongs here - the first version put all five on
+            # one side and it read as a wall rather than a display.
+            freq_hz = state.get("hdhr_frequency_hz")
+            mode_name = state.get("hdhr_lock_mode") or ""
+            std, bw = "", ""
+            if mode_name:
+                # t8dvbt2 -> "DVB-T2" and "8 MHz": what an operator
+                # would say out loud, not what the API calls it.
+                try:
+                    bw = f"{mode_name[1]} MHz"
+                    std = "DVB-T2" if mode_name.endswith("dvbt2") else "DVB-T"
+                except Exception:
+                    std = mode_name
+
+            # Line 1 is the RF: where it is, how wide, which standard.
+            # Line 2 is the payload: how much of it, in what codec.
+            # A cleaner division than putting the standard with the
+            # bitrate, and it leaves the two lines about the same
+            # length rather than one short and one long.
+            line1 = f"{freq_hz / 1e6:.3f} MHz" if freq_hz else "--"
+            if bw:
+                line1 += f"  {bw}"
+            if std and state["hdhr_locked"]:
+                line1 += f"  {std}"
+
+            if state["hdhr_locked"]:
+                bps = state.get("hdhr_bitrate_bps") or 0
+                line2 = f"{bps / 1e6:.2f} Mb/s" if bps else "--"
+                # Codecs from the same fields the stream branch uses,
+                # filled by poll_status() from stream_info - which the
+                # API now provides for dvbt as well. The tuner knows
+                # nothing about what is inside the multiplex; mpv does.
+                codecs = [c.upper() for c in
+                          (state.get("stream_video_codec") or "",
+                           state.get("stream_audio_codec") or "") if c]
+                if codecs:
+                    line2 += f"   {'/'.join(codecs)}"
+            else:
+                line2 = "SEARCHING"
+
+            lines = [line1, line2]
+            for i, line in enumerate(lines):
+                y = margin + size + (i * line_h)
+                self.draw_text(cr, margin, y, line, size=size,
+                               colour=colour)
             return
 
         NOT_LOCKED_COLOUR = (0.9, 0.5, 0.1)
@@ -1565,7 +1822,8 @@ class LynxOverlay(Gtk.Window):
         identical either way ('Skeleton' style is just this, with no
         frame call).
         """
-        if not state["online"] and state["mode"] != "stream":
+        if (not state["online"] and state["mode"] != "stream"
+                and state["mode"] != "dvbt"):
             return
 
         pos_l = state.get("ppm_position_l")
@@ -1704,7 +1962,8 @@ class LynxOverlay(Gtk.Window):
         cr.stroke()
 
     def draw_bottom_right(self, cr, width, height):
-        if not state["online"] and state["mode"] != "stream":
+        if (not state["online"] and state["mode"] != "stream"
+                and state["mode"] != "dvbt"):
             return
 
         eye_cx = width - 95
@@ -1735,7 +1994,41 @@ class LynxOverlay(Gtk.Window):
             text = f"{dbm:.0f} dBm" if (dbm_valid or level_str) else "--"
             return frac, text
 
-        if state["mode"] == "stream":
+        if state["mode"] == "dvbt":
+            # The device reports level as 0-100, not dBm. Shown as the
+            # percentage it is rather than converted into a dBm figure
+            # it never measured - the same choice stream mode makes
+            # with its bitrate. Both halves show the same reading:
+            # there is one tuner, so there is one answer.
+            # EYE_DVBT: two halves, two readings - the same use the
+            # eye was built for in diversity mode, except that here
+            # they are two properties of one tuner rather than two
+            # tuners. Top: SEQ. Bottom: level.
+            #
+            # Both are 0-100 from the device, shown as the percentages
+            # they are rather than converted into a dBm figure it never
+            # measured. If a model is ever found that reports dBmV,
+            # that converts to dBm properly and the bottom half can
+            # become directly comparable with the DVB-S2 side.
+            seq = state.get("hdhr_seq")
+            if seq in ("", None):
+                value_text_a = "--"
+                fraction_a = 0.0
+            else:
+                value_text_a = f"SEQ {float(seq):.0f}%"
+                fraction_a = min(1.0, float(seq) / 100.0) ** 0.5
+
+            lvl = state.get("hdhr_level")
+            if lvl in ("", None):
+                value_text_b = "--"
+                fraction_b = 0.0
+            else:
+                value_text_b = f"LVL {float(lvl):.0f}%"
+                fraction_b = min(1.0, float(lvl) / 100.0) ** 0.5
+
+            # One tuner, so one lock state - both halves agree.
+            locked_a = locked_b = state.get("hdhr_locked", False)
+        elif state["mode"] == "stream":
             # No independent tuners in stream mode - both halves show
             # the same bitrate-derived value, per "otherwise both
             # segments show the single tuner that's being displayed".
