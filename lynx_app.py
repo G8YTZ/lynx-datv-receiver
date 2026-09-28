@@ -4646,6 +4646,8 @@ class GpioTxConfigUpdate(BaseModel):
     schedule_weekday_end: str
     schedule_weekend_start: str
     schedule_weekend_end: str
+    on_url: str = ""    # fired once on each Tx on/off transition, same
+    off_url: str = ""   # timings as the pin - e.g. Companion stream start/stop
 
 class QuickLynxConfigUpdate(BaseModel):
     """Off by default. It holds an outbound connection to BATC, and most
@@ -7885,6 +7887,19 @@ def config_page():
                             <input class="form-check-input" type="checkbox" id="gpio-weekend-none-input">
                             <label class="form-check-label small" for="gpio-weekend-none">No schedule (24hr auto)</label>
                         </div>
+                        <hr>
+                        <p class="text-muted small mb-2">
+                            Optional: also call a URL when Tx turns on and off - for example to
+                            start and stop a stream in Companion. Same schedule and settle times
+                            as the pin, fired once per change. Use explicit start/stop actions,
+                            never a toggle. Works without a transmitter relay fitted.
+                        </p>
+                        <label for="gpio-on-url">Tx on URL</label>
+                        <input type="text" class="form-control mb-2" id="gpio-on-url-input"
+                               placeholder="http://companion-ip:8000/api/location/1/3/0/press">
+                        <label for="gpio-off-url">Tx off URL</label>
+                        <input type="text" class="form-control" id="gpio-off-url-input"
+                               placeholder="http://companion-ip:8000/api/location/1/3/1/press">
                         <div class="mt-3 d-flex align-items-center gap-2">
                             <button class="btn btn-save" onclick="saveGpioTx()">Save GPIO settings</button>
                             <span class="save-status" id="gpio-save-status"></span>
@@ -8984,6 +8999,8 @@ async function loadCurrentConfig() {
         document.getElementById('gpio-polarity-input').value = gpio.polarity || 'high';
         document.getElementById('gpio-power-up-input').value = gpio.power_up_settle_secs ?? 5;
         document.getElementById('gpio-power-down-input').value = gpio.power_down_settle_secs ?? 900;
+        document.getElementById('gpio-on-url-input').value = gpio.on_url || '';
+        document.getElementById('gpio-off-url-input').value = gpio.off_url || '';
         setScheduleFields('weekday', gpio.schedule_weekday_start, gpio.schedule_weekday_end);
         setScheduleFields('weekend', gpio.schedule_weekend_start, gpio.schedule_weekend_end);
 
@@ -9952,6 +9969,8 @@ async function saveGpioTx() {
                 schedule_weekday_end: weekday.end,
                 schedule_weekend_start: weekend.start,
                 schedule_weekend_end: weekend.end,
+                on_url: document.getElementById('gpio-on-url-input').value.trim(),
+                off_url: document.getElementById('gpio-off-url-input').value.trim(),
             }
         };
         const r = await fetch('/api/config', {

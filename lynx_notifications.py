@@ -826,6 +826,12 @@ class NotificationManager:
         self._tx_power_up_action = None
         self._tx_power_down_action = None
         self._tx_was_in_window = False
+        self._tx_state = None         # last Tx state actually applied (None = not yet
+                                        # decided since startup/pin change). Gates the
+                                        # on/off URLs so each fires once per real
+                                        # transition, never on a repeated set().
+        self._tx_state_lock = threading.Lock()
+        self._tx_cfg = {}             # latest gpio_tx config, read by _set_tx() at fire time
         # Companion + GPIO Tx run off "is there a picture to transmit",
         # which is NOT the same question as "is RF locked" - see _poll().
         self._confirmed_active = False
@@ -1555,9 +1561,11 @@ class NotificationManager:
         tx_cfg = notif_cfg.get('gpio_tx', {})
         if not tx_cfg.get('enabled', False):
             return
+        self._tx_cfg = tx_cfg
         pin = tx_cfg.get('pin')
         if pin is None:
             return
+        has_urls = bool(tx_cfg.get('on_url') or tx_cfg.get('off_url'))
         active_high = (tx_cfg.get('polarity', 'high') == 'high')
 
         cfg_key = (pin, active_high)
@@ -1570,8 +1578,13 @@ class NotificationManager:
             self._cancel_tx_actions()
             self._tx_was_in_window = False
             self._tx_was_locked = False
+            with self._tx_state_lock:
+                self._tx_state = None
 
-        if not self._gpio_tx.available:
+        if not self._gpio_tx.available and not has_urls:
+            # No working pin and no URLs - nothing to drive. With URLs
+            # configured, carry on: a site streaming to Companion may have
+            # no transmitter relay at all (GpioPin.set() is a no-op then).
             return
 
         if now is None:
@@ -1599,7 +1612,7 @@ class NotificationManager:
             # noisy signal needing debounce), cancelling anything the
             # auto logic had pending.
             self._cancel_tx_actions()
-            self._gpio_tx.set(True)
+            self._set_tx(True)
             print("[notifications] Tx: schedule window started - forcing on")
 
         elif not in_window and self._tx_was_in_window:
@@ -1635,6 +1648,15 @@ class NotificationManager:
         self._tx_was_in_window = in_window
         self._tx_was_locked = locked
 
+        # Startup (or pin change) with nothing on air and nothing pending:
+        # the pin is already off from GpioPin's initial_value, but the
+        # far end hasn't been told. Send "off" once so a stream left
+        # running from before a restart is brought into line.
+        if self._tx_state is None and not (
+                self._tx_power_up_action and self._tx_power_up_action.pending):
+            if not in_window and not locked:
+                self._set_tx(False)
+
     def _cancel_tx_actions(self):
         if self._tx_power_up_action:
             self._tx_power_up_action.cancel()
@@ -1645,10 +1667,39 @@ class NotificationManager:
 
     def _arm_tx_power_up(self, delay):
         self._tx_power_up_action = SettlingAction(
-            delay, lambda: self._gpio_tx.set(True), "Tx-power-up")
+            delay, lambda: self._set_tx(True), "Tx-power-up")
         self._tx_power_up_action.trigger()
 
     def _arm_tx_power_down(self, delay):
         self._tx_power_down_action = SettlingAction(
-            delay, lambda: self._gpio_tx.set(False), "Tx-power-down")
+            delay, lambda: self._set_tx(False), "Tx-power-down")
         self._tx_power_down_action.trigger()
+
+    def _set_tx(self, on: bool):
+        """The single place Tx state changes. Sets the pin, then - only on
+        a genuine change of state - fires the matching on/off URL, so a
+        stream (typically via Companion) follows the transmitter exactly,
+        with the same schedule and settle timings. The URLs should be
+        explicit start/stop actions, never a toggle.
+
+        The URL goes out on its own thread: an unreachable Companion must
+        never delay the pin, and trigger_companion() raises on connection
+        failure, which is caught and logged here."""
+        if self._gpio_tx is not None:
+            self._gpio_tx.set(on)
+        with self._tx_state_lock:
+            changed = (self._tx_state != on)
+            self._tx_state = on
+        if not changed:
+            return
+        url = (self._tx_cfg.get('on_url') if on else self._tx_cfg.get('off_url')) or ''
+        url = url.strip()
+        if not url:
+            return
+        label = "on" if on else "off"
+        def _send():
+            try:
+                trigger_companion(url)
+            except Exception as e:
+                print(f"[notifications] Tx {label} URL failed - {type(e).__name__}: {e}")
+        threading.Thread(target=_send, daemon=True, name=f"tx-url-{label}").start()

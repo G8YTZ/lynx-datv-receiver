@@ -65,6 +65,8 @@ notifications:
     schedule_weekday_start: ''
     schedule_weekend_end: ''
     schedule_weekend_start: ''
+    on_url: ''             # optional: called on Tx on, e.g. Companion "stream start" button
+    off_url: ''            # optional: called on Tx off - explicit stop, never a toggle
   qrz:
     api_key: ''          # your QRZ XML API key, if using logbook notifications
     enabled: false
