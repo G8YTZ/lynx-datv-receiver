@@ -49,6 +49,14 @@ sudo apt update && sudo apt full-upgrade -y
 # (needed to clone the repo below - almost always already
 # present, but listed explicitly rather than assumed, same
 # reasoning the guide itself gives for curl).
+#
+# hdhomerun-config is SiliconDust's own command-line tool, and it
+# is how Lynx talks to an HDHomeRun - discovery, tuning, status,
+# all of it. Without it the DVB-T2 source finds nothing and says
+# so in the log, which is exactly how the first user to try it
+# found out. Listed here rather than made optional: the package is
+# 56 KB, and a receiver that silently cannot use hardware it has
+# is worse than one carrying a tool it does not need.
 echo "--- Installing system dependencies ---"
 sudo apt install -y \
   mpv \
@@ -68,7 +76,8 @@ sudo apt install -y \
   chrony \
   pipewire-bin \
   wlr-randr \
-  git
+  git \
+  hdhomerun-config
 
 # --- Python dependencies -------------------------------------
 # NOTE: the install guide's own copy of this line is missing
