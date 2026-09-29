@@ -3699,23 +3699,38 @@ def hdhr_local_address(device_address: str) -> str:
         s.close()
 
 
-def hdhr_is_amateur_band(freq_hz) -> bool:
-    """Is this frequency in an amateur band?
+# Where a service name is a channel name rather than a callsign, and
+# must never reach QRZ as one. Everything NOT listed here is treated
+# as amateur.
+#
+# Inverted from an allowlist of amateur bands deliberately. A
+# converter puts the tuner somewhere that is not an amateur band at
+# all - the IC-9700's 23cm converter brings 1304 MHz down to 375 MHz -
+# so listing the amateur bands silently refused a callsign, a QRZ
+# lookup and a Pathfinder card to every contact made through one. The
+# same is true of any converter, and of the ATSC 3.0 tuner, which
+# cannot reach 23cm except through one.
+BROADCAST_BANDS = [
+    (174.0, 230.0),   # Band III - DAB and DVB-T
+    (470.0, 694.0),   # Bands IV/V - DVB-T2, post-700MHz-clearance
+]
 
-    Broadcast Band III (174-230 MHz) and Bands IV/V (470-862 MHz) are
-    excluded by simply not being listed. A service name from a
-    broadcast multiplex is a channel name, not a callsign, and must
-    never reach QRZ as one.
+
+def hdhr_is_amateur_band(freq_hz) -> bool:
+    """Should a service name from this frequency be treated as a callsign?
+
+    True for anything outside the broadcast bands. Not a claim that
+    the frequency IS an amateur allocation - a receiver behind a
+    converter is legitimately tuned to an IF that belongs to nobody -
+    only that a name found there is worth believing.
     """
     try:
         mhz = float(freq_hz) / 1e6
     except (TypeError, ValueError):
         return False
-    return (50 <= mhz <= 52          # 6m
-            or 70.0 <= mhz <= 70.5   # 4m
-            or 144 <= mhz <= 148     # 2m
-            or 430 <= mhz <= 440     # 70cm
-            or 1240 <= mhz <= 1325)  # 23cm
+    if mhz <= 0:
+        return False
+    return not any(low <= mhz <= high for low, high in BROADCAST_BANDS)
 
 
 def hdhr_source(device_id=None):
@@ -10668,6 +10683,32 @@ def _tune_dvbt_impl(req: DvbtTuneRequest):
         stop_diversity_combiner()
         diversity_enabled = False
 
+    _dev = req.device_id or hdhr_default_device_id()
+    # Cover the screen before anything else. Without it mpv carries on
+    # showing whatever was on before - a stream, or the previous
+    # multiplex - for the several seconds a tune takes, which reads as
+    # the tune having done nothing at all. _kick_mpv() lowers it again
+    # when the new picture arrives.
+    start_transition_cover()
+
+    # Mode and frequency BEFORE the attempt, so the OSD can show it
+    # while the tune runs - and keeps showing it if the tune fails.
+    #
+    # Setting them afterwards meant a receiver displayed the PREVIOUS
+    # source for the twenty seconds a lock attempt takes, and went on
+    # displaying it for ever if no lock came. That is arbitration
+    # behaviour, which belongs in tri_watch where sources genuinely
+    # compete; in manual mode the operator asked for a frequency and
+    # is entitled to see what is happening on it. A tune to an empty
+    # channel should look like one.
+    current_mode = "dvbt"
+    displayed_receiver_id = None
+    with hdhr_lock:
+        _live_early = hdhr_states.get(_dev)
+        if _live_early is not None:
+            _live_early["frequency_hz"] = req.freq
+            _live_early["lock_mode"] = req.modulation
+
     # Tune and wait for lock. Unlike the RF path - which defers mpv
     # until rf_mpv_lifecycle_monitor() confirms a stable lock - the
     # device reports its own lock and its own packet rate, so there is
@@ -10679,8 +10720,13 @@ def _tune_dvbt_impl(req: DvbtTuneRequest):
             program=req.program,
         )
     except lynx_hdhomerun.HDHomeRunLockTimeout as e:
+        # Lower the cover before giving up, or a failed tune leaves the
+        # screen covered until something else happens to raise and
+        # lower it - which on a receiver doing nothing else is never.
+        end_transition_cover()
         raise HTTPException(status_code=504, detail=str(e))
     except lynx_hdhomerun.HDHomeRunError as e:
+        end_transition_cover()
         raise HTTPException(status_code=502, detail=str(e))
 
     # Ask the poller to fetch the service name on its next pass rather
@@ -10690,7 +10736,6 @@ def _tune_dvbt_impl(req: DvbtTuneRequest):
     #
     # device_id resolved BEFORE the lock is taken: hdhr_default_device_id()
     # takes hdhr_lock itself, and threading.Lock is not reentrant.
-    _dev = req.device_id or hdhr_default_device_id()
     with hdhr_lock:
         live = hdhr_states.get(_dev)
         if live is not None:
