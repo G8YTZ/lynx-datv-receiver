@@ -337,6 +337,9 @@ state = {
     "stream_audio_codec": "",
     "stream_protocol": "",
     "mpv_transitioning": False,
+    # None means the registry is not being published, so the old
+    # mode-enumerating logic runs. True/False is the registry's answer.
+    "sources_showing_picture": None,
     "portable_locator": "",
     "tri_watch_notification": None,   # the current "someone else wants in" message text, or None
     "pathfinder": None,              # end-of-contact card dict, or None if none is due
@@ -827,6 +830,15 @@ def poll_status():
             state["stream_audio_codec"] = stream_info.get('audio_codec') or ""
             state["stream_protocol"] = lynx.get('stream_protocol') or ""
             state["mpv_transitioning"] = lynx.get('mpv_transitioning', False)
+            # Lynx+ step 3. The app publishes its registry's own view
+            # of whether a picture is on screen; the overlay reads the
+            # answer rather than reassembling it from a mode string and
+            # three lock flags. None when the flag is off, which is how
+            # the old path knows to run instead.
+            _srcs = lynx.get('sources')
+            state["sources_showing_picture"] = (
+                _srcs.get('showing_picture') if isinstance(_srcs, dict)
+                and 'showing_picture' in _srcs else None)
             state["portable_locator"] = lynx.get('portable_locator', '')
             state["site_locator"] = lynx.get('site_locator', '')
             state["audio_device"] = lynx.get('audio_device', 'hdmi')
@@ -1054,15 +1066,22 @@ class LynxOverlay(Gtk.Window):
         except OSError:
             transition_age = 0.0
             mpv_transitioning = False
-        # dvbt has its own lock, reported by the device itself, so it
-        # can answer this properly rather than taking the blanket
-        # exemption "stream" needs. state["locked"] describes the
-        # PICOTUNER, which on a receiver without one is correctly
-        # false - and left unqualified it covered live DVB-T2 video
-        # with the logo screen while mpv decoded away underneath.
-        genuinely_locked = ((state["locked"] and state["mpv_running_for_rf"])
-                            or state["mode"] == "stream"
-                            or (state["mode"] == "dvbt" and state["hdhr_locked"]))
+        # The registry answers this when it is being published, and
+        # the old logic runs when it is not - so the two can be
+        # compared on air by changing one line of config.
+        #
+        # What the old logic was: three sources enumerated, each with
+        # its own clause, and a fourth waiting to be written for
+        # ATSC 3.0. Every clause here was added after something was
+        # visibly wrong on screen - the dvbt one after the logo screen
+        # covered live video while mpv decoded away underneath.
+        _reg = state["sources_showing_picture"]
+        if _reg is not None:
+            genuinely_locked = bool(_reg)
+        else:
+            genuinely_locked = ((state["locked"] and state["mpv_running_for_rf"])
+                                or state["mode"] == "stream"
+                                or (state["mode"] == "dvbt" and state["hdhr_locked"]))
         showing_picture = genuinely_locked and not mpv_transitioning
 
         # Auto-Squeak is drawn BEFORE the showing_picture branch and
@@ -1118,7 +1137,14 @@ class LynxOverlay(Gtk.Window):
             # so its presence already means a real, bounded transition is
             # underway; what the tuner happens to be doing partway
             # through one does not change what should be on screen.
-            if mpv_transitioning and state["tri_watch_enabled"]:
+            # NOT gated on tri_watch. The cover exists because mpv
+            # holds its last frame when a source changes, which is true
+            # whatever is doing the changing - and gated that way, a
+            # receiver with tri_watch off never got one at all.
+            # Confirmed live: tuning DVB-T2 left the previous source on
+            # screen for the whole attempt, which reads as the tune
+            # having done nothing.
+            if mpv_transitioning:
                 # Fill the gap with something to look at rather than a
                 # plain caption, where there's something valid to show.
                 #

@@ -2429,6 +2429,16 @@ def diversity_stuck_lock_monitor():
             stuck_a = check("a", picotuner_state)
             stuck_b = check("b", picotuner_state_b)
 
+            # Only when RF is what the receiver is actually showing.
+            # This recovers a stuck tuner by retuning it from the last
+            # saved RF state - which, with another source selected,
+            # drags the player back to RF and away from what the
+            # operator asked for. Confirmed live: selecting DVB-T2 with
+            # nothing transmitting reverted to DVB-S2 about a minute
+            # later, via this path.
+            if current_mode != "rf":
+                continue
+
             if stuck_a or stuck_b:
                 now = time.time()
                 if now - _diversity_stuck_last_retune < DIVERSITY_STUCK_RETUNE_COOLDOWN_SECS:
@@ -11035,6 +11045,23 @@ def tune_preset(req: PresetTuneRequest):
                 result = start_stream(StreamRequest(url=p['url'], name=p['name']))
                 current_preset = p['name']
                 return result
+            elif preset_type == "dvbt":
+                # Dispatched on the preset's own type rather than kept
+                # in a separate list. The two were split because a
+                # DVB-T2 memory clicked on the Picotuner's card would
+                # have tuned it to a frequency in kHz that was really
+                # MHz - a number it accepts without complaint. Knowing
+                # what a preset IS fixes that properly, and means the
+                # Knobler can reach every memory rather than two
+                # thirds of them.
+                result = tune_dvbt(DvbtTuneRequest(
+                    freq=p['freq_hz'],
+                    modulation=p.get('modulation', 't8dvbt2'),
+                    program=p.get('program'),
+                    device_id=p.get('device_id'),
+                ))
+                current_preset = p['name']
+                return result
             else:
                 result = tune(TuneRequest(
                     freq=p['freq'], sr=p['sr'],
@@ -12597,12 +12624,10 @@ def web_ui():
             <div class="card mt-3" id="dvbt-tune-card" style="display:none">
                 <div class="card-header">&#x1F4FA; DVB-T2 Reception (HDHomeRun)</div>
                 <div class="card-body">
-                    <h6 class="text-muted">Presets</h6>
-                    <div id="dvbt-preset-list" class="mb-3"
-                         style="max-height: 180px; overflow-y: auto;">
-                        <div class="text-muted small">No presets</div>
-                    </div>
-                    <hr>
+                    <!-- No preset list here: DVB-T2 memories live in the
+                         one list on the RF card above, alongside DVB-S2
+                         and streams, so the Knobler and the Web UI show
+                         the same thing. -->
                     <h6 class="text-muted">Manual Tune (kHz)</h6>
                     <div class="row g-2 mb-2">
                         <div class="col-7">
@@ -13327,19 +13352,23 @@ async function loadPresets() {
     try {
         const data = await api('GET', '/api/presets');
         const local = (data.local || []).map(p => ({...p, _local: true}));
-        // DVB-T2 memories belong to their own card. Left in here they
-        // would tune the Picotuner to a frequency in kHz that was
-        // really MHz - a number it would accept without complaint.
-        const all = [...local, ...(data.ryde || [])]
-                        .filter(p => p.type !== 'dvbt');
+        // One list, every kind. /api/preset dispatches on the preset's
+        // own type, so clicking a DVB-T2 memory tunes the HDHomeRun
+        // rather than handing the Picotuner a number in the wrong
+        // unit - which is why these used to be filtered apart.
+        //
+        // One list also because the Knobler turns through one, and a
+        // memory the front panel cannot reach may as well not exist.
+        const all = [...local, ...(data.ryde || [])];
         const el = document.getElementById('preset-list');
         if (!all.length) { el.innerHTML = '<div class="text-muted small">No presets</div>'; return; }
         el.innerHTML = all.map(p => `
             <div class="d-flex align-items-center gap-1 mb-1">
                 <button class="btn btn-outline-secondary btn-sm flex-grow-1 text-start text-light" 
                         onclick="tunePreset('${p.name}')">
-                    ${(p.type === 'stream') ? '&#x1F4F6; ' : ''}${p.name}
-                    ${p.freq ? '<small class="text-muted float-end">' + (p.freq/1000).toFixed(3) + ' MHz</small>' : ''}
+                    ${(p.type === 'stream') ? '&#x1F4F6; ' : (p.type === 'dvbt') ? '&#x1F4FA; ' : '&#x1F4E1; '}${p.name}
+                    ${p.freq ? '<small class="text-muted float-end">' + (p.freq/1000).toFixed(3) + ' MHz</small>'
+                             : p.freq_hz ? '<small class="text-muted float-end">' + (p.freq_hz/1e6).toFixed(3) + ' MHz</small>' : ''}
                 </button>
                 ${p._local ? `<button class="btn btn-outline-danger btn-sm" title="Delete" onclick="deletePreset('${p.name}')">&times;</button>` : ''}
             </div>
