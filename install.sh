@@ -40,6 +40,28 @@ fi
 echo "=== Lynx DATV Receiver — Installer ==="
 echo ""
 
+# Which branch, said out loud and early.
+#
+# The installer is fetched FROM a branch but installs whatever BRANCH
+# says, and those are not the same thing: the documented one-liner
+# curls install.sh from beta, which then cloned main because that is
+# the default here. The result was a beta installer quietly installing
+# stable code, and the first anyone knew of it was a receiver
+# reporting the wrong version a week later.
+#
+# Piping into bash swallows arguments unless invoked as
+# "bash -s -- --branch beta", which is easy to leave out, so the
+# defence is to print the answer rather than to assume it was asked
+# for correctly.
+if [ "$BRANCH_EXPLICIT" = "1" ]; then
+  echo ">>> Installing branch: $BRANCH (asked for with --branch)"
+else
+  echo ">>> Installing branch: $BRANCH (default - no --branch given)"
+  echo ">>> For the beta channel, re-run as:"
+  echo ">>>   curl -sSL https://raw.githubusercontent.com/G8YTZ/lynx-datv-receiver/beta/install.sh | bash -s -- --branch beta"
+fi
+echo ""
+
 # --- System update -----------------------------------------
 echo "--- Updating system packages (this can take a while on first run) ---"
 sudo apt update && sudo apt full-upgrade -y
