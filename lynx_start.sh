@@ -502,7 +502,12 @@ while true; do
     # response already carries, and skipping the mpv check entirely
     # whenever it's "idle".
     lynx_mode=$(echo "$status_json" | grep -o '"mode"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/')
-    if [ "$lynx_mode" = "idle" ]; then
+    netout=$(echo "$status_json" | grep -o '"network_output"[[:space:]]*:[[:space:]]*true')
+    if [ -n "$netout" ]; then
+        : # network output - the picture is being forwarded to another
+          # machine and nothing decodes here, so mpv is correctly
+          # absent. Same reasoning as the idle case below.
+    elif [ "$lynx_mode" = "idle" ]; then
         : # genuinely, correctly idle - mpv isn't supposed to be running at all, nothing to check
     elif [ -f /tmp/lynx_mpv_transitioning ]; then
         : # deliberate, in-progress tune transition — mpv's temporary absence is expected, skip this check entirely for this cycle

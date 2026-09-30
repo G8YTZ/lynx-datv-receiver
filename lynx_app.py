@@ -533,7 +533,27 @@ def get_update_branch():
     also going through get_default_branch()'s own auto-detection -
     there's only ever one beta branch, by definition, so there's
     nothing to detect."""
+    # The branch actually checked out wins over the configured
+    # channel when the two disagree.
+    #
+    # They can: install.sh clones whatever --branch says, while this
+    # reads a config setting, and nothing kept them in step. A receiver
+    # cloned on main with channel: beta compared HEAD against
+    # origin/beta, declared itself behind, and pulled beta commits onto
+    # a main checkout - which is how a receiver ends up running a
+    # mixture and showing the desktop through a half-started overlay.
+    #
+    # Trusting git means a receiver updates from where it actually
+    # lives, and the config setting becomes a preference rather than an
+    # instruction that can be wrong.
     channel = config.get('update', {}).get('channel', 'stable')
+    ok, actual = git_cmd("rev-parse", "--abbrev-ref", "HEAD")
+    if ok and actual and actual != "HEAD":
+        want = 'beta' if channel == 'beta' else get_default_branch()
+        if actual != want:
+            print(f"[update] config says '{channel}' but this receiver is "
+                  f"on branch '{actual}' - following git, not the config")
+        return actual
     if channel == 'beta':
         return 'beta'
     return get_default_branch()
@@ -625,6 +645,12 @@ FFMPEG_BG_CMD = None
 
 MPV_SOCKET = "/tmp/mpv-socket"
 MPV_TRANSITION_MARKER = "/tmp/lynx_mpv_transitioning"
+# Network video output (see start_network_output() below). When on,
+# nothing is decoded here at all: the transport stream is forwarded to
+# another machine and the Pi keeps only its overlay.
+network_output_enabled = False
+network_output_proc = None
+
 mpv_transitioning = False  # mirrored to a local marker file (see
                             # MPV_TRANSITION_MARKER) which the overlay
                             # checks directly and instantly on every
@@ -759,6 +785,14 @@ def current_rf_target_port():
     # a freeze recovery to a local tuner's port while a Slave is
     # playing — the same shape of bug this function exists to
     # prevent.
+    # DVB-T2 first: an HDHomeRun streams to its own port and none of
+    # the cases below describe it. Left out originally because this
+    # function predates it, which meant a freeze recovery during a
+    # DVB-T2 session would restart mpv on a Picotuner port that has
+    # nothing on it - the same shape of bug the Slave case above was
+    # added to prevent.
+    if current_mode == "dvbt":
+        return HDHR_VIDEO_PORT
     if receiver_is_remote(active_receiver_id() or 0):
         return REMOTE_VIDEO_OUT_PORT
     if tri_watch_enabled and tri_watch_target_rcv == 2:
@@ -767,6 +801,104 @@ def current_rf_target_port():
         return config['diversity']['combiner_out_port']
     else:
         return cfg['ts_port']
+
+def network_output_target() -> str:
+    """Where the stream goes, as host:port.
+
+    A single address rather than a list: this is "put the picture on
+    that screen over there", not a distribution system. Anyone wanting
+    several viewers should point this at a multicast group, which costs
+    nothing extra here and lets the network do the work.
+    """
+    cfg = config.get('network_output', {}) or {}
+    host = cfg.get('host', '') or ''
+    port = cfg.get('port', 9950)
+    return f"{host}:{port}" if host else ""
+
+
+def network_output_url() -> str:
+    """The URL to type into VLC at the far end.
+
+    udp://@:PORT rather than udp://HOST:PORT - the @ tells VLC to
+    listen on that port rather than to send to it, which is the
+    difference between seeing a picture and seeing nothing while being
+    certain the transmitter is at fault.
+    """
+    cfg = config.get('network_output', {}) or {}
+    return f"udp://@:{cfg.get('port', 9950)}"
+
+
+def stop_network_output():
+    """Stop forwarding, if we are."""
+    global network_output_proc
+    if network_output_proc is not None:
+        try:
+            network_output_proc.terminate()
+            network_output_proc.wait(timeout=3)
+        except Exception:
+            try:
+                network_output_proc.kill()
+            except Exception:
+                pass
+        network_output_proc = None
+
+
+def start_network_output(source_url: str):
+    """Forward the transport stream instead of decoding it.
+
+    socat rather than ffmpeg or tsp: there is nothing to transcode,
+    nothing to remux and nothing to analyse - the bytes arriving are
+    exactly the bytes that should leave. socat is already a dependency,
+    starts instantly, and uses no measurable CPU. Anything cleverer
+    would be a decode we are specifically trying to avoid.
+
+    The source is the same UDP port mpv would have read, so this works
+    identically for a Picotuner, a Slave or an HDHomeRun without
+    knowing which it is.
+    """
+    global network_output_proc
+    stop_network_output()
+
+    target = network_output_target()
+    if not target:
+        print("[netout] no target configured - not forwarding")
+        return
+
+    # udp://@:9941 -> 9941. Everything reaching mpv is a UDP URL of
+    # that shape; a stream from the internet is not forwarded, because
+    # the far end can simply open the same URL itself.
+    if not source_url.startswith("udp://"):
+        print(f"[netout] source {source_url} is not UDP - not forwarding")
+        return
+    try:
+        src_port = int(source_url.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        print(f"[netout] could not read a port from {source_url}")
+        return
+
+    host, port = target.rsplit(":", 1)
+    # -u is unidirectional and UDP4-RECV needs telling to stay: without
+    # it socat handles one datagram and exits, which looked exactly like
+    # the feature working for six seconds and then giving up.
+    # -u is unidirectional; reuseaddr lets it bind a port mpv may only
+    # just have released. No fork option - UDP4-RECV does not take one,
+    # and does not need it: it stays and receives.
+    # tsp rather than socat: socat received the stream and claimed to
+    # forward it, but nothing ever arrived at the far end, while the
+    # same job done with tsp worked first time. TSDuck understands
+    # transport streams rather than just datagrams, and is already a
+    # dependency, so there is no reason to prefer the one that needed
+    # arguing with.
+    cmd = ["tsp", "--realtime", "-I", "ip", f"0.0.0.0:{src_port}",
+           "-O", "ip", f"{host}:{port}"]
+    try:
+        network_output_proc = subprocess.Popen(
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"[netout] forwarding :{src_port} -> {host}:{port}")
+    except Exception as e:
+        print(f"[netout] could not start forwarder: {e}")
+        network_output_proc = None
+
 
 def restart_mpv(target_url: str, is_rf: bool = True):
     """Fully kill and restart the mpv process, pointing it at a fresh
@@ -777,6 +909,11 @@ def restart_mpv(target_url: str, is_rf: bool = True):
     picture never updating) or actively made things worse (cycling the
     video track off/on broke the RF path too). A fresh process cannot
     carry over whatever stale VO state was causing this.
+
+    When network output is on this starts no player at all - see
+    start_network_output(). The overlay carries on drawing over a dark
+    screen, which is the point: the figures stay here and the picture
+    goes to whatever is better at decoding it.
 
     is_rf distinguishes the local Picotuner UDP port from a remote
     stream URL — several flags below are only correct for one or the
@@ -813,6 +950,15 @@ def restart_mpv(target_url: str, is_rf: bool = True):
     start_transition_cover/end_transition_cover) — this function only
     handles the actual process mechanics, so callers can make the
     covered window deliberately wider than just this restart."""
+    if network_output_enabled:
+        # Nothing decodes here. kill_mpv() still runs, because
+        # switching the feature on mid-session has to take the picture
+        # off the local screen as well as put it on the remote one.
+        kill_mpv()
+        start_network_output(target_url)
+        return
+
+    stop_network_output()
     kill_mpv()
 
     # Launch muted so there's no audio pop/glitch as the new process
@@ -2591,6 +2737,16 @@ def rf_mpv_lifecycle_monitor():
             raw_locked = (_lifecycle_active.get("locked", False)
                           if _lifecycle_active else False) or \
                          (diversity_enabled and picotuner_state_b.get("locked", False))
+
+            # Network output means there is deliberately no player
+            # here, so "mpv is not running" is the intended state
+            # rather than a fault to correct. Without this the monitor
+            # sees a lock with no mpv, restarts the forwarder, waits
+            # for a player that will never appear, and goes round
+            # again - which looked like the feature working for a few
+            # seconds and then giving up.
+            if network_output_enabled:
+                continue
 
             if raw_locked:
                 loss_streak = 0
@@ -7035,6 +7191,10 @@ def get_status():
     status = {
         "lynx": {
             "mode": current_mode,
+            # Read by lynx_start.sh's watchdog, which shuts the whole
+            # stack down when no mpv is running. With network output on
+            # that is the intended state, not a crash.
+            "network_output": network_output_enabled,
             # Lynx+ step 2: the registry's own view, for comparison
             # against everything else in this payload. Off by default,
             # and nothing consumes it - it is here to be looked at.
@@ -10999,6 +11159,48 @@ def hdhomerun_programs(device_id: str = None):
         return {"programs": tuner.stream_info()}
     except lynx_hdhomerun.HDHomeRunError as e:
         return {"programs": [], "error": str(e)}
+
+
+class NetworkOutputRequest(BaseModel):
+    enabled: bool
+
+
+@app.post("/api/network_output", tags=["Configuration"],
+          summary="Send the picture to another machine instead of decoding it",
+          description="When on, nothing is decoded here: the transport "
+                      "stream is forwarded to the configured address and "
+                      "the Pi keeps only its overlay - frequency, MER, "
+                      "callsign, magic eye. The picture goes to VLC on a "
+                      "PC, an Apple TV, a Fire Stick or anything else "
+                      "that can open a UDP stream. Recommended for 4K, "
+                      "which a Pi 5 decodes only just and a Pi 4 not at "
+                      "all, while almost any modern television has a "
+                      "hardware decoder sitting idle a few feet away.")
+def set_network_output(req: NetworkOutputRequest):
+    global network_output_enabled
+    network_output_enabled = bool(req.enabled)
+
+    # Take effect now rather than at the next tune. Switching this on
+    # mid-contact should move the picture across immediately, not leave
+    # the operator wondering whether it worked.
+    # current_rf_target_port() already knows about diversity and the
+    # Slave, so this works for all of them without asking which.
+    if current_mode in ("rf", "dvbt"):
+        _src = f"udp://@:{current_rf_target_port()}"
+    else:
+        _src = ""
+
+    if _src:
+        start_transition_cover()
+        restart_mpv(_src, is_rf=True)
+        end_transition_cover()
+    elif not network_output_enabled:
+        stop_network_output()
+
+    return {"success": True,
+            "enabled": network_output_enabled,
+            "target": network_output_target(),
+            "vlc_url": network_output_url()}
 
 
 @app.post("/api/hdhomerun/stop", tags=["RF Reception"],
