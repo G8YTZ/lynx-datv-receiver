@@ -48,7 +48,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -4910,8 +4910,14 @@ class RemoteSourceConfigUpdate(BaseModel):
     status_port: int = 10997
 
 
+class NetworkOutputConfigUpdate(BaseModel):
+    host: str = ""
+    port: int = 9950
+
+
 class ConfigUpdateRequest(BaseModel):
     site: Optional[SiteConfigUpdate] = None
+    network_output: Optional[NetworkOutputConfigUpdate] = None
     picotuner: Optional[PicotunerConfigUpdate] = None
     diversity: Optional[DiversityConfigUpdate] = None
     notifications_qrz: Optional[QrzConfigUpdate] = None
@@ -11165,6 +11171,37 @@ class NetworkOutputRequest(BaseModel):
     enabled: bool
 
 
+@app.get("/api/network_output/playlist.xspf", tags=["Configuration"],
+         summary="A playlist file that opens the stream in VLC",
+         description="Click it in a browser and the operating system "
+                     "hands it to whatever plays .m3u files, which on "
+                     "any machine with VLC installed is VLC. Exists "
+                     "because VLC's own Open Network dialogue mangles a "
+                     "udp:// URL typed into it - the @ is stripped on "
+                     "macOS and the whole address truncated on tvOS - "
+                     "while the identical URL inside a playlist file "
+                     "works every time.")
+def network_output_playlist():
+    cfg = config.get('network_output', {}) or {}
+    port = cfg.get('port', 9950)
+    # XSPF rather than M3U: macOS hands an .m3u to Music, which is
+    # not what anybody wanted. Nothing else claims .xspf, so it goes
+    # to VLC.
+    body = ('<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<playlist version="1" xmlns="http://xspf.org/ns/0/">\n'
+            '  <title>Lynx DATV</title>\n'
+            '  <trackList>\n'
+            '    <track>\n'
+            f'      <location>udp://@:{port}</location>\n'
+            '      <title>Lynx DATV</title>\n'
+            '    </track>\n'
+            '  </trackList>\n'
+            '</playlist>\n')
+    return Response(content=body, media_type="application/xspf+xml",
+                    headers={"Content-Disposition":
+                             'attachment; filename="lynx.xspf"'})
+
+
 @app.post("/api/network_output", tags=["Configuration"],
           summary="Send the picture to another machine instead of decoding it",
           description="When on, nothing is decoded here: the transport "
@@ -12442,6 +12479,9 @@ def update_config(req: ConfigUpdateRequest):
         picotuner_changed = False
         if req.site is not None:
             on_disk.setdefault('site', {}).update(req.site.model_dump())
+        if req.network_output is not None:
+            on_disk.setdefault('network_output', {}).update(
+                req.network_output.model_dump())
         if req.picotuner is not None:
             new_pt = req.picotuner.model_dump()
             picotuner_changed = on_disk.get('picotuner', {}) != {**on_disk.get('picotuner', {}), **new_pt}
@@ -12908,6 +12948,65 @@ def web_ui():
 
         <!-- Control & Config -->
         <div class="col-md-4">
+            <!-- Network video output. First in this column deliberately:
+                 it changes what the receiver is doing right now, which
+                 is what an operator reaches for mid-contact. -->
+            <div class="card mb-3">
+                <div class="card-header">&#x1F4FA; Picture to another screen</div>
+                <div class="card-body">
+                    <div class="form-check form-switch mb-2">
+                        <input class="form-check-input" type="checkbox" role="switch"
+                               id="netout-toggle" onchange="setNetworkOutput(this.checked)"
+                               style="transform:scale(1.4); margin-right:0.6em;">
+                        <label class="form-check-label" for="netout-toggle"
+                               style="font-size:1.05em">Send picture over the network</label>
+                    </div>
+                    <p class="text-muted small mb-2">
+                        Nothing is decoded here: the transport stream goes to the
+                        machine below and VLC draws the picture there. This screen
+                        keeps the overlay &mdash; frequency, MER, callsign, magic eye
+                        &mdash; over a dark background.
+                    </p>
+                    <p class="text-muted small mb-2">
+                        Worth using for 4K, which a Pi&nbsp;5 decodes only just and a
+                        Pi&nbsp;4 not at all, while almost any television, Apple TV or
+                        Fire Stick has a hardware decoder sitting idle.
+                    </p>
+                    <label class="small text-muted mb-1" for="netout-host">Machine to send to</label>
+                    <div class="input-group input-group-sm mb-1">
+                        <input type="text" class="form-control bg-dark text-light border-secondary" id="netout-host"
+                               placeholder="192.168.1.50" onchange="saveNetworkOutputHost()">
+                        <span class="input-group-text">:</span>
+                        <input type="number" class="form-control bg-dark text-light border-secondary" id="netout-port"
+                               style="max-width:6em" value="9950" onchange="saveNetworkOutputHost()">
+                    </div>
+                    <div class="small mb-2" id="netout-subnet-warning" style="display:none; color:#e8a33d;">
+                        That address is on a different subnet from this receiver. It
+                        may still work if your network routes between them &mdash; but
+                        if nothing appears, that is the first thing to check.
+                    </div>
+                    <label class="small text-muted mb-1">Open this in VLC</label>
+                    <div class="input-group input-group-sm mb-1">
+                        <input type="text" class="form-control bg-dark text-light border-secondary" id="netout-url"
+                               readonly value="udp://@:9950">
+                        <button class="btn btn-outline-light" onclick="copyNetworkOutputUrl()"
+                                title="Copy the URL">Copy</button>
+                    </div>
+                    <a class="btn btn-sm btn-primary w-100 mb-1"
+                       href="/api/network_output/playlist.xspf"
+                       title="Downloads a playlist your machine hands straight to VLC">
+                       &#x25B6;&#xFE0F; Open in VLC
+                    </a>
+                    <div class="text-muted small">
+                        Downloads a small playlist file &mdash; open it and
+                        VLC plays the stream. Browsers will not launch a
+                        download on their own, so it is two clicks rather
+                        than one, but it beats typing the URL, which VLC's
+                        own Open Network box mangles.
+                    </div>
+                </div>
+            </div>
+
             <div class="card">
                 <div class="card-header">&#x2699;&#xFE0F; Control</div>
                 <div class="card-body">
@@ -14086,6 +14185,69 @@ async function stopApp() {
         // The server is expected to go down as part of this - not itself
         // a sign anything went wrong.
     }
+}
+
+        // ── Network video output ──────────────────────────────
+//
+// The host and port are saved to config, the switch is not:
+// where the picture goes is a property of the installation,
+// whether it is going there right now is not, and a receiver
+// that came back from a power cut with its own screen dark
+// would be a puzzle rather than a convenience.
+async function setNetworkOutput(on) {
+    try {
+        const r = await api('POST', '/api/network_output', {enabled: !!on});
+        if (r && r.vlc_url) {
+            document.getElementById('netout-url').value = r.vlc_url;
+        }
+        showToast(on
+            ? 'Picture now going to ' + (r.target || 'the network')
+            : 'Picture back on this screen');
+    } catch (e) {
+        showToast('Could not change network output: ' + e, true);
+        document.getElementById('netout-toggle').checked = !on;
+    }
+}
+
+async function saveNetworkOutputHost() {
+    const host = document.getElementById('netout-host').value.trim();
+    const port = parseInt(document.getElementById('netout-port').value, 10) || 9950;
+    document.getElementById('netout-url').value = 'udp://@:' + port;
+    checkNetworkOutputSubnet(host);
+    try {
+        await api('POST', '/api/config', {network_output: {host: host, port: port}});
+    } catch (e) {
+        showToast('Could not save: ' + e, true);
+    }
+}
+
+// A /24 comparison rather than anything cleverer: the browser
+// cannot see the receiver's netmask, and on the networks this
+// runs on a /24 is right often enough to be a useful warning
+// and never a refusal. Routed networks exist, and telling
+// somebody their working setup is impossible would be worse
+// than saying nothing.
+function checkNetworkOutputSubnet(host) {
+    const warn = document.getElementById('netout-subnet-warning');
+    if (!warn) return;
+    const here = window.location.hostname;
+    const a = (host || '').split('.');
+    const b = (here || '').split('.');
+    const looksLikeIp = a.length === 4 && b.length === 4 && !isNaN(+b[0]);
+    warn.style.display = (looksLikeIp &&
+                          (a[0] !== b[0] || a[1] !== b[1] || a[2] !== b[2]))
+                         ? 'block' : 'none';
+}
+
+function copyNetworkOutputUrl() {
+    const el = document.getElementById('netout-url');
+    // No select() first: selecting the field then writing the
+    // clipboard was picking up whatever else was selected on the page
+    // rather than the URL. Writing the value straight out is both
+    // simpler and correct.
+    navigator.clipboard.writeText(el.value).then(
+        () => showToast('Copied - paste into VLC'),
+        () => showToast('Select and copy it by hand', true));
 }
 
 async function shutdownPi() {
