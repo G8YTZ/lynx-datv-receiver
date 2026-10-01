@@ -608,7 +608,12 @@ def ensure_current_version():
             update_state["current_version"] = "unknown"
             print(f"[update-check] version detection failed unexpectedly: {e}")
     if update_state["channel"] is None:
-        update_state["channel"] = config.get('update', {}).get('channel', 'stable')
+        # From git, not from config. A receiver cloned on beta with no
+        # update: section in its config described itself as stable -
+        # what it was told rather than what it is. get_update_branch()
+        # was corrected the same way; this function sits next to it and
+        # was missed.
+        update_state["channel"] = get_update_branch()
 
 
                                # just the initial synchronous part) — both
