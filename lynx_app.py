@@ -14617,6 +14617,20 @@ if __name__ == "__main__":
             continue
         threading.Thread(target=remote_source_monitor, args=(_i,),
                          daemon=True).start()
+        # Per Slave, like the line above. This had been dropped into
+        # the HDHomeRun block below instead, where _i does not exist -
+        # so any receiver that actually found an HDHomeRun died at
+        # startup with "NameError: name '_i' is not defined", while one
+        # without found nothing, never entered that block, and ran
+        # perfectly. It is a Slave's quality feed and has nothing to do
+        # with DVB-T2 at all.
+        #
+        # Separate thread from remote_source_monitor rather than
+        # parsing both formats in one: the two ports update at
+        # different rates and a stall on either must not hold up the
+        # other.
+        threading.Thread(target=remote_quality_monitor, args=(_i,),
+                         daemon=True).start()
     # One sweep rather than a background discovery thread: an HDHomeRun
     # is installed once, not plugged in and out, and a receiver with
     # none should run no thread and send no broadcast - absent hardware
@@ -14627,11 +14641,6 @@ if __name__ == "__main__":
         hdhr_monitor = threading.Thread(target=hdhomerun_monitor,
                                         daemon=True)
         hdhr_monitor.start()
-        # Separate thread rather than parsing both formats in one:
-        # the two ports update at different rates and a stall on
-        # either must not hold up the other.
-        threading.Thread(target=remote_quality_monitor, args=(_i,),
-                         daemon=True).start()
     # Started whenever any Slave is configured. A failed bind is not
     # fatal — status, panels and every local source carry on exactly
     # as before; only Slave video would be unavailable, and the reason
