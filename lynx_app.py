@@ -3426,6 +3426,10 @@ def picotuner_table_monitor_b():
             for line in text.splitlines():
                 parts = line.split()
                 parts = _rejoin_callsign(parts)  # names with spaces
+                # Full service name - the table's CALLSIGN column. Only on
+                # full rows, so a searching tuner cannot post 'search'.
+                if len(parts) >= 16 and parts[0] in (rx_a, rx_b):
+                    (picotuner_state if parts[0] == rx_a else picotuner_state_b)["service"] = parts[2].replace('_', ' ')
                 # Data rows start with the RX number - 1 and 2 on a normal
                 # board, 5 and 6 on a jumpered one, so compared against
                 # what the board reports rather than a literal. Header and
@@ -7362,6 +7366,7 @@ def get_status():
             "mer": picotuner_state["mer"],
             "margin": picotuner_state["margin"],
             "programme": picotuner_state["programme"],
+            "service": picotuner_state.get("service", ""),
             "modcod": picotuner_state["modcod"],
             "codec": picotuner_state["codec"],
             "audio_codec": picotuner_state["audio_codec"],
@@ -7474,6 +7479,7 @@ def get_status():
                 "agc1": picotuner_state_b["agc1"],
                 "agc2": picotuner_state_b["agc2"],
                 "programme": picotuner_state_b["programme"],
+                "service": picotuner_state_b.get("service", ""),
             },
             # Combiner's own live rolling-window stats (see
             # diversity_combiner_pcr.py) — None when not running.
@@ -13386,6 +13392,7 @@ async function updateStatus() {
             // it twice a few pixels apart is noise.
             const rows = [
                 ['Callsign',  pt.callsign || '—'],
+                ['Service',  pt.service || '—'],
                 ['Provider', pt.programme || '—'],
             ];
             if (pt.lnb_lo_khz && pt.downlink_frequency != null) {
@@ -13441,6 +13448,7 @@ async function updateStatus() {
             if (b.online && b.locked) {
                 const rowsB = [
                     ['Callsign',  b.callsign || '—'],
+                    ['Service',  b.service || '—'],
                     ['Provider', b.programme || '—'],  // ptwh0v3k+ (2026-07-23): now genuinely available for rcv=2, confirmed in the live $0,2 capture
                     ['Frequency', b.frequency ? b.frequency + ' MHz' : '—'],
                     ['Symbol Rate', b.symbol_rate ? b.symbol_rate + ' kS/s' : '—'],
@@ -13651,6 +13659,7 @@ async function updateStatus() {
             // rather than a difference worth preserving.
             const rows = [
                 ['Callsign',    rem.callsign || '—'],
+                ['Service',  rem.service || '—'],
                 ['Provider',    rem.programme || '—'],
                 ['Frequency',   rem.frequency ? rem.frequency + ' MHz' : '—'],
                 ['Symbol Rate', rem.symbol_rate ? rem.symbol_rate + ' kS/s' : '—'],
