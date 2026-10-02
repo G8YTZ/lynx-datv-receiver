@@ -833,76 +833,162 @@ def network_output_url() -> str:
     return f"udp://@:{cfg.get('port', 9950)}"
 
 
+# What the forwarder should be carrying, and what it is carrying.
+# restart_mpv() records every source it is given, whatever called it;
+# the watchdog keeps the running forwarder matched to it.
+network_output_lock = threading.RLock()
+network_output_source = ""
+network_output_source_is_rf = True
+network_output_running_src = ""
+network_output_started_at = 0.0
+NETOUT_LOG = "/tmp/lynx-netout.log"
+# Every forwarded source leaves in this one shape: programme 1, PMT
+# 0x100, video 0x101, audio 0x102, tables repeated at every keyframe.
+# VLC sets itself up for the first stream it sees on a port and does not
+# start again when the next one differs, so a constant layout is what
+# lets a source change through without anyone pressing play.
+NETOUT_LAYOUT = ["-mpegts_service_id", "1",
+                 "-mpegts_pmt_start_pid", "0x100",
+                 "-streamid", "0:0x101", "-streamid", "1:0x102",
+                 "-mpegts_flags", "+resend_headers"]
+
+# A new table version on every restart. Without it the new multiplex's
+# PMT carries the same version as the old one, and VLC - having seen
+# "version 0" already - ignores it and waits for PIDs that have gone.
+_netout_tables_version = [0]
+
+
+def _next_tables_version() -> int:
+    _netout_tables_version[0] = (_netout_tables_version[0] + 1) % 32
+    return _netout_tables_version[0]
+
+
 def stop_network_output():
     """Stop forwarding, if we are."""
-    global network_output_proc
-    if network_output_proc is not None:
-        try:
-            network_output_proc.terminate()
-            network_output_proc.wait(timeout=3)
-        except Exception:
+    global network_output_proc, network_output_running_src
+    with network_output_lock:
+        if network_output_proc is not None:
             try:
-                network_output_proc.kill()
+                network_output_proc.terminate()
+                network_output_proc.wait(timeout=3)
             except Exception:
-                pass
-        network_output_proc = None
+                try:
+                    network_output_proc.kill()
+                except Exception:
+                    pass
+            network_output_proc = None
+        network_output_running_src = ""
 
 
 def start_network_output(source_url: str):
-    """Forward the transport stream instead of decoding it.
+    """Forward the stream instead of decoding it - any source.
 
-    socat rather than ffmpeg or tsp: there is nothing to transcode,
-    nothing to remux and nothing to analyse - the bytes arriving are
-    exactly the bytes that should leave. socat is already a dependency,
-    starts instantly, and uses no measurable CPU. Anything cleverer
-    would be a decode we are specifically trying to avoid.
+    UDP sources (Picotuner, diversity, Slave, HDHomeRun) go through tsp:
+    the bytes arriving are exactly the bytes that should leave. socat
+    was tried first and forwarded nothing; TSDuck understands transport
+    streams rather than just datagrams and worked first time.
 
-    The source is the same UDP port mpv would have read, so this works
-    identically for a Picotuner, a Slave or an HDHomeRun without
-    knowing which it is.
+    Stream URLs (RTMP, HTTP/HLS, SRT...) go through ffmpeg -c copy:
+    repackaged as a transport stream, not decoded, so the far end gets
+    the same thing on the same port whatever Lynx is playing.
+
+    Errors go to NETOUT_LOG rather than nowhere - a forwarder that dies
+    quietly is how this feature used to look like it was working.
     """
-    global network_output_proc
-    stop_network_output()
+    global network_output_proc, network_output_running_src
+    global network_output_started_at
+    with network_output_lock:
+        stop_network_output()
+        target = network_output_target()
+        if not target:
+            print("[netout] no target configured - not forwarding")
+            return
+        host, port = target.rsplit(":", 1)
 
-    target = network_output_target()
-    if not target:
-        print("[netout] no target configured - not forwarding")
-        return
+        if source_url.startswith("udp://"):
+            try:
+                src_port = int(source_url.rsplit(":", 1)[1])
+            except (IndexError, ValueError):
+                print(f"[netout] could not read a port from {source_url}")
+                return
+            # Large receive buffer, and an overrun is a dropped packet
+            # rather than a dead forwarder.
+            source = (f"udp://0.0.0.0:{src_port}"
+                      "?fifo_size=1000000&overrun_nonfatal=1")
+        elif re.match(r"^[a-z][a-z0-9+.-]*://", source_url):
+            source = source_url
+        else:
+            print(f"[netout] {source_url} is not something to forward")
+            return
 
-    # udp://@:9941 -> 9941. Everything reaching mpv is a UDP URL of
-    # that shape; a stream from the internet is not forwarded, because
-    # the far end can simply open the same URL itself.
-    if not source_url.startswith("udp://"):
-        print(f"[netout] source {source_url} is not UDP - not forwarding")
-        return
+        # One layout for every source - see NETOUT_LAYOUT. The first
+        # video and audio are the same choice mpv makes playing it here.
+        cmd = (["ffmpeg", "-nostdin", "-loglevel", "warning",
+                "-fflags", "+genpts+discardcorrupt",
+                "-analyzeduration", "1000000",
+                "-i", source,
+                "-map", "0:v:0", "-map", "0:a:0?",
+                "-c", "copy", "-f", "mpegts"]
+               + NETOUT_LAYOUT
+               + ["-tables_version", str(_next_tables_version())]
+               + [f"udp://{host}:{port}?pkt_size=1316"])
+
+        try:
+            log = open(NETOUT_LOG, "ab")
+            network_output_proc = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=log)
+            network_output_running_src = source_url
+            network_output_started_at = time.time()
+            print(f"[netout] forwarding {source_url} -> {host}:{port} ({cmd[0]})")
+        except Exception as e:
+            print(f"[netout] could not start forwarder: {e}")
+            network_output_proc = None
+            network_output_running_src = ""
+
+
+def network_output_watchdog():
+    """Keep the forwarder matching the switch, whatever happens.
+
+    The lifecycle monitor rightly skips everything while forwarding is
+    on - there is no player to look after - but that left nobody to
+    restart the forwarder after a retune, an A/B or diversity change,
+    or a forwarder that simply died. This is that somebody.
+
+    RF and DVB-T ask current_rf_target_port(), the same answer the
+    monitor uses for mpv, so they follow every retune. Anything else
+    follows the last source restart_mpv() was given. A restart at most
+    every 5 s, so a dead stream URL cannot make it thrash.
+    """
+    global network_output_enabled
+    time.sleep(5)
     try:
-        src_port = int(source_url.rsplit(":", 1)[1])
-    except (IndexError, ValueError):
-        print(f"[netout] could not read a port from {source_url}")
-        return
-
-    host, port = target.rsplit(":", 1)
-    # -u is unidirectional and UDP4-RECV needs telling to stay: without
-    # it socat handles one datagram and exits, which looked exactly like
-    # the feature working for six seconds and then giving up.
-    # -u is unidirectional; reuseaddr lets it bind a port mpv may only
-    # just have released. No fork option - UDP4-RECV does not take one,
-    # and does not need it: it stays and receives.
-    # tsp rather than socat: socat received the stream and claimed to
-    # forward it, but nothing ever arrived at the far end, while the
-    # same job done with tsp worked first time. TSDuck understands
-    # transport streams rather than just datagrams, and is already a
-    # dependency, so there is no reason to prefer the one that needed
-    # arguing with.
-    cmd = ["tsp", "--realtime", "-I", "ip", f"0.0.0.0:{src_port}",
-           "-O", "ip", f"{host}:{port}"]
-    try:
-        network_output_proc = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(f"[netout] forwarding :{src_port} -> {host}:{port}")
+        if ((config.get('network_output', {}) or {}).get('enabled')
+                and not network_output_enabled):
+            network_output_enabled = True
+            kill_mpv()
+            print("[netout] switched on at start-up, as saved")
     except Exception as e:
-        print(f"[netout] could not start forwarder: {e}")
-        network_output_proc = None
+        print(f"[netout] could not restore saved switch: {e}")
+
+    while True:
+        try:
+            if network_output_enabled:
+                if current_mode in ("rf", "dvbt"):
+                    want = f"udp://@:{current_rf_target_port()}"
+                else:
+                    want = network_output_source
+                alive = (network_output_proc is not None
+                         and network_output_proc.poll() is None)
+                if (want and (not alive or network_output_running_src != want)
+                        and time.time() - network_output_started_at > 5):
+                    why = "source changed" if alive else "forwarder not running"
+                    print(f"[netout] watchdog: {why} - forwarding {want}")
+                    kill_mpv()
+                    start_network_output(want)
+        except Exception as e:
+            print(f"[netout] watchdog: {e}")
+        time.sleep(3)
 
 
 def restart_mpv(target_url: str, is_rf: bool = True):
@@ -955,6 +1041,8 @@ def restart_mpv(target_url: str, is_rf: bool = True):
     start_transition_cover/end_transition_cover) — this function only
     handles the actual process mechanics, so callers can make the
     covered window deliberately wider than just this restart."""
+    global network_output_source, network_output_source_is_rf
+    network_output_source, network_output_source_is_rf = target_url, is_rf
     if network_output_enabled:
         # Nothing decodes here. kill_mpv() still runs, because
         # switching the feature on mid-session has to take the picture
@@ -11221,12 +11309,19 @@ def network_output_playlist():
     # not what anybody wanted. Nothing else claims .xspf, so it goes
     # to VLC.
     body = ('<?xml version="1.0" encoding="UTF-8"?>\n'
-            '<playlist version="1" xmlns="http://xspf.org/ns/0/">\n'
+            '<playlist version="1" xmlns="http://xspf.org/ns/0/" xmlns:vlc="http://www.videolan.org/vlc/playlist/ns/0/">\n'
             '  <title>Lynx DATV</title>\n'
             '  <trackList>\n'
             '    <track>\n'
             f'      <location>udp://@:{port}</location>\n'
             '      <title>Lynx DATV</title>\n'
+            '      <extension application="http://www.videolan.org/vlc/playlist/0">\n'
+            '        <vlc:id>0</vlc:id>\n'
+            '        <vlc:option>input-repeat=65535</vlc:option>\n'
+            '        <vlc:option>video-on-top</vlc:option>\n'
+            '        <vlc:option>no-macosx-video-autoresize</vlc:option>\n'
+            '        <vlc:option>no-qt-video-autoresize</vlc:option>\n'
+            '      </extension>\n'
             '    </track>\n'
             '  </trackList>\n'
             '</playlist>\n')
@@ -11249,6 +11344,12 @@ def network_output_playlist():
 def set_network_output(req: NetworkOutputRequest):
     global network_output_enabled
     network_output_enabled = bool(req.enabled)
+    # Saved, so the switch means the same after a reboot.
+    try:
+        config.setdefault('network_output', {})['enabled'] = network_output_enabled
+        save_config(config)
+    except Exception as e:
+        print(f"[netout] could not save the switch: {e}")
 
     # Take effect now rather than at the next tune. Switching this on
     # mid-contact should move the picture across immediately, not leave
@@ -11260,9 +11361,17 @@ def set_network_output(req: NetworkOutputRequest):
     else:
         _src = ""
 
+    _is_rf = True
+    if not _src and network_output_source:
+        # A stream or other non-RF source: the same move, with
+        # whatever was last playing - to VLC when switched on, back
+        # to this screen when switched off.
+        _src = network_output_source
+        _is_rf = network_output_source_is_rf
+
     if _src:
         start_transition_cover()
-        restart_mpv(_src, is_rf=True)
+        restart_mpv(_src, is_rf=_is_rf)
         end_transition_cover()
     elif not network_output_enabled:
         stop_network_output()
@@ -14617,6 +14726,7 @@ if __name__ == "__main__":
     quality_b.start()
     freshness = threading.Thread(target=rf_mpv_lifecycle_monitor, daemon=True)
     freshness.start()
+    threading.Thread(target=network_output_watchdog, daemon=True).start()
     diversity_stuck = threading.Thread(target=diversity_stuck_lock_monitor, daemon=True)
     diversity_stuck.start()
     mer_pub = threading.Thread(target=mer_publisher, daemon=True)
