@@ -11319,8 +11319,6 @@ def network_output_playlist():
             '        <vlc:id>0</vlc:id>\n'
             '        <vlc:option>input-repeat=65535</vlc:option>\n'
             '        <vlc:option>video-on-top</vlc:option>\n'
-            '        <vlc:option>no-macosx-video-autoresize</vlc:option>\n'
-            '        <vlc:option>no-qt-video-autoresize</vlc:option>\n'
             '      </extension>\n'
             '    </track>\n'
             '  </trackList>\n'
@@ -13141,10 +13139,21 @@ def web_ui():
                     </a>
                     <div class="text-muted small">
                         Downloads a small playlist file &mdash; open it and
-                        VLC plays the stream. Browsers will not launch a
-                        download on their own, so it is two clicks rather
-                        than one, but it beats typing the URL, which VLC's
-                        own Open Network box mangles.
+                        VLC plays the stream, reopens it by itself when the
+                        source changes, and stays on top of other windows.
+                        Browsers will not launch a download on their own, so
+                        it is two clicks rather than one, but it beats typing
+                        the URL, which VLC's own Open Network box mangles.
+                    </div>
+                    <div class="small mt-2" style="color:#e8a33d;">
+                        One setting VLC only takes from its own preferences:
+                        to stop the window resizing whenever the picture size
+                        changes, untick this once on each computer.<br>
+                        <b>Mac:</b> Settings &rarr; Show All &rarr; Interface
+                        &rarr; Main interfaces &rarr; macOS &rarr;
+                        &ldquo;Resize interface to the native video size&rdquo;<br>
+                        <b>Windows / Linux:</b> Tools &rarr; Preferences &rarr;
+                        Interface &rarr; &ldquo;Resize interface to video size&rdquo;
                     </div>
                 </div>
             </div>
