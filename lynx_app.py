@@ -3288,6 +3288,27 @@ picotuner_state_b = {
 # API, matching the same staleness window picotuner_state itself uses.
 discovered_picotuners = {}
 
+def _rejoin_callsign(parts):
+    """Rejoin a callsign that contains spaces in a Picotuner table row.
+
+    Columns: RX STATUS CALLSIGN MER D FREQUENCY SR ... The FREQUENCY/SR
+    pair (a number >= 50 then an integer) belongs at index 5; if it is
+    found further right, the callsign took that many extra slots. Rows
+    with no such pair (unlocked, acquiring) are returned unchanged.
+    """
+    for f in range(5, len(parts) - 1):
+        try:
+            if float(parts[f]) >= 50 and parts[f + 1].isdigit():
+                extra = f - 5
+                if extra > 0:
+                    return (parts[:2] + [" ".join(parts[2:3 + extra])]
+                            + parts[3 + extra:])
+                return parts
+        except ValueError:
+            continue
+    return parts
+
+
 def picotuner_table_monitor_b():
     """Background thread: reads the rich table-format status from
     Picotuner port 9904 (a confirmed duplicate of 9902). Live-tested
@@ -3404,6 +3425,7 @@ def picotuner_table_monitor_b():
             rx_b = str(picotuner_rx_numbers["b"])
             for line in text.splitlines():
                 parts = line.split()
+                parts = _rejoin_callsign(parts)  # names with spaces
                 # Data rows start with the RX number - 1 and 2 on a normal
                 # board, 5 and 6 on a jumpered one, so compared against
                 # what the board reports rather than a literal. Header and
@@ -13364,7 +13386,7 @@ async function updateStatus() {
             // it twice a few pixels apart is noise.
             const rows = [
                 ['Callsign',  pt.callsign || '—'],
-                ['Programme', pt.programme || '—'],
+                ['Provider', pt.programme || '—'],
             ];
             if (pt.lnb_lo_khz && pt.downlink_frequency != null) {
                 rows.push(['Downlink', pt.downlink_frequency.toFixed(3) + ' MHz']);
@@ -13419,7 +13441,7 @@ async function updateStatus() {
             if (b.online && b.locked) {
                 const rowsB = [
                     ['Callsign',  b.callsign || '—'],
-                    ['Programme', b.programme || '—'],  // ptwh0v3k+ (2026-07-23): now genuinely available for rcv=2, confirmed in the live $0,2 capture
+                    ['Provider', b.programme || '—'],  // ptwh0v3k+ (2026-07-23): now genuinely available for rcv=2, confirmed in the live $0,2 capture
                     ['Frequency', b.frequency ? b.frequency + ' MHz' : '—'],
                     ['Symbol Rate', b.symbol_rate ? b.symbol_rate + ' kS/s' : '—'],
                     ['MER',       b.mer ? b.mer + ' dB' : '—'],
@@ -13572,7 +13594,7 @@ async function updateStatus() {
                         else if (lm.indexOf('dvbt') >= 0) { dstd = 'DVB-T'; }
                         var drows = [
                             ['Callsign', hh.callsign || '-'],
-                            ['Programme', hh.service_name || '-'],
+                            ['Service', hh.service_name || '-'],
                             ['Frequency', hh.frequency_hz ? (hh.frequency_hz / 1e6).toFixed(3) + ' MHz' : '-'],
                             ['Bandwidth', dbw ? dbw + ' MHz' : '-'],
                             ['Standard', dstd],
@@ -13629,7 +13651,7 @@ async function updateStatus() {
             // rather than a difference worth preserving.
             const rows = [
                 ['Callsign',    rem.callsign || '—'],
-                ['Programme',   rem.programme || '—'],
+                ['Provider',    rem.programme || '—'],
                 ['Frequency',   rem.frequency ? rem.frequency + ' MHz' : '—'],
                 ['Symbol Rate', rem.symbol_rate ? rem.symbol_rate + ' kS/s' : '—'],
                 ['MER',         rem.mer ? rem.mer + ' dB' : '—'],
