@@ -282,10 +282,21 @@ class HDHomeRunTuner:
             if not number.strip().isdigit():
                 continue
             parts = rest.strip().split(None, 1)
+            name = parts[1] if len(parts) > 1 else ""
+            # The device appends its own notes in brackets: "(no data)",
+            # "(encrypted)", "(control)". They are not part of the name,
+            # and "no data" means there is nothing to watch: an ATSC 3.0
+            # SLT can announce a service that is not actually present.
+            flags = ""
+            m = re.search(r"\s*\(([^()]*)\)\s*$", name)
+            if m:
+                flags = m.group(1).strip()
+                name = name[:m.start()].strip()
             programs.append({
                 "program": number.strip(),
                 "virtual_channel": parts[0] if parts else "",
-                "name": parts[1] if len(parts) > 1 else "",
+                "name": name,
+                "flags": flags,
             })
         return programs
 

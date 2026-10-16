@@ -4092,6 +4092,25 @@ def _hdhr_block(d):
     }
 
 
+def hdhr_programme_name(programs, wanted) -> str:
+    """The name the device gives a programme, or "".
+
+    wanted is a programme number, or "*" for an ATSC 3.0 tune, where the
+    box carries one TS and none is chosen: then the first programme the
+    box can actually deliver. Entries it flags ("no data", "encrypted")
+    are never it - an ATSC 3.0 SLT can announce a service that is not
+    present, and taking its name put "W6RZ-DT" over our own stream
+    (16 Oct 2026)."""
+    for prog in programs:
+        if wanted == "*":
+            if prog.get("flags"):
+                continue
+            return prog.get("name", "")
+        if prog.get("program") == wanted:
+            return prog.get("name", "")
+    return ""
+
+
 def hdhr_release_others(keep_device_id):
     """Stop every OTHER device streaming to us.
 
@@ -4246,11 +4265,8 @@ def hdhomerun_monitor():
                 if pending_program and status.locked:
                     raw = ""
                     try:
-                        for prog in tuner.stream_info():
-                            if (prog.get("program") == pending_program
-                                    or (pending_program == "*" and prog.get("name"))):
-                                raw = prog.get("name", "")
-                                break
+                        raw = hdhr_programme_name(tuner.stream_info(),
+                                                  pending_program)
                     except lynx_hdhomerun.HDHomeRunError:
                         # Not ready yet, most likely. Left to the retry
                         # below rather than treated as a failure.
