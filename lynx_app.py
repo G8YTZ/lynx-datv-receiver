@@ -3799,6 +3799,14 @@ import lynx_sources
 # source is on screen is worth having anyway.
 HDHR_VIDEO_PORT = 10996
 
+# The box sends to the relay, and the relay to mpv on HDHR_VIDEO_PORT,
+# reading the service names on the way (see lynx_relay.HdhrNameRelay):
+# an ATSC 3.0 box passes the SDT through but does not read it.
+hdhr_relay = lynx_relay.HdhrNameRelay(
+    ingress_port=lynx_relay.HDHR_INGRESS_PORT,
+    mpv_port=HDHR_VIDEO_PORT,
+)
+
 # How often each known device is asked for status. It does not
 # broadcast, so this is a request rather than a packet arriving:
 # often enough for the overlay to feel live, not so often that a busy
@@ -4173,11 +4181,16 @@ def hdhr_source(device_id=None):
         raise HTTPException(
             status_code=404,
             detail=f"HDHomeRun {device_id} not found on the network")
+    # Through the relay when it is running - started here, so every path
+    # that tunes (the card, a preset, the boot resume) has it - and
+    # straight to mpv if its port could not be bound, as before.
+    port = (lynx_relay.HDHR_INGRESS_PORT if hdhr_relay.start()
+            else HDHR_VIDEO_PORT)
     return lynx_hdhomerun.HDHomeRunSource(
         device_id=device_id,
         lynx_host=hdhr_local_address(st.get("address") or device_id),
         tuner=st.get("tuner", 0),
-        udp_port=HDHR_VIDEO_PORT,
+        udp_port=port,
     )
 
 
@@ -4234,13 +4247,20 @@ def hdhomerun_monitor():
                     raw = ""
                     try:
                         for prog in tuner.stream_info():
-                            if prog.get("program") == pending_program:
+                            if (prog.get("program") == pending_program
+                                    or (pending_program == "*" and prog.get("name"))):
                                 raw = prog.get("name", "")
                                 break
                     except lynx_hdhomerun.HDHomeRunError:
                         # Not ready yet, most likely. Left to the retry
                         # below rather than treated as a failure.
                         raw = ""
+                    # The box's list first, as always; then the stream's own
+                    # SDT, read by the relay. An ATSC 3.0 box lists our TS
+                    # programme with no name ("1: 0") because it reads names
+                    # from the SLT, not the SDT it passes through.
+                    if not raw:
+                        raw = hdhr_relay.name_for(pending_program)[0]
 
                     # Same truncation as Ryde's logbook code: keep
                     # characters up to the first non-alphanumeric one,
@@ -11248,6 +11268,7 @@ def _tune_dvbt_impl(req: DvbtTuneRequest):
         diversity_enabled = False
     # Any other HDHomeRun still sending to our port goes quiet first.
     hdhr_release_others(_dev)
+    hdhr_relay.clear()
 
     # Cover the screen before anything else. Without it mpv carries on
     # showing whatever was on before - a stream, or the previous
@@ -11300,7 +11321,9 @@ def _tune_dvbt_impl(req: DvbtTuneRequest):
     # A tune has no business waiting on a name lookup anyway.
     #
     # device_id resolved BEFORE the lock is taken: hdhr_default_device_id()
-    # takes hdhr_lock itself, and threading.Lock is not reentrant.
+    # takes hdhr_lock itself, and threading.Lock is not reentrant. The
+    # device's kind likewise - hdhr_device_kind() can take it too.
+    _atsc = hdhr_device_kind(_dev) == "atsc"
     with hdhr_lock:
         live = hdhr_states.get(_dev)
         if live is not None:
@@ -11308,8 +11331,11 @@ def _tune_dvbt_impl(req: DvbtTuneRequest):
             # a new one is worse than no name at all.
             live["service_name"] = ""
             live["callsign"] = ""
-            live["pending_program"] = (str(req.program)
-                                       if req.program is not None else None)
+            # "*" for an ATSC 3.0 tune: no programme is chosen there (the
+            # box carries one TS), but its name is still wanted.
+            live["pending_program"] = (
+                str(req.program) if req.program is not None
+                else ("*" if _atsc else None))
             live["pending_freq_hz"] = req.freq
             # Kept so a re-lock can ask again. Without it, a station
             # keying up after a gap kept the previous contact's name
