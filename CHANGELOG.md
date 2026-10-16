@@ -2,6 +2,11 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-10-16
+
+**Added**
+- ATSC 3.0 reception, through an ATSC model HDHomeRun (the US Flex 4K, `hdhomerun_dvr_atsc3`). A choice on the HDHomeRun card's bandwidth menu, alongside the DVB-T2 widths. It is the receive end of Lynx-Tx's ATSC 3.0 mode: confirmed on the bench at 437 and 557 MHz, QPSK 13/15, live 4K HEVC with sound, SNQ and SEQ at 100. The box tunes any frequency, not just the US channel plan, and hands back the transport stream carried inside the ATSC 3.0 signal, so Lynx plays it like any other source. The module also accepts the box's other modes, `8vsb` (ATSC 1.0) and US cable QAM.
+
 ## 2026-09-25
 
 **Added**

@@ -13004,7 +13004,7 @@ def web_ui():
 
             <!-- DVB-T2 Reception (HDHomeRun) -->
             <div class="card mt-3" id="dvbt-tune-card" style="display:none">
-                <div class="card-header">&#x1F4FA; DVB-T2 Reception (HDHomeRun)</div>
+                <div class="card-header">&#x1F4FA; DVB-T2 / ATSC 3.0 Reception (HDHomeRun)</div>
                 <div class="card-body">
                     <!-- No preset list here: DVB-T2 memories live in the
                          one list on the RF card above, alongside DVB-S2
@@ -13026,6 +13026,7 @@ def web_ui():
                                 <option value="6">6 MHz</option>
                                 <option value="7">7 MHz</option>
                                 <option value="8" selected>8 MHz</option>
+                                <option value="atsc3">ATSC 3.0 (6 MHz)</option>
                             </select>
                         </div>
                     </div>
@@ -13048,7 +13049,8 @@ def web_ui():
                         the bitrate - 1 and 2 MHz are the narrowband amateur
                         modes, 7 and 8 MHz are broadcast. DVB-T2 is tried
                         first and DVB-T after it, so there is nothing to
-                        choose.
+                        choose. ATSC 3.0 needs an ATSC model (the US Flex 4K)
+                        and tunes any frequency, as from Lynx-Tx.
                     </div>
                 </div>
             </div>
@@ -13718,6 +13720,8 @@ async function updateStatus() {
                         var dstd = '-';
                         if (lm.indexOf('dvbt2') >= 0) { dstd = 'DVB-T2'; }
                         else if (lm.indexOf('dvbt') >= 0) { dstd = 'DVB-T'; }
+                        else if (lm === 'atsc3') { dstd = 'ATSC 3.0'; dbw = '6'; }
+                        else if (lm === '8vsb') { dstd = 'ATSC 1.0'; dbw = '6'; }
                         var drows = [
                             ['Callsign', hh.callsign || '-'],
                             ['Service', hh.service_name || '-'],
@@ -14153,6 +14157,16 @@ async function loadDvbtPrograms(retries) {
     }
 }
 
+// The device's modulation string for what the form says. "atsc3" stands
+// alone; the DVB modes are tNdvbt2 / tNdvbt, N the bandwidth in MHz.
+function dvbtModulation(bw, std) {
+    return bw === 'atsc3' ? 'atsc3' : 't' + bw + std;
+}
+function dvbtLockedStd() {
+    var lm = window._dvbtLockMode || '';
+    return lm.indexOf('dvbt2') >= 0 ? 'dvbt2' : (lm.indexOf('dvbt') >= 0 ? 'dvbt' : 'dvbt2');
+}
+
 async function switchDvbtProgram() {
     // No retune: the tuner is already locked on the multiplex, so this
     // is a demultiplexer change and takes effect immediately. Sending
@@ -14164,15 +14178,14 @@ async function switchDvbtProgram() {
     var bw = document.getElementById('dvbt-bw').value;
     // Whatever is locked now - the tuner reports it, so there is no
     // need to guess or retry here.
-    var lm = (window._dvbtLockMode || ('t' + bw + 'dvbt2'));
+    var lm = (window._dvbtLockMode || dvbtModulation(bw, 'dvbt2'));
     await tuneDvbt(f, lm, sel.value);
 }
 
 async function saveDvbtMemory() {
     var f = document.getElementById('dvbt-freq').value;
     var bw = document.getElementById('dvbt-bw').value;
-    var std = (window._dvbtLockMode || '').indexOf('dvbt2') >= 0 ? 'dvbt2'
-            : ((window._dvbtLockMode || '').indexOf('dvbt') >= 0 ? 'dvbt' : 'dvbt2');
+    var std = dvbtLockedStd();
     var progSel = document.getElementById('dvbt-program');
     if (!f) { return; }
     var name = prompt('Name this preset:', (parseFloat(f)/1000).toFixed(3) + ' MHz');
@@ -14181,7 +14194,7 @@ async function saveDvbtMemory() {
         type: 'dvbt',
         name: name,
         freq_hz: Math.round(parseFloat(f) * 1000),
-        modulation: 't' + bw + std,
+        modulation: dvbtModulation(bw, std),
         program: (progSel && progSel.value) ? progSel.value : null
     });
     if (result && result.note === 'already saved') {
@@ -14199,12 +14212,11 @@ async function saveDvbtBootDefault() {
     if (!f) { return; }
     if (!confirm('Use ' + (parseFloat(f)/1000).toFixed(3) + ' MHz as the fallback on '
                  + 'startup, whenever there is nothing previous to resume?')) { return; }
-    var std = (window._dvbtLockMode || '').indexOf('dvbt2') >= 0 ? 'dvbt2'
-            : ((window._dvbtLockMode || '').indexOf('dvbt') >= 0 ? 'dvbt' : 'dvbt2');
+    var std = dvbtLockedStd();
     await api('POST', '/api/boot-default', {
         type: 'dvbt',
         freq_hz: Math.round(parseFloat(f) * 1000),
-        modulation: 't' + bw + std,
+        modulation: dvbtModulation(bw, std),
         program: (progSel && progSel.value) ? progSel.value : null
     });
     await loadDvbtBootDefault();
@@ -14293,10 +14305,15 @@ async function tuneDvbtManual() {
     // the modulation was named - so two explicit attempts it is. The
     // second only runs when the first genuinely fails, which costs
     // the lock timeout once and nothing thereafter.
-    try {
-        await tuneDvbt(f, 't' + bw + 'dvbt2', prog);
-    } catch (e) {
-        await tuneDvbt(f, 't' + bw + 'dvbt', prog);
+    if (bw === 'atsc3') {
+        // One standard, nothing to fall back to.
+        await tuneDvbt(f, 'atsc3', prog);
+    } else {
+        try {
+            await tuneDvbt(f, 't' + bw + 'dvbt2', prog);
+        } catch (e) {
+            await tuneDvbt(f, 't' + bw + 'dvbt', prog);
+        }
     }
     // After the tune, not before: the list comes from the multiplex,
     // and until the tuner has locked there is no multiplex to ask.
