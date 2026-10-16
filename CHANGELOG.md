@@ -5,7 +5,12 @@ All notable changes to Lynx are documented here, in reverse chronological order.
 ## 2026-10-16
 
 **Added**
-- ATSC 3.0 reception, through an ATSC model HDHomeRun (the US Flex 4K, `hdhomerun_dvr_atsc3`). A choice on the HDHomeRun card's bandwidth menu, alongside the DVB-T2 widths. It is the receive end of Lynx-Tx's ATSC 3.0 mode: confirmed on the bench at 437 and 557 MHz, QPSK 13/15, live 4K HEVC with sound, SNQ and SEQ at 100. The box tunes any frequency, not just the US channel plan, and hands back the transport stream carried inside the ATSC 3.0 signal, so Lynx plays it like any other source. The module also accepts the box's other modes, `8vsb` (ATSC 1.0) and US cable QAM.
+- ATSC 3.0 reception, as a source of its own: an ATSC 3.0 panel and tuning card beside the DVB-T2 ones, shown when an ATSC model HDHomeRun (the US Flex 4K, `hdhomerun_dvr_atsc3`) is on the network. Both boxes can be present at once; each card tunes its own. It is the receive end of Lynx-Tx's ATSC 3.0 mode, confirmed on the bench at 437 and 557 MHz with live 4K HEVC and sound, SNQ and SEQ at 100. The box tunes any frequency, not just the US channel plan, and hands back the transport stream carried inside the signal, so Lynx plays it like any other source.
+
+**Fixed**
+- With two HDHomeRuns on one network, a tune went to whichever had the lower device ID, and the other kept streaming to the same port: the right figures on the status panel over the previous picture. Each tune now goes to a box that supports the modulation (from its own /sys/features), and every other box is told to stop first.
+- The status panel and the on-screen overlay showed only the first HDHomeRun by ID. They now show each box in its own panel, and the overlay follows the one actually on screen.
+- The overlay read the bandwidth and standard from the mode name's second character, so ATSC 3.0 came out as "t MHz, DVB-T".
 
 ## 2026-09-25
 

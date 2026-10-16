@@ -3958,6 +3958,148 @@ def hdhr_default_device_id():
     return None
 
 
+_hdhr_features: dict = {}
+_hdhr_features_failed: dict = {}
+# The device Lynx last tuned: the one whose picture is on screen while in
+# DVB-T2 / ATSC 3.0 mode. Set by the tune route.
+hdhr_active_device = None
+
+
+def hdhr_device_modulations(device_id):
+    """The modulations a device says it supports (its /sys/features), or
+    None if it cannot be asked. Cached: a box's features do not change. A
+    failure is remembered for a minute, so a box that does not answer is
+    not asked again on every status poll."""
+    if device_id in _hdhr_features:
+        return _hdhr_features[device_id]
+    if time.time() - _hdhr_features_failed.get(device_id, 0) < 60:
+        return None
+    with hdhr_lock:
+        st = dict(hdhr_states.get(device_id) or {})
+    try:
+        tuner = lynx_hdhomerun.HDHomeRunTuner(device_id=device_id, tuner=st.get("tuner", 0))
+        mods = set()
+        for line in tuner.get("/sys/features").splitlines():
+            key, _, rest = line.partition(":")
+            if key.strip() == "modulation":
+                mods.update(rest.split())
+        _hdhr_features[device_id] = mods
+        return mods
+    except Exception as e:
+        print(f"[hdhr] features of {device_id}: {type(e).__name__}: {e}")
+        _hdhr_features_failed[device_id] = time.time()
+        return None
+
+
+def hdhr_device_kind(device_id) -> str:
+    """"atsc" for an ATSC model (it lists atsc3), "dvb" for anything else -
+    including a box that could not be asked, which is what every HDHomeRun
+    Lynx knew before ATSC 3.0."""
+    mods = hdhr_device_modulations(device_id)
+    return "atsc" if mods and "atsc3" in mods else "dvb"
+
+
+def hdhr_device_supports(device_id, modulation):
+    """True / False, or None when the device could not be asked.
+
+    ATSC modes must be listed by name. A DVB mode is assumed on any box
+    that lists DVB at all: its QAM entries are wildcards, and the DVB-T2
+    bandwidths it accepts are more than it advertises (see
+    lynx_hdhomerun's notes)."""
+    mods = hdhr_device_modulations(device_id)
+    if mods is None:
+        return None
+    if modulation in lynx_hdhomerun.ATSC_MODULATIONS:
+        return modulation in mods
+    return any(("dvb" in m) or ("qam" in m and m.startswith("a")) for m in mods)
+
+
+def hdhr_device_for(modulation, requested=None):
+    """Which device a tune goes to.
+
+    A named device always wins. Otherwise the default - if it can do this
+    modulation - then any other that can. With an ATSC Flex 4K and a DVB-T2
+    box on one network, "the first one found" sent ATSC 3.0 tunes to a box
+    that cannot demodulate it (16 Oct 2026)."""
+    if requested:
+        return requested
+    default = hdhr_default_device_id()
+    with hdhr_lock:
+        others = [d for d in sorted(hdhr_states) if d != default]
+    for d in ([default] if default else []) + others:
+        if hdhr_device_supports(d, modulation):
+            return d
+    return default
+
+
+def _hdhr_pick(which):
+    """A device record for the status payload, or None.
+
+    "dvb" / "atsc": the first device of that kind. "active": the one Lynx
+    tuned last while in DVB-T2 / ATSC 3.0 mode - whose picture is on
+    screen - and otherwise the DVB box, as before ATSC 3.0, then any."""
+    devices = hdhr_devices()
+    if which == "active":
+        if current_mode == "dvbt" and hdhr_active_device:
+            for d in devices:
+                if d["device_id"] == hdhr_active_device:
+                    return d
+        which = "dvb"
+        fallback = devices[0] if devices else None
+    else:
+        fallback = None
+    for d in devices:
+        if hdhr_device_kind(d["device_id"]) == which:
+            return d
+    return fallback
+
+
+def _hdhr_block(d):
+    """One device as the page and the overlay see it."""
+    if not d:
+        return None
+    return {
+        "device_id": d["device_id"],
+        "kind": hdhr_device_kind(d["device_id"]),
+        # Whether this device's picture is the one on screen. The codec
+        # rows come from the player, so they belong to this device only.
+        "active": current_mode == "dvbt" and d["device_id"] == hdhr_active_device,
+        "online": d["online"],
+        "locked": d["locked"],
+        "lock_mode": d["lock_mode"],
+        "level": d["signal_strength"],
+        "snq": d["signal_quality"],
+        "seq": d["symbol_quality"],
+        "bitrate_bps": d["bitrate_bps"],
+        "frequency_hz": d["frequency_hz"],
+        "service_name": d.get("service_name", ""),
+        # Empty unless the tuned frequency was in an amateur band - see
+        # hdhr_is_amateur_band(). The overlay feeds this to the callsign
+        # field, which reaches QRZ and Pathfinder, so a broadcast channel
+        # name must never arrive here.
+        "callsign": d.get("callsign", ""),
+        # The name from QRZ when it is cached, so a DVB-T2 or ATSC 3.0
+        # station reads "Justin - G8YTZ" like any other contact.
+        "callsign_name": qrz_first_name(d.get("callsign", "")),
+    }
+
+
+def hdhr_release_others(keep_device_id):
+    """Stop every OTHER device streaming to us.
+
+    All of them send to the same port. A DVB-T2 box left streaming from
+    the last tune kept its H.264 broadcast arriving alongside the new
+    ATSC 3.0 stream, and mpv stayed on the old one: the right figures on
+    the status panel over the wrong picture (16 Oct 2026)."""
+    for st in hdhr_devices():
+        if st["device_id"] == keep_device_id:
+            continue
+        try:
+            hdhr_source(st["device_id"]).stop()
+        except Exception as e:
+            print(f"[hdhr] release {st['device_id']} failed: {type(e).__name__}: {e}")
+
+
 def hdhr_local_address(device_address: str) -> str:
     """Which of OUR addresses the device should stream to.
 
@@ -7330,27 +7472,12 @@ def get_status():
             # None when no device was found at startup, which the
             # overlay treats as "not this receiver's problem" rather
             # than as a fault.
-            "hdhomerun": (lambda d: {
-                "online": d["online"],
-                "locked": d["locked"],
-                "lock_mode": d["lock_mode"],
-                "level": d["signal_strength"],
-                "snq": d["signal_quality"],
-                "seq": d["symbol_quality"],
-                "bitrate_bps": d["bitrate_bps"],
-                "frequency_hz": d["frequency_hz"],
-                "service_name": d.get("service_name", ""),
-                # Empty unless the tuned frequency was in an amateur
-                # band - see hdhr_is_amateur_band(). The overlay feeds
-                # this to the callsign field, which reaches QRZ and
-                # Pathfinder, so a broadcast channel name must never
-                # arrive here.
-                "callsign": d.get("callsign", ""),
-                # Same treatment the Picotuner and the Slaves get: the
-                # name from QRZ when it is cached, so a DVB-T2 station
-                # reads "Justin - G8YTZ" like any other contact.
-                "callsign_name": qrz_first_name(d.get("callsign", "")),
-            } if d else None)(next(iter(hdhr_devices()), None)),
+            # The device on screen (or the DVB box when none is), under
+            # the long-standing key the overlay reads; and one block per
+            # kind for the page's DVB-T2 and ATSC 3.0 panels.
+            "hdhomerun": _hdhr_block(_hdhr_pick("active")),
+            "hdhomerun_dvb": _hdhr_block(_hdhr_pick("dvb")),
+            "hdhomerun_atsc": _hdhr_block(_hdhr_pick("atsc")),
 
             "preset": current_preset,
             "stream_name": current_stream_name,
@@ -11093,7 +11220,13 @@ def _tune_dvbt_impl(req: DvbtTuneRequest):
     global current_mode, current_preset, displayed_receiver_id
     global diversity_enabled, mpv_running_for_rf, _tune_lock_handed_off
 
-    source = hdhr_source(req.device_id)
+    # The device that can do this modulation, chosen before anything else
+    # so every step below - the cover, the OSD state, the tune, the saved
+    # state - talks about the same box.
+    _dev = hdhr_device_for(req.modulation, req.device_id)
+    source = hdhr_source(_dev)
+    global hdhr_active_device
+    hdhr_active_device = _dev
 
     # Lynx is changing source, so whatever was being received is no
     # longer being listened to - same reason and same placement as in
@@ -11113,8 +11246,9 @@ def _tune_dvbt_impl(req: DvbtTuneRequest):
     if diversity_enabled:
         stop_diversity_combiner()
         diversity_enabled = False
+    # Any other HDHomeRun still sending to our port goes quiet first.
+    hdhr_release_others(_dev)
 
-    _dev = req.device_id or hdhr_default_device_id()
     # Cover the screen before anything else. Without it mpv carries on
     # showing whatever was on before - a stream, or the previous
     # multiplex - for the several seconds a tune takes, which reads as
@@ -11230,7 +11364,7 @@ def _tune_dvbt_impl(req: DvbtTuneRequest):
         "freq": req.freq,
         "modulation": req.modulation,
         "program": req.program,
-        "device_id": req.device_id,
+        "device_id": _dev,
     })
 
     return {
@@ -11239,7 +11373,7 @@ def _tune_dvbt_impl(req: DvbtTuneRequest):
         "freq_hz": req.freq,
         "modulation": req.modulation,
         "program": req.program,
-        "device_id": req.device_id or hdhr_default_device_id(),
+        "device_id": _dev,
     }
 
 
@@ -11280,8 +11414,12 @@ def hdhomerun_programs(device_id: str = None):
     # somebody opens the dropdown, which is rare, and there is no
     # reason to fetch it every two seconds alongside the status.
     try:
+        # The DVB box when none is named: the service list is the DVB-T2
+        # card's, and an ATSC box carrying TS has no programmes to list.
+        _dvb = _hdhr_pick("dvb")
         tuner = lynx_hdhomerun.HDHomeRunTuner(
-            device_id=device_id or hdhr_default_device_id() or "",
+            device_id=device_id or (_dvb or {}).get("device_id")
+                      or hdhr_default_device_id() or "",
             tuner=0)
         return {"programs": tuner.stream_info()}
     except lynx_hdhomerun.HDHomeRunError as e:
@@ -12918,6 +13056,13 @@ def web_ui():
                 <div class="card-header" id="dvbt-header">&#x1F4FA; DVB-T2</div>
                 <div class="card-body" id="dvbt-status"></div>
             </div>
+            <!-- ATSC 3.0 (HDHomeRun Flex 4K): its own source, beside the
+                 DVB-T2 box rather than instead of it. Hidden when there
+                 is no ATSC model on the network. -->
+            <div class="card mt-2" id="atsc-panel" style="display:none">
+                <div class="card-header" id="atsc-header">&#x1F4FA; ATSC 3.0</div>
+                <div class="card-body" id="atsc-status"></div>
+            </div>
             <div class="card mt-2" id="tri-watch-stream-panel" style="display:none">
                 <div class="card-header" id="tri-watch-stream-header">&#x1F4FA; Stream</div>
                 <div class="card-body" id="tri-watch-stream-status"></div>
@@ -13004,7 +13149,7 @@ def web_ui():
 
             <!-- DVB-T2 Reception (HDHomeRun) -->
             <div class="card mt-3" id="dvbt-tune-card" style="display:none">
-                <div class="card-header">&#x1F4FA; DVB-T2 / ATSC 3.0 Reception (HDHomeRun)</div>
+                <div class="card-header">&#x1F4FA; DVB-T2 Reception (HDHomeRun)</div>
                 <div class="card-body">
                     <!-- No preset list here: DVB-T2 memories live in the
                          one list on the RF card above, alongside DVB-S2
@@ -13026,7 +13171,6 @@ def web_ui():
                                 <option value="6">6 MHz</option>
                                 <option value="7">7 MHz</option>
                                 <option value="8" selected>8 MHz</option>
-                                <option value="atsc3">ATSC 3.0 (6 MHz)</option>
                             </select>
                         </div>
                     </div>
@@ -13049,8 +13193,31 @@ def web_ui():
                         the bitrate - 1 and 2 MHz are the narrowband amateur
                         modes, 7 and 8 MHz are broadcast. DVB-T2 is tried
                         first and DVB-T after it, so there is nothing to
-                        choose. ATSC 3.0 needs an ATSC model (the US Flex 4K)
-                        and tunes any frequency, as from Lynx-Tx.
+                        choose.
+                    </div>
+                </div>
+            </div>
+
+            <!-- ATSC 3.0 Reception (HDHomeRun Flex 4K) -->
+            <div class="card mt-3" id="atsc-tune-card" style="display:none">
+                <div class="card-header">&#x1F4FA; ATSC 3.0 Reception (HDHomeRun)</div>
+                <div class="card-body">
+                    <h6 class="text-muted">Manual Tune (kHz)</h6>
+                    <div class="d-flex gap-2 align-items-center">
+                        <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary"
+                               id="atsc-freq" placeholder="Freq (kHz)" value="437000">
+                        <button class="btn btn-danger btn-sm" onclick="tuneAtscManual()">Tune</button>
+                        <button class="btn btn-outline-warning btn-sm"
+                                onclick="saveAtscMemory()"
+                                title="Save this frequency as a preset">&#x1F4BE;</button>
+                        <button class="btn btn-outline-info btn-sm"
+                                onclick="saveAtscBootDefault()"
+                                title="Use this as the fallback on startup, if there's nothing to resume">&#x1F3E0;</button>
+                    </div>
+                    <div class="text-muted small mt-2">
+                        6 MHz ATSC 3.0, as sent by Lynx-Tx. The tuner takes any
+                        frequency it reaches, not just the US channel plan: 70cm
+                        directly, 23cm through a down-converter.
                     </div>
                 </div>
             </div>
@@ -13686,68 +13853,18 @@ async function updateStatus() {
         // throw away and recreate DOM three times a second on a page
         // somebody may be reading, and would fight any control added to
         // these panels later by destroying it mid-click.
-        // DVB-T2 (HDHomeRun). Looked up both ways: the status payload
-        // nests some blocks under "lynx" and exposes others at the top
-        // level, and this renderer is called with both shapes.
-        const hh = (s.lynx && s.lynx.hdhomerun) || s.hdhomerun || null;
-        const si = (s.lynx && s.lynx.stream_info) || s.stream_info || {};
-        const dvbtPanel = document.getElementById('dvbt-panel');
-        const dvbtCard = document.getElementById('dvbt-tune-card');
-        if (dvbtPanel) {
-            if (!hh) {
-                dvbtPanel.style.display = 'none';
-                if (dvbtCard) { dvbtCard.style.display = 'none'; }
-            } else {
-                dvbtPanel.style.display = '';
-                if (dvbtCard) { dvbtCard.style.display = ''; }
-                var dstate = 'offline';
-                if (hh.online) { dstate = hh.locked ? 'locked' : 'idle'; }
-                setPanelState('dvbt-header', 'dvbt-status',
-                              '&#x1F4FA; DVB-T2', dstate);
-                var dbody = document.getElementById('dvbt-status');
-                if (dbody) {
-                    if (!hh.online) {
-                        dbody.innerHTML = '<div class="text-danger small text-center mt-2">HDHomeRun offline</div>';
-                    } else if (hh.locked) {
-                        // t8dvbt2 gives "8 MHz" and "DVB-T2". The second
-                        // character is the nominal bandwidth in MHz and
-                        // the ladder is exact, so 1 really does mean 1.
-                        var lm = hh.lock_mode || '';
-                        // Kept so the form does not have to ask which
-                        // standard this is - the tuner has already said.
-                        if (lm) { window._dvbtLockMode = lm; }
-                        var dbw = lm.charAt(1);
-                        var dstd = '-';
-                        if (lm.indexOf('dvbt2') >= 0) { dstd = 'DVB-T2'; }
-                        else if (lm.indexOf('dvbt') >= 0) { dstd = 'DVB-T'; }
-                        else if (lm === 'atsc3') { dstd = 'ATSC 3.0'; dbw = '6'; }
-                        else if (lm === '8vsb') { dstd = 'ATSC 1.0'; dbw = '6'; }
-                        var drows = [
-                            ['Callsign', hh.callsign || '-'],
-                            ['Service', hh.service_name || '-'],
-                            ['Frequency', hh.frequency_hz ? (hh.frequency_hz / 1e6).toFixed(3) + ' MHz' : '-'],
-                            ['Bandwidth', dbw ? dbw + ' MHz' : '-'],
-                            ['Standard', dstd],
-                            ['SNQ', (hh.snq !== null && hh.snq !== undefined) ? hh.snq + ' %' : '-'],
-                            ['SEQ', (hh.seq !== null && hh.seq !== undefined) ? hh.seq + ' %' : '-'],
-                            ['Level', (hh.level !== null && hh.level !== undefined) ? hh.level + ' %' : '-'],
-                            ['Bitrate', hh.bitrate_bps ? (hh.bitrate_bps / 1e6).toFixed(2) + ' Mb/s' : '-'],
-                            ['Codec', si.video_codec || '-'],
-                            ['Audio Codec', si.audio_codec || '-']
-                        ];
-                        var dhtml = '';
-                        for (var di = 0; di < drows.length; di++) {
-                            dhtml += '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;">';
-                            dhtml += '<span>' + drows[di][0] + '</span>';
-                            dhtml += '<span class="status-value">' + drows[di][1] + '</span></div>';
-                        }
-                        dbody.innerHTML = dhtml;
-                    } else {
-                        dbody.innerHTML = '<div class="text-muted small text-center mt-2">Searching for signal...</div>';
-                    }
-                }
-            }
-        }
+        // HDHomeRun panels: DVB-T2 and ATSC 3.0, one per kind of box.
+        // Looked up both ways: the status payload nests some blocks under
+        // "lynx" and exposes others at the top level, and this renderer is
+        // called with both shapes. An older server without the per-kind
+        // blocks is shown in the DVB-T2 panel, as before.
+        const L_ = s.lynx || {};
+        const si = L_.stream_info || s.stream_info || {};
+        const hdvb = L_.hdhomerun_dvb || s.hdhomerun_dvb
+            || ((L_.hdhomerun_atsc || s.hdhomerun_atsc) ? null : (L_.hdhomerun || s.hdhomerun || null));
+        const hatsc = L_.hdhomerun_atsc || s.hdhomerun_atsc || null;
+        renderHdhrPanel(hdvb, si, 'dvbt', '&#x1F4FA; DVB-T2');
+        renderHdhrPanel(hatsc, si, 'atsc', '&#x1F4FA; ATSC 3.0');
 
         const remotes = s.remotes || [];
         const remoteHost = document.getElementById('remote-panels');
@@ -14093,6 +14210,66 @@ async function tuneTo() {
     await api('POST', '/api/tune', {freq, sr, plug, lnb_lo_khz});
 }
 
+// One HDHomeRun panel and its tuning card: prefix 'dvbt' or 'atsc'.
+// The codec rows come from the player, so they are shown only for the
+// box whose picture is actually on screen.
+function renderHdhrPanel(hh, si, prefix, title) {
+    var panel = document.getElementById(prefix + '-panel');
+    var card = document.getElementById(prefix + '-tune-card');
+    if (!panel) { return; }
+    if (!hh) {
+        panel.style.display = 'none';
+        if (card) { card.style.display = 'none'; }
+        return;
+    }
+    panel.style.display = '';
+    if (card) { card.style.display = ''; }
+    var dstate = 'offline';
+    if (hh.online) { dstate = hh.locked ? 'locked' : 'idle'; }
+    setPanelState(prefix + '-header', prefix + '-status', title, dstate);
+    var dbody = document.getElementById(prefix + '-status');
+    if (!dbody) { return; }
+    if (!hh.online) {
+        dbody.innerHTML = '<div class="text-danger small text-center mt-2">HDHomeRun offline</div>';
+        return;
+    }
+    if (!hh.locked) {
+        dbody.innerHTML = '<div class="text-muted small text-center mt-2">Searching for signal...</div>';
+        return;
+    }
+    // t8dvbt2 gives "8 MHz" and "DVB-T2": the second character is the
+    // nominal bandwidth in MHz. atsc3 and 8vsb are 6 MHz by definition.
+    var lm = hh.lock_mode || '';
+    // Kept so the DVB form does not have to ask which standard this is.
+    if (lm && prefix === 'dvbt') { window._dvbtLockMode = lm; }
+    var dbw = '', dstd = '-';
+    if (lm === 'atsc3') { dstd = 'ATSC 3.0'; dbw = '6'; }
+    else if (lm === '8vsb') { dstd = 'ATSC 1.0'; dbw = '6'; }
+    else if (lm.indexOf('dvbt2') >= 0) { dstd = 'DVB-T2'; dbw = lm.charAt(1); }
+    else if (lm.indexOf('dvbt') >= 0) { dstd = 'DVB-T'; dbw = lm.charAt(1); }
+    var onScreen = (hh.active === undefined) ? true : hh.active;
+    var drows = [
+        ['Callsign', hh.callsign || '-'],
+        ['Service', hh.service_name || '-'],
+        ['Frequency', hh.frequency_hz ? (hh.frequency_hz / 1e6).toFixed(3) + ' MHz' : '-'],
+        ['Bandwidth', dbw ? dbw + ' MHz' : '-'],
+        ['Standard', dstd],
+        ['SNQ', (hh.snq !== null && hh.snq !== undefined) ? hh.snq + ' %' : '-'],
+        ['SEQ', (hh.seq !== null && hh.seq !== undefined) ? hh.seq + ' %' : '-'],
+        ['Level', (hh.level !== null && hh.level !== undefined) ? hh.level + ' %' : '-'],
+        ['Bitrate', hh.bitrate_bps ? (hh.bitrate_bps / 1e6).toFixed(2) + ' Mb/s' : '-'],
+        ['Codec', onScreen ? (si.video_codec || '-') : 'not on screen'],
+        ['Audio Codec', onScreen ? (si.audio_codec || '-') : '-']
+    ];
+    var dhtml = '';
+    for (var di = 0; di < drows.length; di++) {
+        dhtml += '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;">';
+        dhtml += '<span>' + drows[di][0] + '</span>';
+        dhtml += '<span class="status-value">' + drows[di][1] + '</span></div>';
+    }
+    dbody.innerHTML = dhtml;
+}
+
 async function tuneDvbt(freqMhz, modulation, program) {
     // MHz in the form, Hz on the wire: the device's own API works in
     // Hz and nobody wants to type nine digits. Converted here, in one
@@ -14294,6 +14471,44 @@ async function loadDvbtPresets() {
     } catch (e) { /* the card still tunes without its presets */ }
 }
 
+async function tuneAtscManual() {
+    var f = document.getElementById('atsc-freq').value;
+    if (!f) { return; }
+    // The server sends an atsc3 tune to the ATSC box and releases the
+    // DVB one, so nothing else needs choosing here.
+    await tuneDvbt(f, 'atsc3', null);
+}
+
+async function saveAtscMemory() {
+    var f = document.getElementById('atsc-freq').value;
+    if (!f) { return; }
+    var name = prompt('Name this preset:', (parseFloat(f)/1000).toFixed(3) + ' MHz ATSC 3.0');
+    if (name === null) { return; }
+    var result = await api('POST', '/api/presets/add', {
+        type: 'dvbt', name: name,
+        freq_hz: Math.round(parseFloat(f) * 1000),
+        modulation: 'atsc3', program: null
+    });
+    if (result && result.note === 'already saved') {
+        alert('A preset with this exact name and tuning already exists.');
+    } else if (result && result.note === 'name already used') {
+        alert('A preset named "' + name + '" already exists with different tuning.');
+    }
+    await loadDvbtPresets();
+}
+
+async function saveAtscBootDefault() {
+    var f = document.getElementById('atsc-freq').value;
+    if (!f) { return; }
+    if (!confirm('Use ' + (parseFloat(f)/1000).toFixed(3) + ' MHz ATSC 3.0 as the fallback on '
+                 + 'startup, whenever there is nothing previous to resume?')) { return; }
+    await api('POST', '/api/boot-default', {
+        type: 'dvbt', freq_hz: Math.round(parseFloat(f) * 1000),
+        modulation: 'atsc3', program: null
+    });
+    await loadDvbtBootDefault();
+}
+
 async function tuneDvbtManual() {
     var f = document.getElementById('dvbt-freq').value;
     var bw = document.getElementById('dvbt-bw').value;
@@ -14305,15 +14520,10 @@ async function tuneDvbtManual() {
     // the modulation was named - so two explicit attempts it is. The
     // second only runs when the first genuinely fails, which costs
     // the lock timeout once and nothing thereafter.
-    if (bw === 'atsc3') {
-        // One standard, nothing to fall back to.
-        await tuneDvbt(f, 'atsc3', prog);
-    } else {
-        try {
-            await tuneDvbt(f, 't' + bw + 'dvbt2', prog);
-        } catch (e) {
-            await tuneDvbt(f, 't' + bw + 'dvbt', prog);
-        }
+    try {
+        await tuneDvbt(f, 't' + bw + 'dvbt2', prog);
+    } catch (e) {
+        await tuneDvbt(f, 't' + bw + 'dvbt', prog);
     }
     // After the tune, not before: the list comes from the multiplex,
     // and until the tuner has locked there is no multiplex to ask.
