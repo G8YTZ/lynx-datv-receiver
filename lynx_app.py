@@ -7468,7 +7468,11 @@ def _registry_active_id():
     if current_mode == "stream":
         return "stream"
     if current_mode == "dvbt":
-        _d = hdhr_default_device_id()
+        # The box actually tuned, not the default one: with a DVB-T2 box
+        # and an ATSC 3.0 box both present, the default named the other
+        # box, the registry said "no picture" and the overlay blanked a
+        # perfectly good one.
+        _d = hdhr_active_device or hdhr_default_device_id()
         return f"dvbt:{_d}:0" if _d else None
     if current_mode == "rf":
         if displayed_receiver_id is not None:
