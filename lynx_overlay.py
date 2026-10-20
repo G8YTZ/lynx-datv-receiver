@@ -472,7 +472,7 @@ def ppm_monitor_target():
     simply "<node>.monitor". Falling back, in order, to searching
     PipeWire for a matching ALSA card, then to the default sink.
     """
-    fallback = "@DEFAULT_SINK@.monitor"
+    fallback = None  # None = default sink's monitor, via stream.capture.sink
     try:
         dev = state.get("audio_device", "hdmi")
         if not dev or str(dev).lower() == "auto":
@@ -483,7 +483,7 @@ def ppm_monitor_target():
         resolved = state.get("audio_device_resolved") or dev
 
         if str(resolved).startswith("pipewire/"):
-            return resolved.split("/", 1)[1] + ".monitor"
+            return resolved.split("/", 1)[1]
 
         card = _alsa_card_from_mpv_device(resolved)
         if not card:
@@ -494,7 +494,7 @@ def ppm_monitor_target():
                   f"falling back to the default sink. The meter may read "
                   f"nothing if mpv is playing to a different device.")
             return fallback
-        return target
+        return target.removesuffix(".monitor")
     except Exception as e:
         print(f"[ppm] target resolution failed ({e}) - using the default sink")
         return fallback
@@ -551,7 +551,7 @@ def audio_ppm_monitor():
             if target is None or current_device != target_for_device:
                 target = ppm_monitor_target()
                 target_for_device = current_device
-                print(f"[ppm] monitoring {target}")
+                print(f"[ppm] monitoring {target or 'default sink'}")
                 if proc is not None:
                     try:
                         proc.kill()
@@ -561,7 +561,7 @@ def audio_ppm_monitor():
 
             if proc is None or proc.poll() is not None:
                 proc = subprocess.Popen(
-                    ["pw-cat", "-r", f"--target={target}",
+                    ["pw-cat", "-r", "-P", "{ stream.capture.sink=true }"] + ([f"--target={target}"] if target else []) + [
                      "--format=s16", "--rate", str(SAMPLE_RATE),
                      "--channels", str(CHANNELS), "-"],
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL

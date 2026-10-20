@@ -702,7 +702,7 @@ class SqueakListener(threading.Thread):
     48 kHz stereo is 38 MB that way and 77 MB as float32, and the
     source is 16-bit anyway, so the extra precision would be invented."""
 
-    DEFAULT_SOURCE = '@DEFAULT_MONITOR@'
+    DEFAULT_SOURCE = None  # None = default sink's monitor, via stream.capture.sink
 
     def __init__(self, source=None, on_result=None, sr=48000,
                  chunk_s=0.10):
@@ -714,7 +714,9 @@ class SqueakListener(threading.Thread):
         # device is changed later. A real name can still be given for
         # a site with several sinks where the default is not the one
         # carrying programme audio.
-        self.source = source or self.DEFAULT_SOURCE
+        self.source = source if source and not str(source).startswith('@') else self.DEFAULT_SOURCE
+        if self.source:
+            self.source = self.source.removesuffix('.monitor')
         self.sr = sr
         self.on_result = on_result
         self.chunk = int(sr * chunk_s)
@@ -825,13 +827,13 @@ class SqueakListener(threading.Thread):
         # subtly different from the one already proven on this monitor.
         # If a second capture ever does disturb the graph, that is worth
         # finding out against the known-good method, not a variant.
-        cmd = ['pw-cat', '-r', f'--target={self.source}',
+        cmd = ['pw-cat', '-r', '-P', '{ stream.capture.sink=true }'] + ([f'--target={self.source}'] if self.source else []) + [
                '--format=s16', '--rate', str(self.sr),
                '--channels', '2', '-']
         self._proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                       stderr=subprocess.DEVNULL,
                                       bufsize=self.chunk * 8)
-        print(f"[squeak] listening on {self.source}")
+        print(f"[squeak] listening on {self.source or 'default sink'}")
         nbytes = self.chunk * 2 * 2
         buf = []              # captured chunks during a pass
         t = 0.0
