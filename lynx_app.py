@@ -1955,12 +1955,24 @@ def _read_video_in():
     params = _mpv_prop("video-params")
     if not isinstance(params, dict) or not params.get("h"):
         return None
-    fps = _mpv_prop("container-fps") or _mpv_prop("estimated-vf-fps")
+    fps = _mpv_prop("container-fps")
+    shown_fps = _mpv_prop("estimated-vf-fps")
+    finfo = _mpv_prop("video-frame-info") or {}
+    # Interlaced if the decoder put out twice the stream's frame
+    # rate (fields bobbed to frames - see patch_badges_interlace.py),
+    # or a frame is still flagged interlaced (not deinterlaced).
+    interlaced = bool(finfo.get("interlaced")) or bool(
+        fps and shown_fps and abs(float(shown_fps) / float(fps) - 2) < 0.05)
+    if not fps:
+        fps = shown_fps
     gamma = (params.get("gamma") or "").lower()
     return {
         "width": params.get("w"),
         "height": params.get("h"),
         "fps": round(float(fps), 3) if fps else None,
+        "shown_fps": round(float(shown_fps), 3) if shown_fps else None,
+        "interlaced": interlaced,
+        "display_width": params.get("dw"),
         "codec": (_mpv_prop("video-format") or "").upper() or None,
         "hwdec": _mpv_prop("hwdec-current") or "no",
         # Transfer characteristic: what tells SDR from HDR.
@@ -13504,11 +13516,12 @@ function setPanelState(headerId, bodyId, label, state) {
 }
 
 // Video badges - see patch_video_badges.py.
-function videoLabel(h, rate) {
+function videoLabel(h, rate, interlaced) {
+    const scan = interlaced ? 'i' : 'p';
     if (!h) return '?';
-    if (!rate) return h + 'p';
+    if (!rate) return h + scan;
     const r = Math.abs(rate - Math.round(rate)) < 0.01 ? Math.round(rate) : rate.toFixed(2);
-    return h + 'p' + r;
+    return h + scan + r;
 }
 
 function renderVideoBadges(vin, vout) {
@@ -13520,13 +13533,18 @@ function renderVideoBadges(vin, vout) {
     const warnings = [];
 
     if (vin && vin.height) {
-        let txt = 'IN ' + videoLabel(vin.height, vin.fps);
+        let txt = 'IN ' + videoLabel(vin.height, vin.fps, vin.interlaced);
         if (vin.codec) txt += ' ' + vin.codec;
         if (vin.range && vin.range !== 'SDR') txt += ' ' + vin.range;
         inB.textContent = txt;
         inB.style.background = (vin.range && vin.range !== 'SDR') ? HDR : NORMAL;
         inB.title = 'Received: ' + vin.width + ' x ' + vin.height
+            + (vin.display_width && vin.display_width !== vin.width
+               ? ' (shown ' + vin.display_width + ' wide)' : '')
             + (vin.fps ? ', ' + vin.fps + ' fps' : '')
+            + (vin.interlaced ? ', interlaced' : '')
+            + (vin.interlaced && vin.shown_fps && vin.shown_fps !== vin.fps
+               ? ', deinterlaced to ' + vin.shown_fps + ' fps' : '')
             + (vin.codec ? ', ' + vin.codec : '')
             + ', ' + (vin.range || 'SDR')
             + (vin.primaries ? ' (' + vin.primaries + ')' : '')
@@ -13551,10 +13569,12 @@ function renderVideoBadges(vin, vout) {
         if (o.height < vin.height) {
             warnings.push('Output is smaller than the picture: ' + vin.height + ' lines shown on ' + o.height);
         }
-        if (vin.fps && o.refresh) {
-            const ratio = o.refresh / vin.fps;
+        // The frames actually shown: a bobbed 25i is 50 a second.
+        const shown = vin.shown_fps || vin.fps;
+        if (shown && o.refresh) {
+            const ratio = o.refresh / shown;
             if (Math.abs(ratio - Math.round(ratio)) > 0.01) {
-                warnings.push(vin.fps + ' fps on ' + o.refresh + ' Hz is not a whole multiple: motion will judder');
+                warnings.push(shown + ' fps on ' + o.refresh + ' Hz is not a whole multiple: motion will judder');
             }
         }
     }
@@ -13570,6 +13590,13 @@ async function updateStatus() {
         const mode = s.lynx?.mode || 'idle';
         const badge = document.getElementById('mode-badge');
         badge.textContent = mode.toUpperCase();
+        if (mode === 'dvbt') {
+            // The tuner says which: t8dvbt2 and so on. See
+            // patch_badges_interlace.py.
+            const lmode = ((s.lynx && s.lynx.hdhomerun) || s.hdhomerun || {}).lock_mode || '';
+            badge.textContent = lmode.indexOf('dvbt2') >= 0 ? 'DVB-T2'
+                              : lmode.indexOf('dvbt') >= 0 ? 'DVB-T' : 'DVB-T/T2';
+        }
         badge.style.background = mode === 'idle' ? '#3a4a63' : mode === 'rf' ? '#1a9850' : '#3b82c4';
 
         renderVideoBadges(s.lynx?.video_in, s.lynx?.video_out);
