@@ -131,7 +131,7 @@ done
 # wlan0 doesn't exist (a wired-only install) or `iw` isn't installed -
 # also re-applied every cycle in the watchdog loop further down, in
 # case a later reconnect/roam event ever resets it.
-iw wlan0 set power_save off 2>/dev/null || true
+{ [ -e /sys/class/net/wlan0 ] && iw wlan0 set power_save off > /dev/null 2>&1; } || true
 
 # ── Wait for NTP time sync ──────────────────────────────────────
 # On boot the system clock is often wrong until NTP corrects it a few
@@ -216,7 +216,11 @@ except Exception:
     print(default)
 PYEOF
 }
-LYNX_MAX_HEIGHT="${LYNX_MAX_HEIGHT:-$(_cfg_display max_height 1080)}"
+# The board's own default when the config sets none: 1080 on a Pi,
+# 2160 on a ROCK 5T (lynx_platform.py). Unknown board, or the file
+# missing: 1080, exactly as before.
+LYNX_PLATFORM_MAX=$(python3 "${LYNX_DIR}/lynx_platform.py" default_max_height 2>/dev/null || echo 1080)
+LYNX_MAX_HEIGHT="${LYNX_MAX_HEIGHT:-$(_cfg_display max_height ${LYNX_PLATFORM_MAX:-1080})}"
 LYNX_REFRESH_HZ="${LYNX_REFRESH_HZ:-$(_cfg_display refresh_hz 50)}"
 [ -n "$LYNX_MAX_HEIGHT" ] || LYNX_MAX_HEIGHT=1080
 [ -n "$LYNX_REFRESH_HZ" ] || LYNX_REFRESH_HZ=50
@@ -247,6 +251,32 @@ if command -v wlr-randr > /dev/null 2>&1; then
             sleep 2   # let the compositor settle before anything draws
         else
             echo -e "${AMBER}no usable ${LYNX_MAX_HEIGHT}p mode - leaving as-is${NC}"
+        fi
+    fi
+
+    # ROCK 5T: the height is usually fine as it is, but the refresh rate
+    # still matters - a 4K monitor comes up at 60 Hz, and 25 fps on
+    # 60 Hz judders. Ask for the configured rate at the current size:
+    # a listed mode first, then a custom one (an LG 27UK850 lists 4K
+    # only at 60/30/25 but takes 4K50 happily). Pi: skipped, unchanged.
+    if [ "$(python3 "${LYNX_DIR}/lynx_platform.py" custom_refresh_modes 2>/dev/null)" = "1" ] \
+       && [ -n "$_out" ]; then
+        _now=$(wlr-randr 2>/dev/null | awk '/current/ {print $1, $3; exit}')
+        _res=${_now%% *}; _hz=${_now##* }
+        if [ -n "$_res" ] && [ -n "$_hz" ] \
+           && [ "$(printf '%.0f' "$_hz" 2>/dev/null)" != "$LYNX_REFRESH_HZ" ]; then
+            echo -ne "Display is ${_res} at ${_hz} Hz - asking for ${LYNX_REFRESH_HZ} Hz... "
+            _listed=$(wlr-randr 2>/dev/null | awk -v m="$_res" -v r="$LYNX_REFRESH_HZ" \
+                '$1 == m && $2 == "px," && int($3 + 0.5) == r {print $1 "@" $3; exit}')
+            if [ -n "$_listed" ] && wlr-randr --output "$_out" --mode "$_listed" > /dev/null 2>&1; then
+                echo -e "${GREEN}${_listed}${NC}"
+                sleep 2
+            elif wlr-randr --output "$_out" --custom-mode "${_res}@${LYNX_REFRESH_HZ}Hz" > /dev/null 2>&1; then
+                echo -e "${GREEN}${_res}@${LYNX_REFRESH_HZ}Hz (custom mode)${NC}"
+                sleep 2
+            else
+                echo -e "${AMBER}not accepted - leaving ${_hz} Hz${NC}"
+            fi
         fi
     fi
 else
@@ -447,7 +477,7 @@ while true; do
     # just because it was set once at startup. See the startup-time
     # comment (above, near the network-wait loop) for the full
     # rationale on why this exists at all.
-    iw wlan0 set power_save off 2>/dev/null || true
+    { [ -e /sys/class/net/wlan0 ] && iw wlan0 set power_save off > /dev/null 2>&1; } || true
 
     status_json=$(curl -sf http://localhost:8080/api/status 2>/dev/null)
     if [ -z "$status_json" ]; then

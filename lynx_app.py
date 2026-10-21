@@ -55,6 +55,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import lynx_notifications
+import lynx_platform   # what differs between boards - see that file
 import lynx_gnss
 import lynx_map
 import lynx_relay
@@ -172,6 +173,20 @@ def load_last_state():
         return None
 
 config = load_config()
+
+def display_max_height() -> int:
+    """The display height cap in force: the config's if it sets one,
+    otherwise the board's default (1080 on a Pi, 2160 on a ROCK 5T).
+    lynx_start.sh applies the same rule at start-up."""
+    try:
+        v = (config.get('display') or {}).get('max_height')
+        return int(v) if v is not None else lynx_platform.DEFAULT_MAX_HEIGHT
+    except (TypeError, ValueError):
+        return lynx_platform.DEFAULT_MAX_HEIGHT
+
+print(f"[platform] {lynx_platform.BOARD_NAME} ({lynx_platform.MODEL or 'model unknown'}): "
+      f"mpv {lynx_platform.MPV_VIDEO_FLAGS}, "
+      f"height cap {display_max_height()}")
 
 # ── GNSS (portable locator) ─────────────────────────────────────
 # Waveshare L76K HAT, GPIO header UART - see lynx_gnss.py's own
@@ -1091,7 +1106,7 @@ def restart_mpv(target_url: str, is_rf: bool = True):
 
     cmd = (
         f"mpv --fullscreen --ontop --border=no --no-osc --no-input-default-bindings "
-        f"--cursor-autohide=always --force-window=yes --vo=gpu --hwdec=drm-copy --mute=yes "
+        f"--cursor-autohide=always --force-window=yes {lynx_platform.MPV_VIDEO_FLAGS} --mute=yes "
         f"{audio_device_flag()}"
         f"--audio-pitch-correction=no --script={DRIFT_SCRIPT_PATH} "
         f"{source_flags}"
@@ -1127,7 +1142,13 @@ def restart_mpv(target_url: str, is_rf: bool = True):
     # EGL/Vulkan — confirmed to be the actually-broken path (this is
     # what the "VK_ERROR_OUT_OF_HOST_MEMORY" swapchain failures were).
     # Clearing WAYLAND_DISPLAY here removes that choice entirely.
-    env.pop("WAYLAND_DISPLAY", None)
+    #
+    # Pi only. On the ROCK 5T mpv is Wayland-only (dmabuf-wayland),
+    # so it must keep the variable - see lynx_platform.py.
+    if lynx_platform.KEEP_WAYLAND_DISPLAY:
+        env.setdefault("WAYLAND_DISPLAY", "wayland-0")
+    else:
+        env.pop("WAYLAND_DISPLAY", None)
     # Truncate and redirect to a real log file on every restart -
     # confirmed this was previously going to DEVNULL entirely, meaning
     # /tmp/mpv.log never actually reflected the current, running mpv
@@ -5061,7 +5082,7 @@ class DisplayConfigUpdate(BaseModel):
     refresh_hz: int = 50
     # Cap on display height in lines. Read by lynx_start.sh at startup,
     # so a change needs a restart to take effect.
-    max_height: int = 1080
+    max_height: int = lynx_platform.DEFAULT_MAX_HEIGHT
     # "hdmi" (resolved to the first HDMI output at launch), "auto" to let
     # mpv choose, or an explicit mpv device name from /api/audio/devices.
     audio_device: str = "hdmi"
@@ -7484,7 +7505,9 @@ def get_status():
                       "running": gnss_reader.running, **gnss_reader.status()},
             "ppm_style": config.get('display', {}).get('ppm_style', 'full_fat'),
             "refresh_hz": config.get('display', {}).get('refresh_hz', 50),
-            "max_height": config.get('display', {}).get('max_height', 1080),
+            "max_height": display_max_height(),
+            "board": lynx_platform.BOARD,
+            "board_name": lynx_platform.BOARD_NAME,
             "quicklynx_enabled": bool(config.get('quicklynx', {}).get('enabled', False)),
             "site_locator": config.get('site', {}).get('locator', ''),
             # Published so the overlay's PPM can follow mpv to whichever
@@ -8554,12 +8577,13 @@ def config_page():
                     <div class="card-header">&#x1F5A5;&#xFE0F; Screen</div>
                     <div class="card-body">
                         <p class="text-muted small">
-                            Lynx caps the screen at 1080 lines, switching a 4K monitor down when it
-                            starts. A 4K screen is more than a Raspberry Pi can drive while also
+                            On a Raspberry Pi, Lynx caps the screen at 1080 lines, switching a 4K
+                            monitor down when it starts. A 4K screen is more than a Pi can drive while also
                             decoding a live picture &mdash; it causes picture glitches, audio dropouts
                             and a missing overlay. Nothing is lost: DATV video is well below 1080
                             anyway, so a bigger screen buffer only draws more pixels for exactly the
-                            same picture. An ultrawide monitor is unaffected.
+                            same picture. An ultrawide monitor is unaffected. On a ROCK 5T the full 4K
+                            output is kept.
                         </p>
                         <input type="hidden" id="max-height-hidden" value="1080">
                         <label class="small text-muted mb-1" for="refresh-hz-select">Refresh rate</label>
@@ -12687,7 +12711,12 @@ def get_boot_default():
 @app.get("/api/config", tags=["Configuration"],
          summary="Get current configuration")
 def get_config():
-    return config
+    # The effective max_height is filled in when the file has none:
+    # the config page round-trips it, and falling back to 1080 there
+    # would cap a ROCK 5T at 1080 the first time Screen was saved.
+    display = dict(config.get('display') or {})
+    display.setdefault('max_height', display_max_height())
+    return {**config, 'display': display}
 
 @app.post("/api/config", tags=["Configuration"],
           summary="Save site and/or Picotuner configuration",
