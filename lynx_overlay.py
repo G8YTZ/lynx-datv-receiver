@@ -947,6 +947,9 @@ class LynxOverlay(Gtk.Window):
         Gtk4LayerShell.set_keyboard_mode(self, Gtk4LayerShell.KeyboardMode.NONE)
 
         self.set_decorated(False)
+        # A vanished output closes a layer-shell window, which would
+        # end the whole overlay - see patch_overlay_reattach.py.
+        self.connect("close-request", self._on_close_request)
 
         css = Gtk.CssProvider()
         css.load_from_data(b"""
@@ -997,6 +1000,15 @@ class LynxOverlay(Gtk.Window):
         self._pf_surface = None
         self._pf_surface_key = None
         self._pf_renderer = None
+
+    def _on_close_request(self, *args):
+        """Hide rather than close. gtk4-layer-shell closes the window
+        when its output disappears (monitor switched to another input,
+        or into standby); LynxOverlayApp re-shows it when a monitor
+        comes back."""
+        print("[overlay] output gone - hiding until a monitor returns", flush=True)
+        self.set_visible(False)
+        return True
 
     def tick(self):
         self.drawing_area.queue_draw()
@@ -2255,9 +2267,29 @@ class LynxOverlayApp(Gtk.Application):
         super().__init__(application_id="uk.co.g8ytz.lynxoverlay")
 
     def do_activate(self):
+        # Stay alive with no window showing: while the screen is away
+        # the overlay is hidden, not gone.
+        self.hold()
         win = LynxOverlay()
         win.set_application(self)
         win.present()
+        self.win = win
+        monitors = Gdk.Display.get_default().get_monitors()
+        monitors.connect("items-changed", self._on_monitors_changed)
+
+    def _on_monitors_changed(self, model, position, removed, added):
+        """A monitor came (back): re-show the overlay on it. Hiding and
+        showing again gives the window a fresh layer surface on the new
+        output. Half a second's delay lets the compositor finish setting
+        the output up first."""
+        if model.get_n_items() == 0:
+            return
+        def reshow():
+            print("[overlay] monitor back - re-showing", flush=True)
+            self.win.set_visible(False)
+            self.win.set_visible(True)
+            return False
+        GLib.timeout_add(500, reshow)
 
 
 if __name__ == "__main__":
