@@ -57,10 +57,13 @@ BOARD_NAME = "Radxa ROCK 5T" if IS_ROCK else "Raspberry Pi"
 # How mpv decodes and draws.
 #   Pi:   the GPU path with drm-copy, as proven over months of use.
 #   ROCK: Rockchip's hardware decoder (rkmpp, via ffmpeg-rockchip and
-#         Lynx's patched mpv), frames handed straight to the compositor
-#         as DMA buffers. 4K50 HEVC at about 7% of the machine; the
-#         copying path ran at 282% CPU and dropped frames.
-MPV_VIDEO_FLAGS = ("--vo=dmabuf-wayland --hwdec=rkmpp" if IS_ROCK
+#         Lynx's patched mpv), zero-copy: 4K50 HEVC at a few per cent
+#         of the machine; the copying path ran at 282% CPU and dropped
+#         frames. --hwdec-codecs=all because mpv's default list leaves
+#         out MPEG-2 (UK SD broadcast). gpu-next rather than
+#         dmabuf-wayland: the same cost, but it can also show a
+#         software-decoded picture, where dmabuf-wayland shows black.
+MPV_VIDEO_FLAGS = ("--vo=gpu-next --hwdec=rkmpp --hwdec-codecs=all" if IS_ROCK
                    else "--vo=gpu --hwdec=drm-copy")
 
 # Whether mpv keeps WAYLAND_DISPLAY.

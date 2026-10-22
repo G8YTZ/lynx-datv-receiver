@@ -183,46 +183,61 @@ sudo tee /etc/systemd/system/getty@tty1.service.d/autologin.conf >/dev/null <<EO
 ExecStart=
 ExecStart=-/sbin/agetty --autologin $LYNX_USER --noclear %I \$TERM
 EOF
-if ! grep -q 'Lynx: start labwc' ~/.bash_profile 2>/dev/null; then
-  cat >> ~/.bash_profile <<'EOF'
+# labwc runs in a loop rather than by exec: if it ever exits, it is back
+# two seconds later, and the console session (and getty) never notice.
+# With exec, a labwc that kept exiting made getty restart 14 times in
+# quick succession, then systemd gave up and left a dead console (22 Oct
+# 2026). Each start and exit, with its exit code, goes to /tmp/labwc.log.
+python3 - <<'PY'
+import re
+from pathlib import Path
+p = Path.home() / ".bash_profile"
+s = p.read_text() if p.exists() else ""
+s = re.sub(r"\n?# Lynx: start labwc on the console at boot.*?\nfi\n", "\n", s, flags=re.S)
+block = (
+    "# Lynx: start labwc on the console at boot, and restart it if it ever exits\n"
+    'if [ "$(tty)" = "/dev/tty1" ] && [ -z "$WAYLAND_DISPLAY" ]; then\n'
+    "    export GTK_A11Y=none\n"
+    "    while true; do\n"
+    "        echo \"=== $(date '+%F %T') labwc starting\" >> /tmp/labwc.log\n"
+    "        labwc >> /tmp/labwc.log 2>&1\n"
+    "        echo \"=== $(date '+%F %T') labwc exited, code $?\" >> /tmp/labwc.log\n"
+    "        sleep 2\n"
+    "    done\n"
+    "fi\n"
+)
+p.write_text(s.rstrip("\n") + "\n\n" + block)
+PY
+echo "labwc will start at boot on the console, and restart if it exits."
 
-# Lynx: start labwc on the console at boot
-if [ "$(tty)" = "/dev/tty1" ] && [ -z "$WAYLAND_DISPLAY" ]; then
-    export GTK_A11Y=none
-    exec labwc
-fi
-EOF
-  echo "labwc will start at boot on the console."
-fi
-
-# --- labwc: pointer hidden --------------------------------------------
-# Same keybind as the Pi (Alt+Super+H hides the pointer and parks it
-# off-screen). labwc's own autostart presses it once labwc is ready, so
-# it cannot race a slow boot; lynx_start.sh presses it again when Lynx
-# starts. Moving a mouse brings the pointer back, by design.
-say "Mouse pointer"
+# --- labwc: no visible pointer ------------------------------------------
+# An invisible cursor theme (every cursor one transparent pixel), not the
+# Pi's keybind. labwc 0.8.3 (Debian trixie) has no HideCursor action, and
+# with no screen connected the keybind's WarpCursor made labwc QUIT, so
+# switching the monitor to another input took the whole display down
+# (22 Oct 2026). A blank theme needs no key presses and cannot fail.
+say "Mouse pointer (invisible cursor theme)"
 mkdir -p ~/.config/labwc
-if [ ! -f ~/.config/labwc/rc.xml ] || ! grep -q 'HideCursor' ~/.config/labwc/rc.xml; then
-  [ -f ~/.config/labwc/rc.xml ] && cp ~/.config/labwc/rc.xml ~/.config/labwc/rc.xml.lynx.bak
-  cat > ~/.config/labwc/rc.xml <<'EOF'
-<?xml version="1.0"?>
-<openbox_config>
-  <keyboard>
-    <keybind key="A-W-h">
-      <action name="HideCursor" />
-      <action name="WarpCursor" x="-1" y="-1" />
-    </keybind>
-  </keyboard>
-</openbox_config>
-EOF
-  echo "Pointer-hide keybind installed."
+if [ -f ~/.config/labwc/rc.xml ] && grep -q 'HideCursor' ~/.config/labwc/rc.xml; then
+  cp ~/.config/labwc/rc.xml ~/.config/labwc/rc.xml.lynx-keybind.bak
+  printf '<?xml version="1.0"?>\n<openbox_config>\n</openbox_config>\n' > ~/.config/labwc/rc.xml
+  echo "Removed the cursor keybind from rc.xml (backup: rc.xml.lynx-keybind.bak)."
+elif [ ! -f ~/.config/labwc/rc.xml ]; then
+  printf '<?xml version="1.0"?>\n<openbox_config>\n</openbox_config>\n' > ~/.config/labwc/rc.xml
 fi
-if ! grep -q 'Lynx: hide the pointer' ~/.config/labwc/autostart 2>/dev/null; then
+python3 "$LYNX_DIR/install/lynx_blank_cursor.py"
+
+# labwc's autostart runs every time labwc starts:
+#  - any old wtype cursor-hide line is retired (see above)
+#  - Lynx is restarted if it is running, so after a labwc restart its mpv
+#    and overlay reconnect at once rather than waiting to notice
+touch ~/.config/labwc/autostart
+sed -i 's/^\(sh -c .sleep 3; wtype.*\)$/# retired, see install\/rock5t.sh: \1/' ~/.config/labwc/autostart
+if ! grep -q 'try-restart lynx' ~/.config/labwc/autostart; then
   cat >> ~/.config/labwc/autostart <<'EOF'
-# Lynx: hide the pointer once labwc is up (Alt+Super+H, bound in rc.xml)
-sh -c 'sleep 3; wtype -M alt -M logo -P h' &
+# Lynx: reconnect to this labwc at once if Lynx is already running
+systemctl --user try-restart lynx.service &
 EOF
-  echo "Pointer hidden at every start of labwc."
 fi
 
 # --- Lynx keeps running with nobody logged in ----------------------------

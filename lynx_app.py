@@ -13939,6 +13939,17 @@ async function updateStatus() {
                                     (Date.now() - window._dvbtProgramsEmptyAt > 10000);
                         if (fkey && (stale || retry) && !window._dvbtProgramsBusy) {
                             window._dvbtProgramsFor = fkey;
+                            // The frequency box follows the multiplex
+                            // actually locked, so changing service retunes
+                            // the right one - see
+                            // patch_rock_codecs_dvbt_freq.py. Not while
+                            // somebody is typing in it.
+                            if (stale) {
+                                var fbox = document.getElementById('dvbt-freq');
+                                if (fbox && document.activeElement !== fbox) {
+                                    fbox.value = Math.round(fkey / 1000);
+                                }
+                            }
                             window._dvbtProgramsBusy = true;
                             loadDvbtPrograms(8).finally(function () {
                                 window._dvbtProgramsBusy = false;
