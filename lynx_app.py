@@ -2077,6 +2077,40 @@ def _reapply_refresh_rate():
           f"{'ok' if r.returncode == 0 else 'not accepted'}", flush=True)
 
 
+# _mpv_prop() comes from patch_video_badges.py.
+
+
+def _mpv_playback_problem():
+    """None if mpv is playing normally (or not running, or paused).
+    Otherwise a short reason: playback not moving, or no sound output
+    although the source has sound. See patch_screen_return_stall.py."""
+    tracks = _mpv_prop("track-list")
+    if not isinstance(tracks, list):
+        return None                      # no mpv answering
+    if _mpv_prop("pause"):
+        return None                      # paused on purpose
+    has_audio = any(t.get("type") == "audio" and t.get("selected") for t in tracks)
+    reasons = []
+    if has_audio and not _mpv_prop("current-ao"):
+        reasons.append("no sound output")
+    t1 = _mpv_prop("playback-time")
+    time.sleep(3)
+    t2 = _mpv_prop("playback-time")
+    if isinstance(t1, (int, float)) and isinstance(t2, (int, float)):
+        if t2 - t1 < 0.5:
+            reasons.append(f"playback not moving ({t1:.1f}s -> {t2:.1f}s)")
+    elif t1 is None and t2 is None:
+        reasons.append("no playback position")
+    return ", ".join(reasons) or None
+
+
+def _mpv_state_line():
+    """mpv's state in one log line, for working out what went wrong."""
+    names = ("playback-time", "core-idle", "paused-for-cache", "pause",
+             "current-ao", "audio-device", "eof-reached", "demuxer-cache-idle")
+    return " ".join(f"{n}={_mpv_prop(n)!r}" for n in names)
+
+
 def screen_return_monitor():
     """When a screen comes back: put the refresh rate back, then make
     sure mpv has its picture. An mpv (re)started while no screen was
@@ -2095,15 +2129,34 @@ def screen_return_monitor():
                 time.sleep(2)
                 src = network_output_source
                 is_rf = network_output_source_is_rf
-                if (not network_output_enabled and src
-                        and _mpv_has_picture_problem()
-                        and tune_lock.acquire(timeout=2)):
+                why, event = None, None
+                if not network_output_enabled and src:
+                    if _mpv_has_picture_problem():
+                        why, event = "mpv has sound but no picture", "screen_back_restart"
+                    else:
+                        problem = _mpv_playback_problem()
+                        if problem:
+                            # Log first: this is the evidence for next time.
+                            print(f"[screen] mpv stuck ({problem}): {_mpv_state_line()}",
+                                  flush=True)
+                            mpv_query({"command": ["ao-reload"]})
+                            time.sleep(2)
+                            problem = _mpv_playback_problem()
+                            if problem:
+                                why, event = (f"mpv still stuck after reopening sound "
+                                              f"({problem})"), "screen_back_stall_restart"
+                            else:
+                                print("[screen] reopening mpv's sound output fixed it",
+                                      flush=True)
+                                record_diagnostic_event(
+                                    "screen_back_ao_reload",
+                                    "screen came back with mpv stuck - reopening its "
+                                    "sound output fixed it")
+                if why and tune_lock.acquire(timeout=2):
                     try:
-                        print("[screen] mpv has sound but no picture - restarting it on "
-                              f"{src}", flush=True)
-                        record_diagnostic_event(
-                            "screen_back_restart",
-                            "screen came back and mpv had no picture - restarted it")
+                        print(f"[screen] {why} - restarting it on {src}", flush=True)
+                        record_diagnostic_event(event,
+                                                f"screen came back: {why} - restarted it")
                         start_transition_cover()
                         time.sleep(0.3)
                         restart_mpv(src, is_rf=is_rf)
@@ -8260,6 +8313,8 @@ const REASON_LABELS = {
     "drift_breaker_tripped": "Drift correction: repeated resyncs not helping, backed off",
     "drift_hard_freeze_restart": "Hard freeze detected - immediate mpv restart",
     "screen_back_restart": "Screen came back with no picture - mpv restarted",
+    "screen_back_stall_restart": "Screen came back with mpv stuck - mpv restarted",
+    "screen_back_ao_reload": "Screen came back with mpv stuck - sound output reopened",
     "drift_hard_freeze_suppressed": "Hard freeze detected - restart breaker active, suppressed",
     "drift_hard_freeze_breaker_tripped": "Hard freeze restarts not helping, backed off",
     "notif_confirmed_lock": "Notifications: own lock confirmation (arms settle timers)",
