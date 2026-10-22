@@ -59,11 +59,15 @@ BOARD_NAME = "Radxa ROCK 5T" if IS_ROCK else "Raspberry Pi"
 #   ROCK: Rockchip's hardware decoder (rkmpp, via ffmpeg-rockchip and
 #         Lynx's patched mpv), zero-copy: 4K50 HEVC at a few per cent
 #         of the machine; the copying path ran at 282% CPU and dropped
-#         frames. --hwdec-codecs=all because mpv's default list leaves
-#         out MPEG-2 (UK SD broadcast). gpu-next rather than
-#         dmabuf-wayland: the same cost, but it can also show a
-#         software-decoded picture, where dmabuf-wayland shows black.
-MPV_VIDEO_FLAGS = ("--vo=gpu-next --hwdec=rkmpp --hwdec-codecs=all" if IS_ROCK
+#         frames. MPEG-2 (UK SD broadcast) deliberately stays in
+#         software: the RK3588's MPEG-2 block does not work on this
+#         kernel and returns a purple picture, and mpv's default
+#         hardware list already leaves MPEG-2 out. gpu-next rather
+#         than dmabuf-wayland: the same cost, but it can also show a
+#         software-decoded picture, where dmabuf-wayland shows none.
+#         --deinterlace=auto: only frames still flagged interlaced
+#         (software 576i); hardware frames arrive already bobbed.
+MPV_VIDEO_FLAGS = ("--vo=gpu-next --hwdec=rkmpp --deinterlace=auto" if IS_ROCK
                    else "--vo=gpu --hwdec=drm-copy")
 
 # Whether mpv keeps WAYLAND_DISPLAY.
