@@ -225,6 +225,27 @@ EOF
   echo "Pointer hidden at every start of labwc."
 fi
 
+# --- Lynx keeps running with nobody logged in ----------------------------
+# Lynx is a user service. Without linger, systemd stops a user's
+# services when their last session ends - so when labwc exited (a
+# monitor unplugged, 21 Oct 2026), the web UI went with it.
+say "User services survive logout (linger)"
+sudo loginctl enable-linger "$LYNX_USER"
+
+# --- Ping for ordinary users -----------------------------------------------
+# Armbian's ping lacks the capability to run unprivileged, so Lynx's
+# "wait for the network" check failed every time and waited 45 s at each
+# start. Debian's own recommended fix: allow unprivileged ICMP sockets.
+say "Unprivileged ping"
+echo 'net.ipv4.ping_group_range = 0 2147483647' | sudo tee /etc/sysctl.d/99-lynx-ping.conf >/dev/null
+sudo sysctl --system >/dev/null
+
+# Deliberately NOT done: forcing the HDMI connector on (video=HDMI-A-1:e).
+# At 4K50 HDMI 2.0 needs scrambling re-enabled in the monitor whenever its
+# input wakes, and the hot-plug event is what triggers it. Forced on, an
+# LG 27UK850 came back from another input to a signal it would not show.
+# Monitor-off is handled in lynx_start.sh instead (no screen, no verdict).
+
 # --- Lynx service: the ROCK's extra environment ------------------------
 # install.sh installs the same lynx.service as on the Pi. On the Pi,
 # labwc's session hands the service its Wayland details; here the

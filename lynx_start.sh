@@ -573,7 +573,28 @@ while true; do
     # version that predates this feature, neither of which is itself
     # a failure.
     OVERLAY_HEARTBEAT_FILE="/tmp/lynx_overlay_heartbeat"
-    if [ -f "$OVERLAY_HEARTBEAT_FILE" ]; then
+
+    # No screen, no verdict - see patch_heartbeat_no_screen.py. A
+    # monitor switched to another input or into standby drops
+    # hot-plug; the compositor then stops asking the overlay for
+    # frames, so a stale heartbeat means nothing. Paused while no
+    # connector is connected, and for 45 s after one comes back.
+    _screen_states=""
+    for _st_file in "${LYNX_DRM_SYSFS:-/sys/class/drm}"/card*-*/status; do
+        case "$_st_file" in *Writeback*) continue ;; esac
+        [ -r "$_st_file" ] && _screen_states="$_screen_states $(cat "$_st_file")"
+    done
+    if [ -n "$_screen_states" ] && ! echo "$_screen_states" | grep -qw connected; then
+        [ -z "$LYNX_NO_SCREEN_AT" ] && \
+            echo -e "${AMBER}No screen connected - overlay heartbeat check paused.${NC}"
+        LYNX_NO_SCREEN_AT=$(date +%s)
+    elif [ -n "$LYNX_NO_SCREEN_AT" ] && \
+         [ $(( $(date +%s) - LYNX_NO_SCREEN_AT )) -gt 45 ]; then
+        echo -e "${GREEN}Screen back - overlay heartbeat check resumed.${NC}"
+        LYNX_NO_SCREEN_AT=""
+    fi
+
+    if [ -f "$OVERLAY_HEARTBEAT_FILE" ] && [ -z "$LYNX_NO_SCREEN_AT" ]; then
         heartbeat_age=$(( $(date +%s) - $(stat -c %Y "$OVERLAY_HEARTBEAT_FILE" 2>/dev/null || echo 0) ))
         if [ "$heartbeat_age" -gt 30 ]; then
             echo -e "${RED}Overlay heartbeat stale (${heartbeat_age}s) — not actually rendering.${NC}"
