@@ -1996,6 +1996,128 @@ def video_badge_monitor():
         time.sleep(VIDEO_BADGE_POLL_SECS)
 
 
+# ── Screen presence (see patch_mpv_screen_return.py) ─────────────
+DRM_SYSFS = os.environ.get("LYNX_DRM_SYSFS", "/sys/class/drm")
+
+
+def screen_connected() -> bool:
+    """True unless the kernel says no display is connected. Connector
+    status files present and none "connected" means no screen - a
+    monitor switched to another input or asleep. No status files at
+    all means assume a screen, i.e. behave exactly as before."""
+    states = []
+    try:
+        for name in os.listdir(DRM_SYSFS):
+            if not name.startswith("card") or "-" not in name or "Writeback" in name:
+                continue
+            try:
+                with open(os.path.join(DRM_SYSFS, name, "status")) as f:
+                    states.append(f.read().strip())
+            except OSError:
+                pass
+    except OSError:
+        return True
+    return (not states) or ("connected" in states)
+
+
+def _mpv_has_picture_problem() -> bool:
+    """mpv is playing something with a video track, but has no picture.
+    False when mpv is not running, the source has no video, or all is
+    well."""
+    vp = mpv_query({"command": ["get_property", "video-params"]})
+    if vp and vp.get("error") == "success" and isinstance(vp.get("data"), dict) \
+            and vp["data"].get("h"):
+        return False
+    tl = mpv_query({"command": ["get_property", "track-list"]})
+    if not tl or tl.get("error") != "success":
+        return False          # no mpv answering: nothing to fix here
+    return any(t.get("type") == "video" for t in (tl.get("data") or []))
+
+
+def _reapply_refresh_rate():
+    """ROCK: a monitor coming back is driven at its own preferred mode
+    (60 Hz on an LG 27UK850), and lynx_start.sh only asks for the
+    configured rate at start-up. Ask again: a listed mode at the current
+    size first, then a custom mode - the same rule as lynx_start.sh.
+    Pi: nothing, exactly as before."""
+    if not lynx_platform.CUSTOM_REFRESH_MODES:
+        return
+    try:
+        want = int((config.get('display') or {}).get('refresh_hz', 50) or 50)
+    except (TypeError, ValueError):
+        want = 50
+    env = os.environ.copy()
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    env.setdefault("WAYLAND_DISPLAY", "wayland-0")
+    try:
+        text = subprocess.run(["wlr-randr"], capture_output=True, text=True,
+                              timeout=3, env=env).stdout
+    except Exception:
+        return
+    name, modes = None, []
+    for line in text.splitlines():
+        if line and not line[0].isspace():
+            if name:
+                break          # first output only
+            name = line.split()[0]
+            continue
+        m = re.match(r"\s+(\d+x\d+) px, ([\d.]+) Hz(.*)", line)
+        if m:
+            modes.append((m.group(1), float(m.group(2)), "current" in m.group(3)))
+    current = next((m for m in modes if m[2]), None)
+    if not name or not current or round(current[1]) == want:
+        return
+    res = current[0]
+    listed = next((m for m in modes if m[0] == res and round(m[1]) == want), None)
+    args = (["--mode", f"{res}@{listed[1]:.6f}Hz"] if listed
+            else ["--custom-mode", f"{res}@{want}Hz"])
+    r = subprocess.run(["wlr-randr", "--output", name, *args],
+                       capture_output=True, text=True, timeout=5, env=env)
+    print(f"[screen] {name} came back at {res} {current[1]:g} Hz - asked for {want} Hz: "
+          f"{'ok' if r.returncode == 0 else 'not accepted'}", flush=True)
+
+
+def screen_return_monitor():
+    """When a screen comes back: put the refresh rate back, then make
+    sure mpv has its picture. An mpv (re)started while no screen was
+    connected plays sound but never sets up its video output, and
+    nothing else tells it to try again."""
+    global mpv_last_started_at
+    was = screen_connected()
+    while True:
+        time.sleep(2)
+        try:
+            now = screen_connected()
+            if now and not was:
+                print("[screen] screen back - checking mpv has its picture", flush=True)
+                time.sleep(4)   # let the compositor set the output up first
+                _reapply_refresh_rate()
+                time.sleep(2)
+                src = network_output_source
+                is_rf = network_output_source_is_rf
+                if (not network_output_enabled and src
+                        and _mpv_has_picture_problem()
+                        and tune_lock.acquire(timeout=2)):
+                    try:
+                        print("[screen] mpv has sound but no picture - restarting it on "
+                              f"{src}", flush=True)
+                        record_diagnostic_event(
+                            "screen_back_restart",
+                            "screen came back and mpv had no picture - restarted it")
+                        start_transition_cover()
+                        time.sleep(0.3)
+                        restart_mpv(src, is_rf=is_rf)
+                        if is_rf:
+                            mpv_last_started_at = time.time()
+                        wait_for_mpv_rendering()
+                        end_transition_cover()
+                    finally:
+                        tune_lock.release()
+            was = now
+        except Exception as e:
+            print(f"[screen] {type(e).__name__}: {e}", flush=True)
+
+
 def mpv_decoder_health_monitor():
     """Background thread, RF mode only: watches mpv's own log for two
     related but distinct symptoms of the decoder falling behind, and
@@ -2099,7 +2221,9 @@ def mpv_decoder_health_monitor():
     while True:
         time.sleep(CHECK_INTERVAL)
         try:
-            if current_mode != "rf" or not mpv_running_for_rf:
+            # No screen: playback stalls by design (nothing asks for
+            # frames), which is not a decoder fault.
+            if current_mode != "rf" or not mpv_running_for_rf or not screen_connected():
                 last_size = 0
                 recent_error_times = []
                 high_delay_streak = 0
@@ -2518,6 +2642,16 @@ def mpv_drift_monitor():
                 # source rather than a local Picotuner port.
                 hard_freeze_is_rf = False
 
+            if (hard_freeze_detected_at > 0 and
+                    hard_freeze_detected_at != last_handled_hard_freeze_at and
+                    hard_freeze_target and not screen_connected()):
+                # No screen: nothing asks mpv for frames, so playback
+                # stopping is expected. Restarting here would start an
+                # mpv that cannot set up its picture at all - see
+                # patch_mpv_screen_return.py.
+                print("[mpv_drift] playback stopped with no screen connected - "
+                      "expected, not restarting")
+                last_handled_hard_freeze_at = hard_freeze_detected_at
             if (hard_freeze_detected_at > 0 and
                     hard_freeze_detected_at != last_handled_hard_freeze_at and
                     hard_freeze_target and
@@ -8125,6 +8259,7 @@ const REASON_LABELS = {
     "drift_drop_buffers": "Drift correction: drop-buffers resync",
     "drift_breaker_tripped": "Drift correction: repeated resyncs not helping, backed off",
     "drift_hard_freeze_restart": "Hard freeze detected - immediate mpv restart",
+    "screen_back_restart": "Screen came back with no picture - mpv restarted",
     "drift_hard_freeze_suppressed": "Hard freeze detected - restart breaker active, suppressed",
     "drift_hard_freeze_breaker_tripped": "Hard freeze restarts not helping, backed off",
     "notif_confirmed_lock": "Notifications: own lock confirmation (arms settle timers)",
@@ -14998,6 +15133,8 @@ if __name__ == "__main__":
     decoder_health.start()
     video_badges = threading.Thread(target=video_badge_monitor, daemon=True)
     video_badges.start()
+    screen_return = threading.Thread(target=screen_return_monitor, daemon=True)
+    screen_return.start()
     connectivity = threading.Thread(target=picotuner_connectivity_monitor, daemon=True)
     connectivity.start()
     modcod_monitor = threading.Thread(target=picotuner_modcod_monitor, daemon=True)
