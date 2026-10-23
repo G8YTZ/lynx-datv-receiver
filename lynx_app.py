@@ -343,6 +343,8 @@ current_mode: str = "idle"    # idle | rf | stream
 mpv_running_for_rf: bool = False  # tracks whether mpv has actually been started for the
                                    # current RF tune (as opposed to just tuned-and-waiting-
                                    # for-lock) - see rf_mpv_lifecycle_monitor()
+programme_switched_at: float = 0.0  # a programme change in the same stream: the decoder waits for
+#   that programme's next keyframe, so the health monitor gives it the start-up grace too
 mpv_last_started_at: float = 0.0  # timestamp of the most recent mpv start - lets
                                    # mpv_decoder_health_monitor grant a startup grace period
 # Tri-watch (up to 3 sources - any mix of RF-A, RF-B, and a stream
@@ -2343,7 +2345,7 @@ def mpv_decoder_health_monitor():
                 emergency_delay_streak = 0
             if size == last_size:
                 continue
-            if time.time() - mpv_last_started_at < STARTUP_GRACE_SECS:
+            if time.time() - max(mpv_last_started_at, programme_switched_at) < STARTUP_GRACE_SECS:
                 # Still within the startup grace window - advance our
                 # read position so nothing backlogs, but don't evaluate
                 # anything yet.
@@ -11640,6 +11642,66 @@ def hdhomerun_status():
     }
 
 
+# ── Programmes in a DVB-S2 stream (mpv's own tracks) ──────────────────
+# A transmitter can carry more than one programme in one carrier: Lynx-Tx
+# sends a 4K stills carousel as programme 2 alongside the live picture.
+# mpv already demuxes every programme in the transport stream; choosing one
+# is choosing its video track (and its sound, if it has any). mpv 0.37 has
+# no "program" property any more, so it is done by track (tested 23 Oct
+# 2026 on a two-programme stream from Lynx-Tx's merge).
+def mpv_programmes() -> list:
+    n = _mpv_prop("track-list/count") or 0
+    progs = {}
+    for i in range(int(n)):
+        t = _mpv_prop(f"track-list/{i}") or {}
+        pid = t.get("program-id")
+        if pid is None or t.get("type") not in ("video", "audio"):
+            continue
+        p = progs.setdefault(int(pid), {"program": int(pid), "video": None, "audio": None,
+                                        "width": None, "height": None, "codec": "",
+                                        "selected": False})
+        if t["type"] == "video" and p["video"] is None:
+            p.update(video=t.get("id"), width=t.get("demux-w"), height=t.get("demux-h"),
+                     codec=t.get("codec") or "", selected=bool(t.get("selected")))
+        elif t["type"] == "audio" and p["audio"] is None:
+            p["audio"] = t.get("id")
+    return [p for _, p in sorted(progs.items()) if p["video"] is not None]
+
+
+@app.get("/api/programmes", tags=["RF Reception"],
+         summary="Programmes in the stream now playing",
+         description="Every programme with a picture in the transport stream mpv is "
+                     "playing, from mpv's own tracks. More than one when the "
+                     "transmitter sends a second programme (Lynx-Tx's 4K carousel).")
+def api_programmes():
+    return {"programmes": mpv_programmes()}
+
+
+class ProgrammeRequest(BaseModel):
+    program: int
+
+
+@app.post("/api/programme", tags=["RF Reception"],
+          summary="Watch another programme in the same stream",
+          description="Chooses that programme's picture and sound. A programme "
+                      "with no sound (a stills carousel) keeps none. The picture "
+                      "appears at its next keyframe (up to 10 s for Lynx-Tx's carousel).")
+def api_programme(req: ProgrammeRequest):
+    global programme_switched_at
+    progs = mpv_programmes()
+    p = next((x for x in progs if x["program"] == req.program), None)
+    if not p:
+        raise HTTPException(404, f"No programme {req.program} in this stream")
+    # The new picture starts at its next keyframe; until then the decoder
+    # complains ("Could not find ref"), which must not read as a fault.
+    programme_switched_at = time.time()
+    mpv_cmd({"command": ["set_property", "vid", p["video"]]})
+    mpv_cmd({"command": ["set_property", "aid", p["audio"] if p["audio"] is not None else "no"]})
+    print(f"[programme] now programme {req.program} (video track {p['video']}, "
+          f"sound {p['audio'] if p['audio'] is not None else 'none'})")
+    return {"success": True, "programme": p}
+
+
 @app.get("/api/hdhomerun/programs", tags=["RF Reception"],
          summary="Services in the currently tuned multiplex",
          description="Read from the device's own streaminfo. Empty when "
@@ -13376,6 +13438,11 @@ def web_ui():
                         <button class="btn btn-outline-warning btn-sm" onclick="saveMemory()" title="Save current frequency/SR as a preset">&#x1F4BE;</button>
                         <button class="btn btn-outline-info btn-sm" onclick="saveBootDefault()" title="Use this as the fallback frequency on startup, if there's nothing to resume">&#x1F3E0;</button>
                     </div>
+                    <div class="mt-2 d-flex gap-2 align-items-center" id="s2-prog-row" style="display:none !important">
+                        <label class="small text-muted mb-0" for="s2-programme">Programme</label>
+                        <select class="form-select form-select-sm bg-dark text-light border-secondary"
+                                id="s2-programme" onchange="switchS2Programme()"></select>
+                    </div>
                     <div id="boot-default-note" class="text-muted small mt-1"></div>
                 </div>
             </div>
@@ -14679,6 +14746,41 @@ async function loadDvbtPrograms(retries) {
         sel.appendChild(err);
     }
 }
+
+async function loadS2Programmes() {
+    // Shown only when the stream carries more than one programme with a
+    // picture (Lynx-Tx's 4K carousel as programme 2). Polled gently: it is
+    // a handful of property reads from mpv.
+    var row = document.getElementById('s2-prog-row');
+    var sel = document.getElementById('s2-programme');
+    if (!row || !sel) { return; }
+    try {
+        var r = await fetch('/api/programmes');
+        var progs = ((await r.json()) || {}).programmes || [];
+        if (progs.length < 2) { row.style.setProperty('display', 'none', 'important'); return; }
+        row.style.setProperty('display', 'flex', 'important');
+        if (document.activeElement === sel) { return; }   // not while it is being chosen
+        while (sel.firstChild) { sel.removeChild(sel.firstChild); }
+        for (var i = 0; i < progs.length; i++) {
+            var p = progs[i], o = document.createElement('option');
+            o.value = p.program;
+            o.textContent = 'Programme ' + p.program +
+                (p.width ? ' \u00b7 ' + p.width + '\u00d7' + p.height : '') +
+                (p.codec ? ' ' + p.codec.toUpperCase() : '') +
+                (p.audio === null ? ' (no sound)' : '');
+            if (p.selected) { o.selected = true; }
+            sel.appendChild(o);
+        }
+    } catch (e) { /* mpv not up yet: try again next time */ }
+}
+
+async function switchS2Programme() {
+    var sel = document.getElementById('s2-programme');
+    await api('POST', '/api/programme', {program: parseInt(sel.value, 10)});
+    sel.blur();
+}
+setInterval(loadS2Programmes, 3000);
+loadS2Programmes();
 
 async function switchDvbtProgram() {
     // No retune: the tuner is already locked on the multiplex, so this
