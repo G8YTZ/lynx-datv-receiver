@@ -69,6 +69,11 @@ BOARD_NAME = "Radxa ROCK 5T" if IS_ROCK else "Raspberry Pi"
 #         (software 576i); hardware frames arrive already bobbed.
 MPV_VIDEO_FLAGS = ("--vo=gpu-next --hwdec=rkmpp --deinterlace=auto" if IS_ROCK
                    else "--vo=gpu --hwdec=drm-copy")
+# For trying other video paths without editing code (Pi 5 4K, 24 Oct 2026):
+#   systemctl --user set-environment LYNX_MPV_VIDEO_FLAGS="--vo=dmabuf-wayland --hwdec=drm" LYNX_KEEP_WAYLAND=1
+#   systemctl --user restart lynx
+# and back:  systemctl --user unset-environment LYNX_MPV_VIDEO_FLAGS LYNX_KEEP_WAYLAND
+MPV_VIDEO_FLAGS = os.environ.get("LYNX_MPV_VIDEO_FLAGS") or MPV_VIDEO_FLAGS
 
 # Whether mpv keeps WAYLAND_DISPLAY.
 #   Pi:   removed, forcing mpv onto Xwayland - native Wayland froze on
@@ -76,7 +81,7 @@ MPV_VIDEO_FLAGS = ("--vo=gpu-next --hwdec=rkmpp --deinterlace=auto" if IS_ROCK
 #   ROCK: kept. Lynx's mpv there is built Wayland-only, and dmabuf-
 #         wayland is Wayland by definition: without the variable it has
 #         nowhere to draw ("Error opening/initializing the VO window").
-KEEP_WAYLAND_DISPLAY = IS_ROCK
+KEEP_WAYLAND_DISPLAY = IS_ROCK or os.environ.get("LYNX_KEEP_WAYLAND") == "1"
 
 # Default display height cap, when the config does not set one.
 #   Pi:   1080. At 4K a Pi 5 glitches, drops audio and loses the overlay.
