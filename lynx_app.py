@@ -1094,6 +1094,13 @@ def restart_mpv(target_url: str, is_rf: bool = True):
             # already waits far longer than that for rendering, and
             # adds nothing to running latency.
             "--demuxer-lavf-analyzeduration=1 "
+            # The low-latency profile also sets probe-info=nostreams: no
+            # probing at all once the first table names a stream, so a
+            # second programme in the stream (Lynx-Tx's 4K carousel) never
+            # became a track and could not be chosen. "yes" probes for the
+            # second above as intended (tested 23 Oct 2026, mpv 0.37:
+            # programme 2 listed with it, missing without).
+            "--demuxer-lavf-probe-info=yes "
         )
     else:
         # No format-forcing (let mpv auto-detect the real container —
