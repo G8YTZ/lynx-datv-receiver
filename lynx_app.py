@@ -1982,13 +1982,60 @@ def _read_video_in():
     }
 
 
+board_info = None        # processor temperature and fan - see patch_board_badge.py
+THERMAL_SYSFS = os.environ.get("LYNX_THERMAL_SYSFS", "/sys/class")
+
+
+def _read_board():
+    """Processor temperature and fan speed, from the kernel. Prefers the
+    ROCK's soc-thermal or the Pi's cpu-thermal sensor, otherwise the
+    first one. None if there is no sensor at all."""
+    import glob as _glob
+    def _rd(p):
+        with open(p) as f:
+            return f.read().strip()
+    zones = {}
+    for z in sorted(_glob.glob(f"{THERMAL_SYSFS}/thermal/thermal_zone*")):
+        try:
+            zones[_rd(f"{z}/type")] = z
+        except OSError:
+            pass
+    if not zones:
+        return None
+    sensor = next((n for n in ("soc-thermal", "cpu-thermal") if n in zones),
+                  next(iter(zones)))
+    try:
+        temp_c = round(int(_rd(f"{zones[sensor]}/temp")) / 1000.0, 1)
+    except (OSError, ValueError):
+        return None
+    info = {"temp_c": temp_c, "sensor": sensor,
+            "fan_pwm": None, "fan_pct": None, "fan_rpm": None}
+    for h in sorted(_glob.glob(f"{THERMAL_SYSFS}/hwmon/hwmon*")):
+        try:
+            if _rd(f"{h}/name") not in ("pwmfan", "pwm-fan", "cooling_fan"):
+                continue
+            pwm = int(_rd(f"{h}/pwm1"))
+            info["fan_pwm"] = pwm
+            info["fan_pct"] = round(pwm * 100 / 255)
+            try:
+                info["fan_rpm"] = int(_rd(f"{h}/fan1_input"))
+            except (OSError, ValueError):
+                pass
+            break
+        except (OSError, ValueError):
+            continue
+    return info
+
+
 def video_badge_monitor():
-    global video_in_info, video_out_info
+    global video_in_info, video_out_info, board_info
     while True:
         try:
             outs = _read_video_out()
             vin = _read_video_in()
+            brd = _read_board()
             with _video_badge_lock:
+                board_info = brd
                 video_out_info = outs
                 video_in_info = vin
         except Exception as e:
@@ -7755,6 +7802,7 @@ def get_status():
             # Cached by video_badge_monitor(); never waits on mpv or wlr-randr.
             "video_in": video_in_info,
             "video_out": video_out_info,
+            "board": board_info,
             "timestamp": utc_now_iso()
         },
         "picotuner": {
@@ -13207,6 +13255,7 @@ def web_ui():
             <span class="btn btn-sm" id="mode-badge" style="background:#3a4a63; color:#fff; cursor:default;">IDLE</span>
             <span class="btn btn-sm" id="video-in-badge" style="background:#3a4a63; color:#fff; cursor:default;" title="Received video">NO VIDEO</span>
             <span class="btn btn-sm" id="video-out-badge" style="background:#3a4a63; color:#fff; cursor:default;" title="HDMI output">OUT ?</span>
+            <span class="btn btn-sm" id="board-badge" style="background:#3a4a63; color:#fff; cursor:default; display:none;" title="Processor temperature and fan">--</span>
             <a href="/config" class="btn btn-sm" id="locator-badge" style="background:#3a4a63; color:#fff;" title="Portable locator">&#x1F4CD; —</a>
             <a href="/diagnostics" class="btn btn-sm btn-outline-light" title="mpv restart/stop diagnostics" id="diagnostics-link">mpv: <span id="mpv-restart-count">0</span></a>
             <span class="btn btn-sm" id="version-badge" style="background:#3a4a63; color:#fff; cursor:default;" title="Current version">v?</span>
@@ -13772,6 +13821,39 @@ function renderVideoBadges(vin, vout) {
     if (warnings.length) outB.title += '. ' + warnings.join('. ');
 }
 
+// Board badge - see patch_board_badge.py.
+function renderBoardBadge(b) {
+    const el = document.getElementById('board-badge');
+    if (!el) return;
+    if (!b || b.temp_c === null || b.temp_c === undefined) {
+        el.style.display = 'none';
+        return;
+    }
+    el.style.display = '';
+    const deg = String.fromCharCode(176);
+    let stalled = false;
+    let txt = Math.round(b.temp_c) + deg + 'C';
+    let tip = 'Processor ' + b.temp_c + deg + 'C (' + b.sensor + ')';
+    if (b.fan_pct !== null && b.fan_pct !== undefined) {
+        txt += b.fan_pct > 0 ? ' fan ' + b.fan_pct + '%' : ' fan off';
+        tip += '. Fan ' + (b.fan_pct > 0 ? b.fan_pct + '% (PWM ' + b.fan_pwm + ')' : 'off');
+        if (b.fan_pct > 0 && b.fan_rpm !== null && b.fan_rpm !== undefined) {
+            if (b.fan_rpm === 0) {
+                stalled = true;
+                txt += ' STALLED';
+                tip += ', but not turning (0 rpm)';
+            } else {
+                txt += ' ' + b.fan_rpm + 'rpm';
+                tip += ', ' + b.fan_rpm + ' rpm';
+            }
+        }
+    }
+    el.textContent = txt;
+    el.title = tip;
+    el.style.background = (stalled || b.temp_c >= 80) ? '#c0392b'
+                        : b.temp_c >= 60 ? '#b7791f' : '#3a4a63';
+}
+
 async function updateStatus() {
     try {
         const s = await api('GET', '/api/status');
@@ -13790,6 +13872,7 @@ async function updateStatus() {
         badge.style.background = mode === 'idle' ? '#3a4a63' : mode === 'rf' ? '#1a9850' : '#3b82c4';
 
         renderVideoBadges(s.lynx?.video_in, s.lynx?.video_out);
+        renderBoardBadge(s.lynx?.board);
 
         // Locator badge - value AND provenance (GPS vs configured),
         // per the task: the two must always be shown together, since
