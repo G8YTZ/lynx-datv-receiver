@@ -255,6 +255,38 @@ say "Unprivileged ping"
 echo 'net.ipv4.ping_group_range = 0 2147483647' | sudo tee /etc/sysctl.d/99-lynx-ping.conf >/dev/null
 sudo sysctl --system >/dev/null
 
+# --- Fan: hold the SoC at a steady 40 C --------------------------------
+# Armbian only steps the fan up at 60 C, in five coarse speeds. lynx_fan.py
+# holds 40 C instead: on at 35 C at its slowest reliable speed, faster as
+# needed, off below 30 C. The kernel's 60 C fan step and 85 C CPU
+# throttling stay as the safety net. Settings: /etc/default/lynx-fan.
+say "Fan control (steady 40 C)"
+sudo install -m 755 "$LYNX_DIR/install/lynx_fan.py" /usr/local/sbin/lynx-fan
+[ -f /etc/default/lynx-fan ] || sudo tee /etc/default/lynx-fan >/dev/null <<'EOF'
+# Lynx fan control - see install/lynx_fan.py
+LYNX_FAN_SET_C=40
+LYNX_FAN_ON_C=35
+LYNX_FAN_OFF_C=30
+LYNX_FAN_MIN_PWM=128
+EOF
+sudo tee /etc/systemd/system/lynx-fan.service >/dev/null <<'EOF'
+[Unit]
+Description=Lynx fan control (hold the SoC at a steady temperature)
+After=systemd-modules-load.service
+
+[Service]
+EnvironmentFile=-/etc/default/lynx-fan
+ExecStart=/usr/bin/python3 /usr/local/sbin/lynx-fan
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable lynx-fan.service
+sudo systemctl restart lynx-fan.service
+
 # Deliberately NOT done: forcing the HDMI connector on (video=HDMI-A-1:e).
 # At 4K50 HDMI 2.0 needs scrambling re-enabled in the monitor whenever its
 # input wakes, and the hot-plug event is what triggers it. Forced on, an
