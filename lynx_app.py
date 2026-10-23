@@ -1596,6 +1596,21 @@ picotuner_state = {
     "agc2": "",
 }
 
+def rx_line_callsign(parts, unlocked_states):
+    """The callsign in a tuner's RX line ("1304.072 GB3OO" -> "GB3OO"), or ""
+    when it is not locked. The service name can be more than one word: with
+    a second programme in the stream (Lynx-Tx's "GB3OO 4K") the line read
+    "1304.072 GB3OO 4K", the last word "4K" is no callsign, and the
+    receiver showed SEARCHING at 25 dB MER (23 Oct 2026). So take the first
+    word after the frequency that looks like a callsign, not the last."""
+    if len(parts) < 2 or parts[-1] in unlocked_states:
+        return ""
+    for word in parts[1:]:
+        if looks_like_callsign(word):
+            return word
+    return ""
+
+
 def looks_like_callsign(token):
     """Is this plausibly an amateur callsign?
 
@@ -1820,10 +1835,10 @@ def picotuner_monitor():
                     # tuned value. It was previously accepted as a
                     # callsign and looked up on QRZ 53 times overnight.
                     unlocked_states = {"search", "lost", "header", ""}
-                    if (len(parts) >= 2 and parts[-1] not in unlocked_states
-                            and looks_like_callsign(parts[-1])):
+                    call = rx_line_callsign(parts, unlocked_states)
+                    if call:
                         picotuner_state["locked"] = True
-                        picotuner_state["callsign"] = parts[-1]
+                        picotuner_state["callsign"] = call
                         picotuner_state["frequency"] = parts[0].rstrip("TB")
                     else:
                         picotuner_state["locked"] = False
@@ -1842,10 +1857,10 @@ def picotuner_monitor():
                     # Same set as RX1 above - see the note there on
                     # "header".
                     unlocked_states = {"search", "lost", "header", ""}
-                    if (len(parts) >= 2 and parts[-1] not in unlocked_states
-                            and looks_like_callsign(parts[-1])):
+                    call = rx_line_callsign(parts, unlocked_states)
+                    if call:
                         picotuner_state_b["locked"] = True
-                        picotuner_state_b["callsign"] = parts[-1]
+                        picotuner_state_b["callsign"] = call
                         picotuner_state_b["frequency"] = parts[0].rstrip("TB")
                     else:
                         picotuner_state_b["locked"] = False
