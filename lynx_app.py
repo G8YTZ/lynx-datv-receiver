@@ -1611,6 +1611,24 @@ def rx_line_callsign(parts, unlocked_states):
     return ""
 
 
+def rx_line_held_callsign(parts, state):
+    """A locked tuner whose line has lost its name: "1304.072B" alone, after
+    "1304.072B G8YTZ" on the same frequency. The tuner's firmware shows one
+    service name; with a second programme in the stream (Lynx-Tx's 4K
+    carousel) it showed the callsign for a second or two and then nothing,
+    while still locked (23 Oct 2026). Search, lost and header always say so
+    in words, so a bare frequency right after a lock is the same lock: keep
+    its callsign rather than drop to SEARCHING."""
+    if len(parts) != 1 or not state.get("locked") or not state.get("callsign"):
+        return ""
+    try:
+        was = float(str(state.get("frequency", "")).rstrip("TB"))
+        now = float(parts[0].rstrip("TB"))
+    except ValueError:
+        return ""
+    return state["callsign"] if abs(now - was) < 0.5 else ""
+
+
 def looks_like_callsign(token):
     """Is this plausibly an amateur callsign?
 
@@ -1835,7 +1853,8 @@ def picotuner_monitor():
                     # tuned value. It was previously accepted as a
                     # callsign and looked up on QRZ 53 times overnight.
                     unlocked_states = {"search", "lost", "header", ""}
-                    call = rx_line_callsign(parts, unlocked_states)
+                    call = rx_line_callsign(parts, unlocked_states) or \
+                        rx_line_held_callsign(parts, picotuner_state)
                     if call:
                         picotuner_state["locked"] = True
                         picotuner_state["callsign"] = call
@@ -1857,7 +1876,8 @@ def picotuner_monitor():
                     # Same set as RX1 above - see the note there on
                     # "header".
                     unlocked_states = {"search", "lost", "header", ""}
-                    call = rx_line_callsign(parts, unlocked_states)
+                    call = rx_line_callsign(parts, unlocked_states) or \
+                        rx_line_held_callsign(parts, picotuner_state_b)
                     if call:
                         picotuner_state_b["locked"] = True
                         picotuner_state_b["callsign"] = call
