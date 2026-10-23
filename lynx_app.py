@@ -1293,6 +1293,20 @@ def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
                 content = f.read()
             if any(m in content for m in markers):
                 elapsed = time.time() - start
+                # A few "Missing inuse DPB ent" lines are what the Pi's HEVC
+                # driver says while it joins a 4K stream between keyframes;
+                # a wedged decoder keeps saying it. Treated as fatal at the
+                # first line, every 4K start failed and was retried: the
+                # player restarted about once a second and motion was never
+                # smooth at 4K (23 Oct 2026). So look again 2 s later: only
+                # an error that is still being logged means wedged.
+                if _recent_hevc_decoder_error(start):
+                    later = time.time()
+                    time.sleep(2.0)
+                    if not _recent_hevc_decoder_error(later):
+                        print(f"[mpv_render] confirmed rendering after {elapsed:.1f}s "
+                              f"(HEVC decoder settled after joining between keyframes)")
+                        return True
                 if _recent_hevc_decoder_error(start):
                     print(f"[mpv_render] mpv log shows rendering markers after {elapsed:.1f}s, "
                           f"but a hardware HEVC decoder error was also just logged - treating "
