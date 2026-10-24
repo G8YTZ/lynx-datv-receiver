@@ -1712,11 +1712,18 @@ class LynxOverlay(Gtk.Window):
             if mode_name:
                 # t8dvbt2 -> "DVB-T2" and "8 MHz": what an operator
                 # would say out loud, not what the API calls it.
-                try:
-                    bw = f"{mode_name[1]} MHz"
-                    std = "DVB-T2" if mode_name.endswith("dvbt2") else "DVB-T"
-                except Exception:
-                    std = mode_name
+                # atsc3 / 8vsb are ATSC, 6 MHz by definition: read as
+                # t-style names they came out "t MHz, DVB-T".
+                if mode_name == "atsc3":
+                    std, bw = "ATSC 3.0", "6 MHz"
+                elif mode_name == "8vsb":
+                    std, bw = "ATSC 1.0", "6 MHz"
+                else:
+                    try:
+                        bw = f"{mode_name[1]} MHz"
+                        std = "DVB-T2" if mode_name.endswith("dvbt2") else "DVB-T"
+                    except Exception:
+                        std = mode_name
 
             # Line 1 is the RF: where it is, how wide, which standard.
             # Line 2 is the payload: how much of it, in what codec.

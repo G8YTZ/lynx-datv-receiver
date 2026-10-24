@@ -411,3 +411,194 @@ if __name__ == "__main__":
             print(relay.stats())
     except KeyboardInterrupt:
         relay.stop()
+
+
+# ──────────────────────────────────────────────────────────────────
+# HDHomeRun relay: forward everything, read the service names on the way
+# ──────────────────────────────────────────────────────────────────
+#
+# An ATSC 3.0 HDHomeRun (the Flex 4K) passes a transport stream carried
+# in ALP through untouched, SDT included - but it does not read the SDT
+# itself, because an ATSC 3.0 receiver takes its channel names from the
+# SLT instead. So its programme list says "1: 0", nameless, while the
+# stream carries "G8YTZ UHD" perfectly (VLC shows it). Lynx asked the box,
+# and got nothing.
+#
+# This relay sits where mpv used to: the box sends here, every datagram
+# goes straight on to mpv unchanged, and packets on PID 0x11 are read on
+# the way. The names it finds are a fallback for the existing lookup, not
+# a second one - the poller still asks the box first, as for DVB-T2.
+
+SDT_PID = 0x0011
+SDT_ACTUAL_TID = 0x42
+SERVICE_DESCRIPTOR = 0x48
+HDHR_INGRESS_PORT = 10995
+
+
+def _dvb_text(raw: bytes) -> str:
+    """A DVB string (EN 300 468 Annex A) as text. A first byte below 0x20
+    names the character table; 0x15 is UTF-8, anything else is read as
+    Latin-1, which is right for every amateur callsign."""
+    if not raw:
+        return ""
+    if raw[0] < 0x20:
+        table, raw = raw[0], raw[1:]
+        if table == 0x10:
+            raw = raw[2:]
+        if table == 0x15:
+            return raw.decode("utf-8", "replace").strip()
+    return raw.decode("latin-1", "replace").strip()
+
+
+def parse_sdt_section(sec: bytes) -> dict:
+    """{service_id: (name, provider)} from one SDT Actual section, or {}.
+
+    Layout (EN 300 468 5.2.3): table_id, section_length (12 bits), TS id,
+    version, section numbers, original network id, reserved byte, then a
+    loop of services up to the 4-byte CRC."""
+    if len(sec) < 15 or sec[0] != SDT_ACTUAL_TID:
+        return {}
+    length = ((sec[1] & 0x0F) << 8) | sec[2]
+    end = 3 + length - 4                     # stop before the CRC
+    if end > len(sec):
+        return {}
+    out, i = {}, 11
+    while i + 5 <= end:
+        sid = (sec[i] << 8) | sec[i + 1]
+        dlen = ((sec[i + 3] & 0x0F) << 8) | sec[i + 4]
+        j, dend = i + 5, min(i + 5 + dlen, end)
+        while j + 2 <= dend:
+            tag, tlen = sec[j], sec[j + 1]
+            body = sec[j + 2:j + 2 + tlen]
+            if tag == SERVICE_DESCRIPTOR and len(body) >= 3:
+                plen = body[1]
+                provider = _dvb_text(body[2:2 + plen])
+                k = 2 + plen
+                if k < len(body):
+                    nlen = body[k]
+                    out[sid] = (_dvb_text(body[k + 1:k + 1 + nlen]), provider)
+            j += 2 + tlen
+        i = dend
+    return out
+
+
+class HdhrNameRelay:
+    """Binds one UDP port, forwards every datagram to mpv, reads the SDT.
+
+    No source selection: Lynx releases every other HDHomeRun before a tune
+    (hdhr_release_others), so only the tuned box is sending here.
+    """
+
+    def __init__(self, ingress_port=HDHR_INGRESS_PORT, mpv_host=MPV_HOST, mpv_port=MPV_PORT):
+        self.ingress_port = ingress_port
+        self.mpv_addr = (mpv_host, mpv_port)
+        self._sock = None
+        self._out = None
+        self._thread = None
+        self._running = False
+        self._lock = threading.Lock()
+        self._names = {}            # service_id -> (name, provider)
+        self._sdt_buf = bytearray()
+        self._sdt_need = 0
+        self.packets = 0
+        self.bind_error = None
+
+    def start(self):
+        if self._running:
+            return True
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF_BYTES)
+            s.bind(("0.0.0.0", self.ingress_port))
+            s.settimeout(1.0)
+        except OSError as exc:
+            self.bind_error = f"cannot bind UDP {self.ingress_port}: {exc}"
+            log.error("hdhr relay: %s", self.bind_error)
+            return False
+        self._sock = s
+        self._out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._running = True
+        self._thread = threading.Thread(target=self._run, name="hdhr-relay", daemon=True)
+        self._thread.start()
+        log.info("hdhr relay: %d -> %s:%d", self.ingress_port, *self.mpv_addr)
+        return True
+
+    def stop(self):
+        self._running = False
+        for s in (self._sock, self._out):
+            try:
+                s and s.close()
+            except OSError:
+                pass
+
+    def clear(self):
+        """Forget the names: called on every tune, so the previous
+        multiplex's service can never be shown over a new one."""
+        with self._lock:
+            self._names = {}
+            self._sdt_buf = bytearray()
+            self._sdt_need = 0
+
+    def names(self) -> dict:
+        with self._lock:
+            return dict(self._names)
+
+    def name_for(self, program=None):
+        """(name, provider) for a programme number, or for the only /
+        first service when program is None or "*"; ("", "") if unknown."""
+        names = self.names()
+        if not names:
+            return "", ""
+        if program not in (None, "*"):
+            try:
+                return names.get(int(program), ("", ""))
+            except (TypeError, ValueError):
+                return "", ""
+        return names[min(names)]
+
+    def _run(self):
+        sock, out = self._sock, self._out
+        while self._running:
+            try:
+                data, _ = sock.recvfrom(RECV_SIZE)
+            except socket.timeout:
+                continue
+            except OSError as exc:
+                if self._running:
+                    log.error("hdhr relay recv failed: %s", exc)
+                break
+            try:
+                out.sendto(data, self.mpv_addr)
+            except OSError as exc:
+                log.debug("hdhr relay forward failed: %s", exc)
+            self.packets += 1
+            # Only PID 0x11 is looked at: a few bytes compared per packet.
+            for o in range(0, len(data) - TS_PACKET_SIZE + 1, TS_PACKET_SIZE):
+                if (data[o] == TS_SYNC_BYTE and (data[o + 1] & 0x1F) == 0
+                        and data[o + 2] == SDT_PID):
+                    self._sdt_packet(data[o:o + TS_PACKET_SIZE])
+
+    def _sdt_packet(self, p):
+        afc = (p[3] >> 4) & 0x3
+        if not afc & 0x1:
+            return                                  # no payload
+        i = 4 + (1 + p[4] if afc & 0x2 else 0)
+        if i >= TS_PACKET_SIZE:
+            return
+        if p[1] & 0x40:                             # a section starts here
+            i += 1 + p[i]                           # skip the pointer field
+            if i + 3 > TS_PACKET_SIZE:
+                return
+            self._sdt_buf = bytearray(p[i:])
+            self._sdt_need = 3 + (((p[i + 1] & 0x0F) << 8) | p[i + 2])
+        elif self._sdt_need:
+            self._sdt_buf += p[i:]
+        else:
+            return
+        if self._sdt_need and len(self._sdt_buf) >= self._sdt_need:
+            found = parse_sdt_section(bytes(self._sdt_buf[:self._sdt_need]))
+            self._sdt_need = 0
+            if found:
+                with self._lock:
+                    self._names.update(found)
