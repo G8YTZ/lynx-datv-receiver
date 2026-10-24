@@ -9321,13 +9321,13 @@ def config_page():
                     </div>
                 </div>
                 <div class="card mb-3">
-                    <div class="card-header">&#x1F4FA; DVB-T2 Tuner (HDHomeRun)</div>
+                    <div class="card-header">&#x1F4FA; HDHomeRun Tuners</div>
                     <div class="card-body">
                         <p class="text-muted small">
-                            A SiliconDust HDHomeRun on the network, used as a
-                            DVB-T/T2/C receiver. Found automatically on the
-                            same subnet - nothing needs configuring for one
-                            plugged into the local network.
+                            SiliconDust HDHomeRuns on the network: DVB-T/T2/C
+                            boxes, and ATSC boxes. Found automatically on the
+                            same subnet, and each tune goes to a box that can
+                            receive it. Name them here if you like.
                         </p>
                         <div class="alert alert-warning py-2 small mb-3">
                             Auto-discovery is a broadcast, so it does not cross
@@ -9875,7 +9875,11 @@ async function loadCurrentConfig() {
                         inp.type = 'text';
                         inp.className = 'form-control form-control-sm';
                         inp.id = 'hdhr-name-' + d.device_id;
-                        inp.value = given[d.device_id] || '';
+                        // The current name, in ordinary text: placeholder
+                        // grey was too faint to read. Left at the default,
+                        // it saves as no name given (patch_hdhr_card_tidy.py).
+                        inp.dataset.def = d.default_name || '';
+                        inp.value = given[d.device_id] || d.default_name || d.name || '';
                         inp.placeholder = d.default_name || d.name || d.device_id;
                         const info = document.createElement('div');
                         info.className = 'small text-muted';
@@ -10394,7 +10398,8 @@ async function saveHdhr() {
             names: (function () {
                 const n = {};
                 document.querySelectorAll('[id^="hdhr-name-"]').forEach(function (i) {
-                    n[i.id.slice(10)] = i.value.trim();
+                    const v = i.value.trim();
+                    n[i.id.slice(10)] = (v === (i.dataset.def || '')) ? '' : v;
                 });
                 return n;
             })()
