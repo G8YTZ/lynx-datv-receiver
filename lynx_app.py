@@ -4362,9 +4362,10 @@ def hdhr_discover_once() -> int:
         except lynx_hdhomerun.HDHomeRunError as e:
             print(f"[hdhr] configured address {_manual}: {e}")
 
+    _hdhr_apply_names()
     if count:
         for st in hdhr_devices():
-            print(f"[hdhr] found {st['device_id']} at {st['address']}")
+            print(f"[hdhr] found {st['name']} {st['device_id']} at {st['address']}")
     return count
 
 
@@ -4375,13 +4376,21 @@ def hdhr_default_device_id():
     otherwise the first one by ID. Returns None when nothing has been
     found, which the caller reports rather than guessing.
     """
-    preferred = (config.get('hdhomerun') or {}).get('prefer_device_id')
+    # The box in use first: see patch_hdhr_after_atsc3.py. The lowest ID
+    # alone made the US ATSC box "the HDHomeRun" for the DVB-T2 re-lock
+    # restart and Pathfinder, whichever box was playing.
+    preferred = ((config.get('hdhomerun') or {}).get('prefer_device_id') or "").upper()
     with hdhr_lock:
+        if hdhr_active_device and hdhr_active_device in hdhr_states:
+            return hdhr_active_device
         if preferred and preferred in hdhr_states:
             return preferred
-        for device_id in sorted(hdhr_states):
+        ids = sorted(hdhr_states)
+    # Outside the lock: asking a box its kind takes the lock itself.
+    for device_id in ids:
+        if hdhr_device_kind(device_id) == "dvb":
             return device_id
-    return None
+    return ids[0] if ids else None
 
 
 _hdhr_features: dict = {}
@@ -4486,6 +4495,7 @@ def _hdhr_block(d):
         return None
     return {
         "device_id": d["device_id"],
+        "name": d.get("name", ""),
         "kind": hdhr_device_kind(d["device_id"]),
         # Whether this device's picture is the one on screen. The codec
         # rows come from the player, so they belong to this device only.
@@ -4543,6 +4553,23 @@ def hdhr_release_others(keep_device_id):
             hdhr_source(st["device_id"]).stop()
         except Exception as e:
             print(f"[hdhr] release {st['device_id']} failed: {type(e).__name__}: {e}")
+
+
+def _hdhr_apply_names():
+    """Each box's name: the one given on the config page, else one from
+    what it receives. Two boxes with the same default get the end of
+    their ID added. See patch_hdhr_after_atsc3.py."""
+    given = (config.get('hdhomerun') or {}).get('names') or {}
+    kinds = {d["device_id"]: hdhr_device_kind(d["device_id"]) for d in hdhr_devices()}
+    defaults = {did: ("HDHomeRun ATSC 3.0" if k == "atsc" else "HDHomeRun DVB-T2")
+                for did, k in kinds.items()}
+    with hdhr_lock:
+        for did, st in hdhr_states.items():
+            d = defaults.get(did, f"HDHomeRun {did}")
+            if list(defaults.values()).count(d) > 1:
+                d = f"{d} {did[-4:]}"
+            st["default_name"] = d
+            st["name"] = (given.get(did) or "").strip() or d
 
 
 def hdhr_local_address(device_address: str) -> str:
@@ -5630,6 +5657,14 @@ class NetworkOutputConfigUpdate(BaseModel):
     port: int = 9950
 
 
+class HdhomerunConfigUpdate(BaseModel):
+    """The HDHomeRun card on the config page. There was no such section
+    before, so its Save button saved nothing (patch_hdhr_after_atsc3.py)."""
+    address: str = ""
+    names: dict = {}           # device ID -> friendly name; empty = default
+    prefer_device_id: Optional[str] = None   # None = leave as it is
+
+
 class ConfigUpdateRequest(BaseModel):
     site: Optional[SiteConfigUpdate] = None
     network_output: Optional[NetworkOutputConfigUpdate] = None
@@ -5646,6 +5681,7 @@ class ConfigUpdateRequest(BaseModel):
     gnss: Optional[GnssConfigUpdate] = None
     squeak: Optional[SqueakConfigUpdate] = None
     remote_source: Optional[RemoteSourceConfigUpdate] = None
+    hdhomerun: Optional[HdhomerunConfigUpdate] = None
 
 # ── Helpers ───────────────────────────────────────────────────
 def stop_current():
@@ -9381,13 +9417,13 @@ def config_page():
                     </div>
                 </div>
                 <div class="card mb-3">
-                    <div class="card-header">&#x1F4FA; DVB-T2 Tuner (HDHomeRun)</div>
+                    <div class="card-header">&#x1F4FA; HDHomeRun Tuners</div>
                     <div class="card-body">
                         <p class="text-muted small">
-                            A SiliconDust HDHomeRun on the network, used as a
-                            DVB-T/T2/C receiver. Found automatically on the
-                            same subnet - nothing needs configuring for one
-                            plugged into the local network.
+                            SiliconDust HDHomeRuns on the network: DVB-T/T2/C
+                            boxes, and ATSC boxes. Found automatically on the
+                            same subnet, and each tune goes to a box that can
+                            receive it. Name them here if you like.
                         </p>
                         <div class="alert alert-warning py-2 small mb-3">
                             Auto-discovery is a broadcast, so it does not cross
@@ -9924,9 +9960,29 @@ async function loadCurrentConfig() {
                 if (!devs.length) {
                     el.textContent = 'none found';
                 } else {
-                    el.textContent = devs.map(function (d) {
-                        return d.device_id + ' at ' + (d.address || '?');
-                    }).join(', ');
+                    // One row per box: its name, editable, in ordinary
+                    // text, and what it is. Left at the default, a name
+                    // saves as no name given. See patch_hdhr_after_atsc3.py.
+                    const given = (hdhrCfg.names || {});
+                    el.textContent = '';
+                    devs.forEach(function (d) {
+                        const row = document.createElement('div');
+                        row.className = 'mb-2';
+                        const inp = document.createElement('input');
+                        inp.type = 'text';
+                        inp.className = 'form-control form-control-sm';
+                        inp.id = 'hdhr-name-' + d.device_id;
+                        inp.dataset.def = d.default_name || '';
+                        inp.value = given[d.device_id] || d.default_name || d.name || '';
+                        const info = document.createElement('div');
+                        info.className = 'small text-muted';
+                        info.textContent = (d.kind === 'atsc' ? 'ATSC / ATSC 3.0' : 'DVB-T / T2 / C')
+                            + ' - ' + d.device_id + ' at ' + (d.address || '?')
+                            + (d.online ? '' : ' - offline') + (d.active ? ' - in use' : '');
+                        row.appendChild(inp);
+                        row.appendChild(info);
+                        el.appendChild(row);
+                    });
                 }
             }
         } catch (e) { /* the card still works without it */ }
@@ -10430,7 +10486,15 @@ async function saveHdhr() {
     statusEl.className = 'save-status text-muted';
     try {
         const body = { hdhomerun: {
-            address: document.getElementById('hdhr-address-input').value.trim()
+            address: document.getElementById('hdhr-address-input').value.trim(),
+            names: (function () {
+                const n = {};
+                document.querySelectorAll('[id^="hdhr-name-"]').forEach(function (i) {
+                    const v = i.value.trim();
+                    n[i.id.slice(10)] = (v === (i.dataset.def || '')) ? '' : v;
+                });
+                return n;
+            })()
         }};
         const r = await fetch('/api/config', {
             method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
@@ -10439,7 +10503,7 @@ async function saveHdhr() {
         // Restart required: the address is read once, during the single
         // discovery sweep at startup. A device is installed rather than
         // plugged in and out, so there is no reason to poll for one.
-        statusEl.textContent = 'Saved - restart required.';
+        statusEl.textContent = 'Saved. Names apply now; a new address needs a restart.';
         statusEl.className = 'save-status text-success';
     } catch (e) {
         statusEl.textContent = 'Save failed - see console.';
@@ -11856,11 +11920,15 @@ def _tune_dvbt_impl(req: DvbtTuneRequest):
          description="Devices discovered at startup, their current status, "
                      "and the configured presets.")
 def hdhomerun_status():
+    _active = hdhr_default_device_id()
     return {
         "devices": [
             {
                 "device_id": st["device_id"],
                 "name": st["name"],
+                "default_name": st.get("default_name", st["name"]),
+                "kind": hdhr_device_kind(st["device_id"]),
+                "active": (current_mode == "dvbt" and st["device_id"] == _active),
                 "address": st.get("address"),
                 "online": st["online"],
                 "locked": st["locked"],
@@ -13434,6 +13502,25 @@ def update_config(req: ConfigUpdateRequest):
         # while doing it. The card only edits one; the Slaves page will
         # edit them all, and building a list editor here that is about
         # to be replaced would be waste.
+        if req.hdhomerun is not None:
+            h = on_disk.setdefault('hdhomerun', {})
+            h['address'] = (req.hdhomerun.address or "").strip()
+            names = {str(k).upper(): str(v).strip()
+                     for k, v in (req.hdhomerun.names or {}).items()
+                     if v is not None and str(v).strip()}
+            if names:
+                h['names'] = names
+            else:
+                h.pop('names', None)
+            if req.hdhomerun.prefer_device_id is not None:
+                pref = req.hdhomerun.prefer_device_id.strip().upper()
+                if pref:
+                    h['prefer_device_id'] = pref
+                else:
+                    h.pop('prefer_device_id', None)
+            # Names apply now; only a changed address waits for a restart.
+            config.setdefault('hdhomerun', {})['names'] = names
+            _hdhr_apply_names()
         if req.remote_source is not None:
             srcs = on_disk.get('remote_sources')
             if not isinstance(srcs, list) or not srcs:
