@@ -52,8 +52,6 @@ else:
     BOARD = "pi"
 
 IS_ROCK = BOARD == "rock5t"
-# The Pi 5 gets its own video path (below); a Pi 4 keeps the old one.
-IS_PI5 = not IS_ROCK and "RASPBERRY PI 5" in MODEL.upper()
 BOARD_NAME = "Radxa ROCK 5T" if IS_ROCK else "Raspberry Pi"
 
 # How mpv decodes and draws.
@@ -69,23 +67,8 @@ BOARD_NAME = "Radxa ROCK 5T" if IS_ROCK else "Raspberry Pi"
 #         software-decoded picture, where dmabuf-wayland shows none.
 #         --deinterlace=auto: only frames still flagged interlaced
 #         (software 576i); hardware frames arrive already bobbed.
-#   Pi 5: the HEVC decoder's frames go straight to the GPU (hwdec=drm, no
-#         copy), drawn by gpu-next through OpenGL on native Wayland. With
-#         drm-copy every decoded frame was copied by the processor: fine
-#         at 1080, never smooth at 4K. gpu-next, not dmabuf-wayland: the
-#         Pi 5 decodes only HEVC in hardware, and dmabuf-wayland cannot
-#         show the software-decoded H.264 that most streams are. OpenGL,
-#         not Vulkan: native Wayland froze with Vulkan's swapchain on the
-#         Pi. Tested 24 Oct 2026 on a Pi 5 into an LG 4K at 2160p25:
-#         4K HEVC from Lynx-Tx as smooth as a Zgemma, and every H.264
-#         stream tried played.
-#   Pi 4: unchanged until it has been tried there.
-if IS_ROCK:
-    MPV_VIDEO_FLAGS = "--vo=gpu-next --hwdec=rkmpp --deinterlace=auto"
-elif IS_PI5:
-    MPV_VIDEO_FLAGS = "--vo=gpu-next --gpu-api=opengl --hwdec=drm"
-else:
-    MPV_VIDEO_FLAGS = "--vo=gpu --hwdec=drm-copy"
+MPV_VIDEO_FLAGS = ("--vo=gpu-next --hwdec=rkmpp --deinterlace=auto" if IS_ROCK
+                   else "--vo=gpu --hwdec=drm-copy")
 # For trying other video paths without editing code (Pi 5 4K, 24 Oct 2026):
 #   systemctl --user set-environment LYNX_MPV_VIDEO_FLAGS="--vo=dmabuf-wayland --hwdec=drm" LYNX_KEEP_WAYLAND=1
 #   systemctl --user restart lynx
@@ -93,13 +76,12 @@ else:
 MPV_VIDEO_FLAGS = os.environ.get("LYNX_MPV_VIDEO_FLAGS") or MPV_VIDEO_FLAGS
 
 # Whether mpv keeps WAYLAND_DISPLAY.
-#   Pi 4: removed, forcing mpv onto Xwayland - native Wayland froze on
+#   Pi:   removed, forcing mpv onto Xwayland - native Wayland froze on
 #         the Pi (Vulkan swapchain failures; see restart_mpv()).
-#   Pi 5: kept, for the no-copy path above (OpenGL, not Vulkan).
 #   ROCK: kept. Lynx's mpv there is built Wayland-only, and dmabuf-
 #         wayland is Wayland by definition: without the variable it has
 #         nowhere to draw ("Error opening/initializing the VO window").
-KEEP_WAYLAND_DISPLAY = IS_ROCK or IS_PI5 or os.environ.get("LYNX_KEEP_WAYLAND") == "1"
+KEEP_WAYLAND_DISPLAY = IS_ROCK or os.environ.get("LYNX_KEEP_WAYLAND") == "1"
 
 # Default display height cap, when the config does not set one.
 #   Pi:   1080. At 4K a Pi 5 glitches, drops audio and loses the overlay.
@@ -109,12 +91,9 @@ DEFAULT_MAX_HEIGHT = 2160 if IS_ROCK else 1080
 # Whether lynx_start.sh may ask for the configured refresh rate as a
 # custom mode when the monitor does not list it. Many 4K PC monitors
 # (an LG 27UK850, for one) accept 3840x2160 at 50 Hz but list only 60,
-# 30 and 25; at 60 Hz a 25 fps picture judders. ROCK and Pi 5 (24 Oct
-# 2026: an LG 4K left at 60 Hz judders a 25 fps picture on the Pi 5 too,
-# and a screen plugged in after start-up kept its own 60 Hz). This also
-# puts the configured rate back when a screen is plugged in later. Pi 4:
-# exactly as it was.
-CUSTOM_REFRESH_MODES = IS_ROCK or IS_PI5
+# 30 and 25; at 60 Hz a 25 fps picture judders. ROCK only for now: the
+# Pi path stays exactly as it was.
+CUSTOM_REFRESH_MODES = IS_ROCK
 
 # HDMI outputs Lynx may drive as separate receivers (Lynx+). The Pi 5
 # has two sockets but one HEVC decoder, so its second output is shown
