@@ -337,7 +337,20 @@ class HDHomeRunTuner:
 
         self.set(self._path("channel"), f"{modulation}:{frequency_hz}")
 
-        status = self._wait_for_lock(lock_timeout, poll_interval)
+        try:
+            status = self._wait_for_lock(lock_timeout, poll_interval)
+        except HDHomeRunLockTimeout:
+            # Nothing on air yet - a repeater that only transmits on
+            # activity. Set the programme and the target anyway, so
+            # the box is armed for when the signal arrives: it then
+            # locks and streams by itself. Without this it locked
+            # later but sent nothing (patch_hdhr_arm_on_timeout.py).
+            if program is not None:
+                self.set(self._path("program"), str(program))
+            if target:
+                self.set(self._path("target"), target)
+                self._target = target
+            raise
 
         if program is not None:
             self.set(self._path("program"), str(program))
