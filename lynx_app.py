@@ -11818,6 +11818,34 @@ def _tune_dvbt_impl(req: DvbtTuneRequest):
             program=req.program,
         )
     except lynx_hdhomerun.HDHomeRunLockTimeout as e:
+        # The box is armed for when the signal arrives (see
+        # patch_hdhr_arm_on_timeout.py): remember what it is waiting
+        # for, so the name and callsign are fetched on lock, and so a
+        # restart resumes the same repeater rather than the last one
+        # that happened to be on air.
+        with hdhr_lock:
+            _w = hdhr_states.get(_dev)
+            if _w is not None:
+                _w["service_name"] = ""
+                _w["callsign"] = ""
+                _w["pending_program"] = (str(req.program)
+                                         if req.program is not None else None)
+                _w["pending_freq_hz"] = req.freq
+                _w["last_program"] = _w["pending_program"]
+                _w["logged_callsign"] = ""
+                _w["pending_attempts"] = 10
+        try:
+            save_last_state({
+                "mode": "dvbt",
+                "freq": req.freq,
+                "modulation": req.modulation,
+                "program": req.program,
+                "device_id": req.device_id,
+            })
+        except Exception as _e:
+            print(f"[hdhr] could not save the armed tune: {_e}")
+        print(f"[hdhr] no signal on {req.freq / 1e6:.3f} MHz yet - "
+              f"armed, will play when it arrives", flush=True)
         # Lower the cover before giving up, or a failed tune leaves the
         # screen covered until something else happens to raise and
         # lower it - which on a receiver doing nothing else is never.
