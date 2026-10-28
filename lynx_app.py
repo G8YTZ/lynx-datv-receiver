@@ -525,7 +525,7 @@ def detect_current_version():
     pushed. Called once at startup; the result doesn't change while
     this process keeps running (only a restart after a real update
     would pick up a new one)."""
-    ok, out = git_cmd("describe", "--tags", "--always")
+    ok, out = git_cmd("describe", "--tags", "--match", "v*", "--always")
     return out if ok and out else "unknown"
 
 def get_default_branch():
