@@ -941,7 +941,11 @@ def start_network_output(source_url: str):
         # One layout for every source - see NETOUT_LAYOUT. The first
         # video and audio are the same choice mpv makes playing it here.
         cmd = (["ffmpeg", "-nostdin", "-loglevel", "warning",
-                "-fflags", "+genpts+discardcorrupt",
+                # Damaged packets passed through, not discarded: the
+                # far end conceals them, and a damaged first packet of
+                # an over must not take the H.264 headers with it
+                # (patch_netout_relock.py).
+                "-fflags", "+genpts",
                 "-analyzeduration", "1000000",
                 "-i", source,
                 "-map", "0:v:0", "-map", "0:a:0?",
@@ -4806,6 +4810,14 @@ def hdhomerun_monitor():
                                   "restarting mpv")
                             restart_mpv(f"udp://@:{HDHR_VIDEO_PORT}",
                                         is_rf=False)
+                            # Network output: the forwarder restarted with the over
+                            # too, so it sees the H.264 headers at its start - see
+                            # patch_netout_relock.py. restart_mpv() starts no
+                            # player while network output is on.
+                            if network_output_enabled:
+                                print("[netout] re-lock - restarting the forwarder",
+                                      flush=True)
+                                start_network_output(f"udp://@:{HDHR_VIDEO_PORT}")
                             end_transition_cover()
                         except Exception as e:
                             print(f"[hdhr] restart failed: "
