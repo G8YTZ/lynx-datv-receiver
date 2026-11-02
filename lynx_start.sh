@@ -363,12 +363,22 @@ if [ -w /var/log/lynx ] 2>/dev/null; then
 fi
 python3 ${LYNX_DIR}/lynx_app.py > >(tee -a "${APP_LOG_TARGETS[@]}") 2>&1 &
 APP_PID=$!
-for i in $(seq 1 10); do
+# Up to 90 s, not 10 (2 Nov 2026). The web app fetches the BATC stream
+# list over the internet before it answers, and on a slow line that took
+# longer than 10 s: this script gave up with "failed!" moments before the
+# app came up, so there was no picture, and under systemd the restart
+# took the half-started app down with it, again and again - a black
+# screen and no web page (G8KOE). The watchdog is fed while it waits,
+# and it stops waiting at once if the app has actually died.
+for i in $(seq 1 90); do
     sleep 1
-    curl -sf http://localhost:8080/api/status > /dev/null 2>&1 && break
+    wd
+    curl -sf --max-time 5 http://localhost:8080/api/status > /dev/null 2>&1 && break
+    kill -0 "$APP_PID" 2>/dev/null || break
+    [ "$i" = "10" ] && echo -ne "${AMBER}still starting (slow internet?)... ${NC}"
 done
-if ! curl -sf http://localhost:8080/api/status > /dev/null 2>&1; then
-    echo -e "${RED}failed!${NC}"; exit 1
+if ! curl -sf --max-time 5 http://localhost:8080/api/status > /dev/null 2>&1; then
+    echo -e "${RED}failed!${NC} See /tmp/lynx_app.log"; exit 1
 fi
 MY_IP=$(hostname -I | awk '{print $1}')
 echo -e "${GREEN}OK — http://${MY_IP}:8080${NC}"
