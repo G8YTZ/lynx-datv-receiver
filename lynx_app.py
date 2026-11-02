@@ -1220,27 +1220,58 @@ def restart_mpv(target_url: str, is_rf: bool = True):
     mpv_cmd({"command": ["set_property", "volume", current_volume]})
     mpv_cmd({"command": ["set_property", "mute", False]})
 
-def _recent_hevc_decoder_error(since_ts: float) -> bool:
-    """Checks dmesg for the specific hardware HEVC decoder error
-    ("rpi-hevc-dec ... Missing inuse DPB ent") directly tied to a real,
-    confirmed freeze earlier this session - one a plain mpv restart
-    couldn't recover from, only a full Pi reboot could. Scoped to
-    entries from since_ts onwards specifically, not the whole kernel
-    ring buffer (which persists across the entire uptime) - an old,
-    already-resolved occurrence from hours or days ago must not keep
-    incorrectly flagging every future render attempt as failed forever.
-    Best-effort only: dmesg can require elevated permissions on some
-    systems, or simply be unavailable - any failure here is treated as
-    "no error found" rather than blocking rendering confirmation on
-    something that isn't itself the actual video pipeline."""
+def _kernel_uptime() -> float:
+    """Seconds since boot, on the same clock as dmesg's [   159.496] stamps."""
     try:
-        since_str = datetime.fromtimestamp(since_ts).strftime("%Y-%m-%d %H:%M:%S")
-        out = subprocess.run(["dmesg", "-T", "--since", since_str],
-                              capture_output=True, text=True, timeout=2)
-        return "rpi-hevc-dec" in out.stdout and "DPB" in out.stdout
+        with open("/proc/uptime") as f:
+            return float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+_DMESG_STAMP = re.compile(r"^\[\s*(\d+\.\d+)\]")
+
+
+def _recent_hevc_decoder_error(since_uptime: float) -> bool:
+    """Checks dmesg for the hardware HEVC decoder error ("rpi-hevc-dec ...
+    Missing inuse DPB ent") logged AFTER since_uptime, a reading of
+    _kernel_uptime(). Compared on the kernel's own seconds-since-boot
+    stamps (2 Nov 2026): the old "dmesg -T --since <clock time>" worked to
+    the whole second, so the one line the driver logs as mpv joins a
+    stream between keyframes counted again at the "look again" a moment
+    later, every start was failed, and Lynx restarted mpv about once a
+    second for ever (no picture, then a brief one, then the Pathfinder
+    screen). Best-effort only: any failure reading dmesg counts as "no
+    error found"."""
+    try:
+        out = subprocess.run(["dmesg"], capture_output=True, text=True, timeout=2).stdout
     except Exception as e:
         print(f"[mpv_render] dmesg check failed (non-fatal, treating as no error found): {e}")
         return False
+    for line in out.splitlines():
+        if "rpi-hevc-dec" in line and "DPB" in line:
+            m = _DMESG_STAMP.match(line)
+            if m and float(m.group(1)) > since_uptime:
+                return True
+    return False
+
+
+_MPV_AV_TIME = re.compile(r"AV: (\d+):(\d\d):(\d\d)")
+
+
+def _mpv_play_position() -> Optional[int]:
+    """mpv's playing position in seconds, from the last "AV: h:mm:ss" in
+    its log; None if there is none yet."""
+    try:
+        with open('/tmp/mpv.log') as f:
+            found = _MPV_AV_TIME.findall(f.read()[-4000:])
+    except OSError:
+        return None
+    if not found:
+        return None
+    h, m, sec = found[-1]
+    return int(h) * 3600 + int(m) * 60 + int(sec)
+
 
 def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
     """Polls mpv's own log (freshly truncated by restart_mpv() just
@@ -1289,6 +1320,7 @@ def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
     answered directly from the logs, rather than requiring a fresh
     manual measurement with no earlier data point to compare against."""
     start = time.time()
+    start_up = _kernel_uptime()
     deadline = start + timeout
     markers = ("VO:", "AV:")
     while time.time() < deadline:
@@ -1304,14 +1336,20 @@ def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
                 # player restarted about once a second and motion was never
                 # smooth at 4K (23 Oct 2026). So look again 2 s later: only
                 # an error that is still being logged means wedged.
-                if _recent_hevc_decoder_error(start):
-                    later = time.time()
-                    time.sleep(2.0)
-                    if not _recent_hevc_decoder_error(later):
+                # Wedged means the PICTURE stops, so that is what decides
+                # (2 Nov 2026): with a decoder error logged, watch mpv's
+                # playing position for 3 s. Moving on means it is playing,
+                # whatever the driver said as it joined.
+                if _recent_hevc_decoder_error(start_up):
+                    before = _mpv_play_position()
+                    time.sleep(3.0)
+                    after = _mpv_play_position()
+                    if after is not None and (before is None or after > before):
                         print(f"[mpv_render] confirmed rendering after {elapsed:.1f}s "
-                              f"(HEVC decoder settled after joining between keyframes)")
+                              f"(HEVC decoder grumbled as it joined between keyframes, "
+                              f"but the picture is moving: {before} -> {after} s)")
                         return True
-                if _recent_hevc_decoder_error(start):
+                if _recent_hevc_decoder_error(start_up):
                     print(f"[mpv_render] mpv log shows rendering markers after {elapsed:.1f}s, "
                           f"but a hardware HEVC decoder error was also just logged - treating "
                           f"this as NOT genuinely rendering despite mpv's own pipeline appearing "
