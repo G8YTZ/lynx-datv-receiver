@@ -2,7 +2,8 @@
 """
 lynx_hdhomerun.py — HDHomeRun network tuner source for the Lynx DATV Receiver.
 
-Adds SiliconDust HDHomeRun tuners (DVB-T/T2/C models) as a Lynx source.
+Adds SiliconDust HDHomeRun tuners (DVB-T/T2/C models, and the ATSC 3.0
+models) as a Lynx source.
 
 Why this fits Lynx's architecture
 ---------------------------------
@@ -77,6 +78,12 @@ DVBT_MODULATIONS = {
     "t8dvbt", "t7dvbt", "t6dvbt", "t5dvbt",
     "t4dvbt", "t3dvbt", "t2dvbt", "t1dvbt",
 }
+# ATSC models (the US HDHomeRun Flex 4K, hdhomerun_dvr_atsc3). "atsc3" is
+# ATSC 3.0 - Lynx-Tx's ATSC 3.0 mode, received at any frequency, not only
+# the US channel plan (proven 16 Oct 2026 at 437 and 557 MHz). The box
+# hands back the transport stream carried in ALP, so it plays like any
+# other source. 8vsb is ATSC 1.0; qam256/qam64 are US cable.
+ATSC_MODULATIONS = {"atsc3", "8vsb", "qam256", "qam64"}
 # DVB-C QAM modes are wildcards in /sys/features (e.g. a8qam256-*), so they
 # are matched by pattern rather than listed exhaustively.
 QAM_PATTERN = re.compile(r"^a[678]qam(64|128|256)(-\w+)?$")
@@ -275,10 +282,21 @@ class HDHomeRunTuner:
             if not number.strip().isdigit():
                 continue
             parts = rest.strip().split(None, 1)
+            name = parts[1] if len(parts) > 1 else ""
+            # The device appends its own notes in brackets: "(no data)",
+            # "(encrypted)", "(control)". They are not part of the name,
+            # and "no data" means there is nothing to watch: an ATSC 3.0
+            # SLT can announce a service that is not actually present.
+            flags = ""
+            m = re.search(r"\s*\(([^()]*)\)\s*$", name)
+            if m:
+                flags = m.group(1).strip()
+                name = name[:m.start()].strip()
             programs.append({
                 "program": number.strip(),
                 "virtual_channel": parts[0] if parts else "",
-                "name": parts[1] if len(parts) > 1 else "",
+                "name": name,
+                "flags": flags,
             })
         return programs
 
@@ -296,6 +314,7 @@ class HDHomeRunTuner:
         known = (
             modulation in DVBT2_MODULATIONS
             or modulation in DVBT_MODULATIONS
+            or modulation in ATSC_MODULATIONS
             or bool(QAM_PATTERN.match(modulation))
         )
         if modulation.startswith("auto"):

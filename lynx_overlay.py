@@ -348,6 +348,7 @@ state = {
     # by lynx_app.py so there is only ever one timer. Defaults to 2 if
     # the API doesn't provide it (an older lynx_app.py).
     "pathfinder_delay_secs": 2.0,
+    "pathfinder_placeholder": True,
     # The other half of the configured Pathfinder window - see
     # _cover_max_secs(). Defaults to 30 if the API doesn't provide it
     # (an older lynx_app.py).
@@ -850,6 +851,7 @@ def poll_status():
             state["pathfinder"] = lynx.get('pathfinder')
             state["pathfinder_delay_secs"] = lynx.get('pathfinder_delay_secs', 2.0)
             state["pathfinder_duration_secs"] = lynx.get('pathfinder_duration_secs', 30.0)
+            state["pathfinder_placeholder"] = lynx.get('pathfinder_placeholder', True)
             state["squeak"] = lynx.get('squeak')
             # tri_watch's "someone else wants in" notification - the
             # backend already handles its own expiry (get_notification()
@@ -1193,7 +1195,10 @@ class LynxOverlay(Gtk.Window):
                 # result), and the caption remains the last resort for
                 # when no placeholder image has been supplied.
                 showing_map = self.draw_pathfinder(cr, width, height)
-                if not showing_map and \
+                # The placeholder switch off: no card and no caption, only
+                # the plain black cover (Justin, 2 Nov 2026).
+                placeholder = state.get("pathfinder_placeholder", True)
+                if not showing_map and placeholder and \
                         transition_age >= state["pathfinder_delay_secs"]:
                     showing_map = self.draw_switching_graphic(cr, width, height)
                 if not showing_map:
@@ -1211,7 +1216,7 @@ class LynxOverlay(Gtk.Window):
                     # source change, not a fault, and the wording should not
                     # suggest otherwise. Sized so it reads as a caption rather
                     # than an alarm.
-                    if transition_age >= state["pathfinder_delay_secs"]:
+                    if placeholder and transition_age >= state["pathfinder_delay_secs"]:
                         self.draw_text(cr, width / 2, height / 2, "SWITCHING",
                                        size=32, align="center")
                 # Suppress the corner OSD zones for the WHOLE cover, not
@@ -1712,11 +1717,18 @@ class LynxOverlay(Gtk.Window):
             if mode_name:
                 # t8dvbt2 -> "DVB-T2" and "8 MHz": what an operator
                 # would say out loud, not what the API calls it.
-                try:
-                    bw = f"{mode_name[1]} MHz"
-                    std = "DVB-T2" if mode_name.endswith("dvbt2") else "DVB-T"
-                except Exception:
-                    std = mode_name
+                # atsc3 / 8vsb are ATSC, 6 MHz by definition: read as
+                # t-style names they came out "t MHz, DVB-T".
+                if mode_name == "atsc3":
+                    std, bw = "ATSC 3.0", "6 MHz"
+                elif mode_name == "8vsb":
+                    std, bw = "ATSC 1.0", "6 MHz"
+                else:
+                    try:
+                        bw = f"{mode_name[1]} MHz"
+                        std = "DVB-T2" if mode_name.endswith("dvbt2") else "DVB-T"
+                    except Exception:
+                        std = mode_name
 
             # Line 1 is the RF: where it is, how wide, which standard.
             # Line 2 is the payload: how much of it, in what codec.
