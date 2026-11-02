@@ -5682,6 +5682,10 @@ class PathfinderConfigUpdate(BaseModel):
     enabled: bool = True
     delay_secs: float = 2.0
     duration_secs: float = 30.0
+    # The test card shown when Pathfinder has no map (a stream, or a
+    # station with no QRZ locator). Off: plain black, no card, no caption
+    # (Justin, 2 Nov 2026). Pathfinder's own maps are not affected.
+    placeholder_card: bool = True
 
 
 class RemoteSourceConfigUpdate(BaseModel):
@@ -8109,6 +8113,9 @@ def get_status():
             # nothing left for it to carry once the card it was covering
             # for would itself have finished.
             "pathfinder_duration_secs": pathfinder_tracker.duration_secs,
+            # Whether the overlay may draw the placeholder card (or the
+            # SWITCHING caption) when Pathfinder has no map to show.
+            "pathfinder_placeholder": bool((config.get('pathfinder') or {}).get('placeholder_card', True)),
             "squeak": _squeak_status(),
             # Cached by video_badge_monitor(); never waits on mpv or wlr-randr.
             "video_in": video_in_info,
@@ -9230,6 +9237,12 @@ def config_page():
                         <span id="pf-status" class="save-status ms-2"></span>
                         <hr class="my-3">
                         <div class="fw-semibold small mb-1">Switch placeholder card</div>
+                        <div class="form-check form-switch mb-2">
+                            <input class="form-check-input" type="checkbox" id="pf-placeholder">
+                            <label class="form-check-label small" for="pf-placeholder">Show a card when there is no
+                                Pathfinder map (off: plain black, no card and no caption; the maps themselves
+                                are unaffected). Saved with the Pathfinder settings above.</label>
+                        </div>
                         <p class="text-muted small mb-2">
                             Shown full-screen during a Tri-Watch source change when there is
                             no Pathfinder map to show &mdash; a stream, or a station with no
@@ -10047,6 +10060,7 @@ async function loadCurrentConfig() {
         document.getElementById('pf-enabled').checked = pf.enabled !== false;
         document.getElementById('pf-delay').value = pf.delay_secs ?? 2;
         document.getElementById('pf-duration').value = pf.duration_secs ?? 30;
+        document.getElementById('pf-placeholder').checked = pf.placeholder_card !== false;
         updatePathfinderWarning();
         // Which placeholder card is in place isn't part of the config
         // (it's a file, not a setting), so it's fetched separately.
@@ -10592,7 +10606,8 @@ async function savePathfinder() {
         const body = { pathfinder: {
             enabled: document.getElementById('pf-enabled').checked,
             delay_secs: parseFloat(document.getElementById('pf-delay').value),
-            duration_secs: parseFloat(document.getElementById('pf-duration').value)
+            duration_secs: parseFloat(document.getElementById('pf-duration').value),
+            placeholder_card: document.getElementById('pf-placeholder').checked
         }};
         const r = await fetch('/api/config', {
             method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
