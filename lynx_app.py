@@ -9238,10 +9238,12 @@ def config_page():
                         <hr class="my-3">
                         <div class="fw-semibold small mb-1">Switch placeholder card</div>
                         <div class="form-check form-switch mb-2">
-                            <input class="form-check-input" type="checkbox" id="pf-placeholder">
+                            <input class="form-check-input" type="checkbox" id="pf-placeholder"
+                                   onchange="savePathfinder('pf-placeholder-status')">
                             <label class="form-check-label small" for="pf-placeholder">Show a card when there is no
                                 Pathfinder map (off: plain black, no card and no caption; the maps themselves
-                                are unaffected). Saved with the Pathfinder settings above.</label>
+                                are unaffected). Saved as soon as you change it; takes effect after a restart.</label>
+                            <span id="pf-placeholder-status" class="save-status ms-2"></span>
                         </div>
                         <p class="text-muted small mb-2">
                             Shown full-screen during a Tri-Watch source change when there is
@@ -10598,8 +10600,10 @@ async function saveRemoteSource() {
     }
 }
 
-async function savePathfinder() {
-    const statusEl = document.getElementById('pf-status');
+async function savePathfinder(statusId) {
+    // The placeholder switch saves itself, with its own status beside it
+    // (it sits below the Save button, and flicking it alone saved nothing).
+    const statusEl = document.getElementById(statusId || 'pf-status');
     statusEl.textContent = 'Saving...';
     statusEl.className = 'save-status text-muted';
     try {
