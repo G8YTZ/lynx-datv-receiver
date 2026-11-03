@@ -242,8 +242,8 @@ if command -v wlr-randr > /dev/null 2>&1; then
                     split($1, d, "x")
                     if (d[2] != h) next
                     hz = $3 + 0
-                    if (int(hz + 0.5) == r) exact = $1 "@" hz
-                    if (hz > best) { best = hz; bestmode = $1 "@" hz }
+                    if (int(hz + 0.5) == r) exact = $1 "@" hz "Hz"
+                    if (hz > best) { best = hz; bestmode = $1 "@" hz "Hz" }
                 }
                 END { print (exact != "" ? exact : bestmode) }')
         if [ -n "$_want" ] && wlr-randr --output "$_out" --mode "$_want" > /dev/null 2>&1; then
@@ -267,7 +267,7 @@ if command -v wlr-randr > /dev/null 2>&1; then
            && [ "$(printf '%.0f' "$_hz" 2>/dev/null)" != "$LYNX_REFRESH_HZ" ]; then
             echo -ne "Display is ${_res} at ${_hz} Hz - asking for ${LYNX_REFRESH_HZ} Hz... "
             _listed=$(wlr-randr 2>/dev/null | awk -v m="$_res" -v r="$LYNX_REFRESH_HZ" \
-                '$1 == m && $2 == "px," && int($3 + 0.5) == r {print $1 "@" $3; exit}')
+                '$1 == m && $2 == "px," && int($3 + 0.5) == r {print $1 "@" $3 "Hz"; exit}')
             if [ -n "$_listed" ] && wlr-randr --output "$_out" --mode "$_listed" > /dev/null 2>&1; then
                 echo -e "${GREEN}${_listed}${NC}"
                 sleep 2
