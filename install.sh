@@ -408,6 +408,33 @@ else
   echo "GNSS serial port permissions configured."
 fi
 
+# --- Pi 5 fan: on at 40 C, not 50 C -----------------------------
+# The Pi 5's Active Cooler is run by the kernel from four steps set in
+# config.txt. The first, by default, starts the fan at 50 C and stops it
+# 5 C lower, so a receiver idled with the fan off in the mid 40s (3 Nov
+# 2026: off at 47 C). A receiver decodes around the clock, often in a
+# box, so start at 40 C instead, stopping at 35 C. Only the first step
+# moves; the 60, 67.5 and 75 C steps and the CPU's own throttling are the
+# kernel's defaults, untouched. The ROCK 5T holds a steady 40 C the same
+# way (lynx_fan.py).
+#
+# Above the --deps-only exit, so Update Now brings it to receivers
+# already in service. Written once, under its own [all] so it applies
+# whatever conditional section the file happens to end in. Takes effect
+# at the next boot.
+if [ -f /boot/firmware/config.txt ] \
+   && tr -d '\0' < /proc/device-tree/model 2>/dev/null | grep -q "Raspberry Pi 5"; then
+  if grep -q "^dtparam=fan_temp0=" /boot/firmware/config.txt; then
+    echo "Pi 5 fan step already set in config.txt - leaving it untouched."
+  else
+    echo "--- Pi 5 fan: on at 40 C (takes effect at next boot) ---"
+    sudo cp /boot/firmware/config.txt /boot/firmware/config.txt.lynx-fan.bak
+    printf '\n[all]\n# Lynx: Pi 5 fan on at 40 C, off at 35 C (default 50 C)\ndtparam=fan_temp0=40000\ndtparam=fan_temp0_hyst=5000\n' \
+      | sudo tee -a /boot/firmware/config.txt > /dev/null
+    echo "Added the fan settings to config.txt."
+  fi
+fi
+
 # --- Desktop shell ---------------------------------------------
 # labwc is required - the overlay is a GTK4 layer-shell client and
 # needs a wlroots compositor - but the Pi desktop shell running on top
