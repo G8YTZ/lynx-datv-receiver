@@ -1336,20 +1336,24 @@ def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
                 # player restarted about once a second and motion was never
                 # smooth at 4K (23 Oct 2026). So look again 2 s later: only
                 # an error that is still being logged means wedged.
-                # Wedged means the PICTURE stops, so that is what decides
-                # (2 Nov 2026): with a decoder error logged, watch mpv's
-                # playing position for 3 s. Moving on means it is playing,
-                # whatever the driver said as it joined.
+                # The kernel's own seconds-since-boot stamps decide what
+                # is new (2 Nov 2026), so the one line logged as mpv joins
+                # is not counted twice.
+                #
+                # NOT "is mpv's clock still moving" (2 Nov to 3 Nov 2026): a
+                # wedged decoder putting out purple frames still has a
+                # moving clock, so that test passed a purple picture and
+                # left it on screen. Five beta testers saw exactly that.
+                still_erroring = False
                 if _recent_hevc_decoder_error(start_up):
-                    before = _mpv_play_position()
-                    time.sleep(3.0)
-                    after = _mpv_play_position()
-                    if after is not None and (before is None or after > before):
+                    look_from = _kernel_uptime()
+                    time.sleep(2.0)
+                    if not _recent_hevc_decoder_error(look_from):
                         print(f"[mpv_render] confirmed rendering after {elapsed:.1f}s "
-                              f"(HEVC decoder grumbled as it joined between keyframes, "
-                              f"but the picture is moving: {before} -> {after} s)")
+                              f"(HEVC decoder settled after joining between keyframes)")
                         return True
-                if _recent_hevc_decoder_error(start_up):
+                    still_erroring = True
+                if still_erroring:
                     print(f"[mpv_render] mpv log shows rendering markers after {elapsed:.1f}s, "
                           f"but a hardware HEVC decoder error was also just logged - treating "
                           f"this as NOT genuinely rendering despite mpv's own pipeline appearing "

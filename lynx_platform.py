@@ -80,12 +80,24 @@ BOARD_NAME = "Radxa ROCK 5T" if IS_ROCK else "Raspberry Pi"
 #         4K HEVC from Lynx-Tx as smooth as a Zgemma, and every H.264
 #         stream tried played.
 #   Pi 4: unchanged until it has been tried there.
+#
+#   3 Nov 2026: Pi 5 back on the Pi 4's path. Five beta testers reported
+#   trouble within a day of zero-copy reaching beta (a picture for a few
+#   seconds, then purple; streams that never appeared), all cured by
+#   going back to stable. Zero-copy stays one setting away for testing
+#   (see below) until it has been proved on Justin's own Pi 5.
+PI5_ZERO_COPY = os.environ.get("LYNX_PI5_ZERO_COPY") == "1"
 if IS_ROCK:
     MPV_VIDEO_FLAGS = "--vo=gpu-next --hwdec=rkmpp --deinterlace=auto"
-elif IS_PI5:
+elif IS_PI5 and PI5_ZERO_COPY:
     MPV_VIDEO_FLAGS = "--vo=gpu-next --gpu-api=opengl --hwdec=drm"
 else:
     MPV_VIDEO_FLAGS = "--vo=gpu --hwdec=drm-copy"
+# Pi 5 zero-copy, for testing only (3 Nov 2026):
+#   systemctl --user set-environment LYNX_PI5_ZERO_COPY=1
+#   systemctl --user restart lynx
+# and back:  systemctl --user unset-environment LYNX_PI5_ZERO_COPY
+#
 # For trying other video paths without editing code (Pi 5 4K, 24 Oct 2026):
 #   systemctl --user set-environment LYNX_MPV_VIDEO_FLAGS="--vo=dmabuf-wayland --hwdec=drm" LYNX_KEEP_WAYLAND=1
 #   systemctl --user restart lynx
@@ -95,11 +107,13 @@ MPV_VIDEO_FLAGS = os.environ.get("LYNX_MPV_VIDEO_FLAGS") or MPV_VIDEO_FLAGS
 # Whether mpv keeps WAYLAND_DISPLAY.
 #   Pi 4: removed, forcing mpv onto Xwayland - native Wayland froze on
 #         the Pi (Vulkan swapchain failures; see restart_mpv()).
-#   Pi 5: kept, for the no-copy path above (OpenGL, not Vulkan).
+#   Pi 5: removed, as on the Pi 4, unless zero-copy is switched on for
+#         testing (above), which needs native Wayland (OpenGL, not Vulkan).
 #   ROCK: kept. Lynx's mpv there is built Wayland-only, and dmabuf-
 #         wayland is Wayland by definition: without the variable it has
 #         nowhere to draw ("Error opening/initializing the VO window").
-KEEP_WAYLAND_DISPLAY = IS_ROCK or IS_PI5 or os.environ.get("LYNX_KEEP_WAYLAND") == "1"
+KEEP_WAYLAND_DISPLAY = (IS_ROCK or (IS_PI5 and PI5_ZERO_COPY)
+                        or os.environ.get("LYNX_KEEP_WAYLAND") == "1")
 
 # Default display height cap, when the config does not set one.
 #   Pi:   1080. At 4K a Pi 5 glitches, drops audio and loses the overlay.
@@ -127,6 +141,7 @@ def as_dict() -> dict:
         "board": BOARD,
         "board_name": BOARD_NAME,
         "model": MODEL,
+        "pi5_zero_copy": IS_PI5 and PI5_ZERO_COPY,
         "mpv_video_flags": MPV_VIDEO_FLAGS,
         "keep_wayland_display": KEEP_WAYLAND_DISPLAY,
         "default_max_height": DEFAULT_MAX_HEIGHT,
