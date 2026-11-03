@@ -2185,14 +2185,21 @@ def _mpv_has_picture_problem() -> bool:
     return any(t.get("type") == "video" for t in (tl.get("data") or []))
 
 
-def _reapply_refresh_rate():
-    """ROCK: a monitor coming back is driven at its own preferred mode
-    (60 Hz on an LG 27UK850), and lynx_start.sh only asks for the
-    configured rate at start-up. Ask again: a listed mode at the current
-    size first, then a custom mode - the same rule as lynx_start.sh.
-    Pi: nothing, exactly as before."""
-    if not lynx_platform.CUSTOM_REFRESH_MODES:
-        return
+def _reapply_refresh_rate(reason: str = "came back") -> Optional[bool]:
+    """Puts the screen at the configured refresh rate, at its current size.
+
+    Called when Lynx starts, when the setting is saved, and when a
+    screen comes back (a monitor coming back is driven at its own
+    preferred mode: 60 Hz on an LG 27UK850, 60 Hz on an ATEM). A listed
+    mode at the current size first, then, on the ROCK and Pi 5 only, a
+    custom mode - the same rule as lynx_start.sh.
+
+    Every board for a listed mode (3 Nov 2026): the Refresh rate setting
+    is offered on every board, and a mode the display itself lists is one
+    it has said it accepts. Live, not at the next restart: the size does
+    not change, only the rate, which this already did on every screen
+    return. Returns True if changed, False if refused, None if nothing
+    needed doing (or no screen to ask)."""
     try:
         want = int((config.get('display') or {}).get('refresh_hz', 50) or 50)
     except (TypeError, ValueError):
@@ -2217,15 +2224,59 @@ def _reapply_refresh_rate():
             modes.append((m.group(1), float(m.group(2)), "current" in m.group(3)))
     current = next((m for m in modes if m[2]), None)
     if not name or not current or round(current[1]) == want:
-        return
+        return None
     res = current[0]
     listed = next((m for m in modes if m[0] == res and round(m[1]) == want), None)
+    if not listed and not lynx_platform.CUSTOM_REFRESH_MODES:
+        print(f"[screen] {name} at {res} {current[1]:g} Hz ({reason}) - {want} Hz is not "
+              f"in its mode list, leaving it", flush=True)
+        return False
     args = (["--mode", f"{res}@{listed[1]:.6f}Hz"] if listed
             else ["--custom-mode", f"{res}@{want}Hz"])
     r = subprocess.run(["wlr-randr", "--output", name, *args],
                        capture_output=True, text=True, timeout=5, env=env)
-    print(f"[screen] {name} came back at {res} {current[1]:g} Hz - asked for {want} Hz: "
+    print(f"[screen] {name} at {res} {current[1]:g} Hz ({reason}) - asked for {want} Hz: "
           f"{'ok' if r.returncode == 0 else 'not accepted'}", flush=True)
+    return r.returncode == 0
+
+
+def _check_mpv_after_mode_change(why: str):
+    """After the screen mode changes under a playing mpv: if it has lost
+    its picture, restart it on the same source, as a screen return does."""
+    src, is_rf = network_output_source, network_output_source_is_rf
+    if network_output_enabled or not src:
+        return
+    time.sleep(2)
+    if not _mpv_has_picture_problem():
+        return
+    if tune_lock.acquire(timeout=2):
+        try:
+            print(f"[screen] mpv lost its picture after {why} - restarting it on {src}",
+                  flush=True)
+            record_diagnostic_event("refresh_change_restart",
+                                    f"mpv lost its picture after {why} - restarted it")
+            start_transition_cover()
+            time.sleep(0.3)
+            restart_mpv(src, is_rf=is_rf)
+            wait_for_mpv_rendering()
+            end_transition_cover()
+        finally:
+            tune_lock.release()
+
+
+def refresh_rate_at_start():
+    """Once, as Lynx starts: put the screen at the saved rate. lynx_start.sh
+    asks too, before anything draws, but it can run before the display has
+    finished its HDMI handshake, and what it says goes nowhere a receiver
+    keeps (3 Nov 2026: a Pi 5 into an ATEM sat at 1080p60, its preferred
+    mode, with 50 saved and 50 listed, and nothing to say why). Logged here.
+    Waits up to a minute for a screen; none, and the screen return does it."""
+    deadline = time.time() + 60
+    while time.time() < deadline and not screen_connected():
+        time.sleep(2)
+    time.sleep(5)   # let the compositor finish setting the output up
+    if _reapply_refresh_rate("Lynx starting"):
+        _check_mpv_after_mode_change("the refresh change at start-up")
 
 
 # _mpv_prop() comes from patch_video_badges.py.
@@ -2276,7 +2327,7 @@ def screen_return_monitor():
             if now and not was:
                 print("[screen] screen back - checking mpv has its picture", flush=True)
                 time.sleep(4)   # let the compositor set the output up first
-                _reapply_refresh_rate()
+                _reapply_refresh_rate("came back")
                 time.sleep(2)
                 src = network_output_source
                 is_rf = network_output_source_is_rf
@@ -5640,8 +5691,8 @@ class DisplayConfigUpdate(BaseModel):
     # television here is 25 fps, so each frame occupies exactly two
     # refreshes. At 60 Hz a 25 fps source needs 3:2 pulldown - frames
     # held alternately for two refreshes and three - which shows as
-    # judder on any horizontal pan. Only applied when the display has
-    # to be switched at all, i.e. when it exceeds max_height.
+    # judder on any horizontal pan. Applied at start-up, on save and when
+    # a screen comes back - see _reapply_refresh_rate().
     refresh_hz: int = 50
     # Cap on display height in lines. Read by lynx_start.sh at startup,
     # so a change needs a restart to take effect.
@@ -9164,11 +9215,12 @@ def config_page():
                             <option value="60">60 Hz &mdash; North America, Japan (30 fps)</option>
                         </select>
                         <p class="text-muted small mb-2">
-                            Only used when the screen actually has to be switched. 50 Hz suits 25 fps
+                            Applied when Lynx starts, when you save, and when a screen comes back,
+                            if the screen offers it. 50 Hz suits 25 fps
                             television: each frame then lasts exactly two refreshes. At 60 Hz a 25 fps
                             picture judders on pans, because frames are held alternately for two
-                            refreshes and three. A monitor with no mode at the chosen rate falls back
-                            to the highest it offers.
+                            refreshes and three. A screen with no mode at the chosen rate is left
+                            at its own (a ROCK or Pi 5 asks for a custom mode first).
                         </p>
                         <div class="mt-2 d-flex align-items-center gap-2">
                             <button class="btn btn-save" onclick="saveScreen()">Save screen settings</button>
@@ -10713,10 +10765,11 @@ async function saveScreen() {
         const r = await fetch('/api/config', {method: 'POST',
             headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
         if (!r.ok) throw new Error(await r.text());
-        // The screen mode is set once, by lynx_start.sh, before mpv and
-        // the overlay start - changing it underneath them is exactly
-        // what breaks them - so this cannot take effect live.
-        el.textContent = 'Saved - restart Lynx for this to take effect.';
+        // The refresh rate is applied as it is saved (same size, new
+        // rate, as a screen return has always done). The height cap
+        // still waits for a restart: changing the SIZE underneath mpv
+        // and the overlay is what breaks them.
+        el.textContent = 'Saved. Refresh rate applied now; a height change needs a restart.';
         el.className = 'save-status text-success';
     } catch (e) {
         el.textContent = 'Save failed - see console.';
@@ -13637,6 +13690,13 @@ def update_config(req: ConfigUpdateRequest):
         os.replace(tmp_path, CONFIG_PATH)
 
         config = on_disk  # reload in-memory immediately - site fields take effect right away
+        # Refresh rate: live, on save (3 Nov 2026). Only the rate changes,
+        # not the size, which a screen return has always done live.
+        if req.display is not None:
+            def _apply_saved_rate():
+                if _reapply_refresh_rate("setting saved"):
+                    _check_mpv_after_mode_change("the refresh change")
+            threading.Thread(target=_apply_saved_rate, daemon=True).start()
         _apply_gnss_mode()
         return {
             "success": True,
@@ -15891,6 +15951,7 @@ if __name__ == "__main__":
     video_badges.start()
     screen_return = threading.Thread(target=screen_return_monitor, daemon=True)
     screen_return.start()
+    threading.Thread(target=refresh_rate_at_start, daemon=True).start()
     connectivity = threading.Thread(target=picotuner_connectivity_monitor, daemon=True)
     connectivity.start()
     modcod_monitor = threading.Thread(target=picotuner_modcod_monitor, daemon=True)
