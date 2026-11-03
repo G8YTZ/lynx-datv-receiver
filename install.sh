@@ -408,30 +408,46 @@ else
   echo "GNSS serial port permissions configured."
 fi
 
-# --- Pi 5 fan: on at 40 C, not 50 C -----------------------------
-# The Pi 5's Active Cooler is run by the kernel from four steps set in
-# config.txt. The first, by default, starts the fan at 50 C and stops it
-# 5 C lower, so a receiver idled with the fan off in the mid 40s (3 Nov
-# 2026: off at 47 C). A receiver decodes around the clock, often in a
-# box, so start at 40 C instead, stopping at 35 C. Only the first step
-# moves; the 60, 67.5 and 75 C steps and the CPU's own throttling are the
-# kernel's defaults, untouched. The ROCK 5T holds a steady 40 C the same
-# way (lynx_fan.py).
+# --- Pi 5 fan: on at 40 C, steps at 45, 55 and 65 C ------------
+# The Pi 5's Active Cooler is run by the kernel in four fixed steps set in
+# config.txt: by default on at 50 C (29%), then 60 (49%), 67.5 (69%) and
+# 75 C (98%), each stopping 5 C lower. A receiver idled with the fan off
+# in the mid 40s (3 Nov 2026: off at 47 C). With only the first step moved
+# to 40 C it sat at 46 C on 29%, since nothing faster comes in before
+# 60 C. So all four move down, speeds unchanged: 40, 45, 55 and 65 C.
+# The kernel still runs the fan, and the CPU's own throttling at 85 C is
+# untouched. Steps, not a set temperature: the ROCK 5T's lynx_fan.py holds
+# a steady 40 C, the Pi 5 hovers around 45 C.
 #
 # Above the --deps-only exit, so Update Now brings it to receivers
-# already in service. Written once, under its own [all] so it applies
-# whatever conditional section the file happens to end in. Takes effect
-# at the next boot.
+# already in service. Written under its own [all], so it applies whatever
+# conditional section the file ends in. Lynx's own earlier lines (marked
+# "# Lynx: Pi 5 fan") are replaced; fan settings somebody else put there
+# are left alone. Takes effect at the next boot.
+LYNX_FAN_MARK="# Lynx: Pi 5 fan v2 (on 40 C, steps 45/55/65 C)"
 if [ -f /boot/firmware/config.txt ] \
    && tr -d '\0' < /proc/device-tree/model 2>/dev/null | grep -q "Raspberry Pi 5"; then
-  if grep -q "^dtparam=fan_temp0=" /boot/firmware/config.txt; then
-    echo "Pi 5 fan step already set in config.txt - leaving it untouched."
+  if grep -qF "$LYNX_FAN_MARK" /boot/firmware/config.txt; then
+    echo "Pi 5 fan steps already set in config.txt - leaving them untouched."
+  elif grep -q "^dtparam=fan_temp" /boot/firmware/config.txt \
+       && ! grep -q "^# Lynx: Pi 5 fan" /boot/firmware/config.txt; then
+    echo "config.txt already has fan settings of its own - leaving them untouched."
   else
-    echo "--- Pi 5 fan: on at 40 C (takes effect at next boot) ---"
+    echo "--- Pi 5 fan: on at 40 C, steps at 45, 55, 65 C (takes effect at next boot) ---"
     sudo cp /boot/firmware/config.txt /boot/firmware/config.txt.lynx-fan.bak
-    printf '\n[all]\n# Lynx: Pi 5 fan on at 40 C, off at 35 C (default 50 C)\ndtparam=fan_temp0=40000\ndtparam=fan_temp0_hyst=5000\n' \
-      | sudo tee -a /boot/firmware/config.txt > /dev/null
-    echo "Added the fan settings to config.txt."
+    # Lynx's earlier version, if present: its marker and fan lines go.
+    sudo sed -i -e '/^# Lynx: Pi 5 fan/d' -e '/^dtparam=fan_temp[0-3]\(_hyst\)\?=/d' \
+      /boot/firmware/config.txt
+    printf '\n[all]\n%s\n%s\n' "$LYNX_FAN_MARK" "\
+dtparam=fan_temp0=40000
+dtparam=fan_temp0_hyst=5000
+dtparam=fan_temp1=45000
+dtparam=fan_temp1_hyst=5000
+dtparam=fan_temp2=55000
+dtparam=fan_temp2_hyst=5000
+dtparam=fan_temp3=65000
+dtparam=fan_temp3_hyst=5000" | sudo tee -a /boot/firmware/config.txt > /dev/null
+    echo "Fan steps written to config.txt."
   fi
 fi
 
