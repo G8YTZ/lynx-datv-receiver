@@ -2201,20 +2201,12 @@ def _mpv_has_picture_problem() -> bool:
     return any(t.get("type") == "video" for t in (tl.get("data") or []))
 
 
-_refresh_refused = set()   # (output, size, Hz) a listed mode was refused at
-
-
-def _reapply_refresh_rate(listed_only: bool = False):
-    """ROCK and Pi 5: a monitor coming back is driven at its own preferred
-    mode (60 Hz on an LG 27UK850), and lynx_start.sh only asks for the
+def _reapply_refresh_rate():
+    """ROCK: a monitor coming back is driven at its own preferred mode
+    (60 Hz on an LG 27UK850), and lynx_start.sh only asks for the
     configured rate at start-up. Ask again: a listed mode at the current
     size first, then a custom mode - the same rule as lynx_start.sh.
-    Pi 4: nothing, exactly as before.
-
-    listed_only: the regular check (see screen_return_monitor). It only
-    ever asks for a mode the display itself lists, and asks once: a
-    display that refuses one is not asked again until it comes back, so
-    a screen can never be made to flicker every few seconds."""
+    Pi: nothing, exactly as before."""
     if not lynx_platform.CUSTOM_REFRESH_MODES:
         return
     try:
@@ -2244,20 +2236,11 @@ def _reapply_refresh_rate(listed_only: bool = False):
         return
     res = current[0]
     listed = next((m for m in modes if m[0] == res and round(m[1]) == want), None)
-    key = (name, res, want)
-    if listed_only:
-        if not listed or key in _refresh_refused:
-            return
-    else:
-        _refresh_refused.discard(key)
     args = (["--mode", f"{res}@{listed[1]:.6f}Hz"] if listed
             else ["--custom-mode", f"{res}@{want}Hz"])
     r = subprocess.run(["wlr-randr", "--output", name, *args],
                        capture_output=True, text=True, timeout=5, env=env)
-    if r.returncode != 0 and listed:
-        _refresh_refused.add(key)
-    why = "had gone back to" if listed_only else "came back at"
-    print(f"[screen] {name} {why} {res} {current[1]:g} Hz - asked for {want} Hz: "
+    print(f"[screen] {name} came back at {res} {current[1]:g} Hz - asked for {want} Hz: "
           f"{'ok' if r.returncode == 0 else 'not accepted'}", flush=True)
 
 
@@ -2302,20 +2285,10 @@ def screen_return_monitor():
     nothing else tells it to try again."""
     global mpv_last_started_at
     was = screen_connected()
-    last_rate_check = time.time()
     while True:
         time.sleep(2)
         try:
             now = screen_connected()
-            # The rate can also slip back with no disconnect seen at all
-            # (3 Nov 2026: a Pi 5 into an ATEM sat at 1080p60, its
-            # preferred mode, with 50 configured and 50 listed, and no
-            # "came back" in the log - an HDMI re-handshake shorter than
-            # this loop's 2 s look). So check every 15 s as well, listed
-            # modes only.
-            if now and was and time.time() - last_rate_check >= 15:
-                last_rate_check = time.time()
-                _reapply_refresh_rate(listed_only=True)
             if now and not was:
                 print("[screen] screen back - checking mpv has its picture", flush=True)
                 time.sleep(4)   # let the compositor set the output up first
