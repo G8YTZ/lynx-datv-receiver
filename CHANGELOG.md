@@ -2,6 +2,12 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-11-03
+
+**Fixed**
+- Pi 5: back on the same video path as the Pi 4 and the stable release (`--vo=gpu --hwdec=drm-copy`, through Xwayland). Five beta testers reported trouble within a day of the zero-copy path reaching beta: a picture for a few seconds and then purple, or a stream that never appeared, all cured by going back to stable. Zero-copy stays available for testing with `systemctl --user set-environment LYNX_PI5_ZERO_COPY=1`.
+- A Pi HEVC decoder that keeps reporting errors after mpv starts counts as wedged again, and mpv is restarted. Since 2 November a moving playback clock had been taken as proof of a picture, and a wedged decoder putting out purple frames still has one. The single error logged as mpv joins a stream between keyframes is still ignored, so the restart-every-second loop does not come back.
+
 ## 2026-10-16
 
 **Added**
