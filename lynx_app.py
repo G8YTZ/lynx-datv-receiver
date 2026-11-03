@@ -1898,6 +1898,22 @@ def picotuner_monitor():
             # and permanently SEARCHING while the tuner is locked and
             # decoding perfectly. Confirmed exactly that way on real
             # hardware.
+            # Where each receiver is sending its stream: "TS target RX1
+            # 192.168.0.188:9941". Labelled with the board's own receiver
+            # numbers, like the RX lines below. Used to tell a receiver
+            # another device has taken over from one that has lost its
+            # tuning (see _picotuner_taken_over).
+            for line in text.splitlines():
+                parts = re.split(r'\s{2,}', line.strip())
+                if len(parts) != 2 or not parts[0].lower().startswith("ts target rx"):
+                    continue
+                num = parts[0][len("TS target RX"):].strip()
+                value = parts[1].strip().split()[0] if parts[1].strip() else ""
+                if num == str(picotuner_rx_numbers['a']):
+                    picotuner_state["ts_target"] = value
+                elif num == str(picotuner_rx_numbers['b']):
+                    picotuner_state_b["ts_target"] = value
+
             rx_label_a = f"RX{picotuner_rx_numbers['a']}"
             rx_label_b = f"RX{picotuner_rx_numbers['b']}"
             for line in text.splitlines():
@@ -3127,6 +3143,12 @@ def diversity_stuck_lock_monitor():
 
             stuck_a = check("a", picotuner_state)
             stuck_b = check("b", picotuner_state_b)
+            # A receiver another device has tuned stops reporting to us,
+            # which can look stuck. It isn't ours to recover.
+            if stuck_a and _picotuner_taken_over(1):
+                stuck_a = False
+            if stuck_b and _picotuner_taken_over(2):
+                stuck_b = False
 
             # Only when RF is what the receiver is actually showing.
             # This recovers a stuck tuner by retuning it from the last
@@ -7268,6 +7290,76 @@ PICOTUNER_MISMATCH_SECS = 20.0      # sustained disagreement before acting
 PICOTUNER_RETUNE_SETTLE_SECS = 8.0  # let its firmware finish booting first
 PICOTUNER_RETUNE_COOLDOWN_SECS = 90.0   # don't hammer a tuner that won't take
 
+PICOTUNER_TAKEOVER_ASK_SECS = 30.0  # how often to ask a taker if it has finished
+_my_ips_cache = (0.0, set())
+_takeover_seen = {}                 # rcv -> (ip, last asked, answer)
+
+
+def _my_ips():
+    """This Pi's own addresses, refreshed once a minute."""
+    global _my_ips_cache
+    when, ips = _my_ips_cache
+    if time.time() - when > 60:
+        try:
+            out = subprocess.run(["hostname", "-I"], capture_output=True,
+                                 text=True, timeout=5).stdout
+            ips = set(out.split())
+        except Exception:
+            pass
+        _my_ips_cache = (time.time(), ips)
+    return ips
+
+
+def _ask_lynx_presence(ip, rcv):
+    """The question Lynx Apple TV and iPhone answer on UDP 9950:
+    "LYNX? n" -> "LYNX WATCHING n" or "LYNX IDLE". None when nothing
+    answers (not a Lynx, asleep, or a phone with Lynx in the background)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(1.2)
+        q = f"LYNX? {rcv}".encode()
+        sock.sendto(q, (ip, 9950))
+        sock.sendto(q, (ip, 9950))
+        while True:
+            data, addr = sock.recvfrom(256)
+            if addr[0] == ip:
+                return data.decode(errors="replace").strip()
+    except Exception:
+        return None
+    finally:
+        sock.close()
+
+
+def _picotuner_taken_over(rcv):
+    """The address of the device that has taken over receiver rcv (1 or
+    2), or None when it is still ours (or nobody's).
+
+    The Picotuner sends a receiver's $-status only to whoever tuned it, so
+    a receiver someone else has tuned looks, from here, exactly like one
+    that has lost its tuning: no symbol rate. Without this check the
+    watchdogs "restored" it within 30 s, snatching it back from an
+    iPhone watching over a VPN (3 Nov 2026)."""
+    st = picotuner_state_b if rcv == 2 else picotuner_state
+    target = str(st.get("ts_target", "") or "")
+    ip = target.split(":")[0]
+    if not ip or ip == "0.0.0.0" or ip in _my_ips():
+        _takeover_seen.pop(rcv, None)
+        return None
+    now = time.time()
+    seen = _takeover_seen.get(rcv)
+    if seen is None or seen[0] != ip or now - seen[1] >= PICOTUNER_TAKEOVER_ASK_SECS:
+        answer = _ask_lynx_presence(ip, rcv)
+        if seen is None or seen[0] != ip:
+            print(f"[picotuner] Rx{rcv} taken over by {ip} - leaving it alone "
+                  f"(presence answer: {answer or 'none'})")
+        elif answer != seen[2]:
+            print(f"[picotuner] Rx{rcv} at {ip}: presence answer now {answer or 'none'}")
+        seen = (ip, now, answer)
+        _takeover_seen[rcv] = seen
+    if seen[2] and seen[2].startswith("LYNX") and seen[2] != f"LYNX WATCHING {rcv}":
+        return None          # a Lynx that has finished with it: ours again
+    return ip
+
 
 def _tri_watch_present():
     """True only on builds that actually have tri_watch.
@@ -7426,6 +7518,8 @@ def picotuner_tuning_watchdog():
                 st = picotuner_state_b if rcv == 2 else picotuner_state
                 if rcv == 2 and not st.get("online"):
                     continue          # Rx2 not reporting at all - nothing to compare
+                if _picotuner_taken_over(rcv):
+                    continue          # another device is using it: not a lost tuning
                 got_khz = _picotuner_reported_khz(st)
                 if got_khz is None:
                     wrong.append(f"Rx{rcv} not tuned "
