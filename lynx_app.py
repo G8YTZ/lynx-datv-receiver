@@ -343,6 +343,8 @@ current_mode: str = "idle"    # idle | rf | stream
 mpv_running_for_rf: bool = False  # tracks whether mpv has actually been started for the
                                    # current RF tune (as opposed to just tuned-and-waiting-
                                    # for-lock) - see rf_mpv_lifecycle_monitor()
+programme_wanted = None  # {"program": n, "key": ...}: the programme chosen by hand, kept
+#   across mpv restarts on the same tune (programme_keeper); None = programme 1
 programme_switched_at: float = 0.0  # a programme change in the same stream: the decoder waits for
 #   that programme's next keyframe, so the health monitor gives it the start-up grace too
 mpv_last_started_at: float = 0.0  # timestamp of the most recent mpv start - lets
@@ -12357,22 +12359,68 @@ class ProgrammeRequest(BaseModel):
     program: int
 
 
+def _programme_key():
+    """What is tuned, as the saved state says: a programme chosen by hand
+    belongs to this tune and no other."""
+    st = load_last_state() or {}
+    return (st.get("mode"), st.get("freq"), st.get("sr"), st.get("plug"), st.get("url"))
+
+
+def _select_programme(p):
+    global programme_switched_at
+    # The new picture starts at its next keyframe; until then the decoder
+    # complains ("Could not find ref"), which must not read as a fault.
+    programme_switched_at = time.time()
+    mpv_cmd({"command": ["set_property", "vid", p["video"]]})
+    mpv_cmd({"command": ["set_property", "aid", p["audio"] if p["audio"] is not None else "no"]})
+
+
+def programme_keeper():
+    """Background thread: puts the chosen programme back after mpv restarts.
+
+    mpv always starts on the first programme, and Lynx restarts it for many
+    reasons (a lock regained, a freeze, the screen coming back), so a choice
+    of programme 2 lasted only until the next one: 10 Nov 2026, the 4K
+    carousel chosen on a ROCK 5C went back to the live picture by itself
+    after two minutes. The choice is kept for as long as the same thing is
+    tuned (a re-tune to the same frequency keeps it), and forgotten when
+    something else is."""
+    global programme_wanted
+    while True:
+        time.sleep(2)
+        try:
+            want = programme_wanted
+            if not want:
+                continue
+            if _programme_key() != want["key"]:
+                programme_wanted = None
+                print("[programme] something else tuned - back to programme 1")
+                continue
+            progs = mpv_programmes()
+            p = next((x for x in progs if x["program"] == want["program"]), None)
+            if p and not p["selected"]:
+                _select_programme(p)
+                print(f"[programme] mpv restarted on programme 1 - back to programme "
+                      f"{want['program']} as chosen")
+        except Exception as e:
+            print(f"[programme] {type(e).__name__}: {e}")
+
+
 @app.post("/api/programme", tags=["RF Reception"],
           summary="Watch another programme in the same stream",
           description="Chooses that programme's picture and sound. A programme "
                       "with no sound (a stills carousel) keeps none. The picture "
                       "appears at its next keyframe (up to 10 s for Lynx-Tx's carousel).")
 def api_programme(req: ProgrammeRequest):
-    global programme_switched_at
+    global programme_wanted
     progs = mpv_programmes()
     p = next((x for x in progs if x["program"] == req.program), None)
     if not p:
         raise HTTPException(404, f"No programme {req.program} in this stream")
-    # The new picture starts at its next keyframe; until then the decoder
-    # complains ("Could not find ref"), which must not read as a fault.
-    programme_switched_at = time.time()
-    mpv_cmd({"command": ["set_property", "vid", p["video"]]})
-    mpv_cmd({"command": ["set_property", "aid", p["audio"] if p["audio"] is not None else "no"]})
+    first = progs[0]["program"] if progs else req.program
+    programme_wanted = (None if req.program == first
+                        else {"program": req.program, "key": _programme_key()})
+    _select_programme(p)
     print(f"[programme] now programme {req.program} (video track {p['video']}, "
           f"sound {p['audio'] if p['audio'] is not None else 'none'})")
     return {"success": True, "programme": p}
@@ -16164,6 +16212,7 @@ if __name__ == "__main__":
     freshness = threading.Thread(target=rf_mpv_lifecycle_monitor, daemon=True)
     freshness.start()
     threading.Thread(target=network_output_watchdog, daemon=True).start()
+    threading.Thread(target=programme_keeper, daemon=True).start()
     diversity_stuck = threading.Thread(target=diversity_stuck_lock_monitor, daemon=True)
     diversity_stuck.start()
     mer_pub = threading.Thread(target=mer_publisher, daemon=True)
