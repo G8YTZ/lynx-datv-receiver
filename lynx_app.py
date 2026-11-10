@@ -343,6 +343,7 @@ current_mode: str = "idle"    # idle | rf | stream
 mpv_running_for_rf: bool = False  # tracks whether mpv has actually been started for the
                                    # current RF tune (as opposed to just tuned-and-waiting-
                                    # for-lock) - see rf_mpv_lifecycle_monitor()
+rf_tuned_at: float = 0.0  # when the last RF tune was sent (rf_mpv_lifecycle_monitor)
 programme_wanted = None  # {"program": n, "key": ...}: the programme chosen by hand, kept
 #   across mpv restarts on the same tune (programme_keeper); None = programme 1
 programme_switched_at: float = 0.0  # a programme change in the same stream: the decoder waits for
@@ -3412,6 +3413,13 @@ def rf_mpv_lifecycle_monitor():
             raw_locked = (_lifecycle_active.get("locked", False)
                           if _lifecycle_active else False) or \
                          (diversity_enabled and picotuner_state_b.get("locked", False))
+            # A lock read in the first moment after a tune can be the old
+            # frequency's: the tuner's next status line (once a second) has
+            # not arrived yet. With mpv now started on the first reading,
+            # that would start it on nothing and wait out the 8 s render
+            # check. So readings start counting 1.5 s after a tune.
+            if time.time() - rf_tuned_at < 1.5:
+                raw_locked = False
 
             # Network output means there is deliberately no player
             # here, so "mpv is not running" is the intended state
@@ -12018,6 +12026,8 @@ def _tune_impl(req: TuneRequest):
             stop_diversity_combiner()
         diversity_enabled = False
     
+    global rf_tuned_at
+    rf_tuned_at = time.time()
     current_mode = "rf"
     displayed_receiver_id = None
     if req.lnb_lo_khz:
