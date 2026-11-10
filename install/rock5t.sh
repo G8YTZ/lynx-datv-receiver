@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
-#  Lynx — Radxa ROCK 5T platform setup
-#  Called by install.sh when it finds a ROCK 5T. Also safe to run
+#  Lynx — Radxa ROCK 5T and ROCK 5C platform setup
+#  Called by install.sh when it finds a ROCK 5T or 5C. Also safe to run
 #  on its own: every step checks before it acts, so a second run
 #  changes nothing that is already right.
 #
@@ -28,18 +28,27 @@ STAMP=/usr/local/share/lynx/media-stack.version
 
 say() { echo ""; echo "--- $* ---"; }
 
-# --- Is this really a ROCK 5T on Armbian trixie? ------------------
+# --- Is this really a ROCK 5T or 5C on Armbian trixie? -----------
+# The 5C (10 Nov 2026): the same RK3588 family, vendor kernel, Panthor
+# overlay name, /dev/mpp_service and pwmfan as the 5T; one HDMI output.
 MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)"
 case "$MODEL" in
-  *"ROCK 5T"*|*"Rock 5T"*) ;;
-  *) echo "This script is for the Radxa ROCK 5T (found: '${MODEL:-unknown}')."; exit 1 ;;
+  *"ROCK 5T"*|*"Rock 5T"*) BOARD_SLUG=rock-5t ;;
+  *"ROCK 5C"*|*"Rock 5C"*) BOARD_SLUG=rock-5c ;;
+  *) echo "This script is for the Radxa ROCK 5T or 5C (found: '${MODEL:-unknown}')."; exit 1 ;;
 esac
 . /etc/os-release
 if [ "${VERSION_CODENAME:-}" != "trixie" ]; then
-  echo "Lynx on the ROCK 5T needs Armbian trixie (found: ${PRETTY_NAME:-unknown})."
-  echo "Write the 'Trixie vendor minimal' image from armbian.com/boards/rock-5t first."
+  echo "Lynx on the $MODEL needs Armbian trixie (found: ${PRETTY_NAME:-unknown})."
+  echo "Write the 'Trixie vendor minimal' image from armbian.com/boards/$BOARD_SLUG first."
   exit 1
 fi
+case "$(uname -r)" in
+  *vendor*) ;;
+  *) echo "Lynx on the $MODEL needs Armbian's vendor kernel, for the hardware video decoder"
+     echo "(found: $(uname -r)). Write the 'Trixie vendor minimal' image instead."
+     exit 1 ;;
+esac
 echo "Platform: $MODEL, $PRETTY_NAME, kernel $(uname -r)"
 
 # --- GPU: Panthor, not Rockchip's Mali driver ---------------------
@@ -306,7 +315,7 @@ EOF
 systemctl --user daemon-reload 2>/dev/null || true
 
 echo ""
-echo "=== ROCK 5T platform setup complete ==="
+echo "=== $MODEL platform setup complete ==="
 if [ "$REBOOT_NEEDED" = "1" ]; then
   echo ">>> The GPU driver changed: reboot before using Lynx (sudo reboot)."
 fi

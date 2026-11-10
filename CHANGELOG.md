@@ -2,6 +2,12 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-11-10
+
+**New**
+- Radxa ROCK 5C: recognised by name and given the ROCK video path (`--hwdec=rkmpp`, `gpu-next`, Wayland), with one HDMI output. Armbian trixie, vendor kernel, minimal.
+- One installer for every board: `install.sh` works out whether it is on a Raspberry Pi or a ROCK 5T/5C, and on a ROCK runs `install/rock5t.sh` itself, on a fresh install and on Update Now.
+
 ## 2026-11-03
 
 **Fixed**

@@ -40,6 +40,17 @@ fi
 echo "=== Lynx DATV Receiver — Installer ==="
 echo ""
 
+# Which board. A Radxa ROCK 5T or 5C gets everything below, as a Pi
+# does, and then install/rock5t.sh for its own video stack, kiosk
+# start-up, fan and permissions (10 Nov 2026: one installer for every
+# board). Anything else is treated as a Raspberry Pi, as before.
+LYNX_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)"
+case "$LYNX_MODEL" in
+  *"ROCK 5T"*|*"Rock 5T"*|*"ROCK 5C"*|*"Rock 5C"*) LYNX_ROCK=1 ;;
+  *) LYNX_ROCK=0 ;;
+esac
+echo ">>> Board: ${LYNX_MODEL:-unknown}"
+
 # Which branch, said out loud and early.
 #
 # The installer is fetched FROM a branch but installs whatever BRANCH
@@ -517,6 +528,12 @@ fi
 # --kiosk implies --deps-only: it is a one-off toggle run against an
 # already-working receiver, not a reason to redo the whole install.
 if [ "$1" = "--deps-only" ] || [ "$1" = "--kiosk" ]; then
+  # A ROCK's own set-up is safe to repeat (every step checks first, and
+  # the 15 minute media build is skipped unless its version changed), so
+  # Update Now brings its changes to ROCK receivers too.
+  if [ "$LYNX_ROCK" = "1" ] && [ -f ~/lynx/install/rock5t.sh ]; then
+    LYNX_DIR=~/lynx bash ~/lynx/install/rock5t.sh
+  fi
   echo "--- Dependencies confirmed ($1) ---"
   exit 0
 fi
@@ -686,6 +703,22 @@ else
 </openbox_config>
 RCXML
   echo "Created."
+fi
+
+# A ROCK: its own platform set-up now, after everything above, because
+# it replaces two things this script does for the Pi (the cursor
+# keybind, which makes labwc quit on Debian's labwc, and desktop
+# auto-login, done there by console auto-login instead). Then it has
+# its own closing words; the Pi's below do not apply.
+if [ "$LYNX_ROCK" = "1" ]; then
+  LYNX_DIR=~/lynx bash ~/lynx/install/rock5t.sh
+  echo ""
+  echo "=== Install complete ==="
+  echo ""
+  echo "Reboot to start Lynx:  sudo reboot"
+  echo "Then open http://$(hostname -I | awk '{print $1}'):8080 and set your Picotuner"
+  echo "and site details under Configuration."
+  exit 0
 fi
 
 echo ""
