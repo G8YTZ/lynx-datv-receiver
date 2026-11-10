@@ -3300,18 +3300,25 @@ def rf_mpv_lifecycle_monitor():
     starting mpv (and clearing the cover) from that point on.
     """
     global mpv_running_for_rf, mpv_last_started_at
-    LOCK_CONFIRM_POLLS = 3   # ~3s of sustained lock before starting mpv - avoids reacting to a brief false lock
-    LOSS_CONFIRM_POLLS = 3   # ~3s of sustained loss before stopping mpv - avoids stopping on a brief, normal fade.
+    # 10 Nov 2026: mpv now starts on the FIRST lock reading (was 3 s of
+    # steady lock), at half-second polls. The 3 s cost every start 3 s, and
+    # guarded against false locks that were mostly Lynx misreading the
+    # tuner (a lock shown without its service name, fixed the same day).
+    # A false lock costs nothing on screen: mpv starts behind the cover,
+    # finds no picture, and the cover never lifts.
+    LOCK_CONFIRM_POLLS = 1
+    LOSS_CONFIRM_POLLS = 6   # ~3s of sustained loss before stopping mpv - avoids stopping on a brief, normal fade.
                                # Was ~6s (POLL_SECS=2) - live testing with a co-channel interference edge case
                                # (two overlapping transmissions) showed the receiver can flicker between locked/
                                # unlocked fast enough that the unbroken streak this requires never completed,
                                # leaving mpv stuck on stale content with neither a stop nor a fresh restart ever
                                # triggering. A shorter window helps but doesn't fully close this if flickering is
                                # faster than even this - worth further testing per Justin's plan.
-    POLL_SECS = 1
+    POLL_SECS = 0.5
 
     lock_streak = 0
     loss_streak = 0
+    lock_seen_at = None   # first reading of the current lock: for "lock to picture" timing
 
     while True:
         time.sleep(POLL_SECS)
@@ -3419,11 +3426,14 @@ def rf_mpv_lifecycle_monitor():
             if raw_locked:
                 loss_streak = 0
                 lock_streak += 1
+                if lock_seen_at is None:
+                    lock_seen_at = time.time()
                 if lock_streak >= LOCK_CONFIRM_POLLS and not mpv_running_for_rf:
                     if tune_lock.acquire(timeout=2):
                         try:
                             print(f"[rf_mpv_lifecycle] Confirmed lock after "
                                   f"{lock_streak * POLL_SECS}s - starting mpv")
+                            mpv_asked_at = time.time()
                             # Same answer as before for diversity and
                             # for receiver A, and the right one for a
                             # Slave. Asking beats deciding again:
@@ -3448,8 +3458,13 @@ def rf_mpv_lifecycle_monitor():
                                 end_transition_cover()
                                 mpv_running_for_rf = True
                                 mpv_last_started_at = time.time()
+                                took = time.time() - lock_seen_at
+                                print(f"[rf_mpv_lifecycle] lock to picture {took:.1f}s "
+                                      f"(waiting for lock reading "
+                                      f"{mpv_asked_at - lock_seen_at:.1f}s, mpv to picture "
+                                      f"{time.time() - mpv_asked_at:.1f}s)")
                                 record_diagnostic_event("rf_lock_confirmed_start",
-                                                  f"after {lock_streak * POLL_SECS}s idle")
+                                                  f"lock to picture {took:.1f}s")
                             else:
                                 # mpv never confirmed real rendering within the
                                 # timeout - confirmed live as a genuine bug when
@@ -3472,6 +3487,7 @@ def rf_mpv_lifecycle_monitor():
                     # establish the correct mpv state - try again next poll.
             else:
                 lock_streak = 0
+                lock_seen_at = None
                 loss_streak += 1
                 if loss_streak >= LOSS_CONFIRM_POLLS and mpv_running_for_rf:
                     if tune_lock.acquire(timeout=2):
