@@ -32,6 +32,8 @@ pat = {}                          # programme number -> PMT PID
 pmt = {}                          # PMT PID -> (programme, PCR PID, [(type, PID)])
 pcr_pids = set()
 first_rap = {}                    # PID -> time of first random access point
+last_pcr = {}                     # PID -> last PCR, in seconds (27 MHz / 27e6)
+last_pts = {}                     # PID -> last PES PTS, in seconds (90 kHz)
 t0 = None
 
 
@@ -79,11 +81,20 @@ def packet(p, now):
             flags = p[5]
             if flags & 0x10:
                 pcr_pids.add(pid)
+                if len(p) >= 12:
+                    b = p[6:12]
+                    base = (b[0] << 25) | (b[1] << 17) | (b[2] << 9) | (b[3] << 1) | (b[4] >> 7)
+                    last_pcr[pid] = (base * 300 + (((b[4] & 1) << 8) | b[5])) / 27e6
             if flags & 0x40 and pid not in first_rap:
                 first_rap[pid] = now
         i = 5 + alen
     if afc in (1, 3) and p[1] & 0x40 and (pid == 0 or pid in pat.values()):
         section(pid, p[i:], now)
+    elif afc in (1, 3) and p[1] & 0x40 and p[i:i + 3] == b"\x00\x00\x01" and len(p) >= i + 14:
+        if p[i + 7] & 0x80:                      # PES header has a PTS
+            q = p[i + 9:i + 14]
+            last_pts[pid] = (((q[0] >> 1) & 7) << 30 | q[1] << 22 | (q[2] >> 1) << 15
+                             | q[3] << 7 | q[4] >> 1) / 90000.0
 
 
 if a.file:
@@ -93,7 +104,14 @@ if a.file:
 else:
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("", a.port))
+    for _ in range(100):          # 10 s for whatever holds the port to let go
+        try:
+            s.bind(("", a.port))
+            break
+        except OSError:
+            time.sleep(0.1)
+    else:
+        sys.exit(f"UDP {a.port} is still in use (ss -ulpn | grep {a.port})")
     s.settimeout(1)
     end = time.time() + a.seconds
     print(f"Listening on UDP {a.port} for {a.seconds:.0f} s...", file=sys.stderr)
@@ -132,4 +150,18 @@ for prog, ppid in sorted(pat.items()):
                   + (f", first keyframe at {rap:.1f} s" if rap is not None else ", no keyframe seen"))
     else:
         print("   its PMT never arrived")
+clocks = []
+for prog, ppid in sorted(pat.items()):
+    if ppid in pmt:
+        _, pcr, streams = pmt[ppid]
+        vids = [spid for st, spid in streams if st in (0x01, 0x02, 0x1b, 0x24) and spid in last_pts]
+        if pcr in last_pcr and vids:
+            clocks.append((prog, last_pcr[pcr], last_pts[vids[0]]))
+if clocks:
+    print("Clocks at the end of the capture (seconds):")
+    for prog, pcr, pts in clocks:
+        print(f"   Programme {prog}: PCR {pcr:.3f}, picture PTS {pts:.3f}, PTS - PCR {pts - pcr:+.3f}")
+    if len(clocks) >= 2:
+        (p1, c1, t1), (p2, c2, t2) = clocks[0], clocks[1]
+        print(f"   Programme {p2} against {p1}: PCR {c2 - c1:+.3f} s, picture PTS {t2 - t1:+.3f} s")
 print("PIDs: " + ", ".join(f"0x{p:04x}={n}" for p, n in sorted(counts.items())))
