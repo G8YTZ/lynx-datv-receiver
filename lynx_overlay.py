@@ -1201,6 +1201,14 @@ class LynxOverlay(Gtk.Window):
                 if not showing_map and placeholder and \
                         transition_age >= state["pathfinder_delay_secs"]:
                     showing_map = self.draw_switching_graphic(cr, width, height)
+                    # RF: the corner OSD (callsign, MER, lock) stays on top of
+                    # the cover while the receiver acquires, as it always
+                    # meant to. The cover used to hide it after 2 s, and was
+                    # seldom noticed because a slow lock reading outlasted the
+                    # cover's 30 s cap; with the lock read at once (10 Nov
+                    # 2026) the whole wait was black (Justin, ROCK 5C).
+                    if showing_map and state.get("mode") == "rf":
+                        showing_map = False
                 if not showing_map:
                     cr.set_source_rgba(0, 0, 0, 1.0)
                     cr.set_operator(cairo.OPERATOR_SOURCE)
