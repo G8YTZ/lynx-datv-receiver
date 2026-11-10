@@ -2546,7 +2546,13 @@ def mpv_decoder_health_monitor():
                 emergency_delay_streak = 0
             if size == last_size:
                 continue
-            if time.time() - max(mpv_last_started_at, programme_switched_at) < STARTUP_GRACE_SECS:
+            # A second programme chosen by hand (Lynx-Tx's stills carousel)
+            # shows a new picture every few seconds and has no sound, so
+            # its playback clock creeps forward in jumps: to these checks
+            # that is a stall, and they restarted mpv every half minute
+            # (10 Nov 2026). Left alone while one is being watched.
+            if programme_wanted or \
+                    time.time() - max(mpv_last_started_at, programme_switched_at) < STARTUP_GRACE_SECS:
                 # Still within the startup grace window - advance our
                 # read position so nothing backlogs, but don't evaluate
                 # anything yet.
