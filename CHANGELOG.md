@@ -8,6 +8,7 @@ All notable changes to Lynx are documented here, in reverse chronological order.
 - RF: mpv starts on the first lock reading, half a second apart, instead of after 3 s of steady lock: about 3 s off every start. A false lock shows nothing, because the cover only lifts once mpv has a picture. Lock is still lost after 3 s without one. Each start logs "lock to picture" with how long it took.
 
 **Fixed**
+- The web page's programme choice no longer vanishes and comes back while mpv restarts: the last list seen on the same tune is kept for a minute.
 - Watching a stills programme with no sound (Lynx-Tx's 4K carousel): the drift correction and the freeze checks leave it alone. Its picture changes every few seconds, which they took for a stall, and mpv was restarted every half minute, flashing up programme 1 in between.
 - A second programme chosen by hand (Lynx-Tx's 4K carousel) stays chosen when mpv restarts, for as long as the same thing is tuned. It used to go back to programme 1 at the next restart, two minutes later on the ROCK 5C.
 - Picotuner lock with two programmes in the multiplex: a receiver line showing only a frequency ("1316.074B") now counts as locked. With a second programme the tuner shows the service name for about a second every half minute, and Lynx read the rest as unlocked: mpv stopped and started, and diversity re-tuned a receiver at 30 dB MER.

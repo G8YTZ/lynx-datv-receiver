@@ -12374,7 +12374,25 @@ def mpv_programmes() -> list:
                      "playing, from mpv's own tracks. More than one when the "
                      "transmitter sends a second programme (Lynx-Tx's 4K carousel).")
 def api_programmes():
-    return {"programmes": mpv_programmes()}
+    """While mpv restarts (a lock regained, a freeze) it has no tracks for a
+    second or two, and the page's programme choice vanished and came back
+    (10 Nov 2026). The last list seen on this same tune is kept for a
+    minute, so the choice stays put across a restart."""
+    global _programmes_seen
+    progs = mpv_programmes()
+    key = _programme_key()
+    if len(progs) >= 2:
+        _programmes_seen = (key, time.time(), progs)
+    elif _programmes_seen and _programmes_seen[0] == key \
+            and time.time() - _programmes_seen[1] < 60:
+        want = (programme_wanted or {}).get("program")
+        first = _programmes_seen[2][0]["program"]
+        progs = [dict(x, selected=(x["program"] == (want or first)))
+                 for x in _programmes_seen[2]]
+    return {"programmes": progs}
+
+
+_programmes_seen = None   # (tune key, when, list): see api_programmes()
 
 
 class ProgrammeRequest(BaseModel):
