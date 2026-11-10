@@ -9,6 +9,7 @@ Agreed with Justin G8YTZ, 2 November 2026. In order; each step is tried on Justi
 - One install script for every board: it works out Pi 4, Pi 5, ROCK 5T or ROCK 5C by itself.
 - GNSS: Justin has a spare GNSS hat for the 5C, for location and time as on the other receivers.
 - Folded into `beta-wip`, then `beta`.
+- **Where it is (10 Nov 2026):** The 5C (Armbian 26.11.1 trixie, vendor 6.1.115, 4 GB) installs with the one `install.sh`, which now runs `install/rock5t.sh` itself on a ROCK 5T or 5C. Recognised as "Radxa ROCK 5C", ROCK video path, one HDMI. 4K HEVC on air plays in hardware (rkmpp, mpv about 17% of one core). Fan control works. The same evening, on Lynx-Tx's two-programme multiplex: the diversity combiner cut on one PCR PID; a bare frequency line counts as a Picotuner lock; mpv starts on the first lock reading (lock to picture about 6 s); a chosen programme survives mpv restarts; the drift and freeze checks leave a stills programme alone; `overrun_nonfatal=1` on mpv's UDP source (FFmpeg's ring had overrun and stopped reading for good). Still open: why mpv falls behind on the carousel at all; mpv only lists programme 2 if it shows up in its first second; the Picotuner's "header" every 35 to 40 s; the GNSS hat (step 5).
 
 ## 2. Beta merged into main
 
