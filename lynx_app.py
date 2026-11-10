@@ -3540,6 +3540,14 @@ def rf_mpv_lifecycle_monitor():
                             start_transition_cover()
                             kill_mpv()
                             mpv_running_for_rf = False
+                            # mpv is gone, so nothing is left underneath to
+                            # hide: lower the cover and let the overlay say
+                            # what the receiver is doing (the orange status).
+                            # Left up, it stayed until its 30 s cap, hiding the
+                            # OSD by design for a switch, and the screen sat
+                            # black for half a minute after every loss of
+                            # signal (10 Nov 2026, Justin, ROCK 5C).
+                            end_transition_cover()
                             record_diagnostic_event("rf_loss_confirmed_stop",
                                               f"after {loss_streak * POLL_SECS}s of confirmed loss")
                         finally:

@@ -9,7 +9,7 @@ All notable changes to Lynx are documented here, in reverse chronological order.
 
 **Fixed**
 - Changing programme in a two-programme stream restarts mpv on the new programme, behind the cover, as a set-top box restarts its decoder. Each programme runs on its own clock (Lynx-Tx's carousel was 104 s behind the live picture), and swapping tracks in a running mpv kept the old clock: a minute for a carousel picture, pictures missing their bottom, then a freeze.
-- RF: the status OSD (callsign, MER, lock) stays on top of the cover while the receiver acquires, instead of a black screen.
+- RF: after a loss of signal the screen shows the logo and the orange status again within a few seconds. The cover put up when the signal went stayed until its 30 s cap, hiding the status, so every loss of signal meant half a minute of black.
 - RF: mpv no longer freezes for good when FFmpeg's UDP buffer overruns. By default FFmpeg stops reading the socket after an overrun, so the picture froze with the network queue full; now it carries on and loses only what did not fit (`overrun_nonfatal=1`). Seen on Lynx-Tx's carousel: slow pictures, pictures missing their bottom, then a freeze.
 - The web page's programme choice no longer vanishes and comes back while mpv restarts: the last list seen on the same tune is kept for a minute.
 - Watching a stills programme with no sound (Lynx-Tx's 4K carousel): the drift correction and the freeze checks leave it alone. Its picture changes every few seconds, which they took for a stall, and mpv was restarted every half minute, flashing up programme 1 in between.
