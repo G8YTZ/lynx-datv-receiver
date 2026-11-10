@@ -365,11 +365,32 @@ class Segmenter:
         self.current_pcr = None
         self.current_packets = []  # list of (packet_bytes, tei)
         self._dropped_for_no_pcr = 0  # rate-limits the warning below
+        self.pcr_pid = None        # the one PID whose PCRs mark segments
 
-    def add_packet(self, packet: bytes, tei: bool, pcr):
+    def add_packet(self, packet: bytes, tei: bool, pcr, pid=None):
         """Returns (closed_pcr, closed_packets, closed_has_error) if
-        this packet closed out a previous segment, else None."""
+        this packet closed out a previous segment, else None.
+
+        Segments are cut on ONE PCR PID only: the lowest-numbered PID
+        seen carrying PCR. A multiplex with two programmes (Lynx-Tx's
+        4K stills carousel beside the main picture, 10 Nov 2026) has
+        two PCR PIDs, each on its own clock. Cut on both, the segments'
+        PCR values came from two unrelated clocks, and the decider,
+        which puts segments in PCR order, shuffled the stream: mpv fell
+        behind, drop-buffers fired every few seconds, then the restart
+        breaker gave up. The lowest PID is chosen so both receivers
+        settle on the same one whatever moment each joined; a PCR on
+        any other PID is just another packet in the current segment."""
         result = None
+        if pcr is not None and pid is not None:
+            if self.pcr_pid is None or pid < self.pcr_pid:
+                if self.pcr_pid is not None:
+                    log(f"[segmenter] segmenting on PCR PID 0x{pid:04x} "
+                        f"(was 0x{self.pcr_pid:04x})")
+                    self.current_pcr = None   # never mix the two clocks in one segment
+                self.pcr_pid = pid
+            elif pid != self.pcr_pid:
+                pcr = None
         if pcr is not None:
             if self.current_pcr is not None:
                 has_error = any(t for (_, t) in self.current_packets)
@@ -736,7 +757,7 @@ def combine(port_a: int, port_b: int, out_ip: str, out_port: int, stats: Stats, 
                 if pid == 8191:
                     continue  # null/stuffing packet, no real content
                 stats.record_input_packet(source_label, not tei)
-                closed = segmenter.add_packet(packet, tei, pcr)
+                closed = segmenter.add_packet(packet, tei, pcr, pid)
                 if closed is not None:
                     closed_pcr, closed_packets, closed_has_error = closed
                     with lock:

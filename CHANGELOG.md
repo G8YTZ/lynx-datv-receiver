@@ -4,6 +4,9 @@ All notable changes to Lynx are documented here, in reverse chronological order.
 
 ## 2026-11-10
 
+**Fixed**
+- Diversity on a multiplex with two programmes (Lynx-Tx's stills carousel beside the main picture): the combiner now cuts its segments on one PCR PID only, the lowest. Cut on both programmes' clocks it put the stream out of order, and the picture froze every few seconds until Lynx gave up.
+
 **New**
 - Radxa ROCK 5C: recognised by name and given the ROCK video path (`--hwdec=rkmpp`, `gpu-next`, Wayland), with one HDMI output. Armbian trixie, vendor kernel, minimal.
 - One installer for every board: `install.sh` works out whether it is on a Raspberry Pi or a ROCK 5T/5C, and on a ROCK runs `install/rock5t.sh` itself, on a fresh install and on Update Now.
