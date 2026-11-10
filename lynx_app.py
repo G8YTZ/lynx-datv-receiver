@@ -12540,9 +12540,19 @@ def _restart_on_programme(why: str):
     are 10 s apart."""
     global programme_switched_at, mpv_last_started_at
     src, is_rf = network_output_source, network_output_source_is_rf
-    if not src or not tune_lock.acquire(timeout=5):
+    if not src:
+        return
+    # Waits for a restart already under way (up to 15 s for a carousel
+    # picture) rather than giving up: with 5 s, choosing programme 1 while
+    # programme 2 was still starting did nothing at all (10 Nov 2026).
+    if not tune_lock.acquire(timeout=25):
+        print(f"[programme] could not restart mpv ({why}): something else held it for 25 s")
         return
     try:
+        if programme_wanted and programme_wanted.get("program") is not None \
+                and f"programme {programme_wanted['program']}" not in why \
+                and why.startswith("chosen"):
+            why = f"chosen: programme {programme_wanted['program']} (latest choice)"
         print(f"[programme] restarting mpv ({why}) {_programme_track_flags().strip() or 'programme 1'}")
         programme_switched_at = time.time()
         start_transition_cover()
