@@ -1015,6 +1015,23 @@ def network_output_watchdog():
         time.sleep(3)
 
 
+def _udp_url_for_mpv(url: str) -> str:
+    """A udp:// source with FFmpeg's overrun made survivable.
+
+    FFmpeg reads a UDP socket in a thread of its own into a 5 MB ring. If
+    mpv stops taking from the ring for a few seconds the ring overruns, and
+    by default the reading thread then STOPS for good: the socket is never
+    read again, the kernel queue sits full (428 kB) and throws everything
+    away, and mpv freezes on its last picture with an empty cache. Seen 10
+    Nov 2026 on a ROCK 5C watching Lynx-Tx's carousel (programme 2):
+    pictures took up to a minute, came in with their bottom missing, then
+    stopped altogether. overrun_nonfatal keeps the thread reading and
+    loses only what did not fit."""
+    if url.startswith("udp://") and "overrun_nonfatal" not in url:
+        return url + ("&" if "?" in url else "?") + "overrun_nonfatal=1"
+    return url
+
+
 def restart_mpv(target_url: str, is_rf: bool = True):
     """Fully kill and restart the mpv process, pointing it at a fresh
     target URL. Used instead of IPC-only reload commands (loadfile,
@@ -1128,7 +1145,7 @@ def restart_mpv(target_url: str, is_rf: bool = True):
         f"{source_flags}"
         f"--keep-open=yes --idle=yes "
         f"--input-ipc-server={MPV_SOCKET} "
-        f"'{target_url}'"
+        f"'{_udp_url_for_mpv(target_url)}'"
     )
     env = os.environ.copy()
     env["DISPLAY"] = ":0"

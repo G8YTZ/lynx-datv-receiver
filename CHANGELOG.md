@@ -8,6 +8,7 @@ All notable changes to Lynx are documented here, in reverse chronological order.
 - RF: mpv starts on the first lock reading, half a second apart, instead of after 3 s of steady lock: about 3 s off every start. A false lock shows nothing, because the cover only lifts once mpv has a picture. Lock is still lost after 3 s without one. Each start logs "lock to picture" with how long it took.
 
 **Fixed**
+- RF: mpv no longer freezes for good when FFmpeg's UDP buffer overruns. By default FFmpeg stops reading the socket after an overrun, so the picture froze with the network queue full; now it carries on and loses only what did not fit (`overrun_nonfatal=1`). Seen on Lynx-Tx's carousel: slow pictures, pictures missing their bottom, then a freeze.
 - The web page's programme choice no longer vanishes and comes back while mpv restarts: the last list seen on the same tune is kept for a minute.
 - Watching a stills programme with no sound (Lynx-Tx's 4K carousel): the drift correction and the freeze checks leave it alone. Its picture changes every few seconds, which they took for a stall, and mpv was restarted every half minute, flashing up programme 1 in between.
 - A second programme chosen by hand (Lynx-Tx's 4K carousel) stays chosen when mpv restarts, for as long as the same thing is tuned. It used to go back to programme 1 at the next restart, two minutes later on the ROCK 5C.
