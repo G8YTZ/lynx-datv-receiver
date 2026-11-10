@@ -1015,6 +1015,23 @@ def network_output_watchdog():
         time.sleep(3)
 
 
+def _programme_track_flags() -> str:
+    """mpv's --vid/--aid for a programme chosen by hand on what is tuned
+    now, or "" for mpv's own choice (the first programme).
+
+    Each programme in a multiplex runs on its own clock: Lynx-Tx's carousel
+    was 104 s behind the live picture (10 Nov 2026). Swapping tracks in a
+    running mpv kept the old programme's clock, so the new one's pictures
+    were all "late" and mostly dropped (a minute for a picture), or held,
+    which stopped mpv reading until FFmpeg's buffer overran. So a programme
+    is chosen by starting mpv on it, as a set-top box restarts its decoder."""
+    want = programme_wanted
+    if not want or want.get("key") != _programme_key():
+        return ""
+    aid = want.get("audio")
+    return f"--vid={want['video']} --aid={aid if aid is not None else 'no'} "
+
+
 def _udp_url_for_mpv(url: str) -> str:
     """A udp:// source with FFmpeg's overrun made survivable.
 
@@ -1144,6 +1161,7 @@ def restart_mpv(target_url: str, is_rf: bool = True):
         f"--audio-pitch-correction=no --script={DRIFT_SCRIPT_PATH} "
         f"{source_flags}"
         f"--keep-open=yes --idle=yes "
+        f"{_programme_track_flags()}"
         f"--input-ipc-server={MPV_SOCKET} "
         f"'{_udp_url_for_mpv(target_url)}'"
     )
@@ -2569,7 +2587,7 @@ def mpv_decoder_health_monitor():
             # its playback clock creeps forward in jumps: to these checks
             # that is a stall, and they restarted mpv every half minute
             # (10 Nov 2026). Left alone while one is being watched.
-            if programme_wanted or \
+            if (programme_wanted and not programme_wanted.get("first")) or \
                     time.time() - max(mpv_last_started_at, programme_switched_at) < STARTUP_GRACE_SECS:
                 # Still within the startup grace window - advance our
                 # read position so nothing backlogs, but don't evaluate
@@ -12433,13 +12451,9 @@ def _programme_key():
     return (st.get("mode"), st.get("freq"), st.get("sr"), st.get("plug"), st.get("url"))
 
 
-def _select_programme(p):
-    global programme_switched_at
-    # The new picture starts at its next keyframe; until then the decoder
-    # complains ("Could not find ref"), which must not read as a fault.
-    programme_switched_at = time.time()
-    mpv_cmd({"command": ["set_property", "vid", p["video"]]})
-    mpv_cmd({"command": ["set_property", "aid", p["audio"] if p["audio"] is not None else "no"]})
+def mpv_programmes_known(progs) -> bool:
+    """mpv is up and has found at least one programme with a picture."""
+    return bool(progs)
 
 
 def programme_keeper():
@@ -12465,10 +12479,17 @@ def programme_keeper():
                 continue
             progs = mpv_programmes()
             p = next((x for x in progs if x["program"] == want["program"]), None)
-            if p and not p["selected"]:
-                _select_programme(p)
-                print(f"[programme] mpv restarted on programme 1 - back to programme "
-                      f"{want['program']} as chosen")
+            if p is None and not want.get("first") and mpv_programmes_known(progs) \
+                    and time.time() - programme_switched_at > 20:
+                # mpv started without finding the programme at all (its
+                # table came too late for mpv's first second): try again.
+                _restart_on_programme(f"programme {want['program']} not found: trying again")
+            elif p and not p["selected"] and time.time() - programme_switched_at > 20:
+                # mpv numbers its tracks in the order it finds them, which
+                # can change from one start to the next: started on the wrong
+                # numbers, start again on the right ones (at most every 20 s).
+                want["video"], want["audio"] = p["video"], p["audio"]
+                _restart_on_programme(f"track numbers changed: programme {want['program']}")
         except Exception as e:
             print(f"[programme] {type(e).__name__}: {e}")
 
@@ -12485,12 +12506,38 @@ def api_programme(req: ProgrammeRequest):
     if not p:
         raise HTTPException(404, f"No programme {req.program} in this stream")
     first = progs[0]["program"] if progs else req.program
-    programme_wanted = (None if req.program == first
-                        else {"program": req.program, "key": _programme_key()})
-    _select_programme(p)
-    print(f"[programme] now programme {req.program} (video track {p['video']}, "
-          f"sound {p['audio'] if p['audio'] is not None else 'none'})")
+    # Every choice is remembered with its track numbers, the first
+    # programme's too: mpv's own first pick is whichever video it found
+    # first, which on a two-programme stream can be the other one.
+    programme_wanted = {"program": req.program, "key": _programme_key(),
+                        "video": p["video"], "audio": p["audio"],
+                        "first": req.program == first}
+    if not p["selected"]:
+        threading.Thread(target=_restart_on_programme,
+                         args=(f"chosen: programme {req.program}",), daemon=True).start()
     return {"success": True, "programme": p}
+
+
+def _restart_on_programme(why: str):
+    """Restart mpv on the programme in programme_wanted (or the first),
+    behind the cover. Up to 15 s for a picture: the carousel's keyframes
+    are 10 s apart."""
+    global programme_switched_at, mpv_last_started_at
+    src, is_rf = network_output_source, network_output_source_is_rf
+    if not src or not tune_lock.acquire(timeout=5):
+        return
+    try:
+        print(f"[programme] restarting mpv ({why}) {_programme_track_flags().strip() or 'programme 1'}")
+        programme_switched_at = time.time()
+        start_transition_cover()
+        time.sleep(0.3)
+        restart_mpv(src, is_rf=is_rf)
+        if is_rf:
+            mpv_last_started_at = time.time()
+        wait_for_mpv_rendering(timeout=15)
+        end_transition_cover()
+    finally:
+        tune_lock.release()
 
 
 @app.get("/api/hdhomerun/programs", tags=["RF Reception"],
