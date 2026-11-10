@@ -5,6 +5,7 @@ All notable changes to Lynx are documented here, in reverse chronological order.
 ## 2026-11-10
 
 **Fixed**
+- Picotuner lock with two programmes in the multiplex: a receiver line showing only a frequency ("1316.074B") now counts as locked. With a second programme the tuner shows the service name for about a second every half minute, and Lynx read the rest as unlocked: mpv stopped and started, and diversity re-tuned a receiver at 30 dB MER.
 - Diversity on a multiplex with two programmes (Lynx-Tx's stills carousel beside the main picture): the combiner now cuts its segments on one PCR PID only, the lowest. Cut on both programmes' clocks it put the stream out of order, and the picture froze every few seconds until Lynx gave up.
 
 **New**

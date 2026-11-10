@@ -1678,6 +1678,34 @@ def rx_line_callsign(parts, unlocked_states):
     return ""
 
 
+def rx_line_bare_lock(parts):
+    """A tuner line that is a frequency and nothing else ("1316.074B").
+
+    WinterHill always says when it is NOT locked, in words: "search",
+    "lost", "header". A bare frequency is a lock whose service name it is
+    not showing. With two programmes in the multiplex (Lynx-Tx's 4K
+    carousel) the name appears for about a second every half minute or
+    so, and the rest of the time the line is bare (10 Nov 2026, ROCK 5C,
+    both receivers on 1316 MHz at 30 dB MER):
+
+        21:32:59 RX1 1316.074T header      RX2 (blank)
+        21:33:00 RX1 1316.074T G8YTZ       RX2 1316.074B G8YTZ
+        21:33:01 RX1 1316.074T             RX2 1316.074B   ... for 30 s+
+
+    Lynx used to count a lock only once it had seen the name, and kept it
+    through bare lines after that (rx_line_held_callsign). But the blank
+    and "header" lines in between dropped the lock and the held name, so
+    each receiver then read as unlocked for half a minute at a time: mpv
+    stopped and started, and diversity re-tuned a receiver at 30 dB."""
+    if len(parts) != 1 or not parts[0][-1:] in ("T", "B"):
+        return False
+    try:
+        float(parts[0][:-1])
+    except ValueError:
+        return False
+    return True
+
+
 def rx_line_held_callsign(parts, state):
     """A locked tuner whose line has lost its name: "1304.072B" alone, after
     "1304.072B G8YTZ" on the same frequency. The tuner's firmware shows one
@@ -1938,9 +1966,10 @@ def picotuner_monitor():
                     unlocked_states = {"search", "lost", "header", ""}
                     call = rx_line_callsign(parts, unlocked_states) or \
                         rx_line_held_callsign(parts, picotuner_state)
-                    if call:
+                    if call or rx_line_bare_lock(parts):
                         picotuner_state["locked"] = True
-                        picotuner_state["callsign"] = call
+                        picotuner_state["callsign"] = call or (
+                            picotuner_state.get("callsign", "") if picotuner_state.get("locked") else "")
                         picotuner_state["frequency"] = parts[0].rstrip("TB")
                     else:
                         picotuner_state["locked"] = False
@@ -1961,9 +1990,10 @@ def picotuner_monitor():
                     unlocked_states = {"search", "lost", "header", ""}
                     call = rx_line_callsign(parts, unlocked_states) or \
                         rx_line_held_callsign(parts, picotuner_state_b)
-                    if call:
+                    if call or rx_line_bare_lock(parts):
                         picotuner_state_b["locked"] = True
-                        picotuner_state_b["callsign"] = call
+                        picotuner_state_b["callsign"] = call or (
+                            picotuner_state_b.get("callsign", "") if picotuner_state_b.get("locked") else "")
                         picotuner_state_b["frequency"] = parts[0].rstrip("TB")
                     else:
                         picotuner_state_b["locked"] = False
