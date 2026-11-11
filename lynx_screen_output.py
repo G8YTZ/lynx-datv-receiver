@@ -358,7 +358,7 @@ class ScreenOutput:
         return ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
                 "-fflags", "+nobuffer",
                 "-i", f"udp://127.0.0.1:{LOOP_PORT}?overrun_nonfatal=1"
-                      "&fifo_size=100000&buffer_size=4194304&timeout=5000000",
+                      "&fifo_size=100000&buffer_size=425984&timeout=15000000",
                 "-map", "0", "-c", "copy",
                 "-f", "mpegts", "-mpegts_service_id", "1",
                 "-metadata", f"service_name={self.service_name()}",
@@ -375,6 +375,13 @@ class ScreenOutput:
         cfg = self.get_config()
         s = settings(cfg)
         mode = s["mode"]
+        missing = self.available()
+        if missing and mode != "hdmi":
+            self.last_error = ("missing on this receiver: " + ", ".join(missing)
+                               + " (run the installer again)")
+            with self.lock:
+                self._stop_all()
+            return
         with self.lock:
             if mode == "srt":
                 ensure_null_sink()
@@ -424,6 +431,10 @@ class ScreenOutput:
                 self.sender = None
             if skey is None:
                 self.last_error = "no SRT address set"
+                return
+            # The sender reads the capture's loopback stream: give the
+            # capture a few seconds to start writing before it opens.
+            if not self._alive(self.capture) or now - self.capture_since < 3:
                 return
             if not self._alive(self.sender):
                 if self.sender is not None:
@@ -484,8 +495,7 @@ class ScreenOutput:
                   flush=True)
         while not self.stopping:
             try:
-                if not missing or settings(self.get_config())["mode"] == "hdmi":
-                    self.tick()
+                self.tick()
             except Exception as e:
                 print(f"[srt] watchdog: {e}", flush=True)
             time.sleep(2)

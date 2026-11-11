@@ -194,6 +194,8 @@ else
   rm -rf wf-recorder
   git clone --depth 1 -b "$WF_RECORDER_TAG" https://github.com/ammen99/wf-recorder.git || exit 1
   cd wf-recorder || exit 1
+  # FFmpeg 8 removed AVCodec.pix_fmts/sample_fmts/ch_layouts (11 Nov 2026).
+  git apply "$LYNX_DIR/patches/wf-recorder-0.6.0-ffmpeg8.patch" || exit 1
   meson setup build --prefix=/usr/local --buildtype=release \
     -Ddefault_codec=h264_rkmpp -Ddefault_pixel_format=bgr0 \
     -Ddefault_audio_backend=pipewire || exit 1
