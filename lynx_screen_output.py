@@ -313,6 +313,7 @@ class ScreenOutput:
         self.capture_since = 0.0
         self.last_error = ""
         self.screen = None          # the output being captured
+        self.keys_repaired = False  # rc.xml keys re-added once this run
         self.thread = None
         self.stopping = False
 
@@ -346,6 +347,22 @@ class ScreenOutput:
                 time.sleep(0.5)
                 outs = outputs() or {}
                 virt = virtual_name(outs)
+                if not virt and not self.keys_repaired:
+                    # The keys may never have been added (a hand-built
+                    # wf-recorder skipped the installer step; Thomas
+                    # DL5BCA, 11 Nov 2026). Add them, let labwc reload,
+                    # and press once more: once per Lynx start.
+                    self.keys_repaired = True
+                    script = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                          "install", "lynx_labwc_srt_keys.py")
+                    rc, out = _run(["python3", script], timeout=15)
+                    print(f"[srt] no virtual screen: re-adding labwc's keys "
+                          f"({out.strip() or rc})", flush=True)
+                    time.sleep(1.5)
+                    _press(KEY_ADD)
+                    time.sleep(0.5)
+                    outs = outputs() or {}
+                    virt = virtual_name(outs)
                 if not virt:
                     self.last_error = ("labwc made no virtual screen: is the "
                                        "VirtualOutputAdd key in rc.xml?")
