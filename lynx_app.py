@@ -12499,6 +12499,7 @@ class ScreenOutputRequest(BaseModel):
     mode: Optional[str] = None          # hdmi | srt
     format: Optional[str] = None        # 1080p50 | 1080p25 | 2160p25 | 2160p50
     codec: Optional[str] = None         # hevc | h264
+    audio_delay_ms: Optional[int] = None
     host: Optional[str] = None
     port: Optional[int] = None
     srt_mode: Optional[str] = None      # caller | listener
@@ -14391,6 +14392,9 @@ def web_ui():
                     <details class="mb-2">
                         <summary class="small text-muted">More SRT settings</summary>
                         <div class="mt-2">
+                            <label class="small text-muted mb-1" for="scrout-delay">Sound delay (ms): plus if the picture is late</label>
+                            <input type="number" class="form-control form-control-sm mb-2 bg-dark text-light border-secondary"
+                                   id="scrout-delay" step="20" onchange="saveScreenOutput()">
                             <label class="small text-muted mb-1" for="scrout-srtmode">Who connects</label>
                             <select class="form-select form-select-sm mb-2 bg-dark text-light border-secondary"
                                     id="scrout-srtmode" onchange="saveScreenOutput()">
@@ -15887,6 +15891,7 @@ function showScreenOutput(st) {
         });
         document.getElementById('scrout-format').value = set.format || '1080p50';
         document.getElementById('scrout-codec').value = set.codec || 'hevc';
+        document.getElementById('scrout-delay').value = set.audio_delay_ms ?? 0;
         document.getElementById('scrout-bitrate').value =
             (st.bitrate_set ? set.bitrate_kbps : '');
         document.getElementById('scrout-bitrate').placeholder =
@@ -15952,6 +15957,7 @@ async function saveScreenOutput(withPass) {
         port: parseInt(document.getElementById('scrout-port').value, 10) || 9000,
         format: document.getElementById('scrout-format').value,
         codec: document.getElementById('scrout-codec').value,
+        audio_delay_ms: parseInt(document.getElementById('scrout-delay').value, 10) || 0,
         bitrate_kbps: parseInt(document.getElementById('scrout-bitrate').value, 10) || 0,
         latency_ms: parseInt(document.getElementById('scrout-latency').value, 10) || 500,
         srt_mode: document.getElementById('scrout-srtmode').value,

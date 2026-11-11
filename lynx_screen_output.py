@@ -86,6 +86,12 @@ FORMATS = {
 SOFTWARE_FORMATS = ("720p50", "720p25", "1080p25", "1080p50")
 SOFTWARE_DEFAULT = "720p50"
 
+# Sound delay for the SRT feed, in ms: the sound's timestamps are moved
+# by this much (positive: later) in the sender, with no re-encoding. On
+# the Pi the picture reached the capture later than its sound (11 Nov
+# 2026); the ROCK needed none.
+AUDIO_DELAY_DEFAULT_MS = 0
+
 DEFAULTS = {
     "mode": "hdmi",
     "format": "1080p50",
@@ -97,6 +103,7 @@ DEFAULTS = {
     "latency_ms": 500,
     "bitrate_kbps": None,      # None: by codec and format (see settings())
     "passphrase": "",
+    "audio_delay_ms": None,    # None: board default (AUDIO_DELAY_DEFAULT_MS)
     "streamid": "",
 }
 
@@ -115,6 +122,9 @@ def settings(config):
     elif s.get("format") not in FORMATS:
         s["format"] = "1080p50"
     s["width"], s["height"], s["fps"] = FORMATS[s["format"]]
+    if s.get("audio_delay_ms") is None:
+        s["audio_delay_ms"] = AUDIO_DELAY_DEFAULT_MS
+    s["audio_delay_ms"] = max(-1000, min(2000, int(s["audio_delay_ms"])))
     if s.get("codec") not in ("hevc", "h264"):
         s["codec"] = "hevc" if HARDWARE_ENCODER else "h264"
     if not s.get("bitrate_kbps"):
@@ -453,11 +463,22 @@ class ScreenOutput:
                 "-i", f"udp://127.0.0.1:{LOOP_PORT}?overrun_nonfatal=1"
                       f"&fifo_size={fifo}&buffer_size={kbuf}&timeout=15000000",
                 "-map", "0", "-c", "copy",
+                ] + self._delay_args(s) + [
                 "-f", "mpegts", "-mpegts_service_id", "1",
                 "-metadata", f"service_name={self.service_name()}",
                 "-metadata", "service_provider=Lynx",
                 "-mpegts_flags", "+resend_headers",
                 url]
+
+    @staticmethod
+    def _delay_args(s):
+        """The setts bitstream filter moves the sound's timestamps by the
+        set delay, within -c copy: no decoding or re-encoding."""
+        ms = int(s.get("audio_delay_ms") or 0)
+        if not ms:
+            return []
+        d = ms / 1000.0
+        return ["-bsf:a", f"setts=pts=PTS+{d}/TB:dts=DTS+{d}/TB"]
 
     def _backoff(self, fails):
         if fails < 0:
