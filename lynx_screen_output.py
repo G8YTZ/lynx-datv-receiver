@@ -430,11 +430,14 @@ class ScreenOutput:
         # caller to come, or the far end to answer), and on connecting
         # sent all it had queued in one burst: older than SRT's latency,
         # so the far end dropped it ("RCV-DROPPED", VLC, 11 Nov 2026).
-        # Its queue now holds a quarter of a second at the bit rate, and
-        # the kernel's no more than that, so what goes first is recent.
+        # Its queue now holds one second at the bit rate. A quarter of a
+        # second (first try) was smaller than an H.265 keyframe's burst,
+        # so part of each keyframe was dropped: white flashes in VLC
+        # until the next one (5C, 11 Nov 2026). A second's backlog on
+        # connecting is within what SRT absorbs at join.
         bps = int(s["bitrate_kbps"]) * 1000 + 256000
-        fifo = max(300, int(bps * 0.25 / 8 / 188))
-        kbuf = max(65536, int(bps * 0.25 / 8))
+        fifo = max(2000, int(bps * 1.0 / 8 / 188))
+        kbuf = 4194304          # the kernel caps it (425984 on the 5C)
         return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
                 "-fflags", "+nobuffer+discardcorrupt",
                 "-probesize", "1000000", "-analyzeduration", "1000000",
