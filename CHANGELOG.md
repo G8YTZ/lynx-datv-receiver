@@ -2,6 +2,25 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-11-11
+
+**New**
+- Radxa ROCK 5C supported, alongside the 5T and the Pi. One installer for every board: it works out which it is on.
+- Two programmes in one carrier (Lynx-Tx's 4K carousel): both offered on the web page, remembered per tune like a channel scan, and a change of programme starts the player on the new programme's own clock.
+- Picotuner receivers can be shared with another Lynx (Apple TV, iPhone) or protected for a repeater (Config, Picotuner).
+
+**Changed**
+- No black transition cover. While a picture starts, the screen shows the logo and the receiver's status, or the stream starting. `LYNX_COVER=1` brings the cover back.
+- Faster lock to picture on RF: about 3 s quicker.
+- Pi 5 fan comes on at 40 °C and steps up at 45, 55 and 65 °C.
+
+**Fixed**
+- Lynx restarted itself every time a signal went away. It now waits quietly and the picture returns with the signal.
+- Choosing a stream that is not sending no longer locks out tuning for about a minute.
+- Pictures that froze for good after a network buffer overrun.
+- Diversity and lock detection on carriers with two programmes.
+- The saved refresh rate (50 Hz) is applied at start-up and when saved, with no restart.
+
 ## 2026-11-03
 
 **Fixed**

@@ -1270,6 +1270,18 @@ class LynxOverlay(Gtk.Window):
         # SEARCHING flag, PPM and magic eye all land straight on top of
         # it. They are meaningless at that moment anyway: the contact is
         # over and the tuner is back to searching.
+        # Logged whenever what the overlay decides to show changes, so a
+        # missing OSD can be traced to its cause (10 Nov 2026: the orange
+        # status went missing on a ROCK 5C for half a minute at a time).
+        _why = (state["mode"], bool(state.get("locked")), bool(state["mpv_running_for_rf"]),
+                _reg, mpv_transitioning, showing_picture, bool(showing_squeak), bool(showing_map))
+        if _why != getattr(self, "_last_why", None):
+            self._last_why = _why
+            print(time.strftime("%H:%M:%S") +
+                  " [overlay] mode=%s locked=%s mpv=%s registry=%s cover=%s picture=%s squeak=%s "
+                  "osd_hidden=%s" % _why + (f" cover_age={transition_age:.1f}s" if mpv_transitioning else ""),
+                  flush=True)
+
         if not showing_map:
             self.draw_top_right(cr, width, height)
             self.draw_top_left(cr, width, height)

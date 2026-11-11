@@ -343,6 +343,10 @@ current_mode: str = "idle"    # idle | rf | stream
 mpv_running_for_rf: bool = False  # tracks whether mpv has actually been started for the
                                    # current RF tune (as opposed to just tuned-and-waiting-
                                    # for-lock) - see rf_mpv_lifecycle_monitor()
+switch_generation = 0     # bumped by every tune/stream request: a waiting start gives way
+rf_tuned_at: float = 0.0  # when the last RF tune was sent (rf_mpv_lifecycle_monitor)
+programme_wanted = None  # {"program": n, "key": ...}: the programme chosen by hand, kept
+#   across mpv restarts on the same tune (programme_keeper); None = programme 1
 programme_switched_at: float = 0.0  # a programme change in the same stream: the decoder waits for
 #   that programme's next keyframe, so the health monitor gives it the start-up grace too
 mpv_last_started_at: float = 0.0  # timestamp of the most recent mpv start - lets
@@ -706,11 +710,19 @@ def start_transition_cover():
     # The cover has genuinely been up continuously the whole time, so the
     # original timestamp is the honest one. Nesting starts is normal here
     # and should extend a cover, never restart it.
-    try:
-        os.close(os.open(MPV_TRANSITION_MARKER,
-                         os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-    except FileExistsError:
-        pass
+    # No cover by default (Justin, 11 Nov 2026, after testing on a Pi 5 and
+    # the ROCK 5C: "no need for a cover"). The overlay is never told, so it
+    # shows what it would anyway: the logo screen and the status until a
+    # picture is confirmed in RF, mpv itself on a stream. Everything else
+    # here still happens. To bring the cover back:
+    #   systemctl --user set-environment LYNX_COVER=1
+    #   systemctl --user restart lynx
+    if os.environ.get("LYNX_COVER") == "1":
+        try:
+            os.close(os.open(MPV_TRANSITION_MARKER,
+                             os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        except FileExistsError:
+            pass
     # Mute the OLD process right away — launching the new one with
     # --mute=yes only silences audio from the new source, it does
     # nothing about the old source still being audible for however
@@ -1012,6 +1024,40 @@ def network_output_watchdog():
         time.sleep(3)
 
 
+def _programme_track_flags() -> str:
+    """mpv's --vid/--aid for a programme chosen by hand on what is tuned
+    now, or "" for mpv's own choice (the first programme).
+
+    Each programme in a multiplex runs on its own clock: Lynx-Tx's carousel
+    was 104 s behind the live picture (10 Nov 2026). Swapping tracks in a
+    running mpv kept the old programme's clock, so the new one's pictures
+    were all "late" and mostly dropped (a minute for a picture), or held,
+    which stopped mpv reading until FFmpeg's buffer overran. So a programme
+    is chosen by starting mpv on it, as a set-top box restarts its decoder."""
+    want = programme_wanted
+    if not want or want.get("key") != _programme_key():
+        return ""
+    aid = want.get("audio")
+    return f"--vid={want['video']} --aid={aid if aid is not None else 'no'} "
+
+
+def _udp_url_for_mpv(url: str) -> str:
+    """A udp:// source with FFmpeg's overrun made survivable.
+
+    FFmpeg reads a UDP socket in a thread of its own into a 5 MB ring. If
+    mpv stops taking from the ring for a few seconds the ring overruns, and
+    by default the reading thread then STOPS for good: the socket is never
+    read again, the kernel queue sits full (428 kB) and throws everything
+    away, and mpv freezes on its last picture with an empty cache. Seen 10
+    Nov 2026 on a ROCK 5C watching Lynx-Tx's carousel (programme 2):
+    pictures took up to a minute, came in with their bottom missing, then
+    stopped altogether. overrun_nonfatal keeps the thread reading and
+    loses only what did not fit."""
+    if url.startswith("udp://") and "overrun_nonfatal" not in url:
+        return url + ("&" if "?" in url else "?") + "overrun_nonfatal=1"
+    return url
+
+
 def restart_mpv(target_url: str, is_rf: bool = True):
     """Fully kill and restart the mpv process, pointing it at a fresh
     target URL. Used instead of IPC-only reload commands (loadfile,
@@ -1124,8 +1170,9 @@ def restart_mpv(target_url: str, is_rf: bool = True):
         f"--audio-pitch-correction=no --script={DRIFT_SCRIPT_PATH} "
         f"{source_flags}"
         f"--keep-open=yes --idle=yes "
+        f"{_programme_track_flags()}"
         f"--input-ipc-server={MPV_SOCKET} "
-        f"'{target_url}'"
+        f"'{_udp_url_for_mpv(target_url)}'"
     )
     env = os.environ.copy()
     env["DISPLAY"] = ":0"
@@ -1323,7 +1370,16 @@ def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
     start_up = _kernel_uptime()
     deadline = start + timeout
     markers = ("VO:", "AV:")
+    gen = switch_generation
     while time.time() < deadline:
+        # A newer tune or stream was asked for: stop waiting on this one,
+        # so the new request gets the lock at once. A stream that was not
+        # sending held everything up for 12 + 20 s of render checks (and
+        # the new request gave up after 15 s), so for about a minute
+        # nothing could be tuned (11 Nov 2026, Pi and ROCK).
+        if switch_generation != gen:
+            print("[mpv_render] a newer tune or stream was asked for: no longer waiting")
+            return False
         try:
             with open('/tmp/mpv.log') as f:
                 content = f.read()
@@ -1678,6 +1734,34 @@ def rx_line_callsign(parts, unlocked_states):
     return ""
 
 
+def rx_line_bare_lock(parts):
+    """A tuner line that is a frequency and nothing else ("1316.074B").
+
+    WinterHill always says when it is NOT locked, in words: "search",
+    "lost", "header". A bare frequency is a lock whose service name it is
+    not showing. With two programmes in the multiplex (Lynx-Tx's 4K
+    carousel) the name appears for about a second every half minute or
+    so, and the rest of the time the line is bare (10 Nov 2026, ROCK 5C,
+    both receivers on 1316 MHz at 30 dB MER):
+
+        21:32:59 RX1 1316.074T header      RX2 (blank)
+        21:33:00 RX1 1316.074T G8YTZ       RX2 1316.074B G8YTZ
+        21:33:01 RX1 1316.074T             RX2 1316.074B   ... for 30 s+
+
+    Lynx used to count a lock only once it had seen the name, and kept it
+    through bare lines after that (rx_line_held_callsign). But the blank
+    and "header" lines in between dropped the lock and the held name, so
+    each receiver then read as unlocked for half a minute at a time: mpv
+    stopped and started, and diversity re-tuned a receiver at 30 dB."""
+    if len(parts) != 1 or not parts[0][-1:] in ("T", "B"):
+        return False
+    try:
+        float(parts[0][:-1])
+    except ValueError:
+        return False
+    return True
+
+
 def rx_line_held_callsign(parts, state):
     """A locked tuner whose line has lost its name: "1304.072B" alone, after
     "1304.072B G8YTZ" on the same frequency. The tuner's firmware shows one
@@ -1902,6 +1986,22 @@ def picotuner_monitor():
             # and permanently SEARCHING while the tuner is locked and
             # decoding perfectly. Confirmed exactly that way on real
             # hardware.
+            # Where each receiver is sending its stream: "TS target RX1
+            # 192.168.0.188:9941". Labelled with the board's own receiver
+            # numbers, like the RX lines below. Used to tell a receiver
+            # another device has taken over from one that has lost its
+            # tuning (see _picotuner_taken_over).
+            for line in text.splitlines():
+                parts = re.split(r'\s{2,}', line.strip())
+                if len(parts) != 2 or not parts[0].lower().startswith("ts target rx"):
+                    continue
+                num = parts[0][len("TS target RX"):].strip()
+                value = parts[1].strip().split()[0] if parts[1].strip() else ""
+                if num == str(picotuner_rx_numbers['a']):
+                    picotuner_state["ts_target"] = value
+                elif num == str(picotuner_rx_numbers['b']):
+                    picotuner_state_b["ts_target"] = value
+
             rx_label_a = f"RX{picotuner_rx_numbers['a']}"
             rx_label_b = f"RX{picotuner_rx_numbers['b']}"
             for line in text.splitlines():
@@ -1922,9 +2022,10 @@ def picotuner_monitor():
                     unlocked_states = {"search", "lost", "header", ""}
                     call = rx_line_callsign(parts, unlocked_states) or \
                         rx_line_held_callsign(parts, picotuner_state)
-                    if call:
+                    if call or rx_line_bare_lock(parts):
                         picotuner_state["locked"] = True
-                        picotuner_state["callsign"] = call
+                        picotuner_state["callsign"] = call or (
+                            picotuner_state.get("callsign", "") if picotuner_state.get("locked") else "")
                         picotuner_state["frequency"] = parts[0].rstrip("TB")
                     else:
                         picotuner_state["locked"] = False
@@ -1945,9 +2046,10 @@ def picotuner_monitor():
                     unlocked_states = {"search", "lost", "header", ""}
                     call = rx_line_callsign(parts, unlocked_states) or \
                         rx_line_held_callsign(parts, picotuner_state_b)
-                    if call:
+                    if call or rx_line_bare_lock(parts):
                         picotuner_state_b["locked"] = True
-                        picotuner_state_b["callsign"] = call
+                        picotuner_state_b["callsign"] = call or (
+                            picotuner_state_b.get("callsign", "") if picotuner_state_b.get("locked") else "")
                         picotuner_state_b["frequency"] = parts[0].rstrip("TB")
                     else:
                         picotuner_state_b["locked"] = False
@@ -2498,7 +2600,13 @@ def mpv_decoder_health_monitor():
                 emergency_delay_streak = 0
             if size == last_size:
                 continue
-            if time.time() - max(mpv_last_started_at, programme_switched_at) < STARTUP_GRACE_SECS:
+            # A second programme chosen by hand (Lynx-Tx's stills carousel)
+            # shows a new picture every few seconds and has no sound, so
+            # its playback clock creeps forward in jumps: to these checks
+            # that is a stall, and they restarted mpv every half minute
+            # (10 Nov 2026). Left alone while one is being watched.
+            if (programme_wanted and not programme_wanted.get("first")) or \
+                    time.time() - max(mpv_last_started_at, programme_switched_at) < STARTUP_GRACE_SECS:
                 # Still within the startup grace window - advance our
                 # read position so nothing backlogs, but don't evaluate
                 # anything yet.
@@ -3182,6 +3290,12 @@ def diversity_stuck_lock_monitor():
 
             stuck_a = check("a", picotuner_state)
             stuck_b = check("b", picotuner_state_b)
+            # A receiver another device has tuned stops reporting to us,
+            # which can look stuck. It isn't ours to recover.
+            if stuck_a and _picotuner_taken_over(1):
+                stuck_a = False
+            if stuck_b and _picotuner_taken_over(2):
+                stuck_b = False
 
             # Only when RF is what the receiver is actually showing.
             # This recovers a stuck tuner by retuning it from the last
@@ -3240,18 +3354,25 @@ def rf_mpv_lifecycle_monitor():
     starting mpv (and clearing the cover) from that point on.
     """
     global mpv_running_for_rf, mpv_last_started_at
-    LOCK_CONFIRM_POLLS = 3   # ~3s of sustained lock before starting mpv - avoids reacting to a brief false lock
-    LOSS_CONFIRM_POLLS = 3   # ~3s of sustained loss before stopping mpv - avoids stopping on a brief, normal fade.
+    # 10 Nov 2026: mpv now starts on the FIRST lock reading (was 3 s of
+    # steady lock), at half-second polls. The 3 s cost every start 3 s, and
+    # guarded against false locks that were mostly Lynx misreading the
+    # tuner (a lock shown without its service name, fixed the same day).
+    # A false lock costs nothing on screen: mpv starts behind the cover,
+    # finds no picture, and the cover never lifts.
+    LOCK_CONFIRM_POLLS = 1
+    LOSS_CONFIRM_POLLS = 6   # ~3s of sustained loss before stopping mpv - avoids stopping on a brief, normal fade.
                                # Was ~6s (POLL_SECS=2) - live testing with a co-channel interference edge case
                                # (two overlapping transmissions) showed the receiver can flicker between locked/
                                # unlocked fast enough that the unbroken streak this requires never completed,
                                # leaving mpv stuck on stale content with neither a stop nor a fresh restart ever
                                # triggering. A shorter window helps but doesn't fully close this if flickering is
                                # faster than even this - worth further testing per Justin's plan.
-    POLL_SECS = 1
+    POLL_SECS = 0.5
 
     lock_streak = 0
     loss_streak = 0
+    lock_seen_at = None   # first reading of the current lock: for "lock to picture" timing
 
     while True:
         time.sleep(POLL_SECS)
@@ -3345,6 +3466,13 @@ def rf_mpv_lifecycle_monitor():
             raw_locked = (_lifecycle_active.get("locked", False)
                           if _lifecycle_active else False) or \
                          (diversity_enabled and picotuner_state_b.get("locked", False))
+            # A lock read in the first moment after a tune can be the old
+            # frequency's: the tuner's next status line (once a second) has
+            # not arrived yet. With mpv now started on the first reading,
+            # that would start it on nothing and wait out the 8 s render
+            # check. So readings start counting 1.5 s after a tune.
+            if time.time() - rf_tuned_at < 1.5:
+                raw_locked = False
 
             # Network output means there is deliberately no player
             # here, so "mpv is not running" is the intended state
@@ -3359,11 +3487,14 @@ def rf_mpv_lifecycle_monitor():
             if raw_locked:
                 loss_streak = 0
                 lock_streak += 1
+                if lock_seen_at is None:
+                    lock_seen_at = time.time()
                 if lock_streak >= LOCK_CONFIRM_POLLS and not mpv_running_for_rf:
                     if tune_lock.acquire(timeout=2):
                         try:
                             print(f"[rf_mpv_lifecycle] Confirmed lock after "
                                   f"{lock_streak * POLL_SECS}s - starting mpv")
+                            mpv_asked_at = time.time()
                             # Same answer as before for diversity and
                             # for receiver A, and the right one for a
                             # Slave. Asking beats deciding again:
@@ -3388,8 +3519,13 @@ def rf_mpv_lifecycle_monitor():
                                 end_transition_cover()
                                 mpv_running_for_rf = True
                                 mpv_last_started_at = time.time()
+                                took = time.time() - lock_seen_at
+                                print(f"[rf_mpv_lifecycle] lock to picture {took:.1f}s "
+                                      f"(waiting for lock reading "
+                                      f"{mpv_asked_at - lock_seen_at:.1f}s, mpv to picture "
+                                      f"{time.time() - mpv_asked_at:.1f}s)")
                                 record_diagnostic_event("rf_lock_confirmed_start",
-                                                  f"after {lock_streak * POLL_SECS}s idle")
+                                                  f"lock to picture {took:.1f}s")
                             else:
                                 # mpv never confirmed real rendering within the
                                 # timeout - confirmed live as a genuine bug when
@@ -3412,6 +3548,7 @@ def rf_mpv_lifecycle_monitor():
                     # establish the correct mpv state - try again next poll.
             else:
                 lock_streak = 0
+                lock_seen_at = None
                 loss_streak += 1
                 if loss_streak >= LOSS_CONFIRM_POLLS and mpv_running_for_rf:
                     if tune_lock.acquire(timeout=2):
@@ -3421,6 +3558,14 @@ def rf_mpv_lifecycle_monitor():
                             start_transition_cover()
                             kill_mpv()
                             mpv_running_for_rf = False
+                            # mpv is gone, so nothing is left underneath to
+                            # hide: lower the cover and let the overlay say
+                            # what the receiver is doing (the orange status).
+                            # Left up, it stayed until its 30 s cap, hiding the
+                            # OSD by design for a switch, and the screen sat
+                            # black for half a minute after every loss of
+                            # signal (10 Nov 2026, Justin, ROCK 5C).
+                            end_transition_cover()
                             record_diagnostic_event("rf_loss_confirmed_stop",
                                               f"after {loss_streak * POLL_SECS}s of confirmed loss")
                         finally:
@@ -5577,6 +5722,7 @@ class PicotunerConfigUpdate(BaseModel):
     ts_port: int
     ts_port_b: int
     status_port: int
+    receivers: Optional[str] = None   # "share" or "protect"
 
 class DiversityConfigUpdate(BaseModel):
     mer_switch_dwell_secs: Optional[float] = None
@@ -7323,6 +7469,97 @@ PICOTUNER_MISMATCH_SECS = 20.0      # sustained disagreement before acting
 PICOTUNER_RETUNE_SETTLE_SECS = 8.0  # let its firmware finish booting first
 PICOTUNER_RETUNE_COOLDOWN_SECS = 90.0   # don't hammer a tuner that won't take
 
+PICOTUNER_TAKEOVER_ASK_SECS = 30.0  # how often to ask a taker if it has finished
+_my_ips_cache = (0.0, set())
+_takeover_seen = {}                 # rcv -> (ip, last asked, answer)
+
+
+def _my_ips():
+    """This Pi's own addresses, refreshed once a minute."""
+    global _my_ips_cache
+    when, ips = _my_ips_cache
+    if time.time() - when > 60:
+        try:
+            out = subprocess.run(["hostname", "-I"], capture_output=True,
+                                 text=True, timeout=5).stdout
+            ips = set(out.split())
+        except Exception:
+            pass
+        _my_ips_cache = (time.time(), ips)
+    return ips
+
+
+def _ask_lynx_presence(ip, rcv):
+    """The question Lynx Apple TV and iPhone answer on UDP 9950:
+    "LYNX? n" -> "LYNX WATCHING n" or "LYNX IDLE". None when nothing
+    answers (not a Lynx, asleep, or a phone with Lynx in the background)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(1.2)
+        q = f"LYNX? {rcv}".encode()
+        sock.sendto(q, (ip, 9950))
+        sock.sendto(q, (ip, 9950))
+        while True:
+            data, addr = sock.recvfrom(256)
+            if addr[0] == ip:
+                return data.decode(errors="replace").strip()
+    except Exception:
+        return None
+    finally:
+        sock.close()
+
+
+PICOTUNER_PROTECT_RECLAIM_SECS = 15.0  # protected: at most one take-back per 15 s
+
+
+def _picotuner_mode():
+    """"share" (the default) or "protect", from the Config page."""
+    m = str((config.get('picotuner', {}) or {}).get('receivers', 'share')).lower()
+    return 'protect' if m == 'protect' else 'share'
+
+
+def _picotuner_target_other(rcv):
+    """The address receiver rcv is sending to, when that is another
+    device; None when it is sending to this Pi, to nowhere, or unknown."""
+    st = picotuner_state_b if rcv == 2 else picotuner_state
+    ip = str(st.get("ts_target", "") or "").split(":")[0]
+    if not ip or ip == "0.0.0.0" or ip in _my_ips():
+        return None
+    return ip
+
+
+def _picotuner_taken_over(rcv):
+    """The address of the device that has taken over receiver rcv (1 or
+    2), or None when it is still ours (or nobody's).
+
+    The Picotuner sends a receiver's $-status only to whoever tuned it, so
+    a receiver someone else has tuned looks, from here, exactly like one
+    that has lost its tuning: no symbol rate. Without this check the
+    watchdogs "restored" it within 30 s, snatching it back from an
+    iPhone watching over a VPN (3 Nov 2026)."""
+    st = picotuner_state_b if rcv == 2 else picotuner_state
+    target = str(st.get("ts_target", "") or "")
+    ip = target.split(":")[0]
+    if not ip or ip == "0.0.0.0" or ip in _my_ips():
+        _takeover_seen.pop(rcv, None)
+        return None
+    if _picotuner_mode() == 'protect':
+        return None          # protected: the tuning watchdog takes it straight back
+    now = time.time()
+    seen = _takeover_seen.get(rcv)
+    if seen is None or seen[0] != ip or now - seen[1] >= PICOTUNER_TAKEOVER_ASK_SECS:
+        answer = _ask_lynx_presence(ip, rcv)
+        if seen is None or seen[0] != ip:
+            print(f"[picotuner] Rx{rcv} taken over by {ip} - leaving it alone "
+                  f"(presence answer: {answer or 'none'})")
+        elif answer != seen[2]:
+            print(f"[picotuner] Rx{rcv} at {ip}: presence answer now {answer or 'none'}")
+        seen = (ip, now, answer)
+        _takeover_seen[rcv] = seen
+    if seen[2] and seen[2].startswith("LYNX") and seen[2] != f"LYNX WATCHING {rcv}":
+        return None          # a Lynx that has finished with it: ours again
+    return ip
+
 
 def _tri_watch_present():
     """True only on builds that actually have tri_watch.
@@ -7459,6 +7696,41 @@ def _picotuner_reported_sr(st):
     return sr if sr > 0 else None
 
 
+def lynx_presence_responder():
+    """Answers the question Lynx Apple TV and iPhone ask before taking a
+    Picotuner receiver: "LYNX? n" on UDP 9950, answered from the same
+    socket straight back to the asker. "LYNX WATCHING n" while this Lynx is
+    using receiver n (tuned for it, and its stream still comes here),
+    otherwise "LYNX IDLE". The exact text existing app builds compare
+    against, so a receiver in use here is reported as in use."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("", 9950))
+    except OSError as e:
+        print(f"[presence] could not listen on UDP 9950: {e}")
+        return
+    print("[presence] answering Lynx devices on UDP 9950")
+    while True:
+        try:
+            data, addr = sock.recvfrom(256)
+            text = data.decode(errors="replace").strip()
+            if not text.startswith("LYNX?"):
+                continue
+            try:
+                n = int(text.split()[1])
+            except (IndexError, ValueError):
+                continue
+            answer = "LYNX IDLE"
+            if n in _picotuner_expected_tuning() and not _picotuner_target_other(n):
+                answer = f"LYNX WATCHING {n}"
+            sock.sendto(answer.encode(), addr)
+            print(f"[presence] {addr[0]} asked about Rx{n}: {answer}")
+        except Exception as e:
+            print(f"[presence] {e}")
+            time.sleep(1)
+
+
 def picotuner_tuning_watchdog():
     """Puts the Picotuner back where it belongs whenever it has lost its
     tuning, whatever the cause."""
@@ -7476,11 +7748,32 @@ def picotuner_tuning_watchdog():
                 bad_since = None
                 continue
 
+            # Protected (a repeater): a receiver Lynx is using that another
+            # device has tuned is taken back at once, not after the 20 s a
+            # lost tuning waits, and with a shorter cooldown than a restore
+            # that isn't taking.
+            if _picotuner_mode() == 'protect':
+                grabbed = [(r, _picotuner_target_other(r)) for r in expected]
+                grabbed = [(r, ip) for r, ip in grabbed if ip]
+                if grabbed:
+                    now = time.time()
+                    if now - last_fix >= PICOTUNER_PROTECT_RECLAIM_SECS:
+                        for r, ip in grabbed:
+                            print(f"[picotuner] Rx{r} taken by {ip} - receivers "
+                                  f"are protected (repeater), taking it back")
+                        last_fix = now
+                        bad_since = None
+                        threading.Thread(target=_picotuner_restore_tuning,
+                                         daemon=True).start()
+                    continue
+
             wrong = []
             for rcv, (want_khz, want_sr) in expected.items():
                 st = picotuner_state_b if rcv == 2 else picotuner_state
                 if rcv == 2 and not st.get("online"):
                     continue          # Rx2 not reporting at all - nothing to compare
+                if _picotuner_taken_over(rcv):
+                    continue          # another device is using it: not a lost tuning
                 got_khz = _picotuner_reported_khz(st)
                 if got_khz is None:
                     wrong.append(f"Rx{rcv} not tuned "
@@ -9518,6 +9811,22 @@ def config_page():
                                 <label for="pt-ts-port-b">TS port (B)</label>
                                 <input type="number" class="form-control" id="pt-ts-port-b-input">
                             </div>
+                            <div class="col-md-6">
+                                <label for="pt-receivers">Receivers</label>
+                                <select class="form-select" id="pt-receivers-input">
+                                    <option value="share">Share with other devices</option>
+                                    <option value="protect">Protect (repeater)</option>
+                                </select>
+                            </div>
+                            <div class="col-12">
+                                <p class="text-muted small mb-0">
+                                    Share: another device (an iPhone or Apple TV, say) may take a
+                                    receiver this Lynx is using; Lynx takes it back when that device has
+                                    finished. Protect: a receiver Lynx is using is always taken straight
+                                    back, about 10 s later. Use Protect on a repeater. Takes effect on Save,
+                                    with no restart.
+                                </p>
+                            </div>
                         </div>
                         <div class="mt-3 d-flex align-items-center gap-2">
                             <button class="btn btn-save" onclick="savePicotuner()">Save Picotuner settings</button>
@@ -10157,6 +10466,7 @@ async function loadCurrentConfig() {
         document.getElementById('pt-ts-port-input').value = cfg.picotuner?.ts_port || '';
         document.getElementById('pt-cmd-port-b-input').value = cfg.picotuner?.cmd_port_b || '';
         document.getElementById('pt-ts-port-b-input').value = cfg.picotuner?.ts_port_b || '';
+        document.getElementById('pt-receivers-input').value = cfg.picotuner?.receivers === 'protect' ? 'protect' : 'share';
 
         document.getElementById('div-dwell-input').value = cfg.diversity?.mer_switch_dwell_secs ?? 10.0;
         document.getElementById('div-margin-input').value = cfg.diversity?.mer_switch_margin_db ?? 1.0;
@@ -10820,6 +11130,7 @@ async function savePicotuner() {
                 ts_port: parseInt(document.getElementById('pt-ts-port-input').value),
                 cmd_port_b: parseInt(document.getElementById('pt-cmd-port-b-input').value),
                 ts_port_b: parseInt(document.getElementById('pt-ts-port-b-input').value),
+                receivers: document.getElementById('pt-receivers-input').value,
             }
         };
         const r = await fetch('/api/config', {
@@ -11593,7 +11904,8 @@ def tune(req: TuneRequest):
     # working fine, since it never touched this lock at all — exactly
     # what was reported after a burst of rapid, overlapping preset/
     # stream switches.
-    global _tune_lock_handed_off
+    global _tune_lock_handed_off, switch_generation
+    switch_generation += 1          # anything still waiting on a picture gives way
     if not tune_lock.acquire(timeout=15):
         raise HTTPException(status_code=503, detail="Another tune operation is already in progress — please try again shortly")
     _tune_lock_handed_off = False
@@ -11776,6 +12088,8 @@ def _tune_impl(req: TuneRequest):
             stop_diversity_combiner()
         diversity_enabled = False
     
+    global rf_tuned_at
+    rf_tuned_at = time.time()
     current_mode = "rf"
     displayed_receiver_id = None
     if req.lnb_lo_khz:
@@ -12132,11 +12446,132 @@ def mpv_programmes() -> list:
                      "playing, from mpv's own tracks. More than one when the "
                      "transmitter sends a second programme (Lynx-Tx's 4K carousel).")
 def api_programmes():
-    return {"programmes": mpv_programmes()}
+    """The programmes on what is tuned: mpv's, or the remembered list.
+
+    Remembered per tune, like a television's channel scan, and kept on disk
+    (config/lynx_programmes.json). mpv only knows the programmes it saw in
+    its first second, and a transmitter coming on air starts its second
+    programme a few seconds after the first (Lynx-Tx's carousel), so when a
+    signal returned Lynx offered only programme 1 until a re-tune (10 Nov
+    2026). Lynx for Enigma2 does the same thing by scanning once and zapping
+    by service. Choosing a remembered programme restarts mpv, which by then
+    finds it on air. A restart's moment without tracks is covered too."""
+    progs = mpv_programmes()
+    key = _programme_key_str()
+    known = _programmes_known().get(key) or []
+    if len(progs) >= 2 and (_programmes_strip(progs) != known or
+                            time.time() - (_programmes_cache or {}).get(key, {}).get("seen", 0) > 3600):
+        _programmes_remember(key, progs)
+        known = _programmes_strip(progs)
+    if len(progs) < len(known):
+        on = {x["program"] for x in progs}
+        sel = next((x["program"] for x in progs if x.get("selected")), None)
+        want = (programme_wanted or {}).get("program")
+        chosen = want or sel or known[0]["program"]
+        progs = [dict(x, selected=(x["program"] == chosen), on_air=(x["program"] in on or None))
+                 for x in known]
+    return {"programmes": progs}
+
+
+# In /tmp: forgotten at every reboot, as Justin wanted (11 Nov 2026), and
+# kept across a restart of Lynx. An entry not seen again for 7 days goes too.
+PROGRAMMES_PATH = Path("/tmp/lynx_programmes.json")
+PROGRAMMES_KEEP_SECS = 7 * 24 * 3600
+_programmes_cache = None
+
+
+def _programme_key_str() -> str:
+    return json.dumps(_programme_key())
+
+
+def _programmes_known() -> dict:
+    global _programmes_cache
+    if _programmes_cache is None:
+        try:
+            _programmes_cache = json.loads(PROGRAMMES_PATH.read_text())
+        except Exception:
+            _programmes_cache = {}
+    now = time.time()
+    for k in [k for k, v in _programmes_cache.items()
+              if not isinstance(v, dict) or now - v.get("seen", 0) > PROGRAMMES_KEEP_SECS]:
+        del _programmes_cache[k]
+    return {k: v["programmes"] for k, v in _programmes_cache.items()}
+
+
+def _programmes_strip(progs: list) -> list:
+    return [{k: x.get(k) for k in ("program", "video", "audio", "width", "height", "codec")}
+            for x in progs]
+
+
+def _programmes_remember(key: str, progs: list):
+    _programmes_known()                       # loads, and drops the expired
+    known = _programmes_cache
+    known[key] = {"programmes": _programmes_strip(progs), "seen": time.time()}
+    try:
+        PROGRAMMES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PROGRAMMES_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(known, indent=1))
+        tmp.replace(PROGRAMMES_PATH)
+        print(f"[programme] remembered {len(progs)} programmes for this tune")
+    except OSError as e:
+        print(f"[programme] could not save the programme list: {e}")
 
 
 class ProgrammeRequest(BaseModel):
     program: int
+
+
+def _programme_key():
+    """What is tuned, as the saved state says: a programme chosen by hand
+    belongs to this tune and no other."""
+    st = load_last_state() or {}
+    return (st.get("mode"), st.get("freq"), st.get("sr"), st.get("plug"), st.get("url"))
+
+
+def mpv_programmes_known(progs) -> bool:
+    """mpv is up and has found at least one programme with a picture."""
+    return bool(progs)
+
+
+def programme_keeper():
+    """Background thread: puts the chosen programme back after mpv restarts.
+
+    mpv always starts on the first programme, and Lynx restarts it for many
+    reasons (a lock regained, a freeze, the screen coming back), so a choice
+    of programme 2 lasted only until the next one: 10 Nov 2026, the 4K
+    carousel chosen on a ROCK 5C went back to the live picture by itself
+    after two minutes. The choice is kept for as long as the same thing is
+    tuned (a re-tune to the same frequency keeps it), and forgotten when
+    something else is."""
+    global programme_wanted
+    while True:
+        time.sleep(2)
+        try:
+            want = programme_wanted
+            if not want:
+                continue
+            if _programme_key() != want["key"]:
+                programme_wanted = None
+                print("[programme] something else tuned - back to programme 1")
+                continue
+            # Never restarts mpv by itself (Justin, 11 Nov 2026: one restart
+            # per choice, no automatic ones). It only keeps the record true.
+            progs = mpv_programmes()
+            if not progs or time.time() - programme_switched_at < 20:
+                continue
+            p = next((x for x in progs if x["program"] == want["program"]), None)
+            if p is None and not want.get("first"):
+                programme_wanted = None
+                print(f"[programme] programme {want['program']} is not on air: choice "
+                      f"dropped (choose it again once it is)")
+            elif p and not p["selected"] and (want.get("video"), want.get("audio")) != (p["video"], p["audio"]):
+                # mpv numbered its tracks differently this time: remember the
+                # right numbers for the next start (no restart now).
+                want["video"], want["audio"] = p["video"], p["audio"]
+                print(f"[programme] programme {want['program']} has new track numbers "
+                      f"(video {p['video']}): used from the next start")
+        except Exception as e:
+            print(f"[programme] {type(e).__name__}: {e}")
 
 
 @app.post("/api/programme", tags=["RF Reception"],
@@ -12145,19 +12580,71 @@ class ProgrammeRequest(BaseModel):
                       "with no sound (a stills carousel) keeps none. The picture "
                       "appears at its next keyframe (up to 10 s for Lynx-Tx's carousel).")
 def api_programme(req: ProgrammeRequest):
-    global programme_switched_at
+    global programme_wanted
     progs = mpv_programmes()
     p = next((x for x in progs if x["program"] == req.program), None)
     if not p:
+        # Remembered from an earlier time on this tune but not (yet) in mpv:
+        # restart mpv on it, with the track numbers it had then.
+        known = _programmes_known().get(_programme_key_str()) or []
+        p = next((dict(x, selected=False) for x in known if x["program"] == req.program), None)
+        progs = known or progs
+    if not p:
         raise HTTPException(404, f"No programme {req.program} in this stream")
-    # The new picture starts at its next keyframe; until then the decoder
-    # complains ("Could not find ref"), which must not read as a fault.
-    programme_switched_at = time.time()
-    mpv_cmd({"command": ["set_property", "vid", p["video"]]})
-    mpv_cmd({"command": ["set_property", "aid", p["audio"] if p["audio"] is not None else "no"]})
-    print(f"[programme] now programme {req.program} (video track {p['video']}, "
-          f"sound {p['audio'] if p['audio'] is not None else 'none'})")
+    first = progs[0]["program"] if progs else req.program
+    # Every choice is remembered with its track numbers, the first
+    # programme's too: mpv's own first pick is whichever video it found
+    # first, which on a two-programme stream can be the other one.
+    programme_wanted = {"program": req.program, "key": _programme_key(),
+                        "video": p["video"], "audio": p["audio"],
+                        "first": req.program == first}
+    if not p["selected"]:
+        threading.Thread(target=_restart_on_programme,
+                         args=(f"chosen: programme {req.program}",), daemon=True).start()
     return {"success": True, "programme": p}
+
+
+def _restart_on_programme(why: str):
+    """Restart mpv on the programme in programme_wanted (or the first). Up
+    to 15 s for a picture: the carousel's keyframes are 10 s apart."""
+    global programme_switched_at, mpv_last_started_at, mpv_running_for_rf
+    src, is_rf = network_output_source, network_output_source_is_rf
+    if not src:
+        return
+    # Waits for a restart already under way (up to 15 s for a carousel
+    # picture) rather than giving up: with 5 s, choosing programme 1 while
+    # programme 2 was still starting did nothing at all (10 Nov 2026).
+    if not tune_lock.acquire(timeout=25):
+        print(f"[programme] could not restart mpv ({why}): something else held it for 25 s")
+        return
+    try:
+        if programme_wanted and programme_wanted.get("program") is not None \
+                and f"programme {programme_wanted['program']}" not in why \
+                and why.startswith("chosen"):
+            why = f"chosen: programme {programme_wanted['program']} (latest choice)"
+        print(f"[programme] restarting mpv ({why}) {_programme_track_flags().strip() or 'programme 1'}")
+        programme_switched_at = time.time()
+        if is_rf:
+            # RF: no cover. Marking mpv as not yet running makes the overlay
+            # show what it shows while a receiver acquires: the logo and the
+            # status, frequency, lock and MER, which all still hold on the
+            # same carrier (Justin, 11 Nov 2026: "no orange overlay between
+            # channels"). Back to the picture once mpv has one; if it never
+            # does, rf_mpv_lifecycle_monitor() starts it again as on a lock.
+            mpv_running_for_rf = False
+            restart_mpv(src, is_rf=True)
+            mpv_last_started_at = time.time()
+            if wait_for_mpv_rendering(timeout=15):
+                time.sleep(0.3)
+                mpv_running_for_rf = True
+        else:
+            start_transition_cover()
+            time.sleep(0.3)
+            restart_mpv(src, is_rf=is_rf)
+            wait_for_mpv_rendering(timeout=15)
+            end_transition_cover()
+    finally:
+        tune_lock.release()
 
 
 @app.get("/api/hdhomerun/programs", tags=["RF Reception"],
@@ -12528,7 +13015,8 @@ def start_stream(req: StreamRequest):
     # briefly exposing the desktop underneath. Reported directly: a
     # "flash of desktop" during rapid stream switching, right before RF
     # tuning stopped responding entirely from the related tune_lock bug.
-    global _tune_lock_handed_off
+    global _tune_lock_handed_off, switch_generation
+    switch_generation += 1          # anything still waiting on a picture gives way
     if not tune_lock.acquire(timeout=15):
         raise HTTPException(status_code=503, detail="Another tune/stream operation is already in progress — please try again shortly")
     _tune_lock_handed_off = False
@@ -12641,8 +13129,9 @@ def _start_stream_impl(req: StreamRequest):
             # before giving up; if that also fails, the cover stays up
             # rather than exposing anything - a stuck cover is a far
             # smaller problem than a silently exposed desktop.
+            _my_gen = switch_generation
             rendering_confirmed = wait_for_mpv_rendering(timeout=12.0)
-            if not rendering_confirmed:
+            if not rendering_confirmed and switch_generation == _my_gen:
                 print(f"[stream_start] mpv did not confirm rendering within 12s for "
                       f"'{req.name or req.url}' - giving it one more, longer attempt "
                       f"before uncovering")
@@ -13522,8 +14011,13 @@ def update_config(req: ConfigUpdateRequest):
             on_disk.setdefault('network_output', {}).update(
                 req.network_output.model_dump())
         if req.picotuner is not None:
-            new_pt = req.picotuner.model_dump()
-            picotuner_changed = on_disk.get('picotuner', {}) != {**on_disk.get('picotuner', {}), **new_pt}
+            new_pt = req.picotuner.model_dump(exclude_none=True)
+            if new_pt.get('receivers') not in (None, 'share', 'protect'):
+                new_pt.pop('receivers')
+            # receivers (share/protect) is read live by the tuning watchdog
+            # and the presence responder: changing it needs no restart.
+            restart_part = {k: v for k, v in new_pt.items() if k != 'receivers'}
+            picotuner_changed = on_disk.get('picotuner', {}) != {**on_disk.get('picotuner', {}), **restart_part}
             on_disk.setdefault('picotuner', {}).update(new_pt)
 
         diversity_changed = False
@@ -15941,6 +16435,7 @@ if __name__ == "__main__":
     freshness = threading.Thread(target=rf_mpv_lifecycle_monitor, daemon=True)
     freshness.start()
     threading.Thread(target=network_output_watchdog, daemon=True).start()
+    threading.Thread(target=programme_keeper, daemon=True).start()
     diversity_stuck = threading.Thread(target=diversity_stuck_lock_monitor, daemon=True)
     diversity_stuck.start()
     mer_pub = threading.Thread(target=mer_publisher, daemon=True)
@@ -16075,6 +16570,7 @@ if __name__ == "__main__":
     picotuner_watchdog_thread = threading.Thread(
         target=picotuner_tuning_watchdog, daemon=True)
     picotuner_watchdog_thread.start()
+    threading.Thread(target=lynx_presence_responder, daemon=True).start()
     # Repeater-activity notifications (QRZ/Slack/Companion/GPIO Tx) - its
     # own, independent monitor, deliberately not gated on current_mode the
     # way rf_mpv_lifecycle_monitor() is (see lynx_notifications.py's own

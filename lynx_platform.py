@@ -17,11 +17,13 @@ Boards:
           board gets exactly the behaviour Lynx had before this file
           existed, so nothing changes for anyone by accident)
   rock5t  Radxa ROCK 5T on Armbian trixie
+  rock5c  Radxa ROCK 5C on Armbian trixie: the same RK3588 video path as
+          the 5T (rkmpp, gpu-next, Wayland), with one HDMI output
 
 Every value below was found the hard way on 21 Oct 2026, porting Lynx
 to the ROCK 5T. The reason is given beside each one.
 
-For testing, LYNX_PLATFORM=pi or LYNX_PLATFORM=rock5t overrides the
+For testing, LYNX_PLATFORM=pi, rock5t or rock5c overrides the
 detection.
 
 From the shell:  python3 lynx_platform.py                 (all values)
@@ -44,17 +46,20 @@ def _model() -> str:
 MODEL = _model()
 
 _override = os.environ.get("LYNX_PLATFORM", "").strip().lower()
-if _override in ("pi", "rock5t"):
+if _override in ("pi", "rock5t", "rock5c"):
     BOARD = _override
 elif "ROCK 5T" in MODEL.upper():
     BOARD = "rock5t"
+elif "ROCK 5C" in MODEL.upper():     # "Radxa ROCK 5C" (10 Nov 2026)
+    BOARD = "rock5c"
 else:
     BOARD = "pi"
 
-IS_ROCK = BOARD == "rock5t"
+ROCK_NAMES = {"rock5t": "Radxa ROCK 5T", "rock5c": "Radxa ROCK 5C"}
+IS_ROCK = BOARD in ROCK_NAMES
 # The Pi 5 gets its own video path (below); a Pi 4 keeps the old one.
 IS_PI5 = not IS_ROCK and "RASPBERRY PI 5" in MODEL.upper()
-BOARD_NAME = "Radxa ROCK 5T" if IS_ROCK else "Raspberry Pi"
+BOARD_NAME = ROCK_NAMES.get(BOARD, "Raspberry Pi")
 
 # How mpv decodes and draws.
 #   Pi:   the GPU path with drm-copy, as proven over months of use.
@@ -132,8 +137,8 @@ CUSTOM_REFRESH_MODES = IS_ROCK or IS_PI5
 
 # HDMI outputs Lynx may drive as separate receivers (Lynx+). The Pi 5
 # has two sockets but one HEVC decoder, so its second output is shown
-# greyed out: "HDMI 2: ROCK 5T only".
-HDMI_OUTPUTS = 2 if IS_ROCK else 1
+# greyed out: "HDMI 2: ROCK 5T only". The ROCK 5C has one socket.
+HDMI_OUTPUTS = 2 if BOARD == "rock5t" else 1
 
 
 def as_dict() -> dict:
