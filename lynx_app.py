@@ -14363,6 +14363,8 @@ def web_ui():
                     <label class="small text-muted mb-1" for="scrout-format">Picture</label>
                     <select class="form-select form-select-sm mb-2 bg-dark text-light border-secondary"
                             id="scrout-format" onchange="saveScreenOutput()">
+                        <option value="720p50">720p50</option>
+                        <option value="720p25">720p25</option>
                         <option value="1080p50">1080p50</option>
                         <option value="1080p25">1080p25</option>
                         <option value="2160p25">2160p25 (4K)</option>

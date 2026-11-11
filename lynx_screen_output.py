@@ -70,6 +70,8 @@ KEY_REMOVE = "F10"
 # Picture formats for the SRT feed: (width, height, frames a second).
 # Any of them on SRT mode's virtual screen, whatever a monitor offers.
 FORMATS = {
+    "720p50": (1280, 720, 50),
+    "720p25": (1280, 720, 25),
     "1080p50": (1920, 1080, 50),
     "1080p25": (1920, 1080, 25),
     "2160p25": (3840, 2160, 25),
@@ -77,8 +79,12 @@ FORMATS = {
 }
 
 # What a board without a hardware encoder (the Pi) can offer: H.264 in
-# software (libx264), 1080p only. H.265 in software is far too slow.
-SOFTWARE_FORMATS = ("1080p25", "1080p50")
+# software (libx264), 720p or 1080p. H.265 in software is far too slow.
+# At 1080p25 superfast the Pi 5 was flat out (wf-recorder 200%, 9% idle,
+# load 5.3): judder and poor lip-sync (11 Nov 2026). Now ultrafast, and
+# 720p50 by default.
+SOFTWARE_FORMATS = ("720p50", "720p25", "1080p25", "1080p50")
+SOFTWARE_DEFAULT = "720p50"
 
 DEFAULTS = {
     "mode": "hdmi",
@@ -101,20 +107,23 @@ def settings(config):
     # Its own format, not Lynx's Refresh rate (50 or 60 only): in SRT
     # mode the screen output owns the screen mode, and the
     # Refresh rate setting stands aside (lynx_app._reapply_refresh_rate).
-    if s.get("format") not in FORMATS:
-        s["format"] = "1080p50"
     if not HARDWARE_ENCODER:
-        if s["format"] not in SOFTWARE_FORMATS:
-            s["format"] = "1080p25"
+        if s.get("format") not in SOFTWARE_FORMATS or \
+                not (config.get("screen_output") or {}).get("format"):
+            s["format"] = SOFTWARE_DEFAULT
         s["codec"] = "h264"
+    elif s.get("format") not in FORMATS:
+        s["format"] = "1080p50"
     s["width"], s["height"], s["fps"] = FORMATS[s["format"]]
     if s.get("codec") not in ("hevc", "h264"):
         s["codec"] = "hevc" if HARDWARE_ENCODER else "h264"
     if not s.get("bitrate_kbps"):
         # H.265 needs about two thirds of H.264's rate for the same look.
         uhd = s["height"] > 1080
+        hd = s["height"] > 720
         s["bitrate_kbps"] = ({"hevc": 12000, "h264": 16000} if uhd else
-                             {"hevc": 4000, "h264": 6000})[s["codec"]]
+                             {"hevc": 4000, "h264": 6000} if hd else
+                             {"hevc": 2500, "h264": 4000})[s["codec"]]
     if s["mode"] not in MODES:
         s["mode"] = "hdmi"      # includes a saved "both" (removed)
     return s
@@ -409,7 +418,7 @@ class ScreenOutput:
             # default constant quality so the bit rate holds; the VBV
             # (maxrate, bufsize of one second) keeps it near constant.
             cmd += ["-c", "libx264", "-x", "yuv420p",
-                    "-p", "preset=superfast", "-p", "tune=zerolatency",
+                    "-p", "preset=ultrafast", "-p", "tune=zerolatency",
                     "-p", "crf=-1", "-p", f"b={kbps * 1000}",
                     "-p", f"maxrate={kbps * 1000}",
                     "-p", f"bufsize={kbps * 1000}",
