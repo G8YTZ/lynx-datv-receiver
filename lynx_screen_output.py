@@ -425,10 +425,20 @@ class ScreenOutput:
         url = srt_url(s)
         if not url:
             return None
-        return ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
-                "-fflags", "+nobuffer",
+        # The sender reads the capture while it waits to connect (a
+        # caller to come, or the far end to answer), and on connecting
+        # sent all it had queued in one burst: older than SRT's latency,
+        # so the far end dropped it ("RCV-DROPPED", VLC, 11 Nov 2026).
+        # Its queue now holds a quarter of a second at the bit rate, and
+        # the kernel's no more than that, so what goes first is recent.
+        bps = int(s["bitrate_kbps"]) * 1000 + 256000
+        fifo = max(300, int(bps * 0.25 / 8 / 188))
+        kbuf = max(65536, int(bps * 0.25 / 8))
+        return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
+                "-fflags", "+nobuffer+discardcorrupt",
+                "-probesize", "1000000", "-analyzeduration", "1000000",
                 "-i", f"udp://127.0.0.1:{LOOP_PORT}?overrun_nonfatal=1"
-                      "&fifo_size=100000&buffer_size=425984&timeout=15000000",
+                      f"&fifo_size={fifo}&buffer_size={kbuf}&timeout=15000000",
                 "-map", "0", "-c", "copy",
                 "-f", "mpegts", "-mpegts_service_id", "1",
                 "-metadata", f"service_name={self.service_name()}",
@@ -439,7 +449,7 @@ class ScreenOutput:
     def _backoff(self, fails):
         if fails < 0:
             return 0.5
-        return (2, 5, 10, 20)[min(fails, 3)]
+        return (2, 5, 10)[min(fails, 2)]
 
     def tick(self):
         """One pass of the watchdog: arrange screens, keep both
