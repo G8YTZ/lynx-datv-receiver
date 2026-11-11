@@ -39,3 +39,4 @@ __pycache__/
 *.bak*
 *.bak_*
 *.bak
+config/lynx_programmes.json

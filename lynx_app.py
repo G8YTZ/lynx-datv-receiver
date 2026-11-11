@@ -12435,25 +12435,66 @@ def mpv_programmes() -> list:
                      "playing, from mpv's own tracks. More than one when the "
                      "transmitter sends a second programme (Lynx-Tx's 4K carousel).")
 def api_programmes():
-    """While mpv restarts (a lock regained, a freeze) it has no tracks for a
-    second or two, and the page's programme choice vanished and came back
-    (10 Nov 2026). The last list seen on this same tune is kept for a
-    minute, so the choice stays put across a restart."""
-    global _programmes_seen
+    """The programmes on what is tuned: mpv's, or the remembered list.
+
+    Remembered per tune, like a television's channel scan, and kept on disk
+    (config/lynx_programmes.json). mpv only knows the programmes it saw in
+    its first second, and a transmitter coming on air starts its second
+    programme a few seconds after the first (Lynx-Tx's carousel), so when a
+    signal returned Lynx offered only programme 1 until a re-tune (10 Nov
+    2026). Lynx for Enigma2 does the same thing by scanning once and zapping
+    by service. Choosing a remembered programme restarts mpv, which by then
+    finds it on air. A restart's moment without tracks is covered too."""
     progs = mpv_programmes()
-    key = _programme_key()
-    if len(progs) >= 2:
-        _programmes_seen = (key, time.time(), progs)
-    elif _programmes_seen and _programmes_seen[0] == key \
-            and time.time() - _programmes_seen[1] < 60:
+    key = _programme_key_str()
+    known = _programmes_known().get(key) or []
+    if len(progs) >= 2 and _programmes_strip(progs) != known:
+        _programmes_remember(key, progs)
+        known = _programmes_strip(progs)
+    if len(progs) < len(known):
+        on = {x["program"] for x in progs}
+        sel = next((x["program"] for x in progs if x.get("selected")), None)
         want = (programme_wanted or {}).get("program")
-        first = _programmes_seen[2][0]["program"]
-        progs = [dict(x, selected=(x["program"] == (want or first)))
-                 for x in _programmes_seen[2]]
+        chosen = want or sel or known[0]["program"]
+        progs = [dict(x, selected=(x["program"] == chosen), on_air=(x["program"] in on or None))
+                 for x in known]
     return {"programmes": progs}
 
 
-_programmes_seen = None   # (tune key, when, list): see api_programmes()
+PROGRAMMES_PATH = Path(__file__).parent / "config" / "lynx_programmes.json"
+_programmes_cache = None
+
+
+def _programme_key_str() -> str:
+    return json.dumps(_programme_key())
+
+
+def _programmes_known() -> dict:
+    global _programmes_cache
+    if _programmes_cache is None:
+        try:
+            _programmes_cache = json.loads(PROGRAMMES_PATH.read_text())
+        except Exception:
+            _programmes_cache = {}
+    return _programmes_cache
+
+
+def _programmes_strip(progs: list) -> list:
+    return [{k: x.get(k) for k in ("program", "video", "audio", "width", "height", "codec")}
+            for x in progs]
+
+
+def _programmes_remember(key: str, progs: list):
+    known = _programmes_known()
+    known[key] = _programmes_strip(progs)
+    try:
+        PROGRAMMES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PROGRAMMES_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(known, indent=1))
+        tmp.replace(PROGRAMMES_PATH)
+        print(f"[programme] remembered {len(progs)} programmes for this tune")
+    except OSError as e:
+        print(f"[programme] could not save the programme list: {e}")
 
 
 class ProgrammeRequest(BaseModel):
@@ -12519,6 +12560,12 @@ def api_programme(req: ProgrammeRequest):
     global programme_wanted
     progs = mpv_programmes()
     p = next((x for x in progs if x["program"] == req.program), None)
+    if not p:
+        # Remembered from an earlier time on this tune but not (yet) in mpv:
+        # restart mpv on it, with the track numbers it had then.
+        known = _programmes_known().get(_programme_key_str()) or []
+        p = next((dict(x, selected=False) for x in known if x["program"] == req.program), None)
+        progs = known or progs
     if not p:
         raise HTTPException(404, f"No programme {req.program} in this stream")
     first = progs[0]["program"] if progs else req.program
