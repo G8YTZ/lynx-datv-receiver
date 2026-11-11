@@ -14400,7 +14400,7 @@ def web_ui():
                         </div>
                     </div>
                     <details class="mb-2">
-                        <summary class="small text-muted">More SRT settings</summary>
+                        <summary class="small" style="cursor:pointer; color:#cfd8e3;">&#x2699;&#xFE0F; More SRT settings (who connects, passphrase, sound delay)</summary>
                         <div class="mt-2">
                             <label class="small text-muted mb-1" for="scrout-delay">Sound delay (ms): plus if the picture is late</label>
                             <input type="number" class="form-control form-control-sm mb-2 bg-dark text-light border-secondary"
@@ -15926,10 +15926,16 @@ function showScreenOutput(st) {
         colour = '#e8a33d';
     } else if (st.mode === 'hdmi') {
         txt = 'Picture on HDMI only.';
-    } else if (st.sending && st.connected_for_s >= 5) {
-        txt = 'Sending ' + (st.screen || '') + ' to ' + (set.host || 'listener') +
-              ' for ' + st.connected_for_s + ' s.';
+    } else if (st.connected) {
+        txt = (set.srt_mode === 'caller' ? 'Sending to ' + (set.host || '?') :
+               'A caller is connected') + ': ' + st.connected_for_s + ' s.';
         colour = '#5cb85c';
+    } else if (!st.error && set.srt_mode !== 'caller' && st.sending) {
+        // Listener, waiting: say exactly how to connect, with this
+        // receiver's own address (Thomas DL5BCA worked it out himself).
+        const url = 'srt://' + window.location.hostname + ':' + (set.port || 9000);
+        txt = 'Waiting for a caller: in VLC open ' + url +
+              ' (OBS Media Source: ' + url + '?mode=caller).';
     } else {
         txt = st.error ? st.error : 'Connecting...';
         colour = st.error ? '#e8a33d' : '';

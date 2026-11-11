@@ -60,6 +60,10 @@ LOG = "/tmp/lynx-srt.log"
 # the HDMI connector says "disconnected" but something is still asking
 # for frames.
 VIRTUAL_MARKER = "/tmp/lynx_virtual_screen"
+# The sender's progress report, once a second. FFmpeg writes it only once
+# its output is open and data flows: in listener mode, once a caller has
+# connected. So a fresh file means connected, not merely waiting.
+PROGRESS = "/tmp/lynx-srt-progress"
 LOG_MAX = 512 * 1024
 
 # Keys bound in labwc's rc.xml (install/rock5t.sh): Super+Alt+Shift+F9
@@ -485,6 +489,7 @@ class ScreenOutput:
                 "-metadata", f"service_name={self.service_name()}",
                 "-metadata", "service_provider=Lynx",
                 "-mpegts_flags", "+resend_headers",
+                "-progress", PROGRESS, "-stats_period", "1",
                 url]
 
     @staticmethod
@@ -643,15 +648,38 @@ class ScreenOutput:
             self.thread = threading.Thread(target=self.run, daemon=True)
             self.thread.start()
 
+    def connected_since(self):
+        """When data started flowing to the far end, or None if it is not
+        flowing now (no fresh progress report since this sender began)."""
+        if not self._alive(self.sender):
+            return None
+        try:
+            m = os.path.getmtime(PROGRESS)
+            # FFmpeg creates it empty at start, and writes to it only
+            # once data flows (checked with a listener and no caller).
+            if os.path.getsize(PROGRESS) == 0:
+                return None
+        except OSError:
+            return None
+        now = time.time()
+        if m < self.sender_since or now - m > 3:
+            self.flow_since = None
+            return None
+        if not getattr(self, "flow_since", None) or self.flow_since < self.sender_since:
+            self.flow_since = m
+        return self.flow_since
+
     def status(self):
         s = settings(self.get_config())
         up = self._alive(self.sender)
+        flowing = self.connected_since()
         return {
             "mode": s["mode"],
             "screen": self.screen,
             "capturing": self._alive(self.capture),
             "sending": up,
-            "connected_for_s": int(time.time() - self.sender_since) if up else 0,
+            "connected": flowing is not None,
+            "connected_for_s": int(time.time() - flowing) if flowing else 0,
             "url": srt_url_public(s),
             "error": self.last_error,
             "missing": self.available(),
