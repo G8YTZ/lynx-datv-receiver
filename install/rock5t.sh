@@ -169,6 +169,10 @@ else
   echo "Media stack installed."
 fi
 
+# --- Screen output over SRT: wf-recorder on our FFmpeg ------------------
+# See install/build_wf_recorder.sh (shared with the Pi).
+LYNX_ROCK=1 LYNX_DIR="$LYNX_DIR" SRC_DIR="$SRC_DIR" bash "$LYNX_DIR/install/build_wf_recorder.sh"
+
 # --- Audio: PipeWire user session -----------------------------------
 # Raspberry Pi OS Desktop runs this already. Armbian minimal does not,
 # and without it mpv has no HDMI audio and Lynx's level meter reports
@@ -235,6 +239,10 @@ elif [ ! -f ~/.config/labwc/rc.xml ]; then
   printf '<?xml version="1.0"?>\n<openbox_config>\n</openbox_config>\n' > ~/.config/labwc/rc.xml
 fi
 python3 "$LYNX_DIR/install/lynx_blank_cursor.py"
+
+# --- labwc: keys for the SRT virtual screen ------------------------------
+say "labwc keys for SRT screen output"
+python3 "$LYNX_DIR/install/lynx_labwc_srt_keys.py"
 
 # labwc's autostart runs every time labwc starts:
 #  - any old wtype cursor-hide line is retired (see above)

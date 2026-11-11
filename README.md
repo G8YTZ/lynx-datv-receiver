@@ -10,6 +10,7 @@ A DATV receiver for the Picotuner (WinterHill firmware), on a Raspberry Pi 5 or 
 - Hardware decoding, 4K H.265 included: on the Pi 5 through its HEVC decoder, on the ROCK 5T and 5C through Rockchip's (rkmpp)
 - More than one programme in a carrier (Lynx-Tx's 4K stills carousel beside the live picture): every programme offered on the web page, and remembered for each tune like a television's channel scan
 - Web Control Portal for tuning, memory presets, live BATC stream browsing, and volume control
+- **SRT output**: the finished screen (picture, overlay, chat and sound) sent over SRT, to VLC or a transmitter, with nothing plugged into HDMI. Up to 2160p50 H.265 on a ROCK, 1080p H.264 on a Pi 5. See [`docs/SRT_OUTPUT.md`](./docs/SRT_OUTPUT.md)
 - DVB-T/T2/C reception via a SiliconDust HDHomeRun network tuner, found automatically on the local network, including narrowband DVB-T2 at 1 and 2 MHz on 2m and 70cm as well as full-bandwidth broadcast multiplexes
 - Optional two-tuner diversity combining, with automatic source switching based on signal quality
 - Repeater/receiver-activity notifications (QRZ Logbook, Slack, Bitfocus Companion, GPIO Tx control)
@@ -29,6 +30,7 @@ Start Lynx, then set your Picotuner's IP address and your site details from the 
 - [`lynx_webui_manual.docx`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/docs/lynx_webui_manual.docx): what every button and field on the Web Control Portal does
 - [`lynx_overlay_annotated.pdf`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/docs/lynx_overlay_annotated.pdf): annotated guide to the on-screen display overlay
 - [`lynx_diversity_overview.docx`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/docs/lynx_diversity_overview.docx): how diversity reception works, and what's next
+- [`docs/SRT_OUTPUT.md`](./docs/SRT_OUTPUT.md): the SRT output, the Screen output card, and watching it in VLC
 - [`CHANGELOG.md`](./CHANGELOG.md): what's changed recently, in one place
 - [`docs/ROADMAP.md`](./docs/ROADMAP.md): what's being worked on next
 

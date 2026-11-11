@@ -2,6 +2,18 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-11-11 (afternoon)
+
+**New**
+- SRT output: the finished screen (picture, overlay, chat, PPM and sound) over SRT. A Screen output card with HDMI and SRT buttons; in SRT mode Lynx draws on a virtual screen and switches HDMI off, so nothing need be plugged in. ROCK: up to 2160p50, H.265 (default) or H.264, encoded in hardware with no copy through the processor. Pi 5: H.264 in software, 720p or 1080p, for sources up to 1080p. Lynx listens by default (the far end calls); passphrase, stream ID, latency, bit rate and a sound delay are on the card. See `docs/SRT_OUTPUT.md`.
+
+**Removed**
+- "Picture to another screen" (UDP output). SRT replaces it.
+
+**Fixed**
+- The PPM follows the sound to wherever the player sends it.
+- Messages from the web page's network cards were never shown.
+
 ## 2026-11-11
 
 **New**

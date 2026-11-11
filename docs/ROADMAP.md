@@ -21,7 +21,13 @@ Once the 5C and the current beta (Pi 5 zero-copy H.265, the mpv restart fix, the
 
 ## 3. Lynx-Tx takes SRT streams
 
-From a Pi 4-based receiver at the repeater site, so Lynx-Tx becomes a repeater: receive, SRT, transmit, all managed from one page.
+From a receiver at the repeater site, so Lynx-Tx becomes a repeater: receive, SRT, transmit, all managed from one page.
+
+- **Receiver side done (11 Nov 2026):** SRT output of the finished screen, on the ROCK to 2160p50 H.265 and on the Pi 5 at 1080p (see `docs/SRT_OUTPUT.md`). Listener by default. Tested from VLC: Tx on and off, two transmitters, changes of resolution, passphrase.
+- **Lynx-Tx's stream input:** Takes SRT; sound as AC-3 that follows its source (2.0 for stereo, 5.1 only for 5.1).
+- **Lynx-Tx SRT out while transmitting:** A copy of the on-air multiplex, tapped from the chain over local UDP so it can never hold up the transmission.
+- **Receiver, later:** "Received stream, untouched" over SRT (4K on a Pi, AC-3 as sent, both programmes); the overlay as data in the stream for the Tx to draw its own; two tuners as two SRT feeds for picture in picture; a lip-sync measurement (flash and bleep from the Tx, measured at the SRT output); a relay such as MediaMTX for more than one viewer.
+- **OSD revamp:** The overlay restyled like the Lynx bar, shown on each new transmission and hidden after 8, 15, 30 or 60 s, or kept up.
 
 ## 4. Lynx Rx inside Lynx-Tx
 
