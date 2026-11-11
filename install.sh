@@ -222,6 +222,16 @@ sudo systemctl daemon-reload
 sudo systemctl restart chrony 2>/dev/null || true
 echo "GNSS socket permissions configured."
 
+# --- Larger UDP receive buffers -----------------------------------
+# The fast programme change relay (lynx_fcc.py) bursts a programme from its
+# last keyframe to mpv in one go, often 300 kB or more. The kernel gives a
+# socket at most net.core.rmem_max (about 200 kB by default), so the end of
+# a burst could be thrown away and the keyframe with it. Above --deps-only,
+# so Update Now brings it to receivers already installed.
+echo "--- UDP receive buffer limit ---"
+echo 'net.core.rmem_max = 8388608' | sudo tee /etc/sysctl.d/99-lynx-udp.conf > /dev/null
+sudo sysctl -q -p /etc/sysctl.d/99-lynx-udp.conf || true
+
 # --- Passwordless sudo for the privileged buttons ---------------
 # ABOVE the --deps-only exit deliberately. Reboot, Shutdown, Update and
 # Kill WiFi all shell out to sudo, and they are fire-and-forget by

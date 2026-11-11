@@ -1055,7 +1055,13 @@ def _udp_url_for_mpv(url: str) -> str:
     stopped altogether. overrun_nonfatal keeps the thread reading and
     loses only what did not fit."""
     if url.startswith("udp://") and "overrun_nonfatal" not in url:
-        return url + ("&" if "?" in url else "?") + "overrun_nonfatal=1"
+        url += ("&" if "?" in url else "?") + "overrun_nonfatal=1"
+        # A 4 MB socket buffer: the fast programme change relay sends a
+        # programme's last keyframe onwards in one burst (300 kB and more),
+        # faster than mpv reads it while starting up. The kernel grants it
+        # only up to net.core.rmem_max (raised by the installer).
+        if url.endswith(f":{FCC_OUT_PORT}?overrun_nonfatal=1"):
+            url += "&buffer_size=4194304"
     return url
 
 
