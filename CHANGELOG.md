@@ -2,6 +2,11 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-11-11
+
+**Fixed**
+- Choosing a stream that is not sending no longer locks out tuning for about a minute. Lynx waited 12 s then 20 s more for its picture, and a new tune or stream gave up after 15 s; a new request now makes the waiting one give way at once.
+
 ## 2026-11-10
 
 **Faster**

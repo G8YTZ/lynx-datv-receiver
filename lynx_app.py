@@ -343,6 +343,7 @@ current_mode: str = "idle"    # idle | rf | stream
 mpv_running_for_rf: bool = False  # tracks whether mpv has actually been started for the
                                    # current RF tune (as opposed to just tuned-and-waiting-
                                    # for-lock) - see rf_mpv_lifecycle_monitor()
+switch_generation = 0     # bumped by every tune/stream request: a waiting start gives way
 rf_tuned_at: float = 0.0  # when the last RF tune was sent (rf_mpv_lifecycle_monitor)
 programme_wanted = None  # {"program": n, "key": ...}: the programme chosen by hand, kept
 #   across mpv restarts on the same tune (programme_keeper); None = programme 1
@@ -1369,7 +1370,16 @@ def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
     start_up = _kernel_uptime()
     deadline = start + timeout
     markers = ("VO:", "AV:")
+    gen = switch_generation
     while time.time() < deadline:
+        # A newer tune or stream was asked for: stop waiting on this one,
+        # so the new request gets the lock at once. A stream that was not
+        # sending held everything up for 12 + 20 s of render checks (and
+        # the new request gave up after 15 s), so for about a minute
+        # nothing could be tuned (11 Nov 2026, Pi and ROCK).
+        if switch_generation != gen:
+            print("[mpv_render] a newer tune or stream was asked for: no longer waiting")
+            return False
         try:
             with open('/tmp/mpv.log') as f:
                 content = f.read()
@@ -11894,7 +11904,8 @@ def tune(req: TuneRequest):
     # working fine, since it never touched this lock at all — exactly
     # what was reported after a burst of rapid, overlapping preset/
     # stream switches.
-    global _tune_lock_handed_off
+    global _tune_lock_handed_off, switch_generation
+    switch_generation += 1          # anything still waiting on a picture gives way
     if not tune_lock.acquire(timeout=15):
         raise HTTPException(status_code=503, detail="Another tune operation is already in progress — please try again shortly")
     _tune_lock_handed_off = False
@@ -12993,7 +13004,8 @@ def start_stream(req: StreamRequest):
     # briefly exposing the desktop underneath. Reported directly: a
     # "flash of desktop" during rapid stream switching, right before RF
     # tuning stopped responding entirely from the related tune_lock bug.
-    global _tune_lock_handed_off
+    global _tune_lock_handed_off, switch_generation
+    switch_generation += 1          # anything still waiting on a picture gives way
     if not tune_lock.acquire(timeout=15):
         raise HTTPException(status_code=503, detail="Another tune/stream operation is already in progress — please try again shortly")
     _tune_lock_handed_off = False
@@ -13106,8 +13118,9 @@ def _start_stream_impl(req: StreamRequest):
             # before giving up; if that also fails, the cover stays up
             # rather than exposing anything - a stuck cover is a far
             # smaller problem than a silently exposed desktop.
+            _my_gen = switch_generation
             rendering_confirmed = wait_for_mpv_rendering(timeout=12.0)
-            if not rendering_confirmed:
+            if not rendering_confirmed and switch_generation == _my_gen:
                 print(f"[stream_start] mpv did not confirm rendering within 12s for "
                       f"'{req.name or req.url}' - giving it one more, longer attempt "
                       f"before uncovering")
