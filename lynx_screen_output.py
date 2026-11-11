@@ -310,7 +310,18 @@ class ScreenOutput:
         if changed:
             print(f"[srt] screens arranged for {mode}: capturing "
                   f"{screen or 'nothing'}", flush=True)
-            time.sleep(1.0)
+            # Wait until labwc reports the new mode before mpv is
+            # restarted: restarted a second after a 4K to 1080p change,
+            # mpv came up sized for 4K, a zoomed frozen frame (5C, LG,
+            # 11 Nov 2026). Then two seconds more for the screen to sync.
+            if screen and mode != "hdmi":
+                deadline = time.time() + 8
+                while time.time() < deadline:
+                    o = (outputs() or {}).get(screen)
+                    if o and o["enabled"] and _is(o["current"], w, h, hz):
+                        break
+                    time.sleep(0.5)
+            time.sleep(2.0)
             try:
                 self.on_screen_change()
             except Exception as e:
