@@ -4,34 +4,22 @@ All notable changes to Lynx are documented here, in reverse chronological order.
 
 ## 2026-11-11
 
-**Changed**
-- No transition cover by default (tested on a Pi 5 and the ROCK 5C): while a source starts, the screen shows the logo and the status in RF, or the stream starting. `LYNX_COVER=1` brings the cover back.
-
-**Fixed**
-- RF: changing programme shows the logo screen with the status (frequency, lock, MER) until the new programme's picture comes, instead of a blank cover.
-- Choosing a stream that is not sending no longer locks out tuning for about a minute. Lynx waited 12 s then 20 s more for its picture, and a new tune or stream gave up after 15 s; a new request now makes the waiting one give way at once.
-
-## 2026-11-10
-
-**Faster**
-- RF: mpv starts on the first lock reading, half a second apart, instead of after 3 s of steady lock: about 3 s off every start. A false lock shows nothing, because the cover only lifts once mpv has a picture. Lock is still lost after 3 s without one. Each start logs "lock to picture" with how long it took.
-
-**Fixed**
-- A programme choice never restarts mpv by itself: one restart per choice. If the chosen programme is not on air, the choice is dropped and logged.
-- A second programme stays on offer when a signal comes back. Lynx remembers each tune's programmes, like a television's channel scan (in /tmp: forgotten at a reboot, or after 7 days unseen), and choosing one that mpv has not seen yet restarts mpv on it. mpv only knows the programmes on air in its first second, and a transmitter starts its second programme a few seconds after the first.
-- RF: Lynx no longer restarts itself when a signal goes away. Its start script took mpv, stopped on purpose until the signal returns, for a crash and restarted everything: about 10 s of black with no overlay after each loss of signal.
-- Changing programme in a two-programme stream restarts mpv on the new programme, behind the cover, as a set-top box restarts its decoder. Each programme runs on its own clock (Lynx-Tx's carousel was 104 s behind the live picture), and swapping tracks in a running mpv kept the old clock: a minute for a carousel picture, pictures missing their bottom, then a freeze.
-- RF: after a loss of signal the screen shows the logo and the orange status again within a few seconds. The cover put up when the signal went stayed until its 30 s cap, hiding the status, so every loss of signal meant half a minute of black.
-- RF: mpv no longer freezes for good when FFmpeg's UDP buffer overruns. By default FFmpeg stops reading the socket after an overrun, so the picture froze with the network queue full; now it carries on and loses only what did not fit (`overrun_nonfatal=1`). Seen on Lynx-Tx's carousel: slow pictures, pictures missing their bottom, then a freeze.
-- The web page's programme choice no longer vanishes and comes back while mpv restarts: the last list seen on the same tune is kept for a minute.
-- Watching a stills programme with no sound (Lynx-Tx's 4K carousel): the drift correction and the freeze checks leave it alone. Its picture changes every few seconds, which they took for a stall, and mpv was restarted every half minute, flashing up programme 1 in between.
-- A second programme chosen by hand (Lynx-Tx's 4K carousel) stays chosen when mpv restarts, for as long as the same thing is tuned. It used to go back to programme 1 at the next restart, two minutes later on the ROCK 5C.
-- Picotuner lock with two programmes in the multiplex: a receiver line showing only a frequency ("1316.074B") now counts as locked. With a second programme the tuner shows the service name for about a second every half minute, and Lynx read the rest as unlocked: mpv stopped and started, and diversity re-tuned a receiver at 30 dB MER.
-- Diversity on a multiplex with two programmes (Lynx-Tx's stills carousel beside the main picture): the combiner now cuts its segments on one PCR PID only, the lowest. Cut on both programmes' clocks it put the stream out of order, and the picture froze every few seconds until Lynx gave up.
-
 **New**
-- Radxa ROCK 5C: recognised by name and given the ROCK video path (`--hwdec=rkmpp`, `gpu-next`, Wayland), with one HDMI output. Armbian trixie, vendor kernel, minimal.
-- One installer for every board: `install.sh` works out whether it is on a Raspberry Pi or a ROCK 5T/5C, and on a ROCK runs `install/rock5t.sh` itself, on a fresh install and on Update Now.
+- Radxa ROCK 5C supported, alongside the 5T and the Pi. One installer for every board: it works out which it is on.
+- Two programmes in one carrier (Lynx-Tx's 4K carousel): both offered on the web page, remembered per tune like a channel scan, and a change of programme starts the player on the new programme's own clock.
+- Picotuner receivers can be shared with another Lynx (Apple TV, iPhone) or protected for a repeater (Config, Picotuner).
+
+**Changed**
+- No black transition cover. While a picture starts, the screen shows the logo and the receiver's status, or the stream starting. `LYNX_COVER=1` brings the cover back.
+- Faster lock to picture on RF: about 3 s quicker.
+- Pi 5 fan comes on at 40 °C and steps up at 45, 55 and 65 °C.
+
+**Fixed**
+- Lynx restarted itself every time a signal went away. It now waits quietly and the picture returns with the signal.
+- Choosing a stream that is not sending no longer locks out tuning for about a minute.
+- Pictures that froze for good after a network buffer overrun.
+- Diversity and lock detection on carriers with two programmes.
+- The saved refresh rate (50 Hz) is applied at start-up and when saved, with no restart.
 
 ## 2026-11-03
 
