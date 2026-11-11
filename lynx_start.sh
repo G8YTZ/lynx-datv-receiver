@@ -542,7 +542,6 @@ while true; do
     # response already carries, and skipping the mpv check entirely
     # whenever it's "idle".
     lynx_mode=$(echo "$status_json" | grep -o '"mode"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed -E 's/.*:[[:space:]]*"([^"]*)"/\1/')
-    netout=$(echo "$status_json" | grep -o '"network_output"[[:space:]]*:[[:space:]]*true')
     # RF with mpv deliberately stopped: rf_mpv_lifecycle_monitor() stops mpv
     # when the signal goes and starts it when a lock comes back, so mpv's
     # absence then is correct, not a crash. Until 10 Nov 2026 the cover
@@ -550,11 +549,7 @@ while true; do
     # came down after a loss, every Tx going off made this check restart
     # the whole of Lynx (black screen, overlay gone, about 10 s).
     rf_mpv_off=$(echo "$status_json" | grep -o '"mpv_running_for_rf"[[:space:]]*:[[:space:]]*false')
-    if [ -n "$netout" ]; then
-        : # network output - the picture is being forwarded to another
-          # machine and nothing decodes here, so mpv is correctly
-          # absent. Same reasoning as the idle case below.
-    elif [ "$lynx_mode" = "idle" ]; then
+    if [ "$lynx_mode" = "idle" ]; then
         : # genuinely, correctly idle - mpv isn't supposed to be running at all, nothing to check
     elif [ "$lynx_mode" = "rf" ] && [ -n "$rf_mpv_off" ]; then
         : # RF, no lock: mpv stopped on purpose until the signal comes back

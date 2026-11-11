@@ -1,4 +1,4 @@
-"""Screen output: HDMI, SRT or both (ROCK first; 11 Nov 2026).
+"""Screen output: HDMI or SRT (ROCK first; 11 Nov 2026).
 
 What goes out over SRT is the finished screen, the picture with the
 overlay, chat and PPM on it, not the received transport stream. That is
@@ -25,8 +25,12 @@ Modes
          dummy needed). mpv locks to it as it would to a television.
          Sound goes to a PipeWire null sink, lynx_srt, which is what
          is captured.
-  both : The HDMI screen is captured as it is, at whatever rate the
-         television gave. Sound is taken from mpv's own output.
+
+There is no "both": capturing a real HDMI screen made labwc composite
+and copy every frame against the screen's own refresh, and at 2160p it
+missed refreshes, so the LG and the SRT feed juddered alike, while each
+alone was smooth (5C, 11 Nov 2026). Removed (Justin): a mode that
+cannot reach the quality would only bring complaints.
 
 labwc has no IPC, so the virtual screen is made with its own
 VirtualOutputAdd action, bound to a key in rc.xml (install/rock5t.sh)
@@ -40,7 +44,7 @@ import subprocess
 import threading
 import time
 
-MODES = ("hdmi", "srt", "both")
+MODES = ("hdmi", "srt")
 VIRTUAL = "LYNX-SRT"
 NULL_SINK = "lynx_srt"
 LOOP_PORT = 9960
@@ -58,8 +62,7 @@ KEY_ADD = "F9"
 KEY_REMOVE = "F10"
 
 # Picture formats for the SRT feed: (width, height, frames a second).
-# 2160p25 is what the LG on the 5C offers at 4K, so Both works there;
-# 2160p50 is for SRT mode's virtual screen (11 Nov 2026).
+# Any of them on SRT mode's virtual screen, whatever a monitor offers.
 FORMATS = {
     "1080p50": (1920, 1080, 50),
     "1080p25": (1920, 1080, 25),
@@ -84,7 +87,7 @@ def settings(config):
     s = dict(DEFAULTS)
     s.update((config.get("screen_output") or {}))
     # Its own format, not Lynx's Refresh rate (50 or 60 only): in SRT
-    # and Both modes the screen output owns the screen mode, and the
+    # mode the screen output owns the screen mode, and the
     # Refresh rate setting stands aside (lynx_app._reapply_refresh_rate).
     if s.get("format") not in FORMATS:
         s["format"] = "1080p50"
@@ -92,7 +95,7 @@ def settings(config):
     if not s.get("bitrate_kbps"):
         s["bitrate_kbps"] = 16000 if s["height"] > 1080 else 6000
     if s["mode"] not in MODES:
-        s["mode"] = "hdmi"
+        s["mode"] = "hdmi"      # includes a saved "both" (removed)
     return s
 
 
@@ -218,17 +221,14 @@ def srt_url_public(s):
 class ScreenOutput:
     """Keeps the screens and the capture chain as the settings say.
 
-    get_config() returns Lynx's config dict; audio_node() returns the
-    PipeWire node mpv is playing to in 'both' mode (or None for the
-    default sink); service_name() names the programme in the stream;
+    get_config() returns Lynx's config dict; service_name() names the
+    programme in the stream;
     on_screen_change() is called after the screens change (Lynx
     restarts mpv once, so it settles on the new screen).
     """
 
-    def __init__(self, get_config, audio_node=None, service_name=None,
-                 on_screen_change=None):
+    def __init__(self, get_config, service_name=None, on_screen_change=None):
         self.get_config = get_config
-        self.audio_node = audio_node or (lambda: None)
         self.service_name = service_name or (lambda: "Lynx")
         self.on_screen_change = on_screen_change or (lambda: None)
         self.lock = threading.RLock()
@@ -244,7 +244,6 @@ class ScreenOutput:
         self.capture_since = 0.0
         self.last_error = ""
         self.screen = None          # the output being captured
-        self.restore_mode = {}      # {output: (w, h, hz)} Both mode changed
         self.thread = None
         self.stopping = False
 
@@ -293,7 +292,7 @@ class ScreenOutput:
                     changed = True
             screen = virt
         else:
-            # hdmi or both: real screens on, virtual one gone.
+            # hdmi: real screens on, the virtual one gone.
             for n in real:
                 if not outs[n]["enabled"]:
                     _run(["wlr-randr", "--output", n, "--on"])
@@ -301,34 +300,7 @@ class ScreenOutput:
             if virt:
                 _press(KEY_REMOVE)
                 changed = True
-            screen = real[0] if real else None
-            if mode == "hdmi":
-                screen = None
-                # Put back any mode Both chose (the LG back to its own
-                # 4K 30 Hz, 11 Nov 2026).
-                for n, m in list(self.restore_mode.items()):
-                    if n in outs and m:
-                        _run(["wlr-randr", "--output", n,
-                              "--mode", f"{m[0]}x{m[1]}@{m[2]:.6f}Hz"])
-                        print(f"[srt] {n} back to {m[0]}x{m[1]} {m[2]:g} Hz",
-                              flush=True)
-                        changed = True
-                self.restore_mode.clear()
-            elif screen:
-                # Both: the SRT feed runs at the screen's rate, so ask
-                # for 1920x1080 50 Hz if the screen offers it (the LG on
-                # the 5C picks 4K 30 Hz by itself, but lists 1080p50).
-                o = outs[screen]
-                offered = next((m for m in o["modes"] if _is(m, w, h, hz)), None)
-                if offered and not _is(o["current"], w, h, hz):
-                    self.restore_mode.setdefault(screen, o["current"])
-                    _run(["wlr-randr", "--output", screen,
-                          "--mode", f"{w}x{h}@{offered[2]:.6f}Hz"])
-                    changed = True
-                elif not offered and not getattr(self, "_warned_rate", False):
-                    self._warned_rate = True
-                    print(f"[srt] {screen} offers no {w}x{h} {hz} Hz: the SRT "
-                          f"feed runs at {o['current']}", flush=True)
+            screen = None
         if changed:
             print(f"[srt] screens arranged for {mode}: capturing "
                   f"{screen or 'nothing'}", flush=True)
@@ -368,8 +340,7 @@ class ScreenOutput:
                 pass
 
     def _capture_cmd(self, screen, s):
-        mode = s["mode"]
-        node = NULL_SINK if mode == "srt" else self.audio_node()
+        node = NULL_SINK
         kbps = int(s["bitrate_kbps"])
         fps = int(s.get("fps") or 50)
         cmd = ["wf-recorder", "-o", screen,
@@ -378,7 +349,7 @@ class ScreenOutput:
                "-p", "rc_mode=CBR", "-p", f"b={kbps * 1000}",
                "-p", f"g={fps}", "-p", "profile=high",
                "--audio-backend=pipewire",
-               f"--audio={node}" if node else "--audio",
+               f"--audio={node}",
                "-C", "aac", "-P", "b=192000", "-R", "48000",
                "-m", "mpegts", "-y",
                "-f", f"udp://127.0.0.1:{LOOP_PORT}?pkt_size=1316"]

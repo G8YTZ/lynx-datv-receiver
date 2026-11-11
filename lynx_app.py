@@ -672,11 +672,6 @@ FFMPEG_BG_CMD = None
 
 MPV_SOCKET = "/tmp/mpv-socket"
 MPV_TRANSITION_MARKER = "/tmp/lynx_mpv_transitioning"
-# Network video output (see start_network_output() below). When on,
-# nothing is decoded here at all: the transport stream is forwarded to
-# another machine and the Pi keeps only its overlay.
-network_output_enabled = False
-network_output_proc = None
 
 mpv_transitioning = False  # mirrored to a local marker file (see
                             # MPV_TRANSITION_MARKER) which the overlay
@@ -837,159 +832,18 @@ def current_rf_target_port():
     else:
         return cfg['ts_port']
 
-def network_output_target() -> str:
-    """Where the stream goes, as host:port.
-
-    A single address rather than a list: this is "put the picture on
-    that screen over there", not a distribution system. Anyone wanting
-    several viewers should point this at a multicast group, which costs
-    nothing extra here and lets the network do the work.
-    """
-    cfg = config.get('network_output', {}) or {}
-    host = cfg.get('host', '') or ''
-    port = cfg.get('port', 9950)
-    return f"{host}:{port}" if host else ""
+# What mpv was last asked to play, whatever asked (restart_mpv records
+# it): the screen-return check and the SRT output's screen change
+# restart mpv on it. Was the UDP network output's record, until that
+# output was removed in favour of SRT (11 Nov 2026).
+playing_source = ""
+playing_source_is_rf = True
 
 
-def network_output_url() -> str:
-    """The URL to type into VLC at the far end.
-
-    udp://@:PORT rather than udp://HOST:PORT - the @ tells VLC to
-    listen on that port rather than to send to it, which is the
-    difference between seeing a picture and seeing nothing while being
-    certain the transmitter is at fault.
-    """
-    cfg = config.get('network_output', {}) or {}
-    return f"udp://@:{cfg.get('port', 9950)}"
-
-
-# What the forwarder should be carrying, and what it is carrying.
-# restart_mpv() records every source it is given, whatever called it;
-# the watchdog keeps the running forwarder matched to it.
-network_output_lock = threading.RLock()
-network_output_source = ""
-network_output_source_is_rf = True
-network_output_running_src = ""
-network_output_started_at = 0.0
-NETOUT_LOG = "/tmp/lynx-netout.log"
-# Every forwarded source leaves in this one shape: programme 1, PMT
-# 0x100, video 0x101, audio 0x102, tables repeated at every keyframe.
-# VLC sets itself up for the first stream it sees on a port and does not
-# start again when the next one differs, so a constant layout is what
-# lets a source change through without anyone pressing play.
-NETOUT_LAYOUT = ["-mpegts_service_id", "1",
-                 "-mpegts_pmt_start_pid", "0x100",
-                 "-streamid", "0:0x101", "-streamid", "1:0x102",
-                 "-mpegts_flags", "+resend_headers"]
-
-# A new table version on every restart. Without it the new multiplex's
-# PMT carries the same version as the old one, and VLC - having seen
-# "version 0" already - ignores it and waits for PIDs that have gone.
-_netout_tables_version = [0]
-
-
-def _next_tables_version() -> int:
-    _netout_tables_version[0] = (_netout_tables_version[0] + 1) % 32
-    return _netout_tables_version[0]
-
-
-def stop_network_output():
-    """Stop forwarding, if we are."""
-    global network_output_proc, network_output_running_src
-    with network_output_lock:
-        if network_output_proc is not None:
-            try:
-                network_output_proc.terminate()
-                network_output_proc.wait(timeout=3)
-            except Exception:
-                try:
-                    network_output_proc.kill()
-                except Exception:
-                    pass
-            network_output_proc = None
-        network_output_running_src = ""
-
-
-def start_network_output(source_url: str):
-    """Forward the stream instead of decoding it - any source.
-
-    UDP sources (Picotuner, diversity, Slave, HDHomeRun) go through tsp:
-    the bytes arriving are exactly the bytes that should leave. socat
-    was tried first and forwarded nothing; TSDuck understands transport
-    streams rather than just datagrams and worked first time.
-
-    Stream URLs (RTMP, HTTP/HLS, SRT...) go through ffmpeg -c copy:
-    repackaged as a transport stream, not decoded, so the far end gets
-    the same thing on the same port whatever Lynx is playing.
-
-    Errors go to NETOUT_LOG rather than nowhere - a forwarder that dies
-    quietly is how this feature used to look like it was working.
-    """
-    global network_output_proc, network_output_running_src
-    global network_output_started_at
-    with network_output_lock:
-        stop_network_output()
-        target = network_output_target()
-        if not target:
-            print("[netout] no target configured - not forwarding")
-            return
-        host, port = target.rsplit(":", 1)
-
-        if source_url.startswith("udp://"):
-            try:
-                src_port = int(source_url.rsplit(":", 1)[1])
-            except (IndexError, ValueError):
-                print(f"[netout] could not read a port from {source_url}")
-                return
-            # Large receive buffer, and an overrun is a dropped packet
-            # rather than a dead forwarder.
-            source = (f"udp://0.0.0.0:{src_port}"
-                      "?fifo_size=1000000&overrun_nonfatal=1")
-        elif re.match(r"^[a-z][a-z0-9+.-]*://", source_url):
-            source = source_url
-        else:
-            print(f"[netout] {source_url} is not something to forward")
-            return
-
-        # One layout for every source - see NETOUT_LAYOUT. The first
-        # video and audio are the same choice mpv makes playing it here.
-        cmd = (["ffmpeg", "-nostdin", "-loglevel", "warning",
-                # Damaged packets passed through, not discarded: the
-                # far end conceals them, and a damaged first packet of
-                # an over must not take the H.264 headers with it
-                # (patch_netout_relock.py).
-                "-fflags", "+genpts",
-                "-analyzeduration", "1000000",
-                "-i", source,
-                "-map", "0:v:0", "-map", "0:a:0?",
-                "-c", "copy", "-f", "mpegts"]
-               + NETOUT_LAYOUT
-               + ["-tables_version", str(_next_tables_version())]
-               + [f"udp://{host}:{port}?pkt_size=1316"])
-
-        try:
-            log = open(NETOUT_LOG, "ab")
-            network_output_proc = subprocess.Popen(
-                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=log)
-            network_output_running_src = source_url
-            network_output_started_at = time.time()
-            print(f"[netout] forwarding {source_url} -> {host}:{port} ({cmd[0]})")
-        except Exception as e:
-            print(f"[netout] could not start forwarder: {e}")
-            network_output_proc = None
-            network_output_running_src = ""
-
-
-# Screen output: HDMI, SRT or both (lynx_screen_output.py, 11 Nov 2026).
+# Screen output: HDMI or SRT (lynx_screen_output.py, 11 Nov 2026).
 # The finished screen (picture, overlay, chat) captured, hardware
 # encoded and sent over SRT. Built here, started with the other
 # watchdogs; the lambdas look their functions up when called.
-def _screen_output_audio_node():
-    dev = _cached_audio_device_resolved()
-    return dev[len("pipewire/"):] if dev.startswith("pipewire/") else None
-
-
 def _screen_output_service_name():
     call = str((config.get('site') or {}).get('callsign', '') or '').strip()
     return f"Lynx {call}" if call and call.upper() != "XXXXX" else "Lynx"
@@ -1000,8 +854,8 @@ def _screen_output_changed():
     HDMI on or off, its mode changed): one restart on the same source,
     so mpv settles on the new screen at its rate and, in SRT mode,
     plays its sound into the lynx_srt sink."""
-    src, is_rf = network_output_source, network_output_source_is_rf
-    if network_output_enabled or not src:
+    src, is_rf = playing_source, playing_source_is_rf
+    if not src:
         return
     if tune_lock.acquire(timeout=10):
         try:
@@ -1014,54 +868,9 @@ def _screen_output_changed():
 
 screen_output = lynx_screen_output.ScreenOutput(
     get_config=lambda: config,
-    audio_node=lambda: _screen_output_audio_node(),
     service_name=lambda: _screen_output_service_name(),
     on_screen_change=lambda: threading.Thread(
         target=_screen_output_changed, daemon=True).start())
-
-
-def network_output_watchdog():
-    """Keep the forwarder matching the switch, whatever happens.
-
-    The lifecycle monitor rightly skips everything while forwarding is
-    on - there is no player to look after - but that left nobody to
-    restart the forwarder after a retune, an A/B or diversity change,
-    or a forwarder that simply died. This is that somebody.
-
-    RF and DVB-T ask current_rf_target_port(), the same answer the
-    monitor uses for mpv, so they follow every retune. Anything else
-    follows the last source restart_mpv() was given. A restart at most
-    every 5 s, so a dead stream URL cannot make it thrash.
-    """
-    global network_output_enabled
-    time.sleep(5)
-    try:
-        if ((config.get('network_output', {}) or {}).get('enabled')
-                and not network_output_enabled):
-            network_output_enabled = True
-            kill_mpv()
-            print("[netout] switched on at start-up, as saved")
-    except Exception as e:
-        print(f"[netout] could not restore saved switch: {e}")
-
-    while True:
-        try:
-            if network_output_enabled:
-                if current_mode in ("rf", "dvbt"):
-                    want = f"udp://@:{current_rf_target_port()}"
-                else:
-                    want = network_output_source
-                alive = (network_output_proc is not None
-                         and network_output_proc.poll() is None)
-                if (want and (not alive or network_output_running_src != want)
-                        and time.time() - network_output_started_at > 5):
-                    why = "source changed" if alive else "forwarder not running"
-                    print(f"[netout] watchdog: {why} - forwarding {want}")
-                    kill_mpv()
-                    start_network_output(want)
-        except Exception as e:
-            print(f"[netout] watchdog: {e}")
-        time.sleep(3)
 
 
 def _programme_track_flags() -> str:
@@ -1108,11 +917,6 @@ def restart_mpv(target_url: str, is_rf: bool = True):
     video track off/on broke the RF path too). A fresh process cannot
     carry over whatever stale VO state was causing this.
 
-    When network output is on this starts no player at all - see
-    start_network_output(). The overlay carries on drawing over a dark
-    screen, which is the point: the figures stay here and the picture
-    goes to whatever is better at decoding it.
-
     is_rf distinguishes the local Picotuner UDP port from a remote
     stream URL — several flags below are only correct for one or the
     other, not both. Forcing --demuxer-lavf-format=mpegts is correct
@@ -1148,17 +952,8 @@ def restart_mpv(target_url: str, is_rf: bool = True):
     start_transition_cover/end_transition_cover) — this function only
     handles the actual process mechanics, so callers can make the
     covered window deliberately wider than just this restart."""
-    global network_output_source, network_output_source_is_rf
-    network_output_source, network_output_source_is_rf = target_url, is_rf
-    if network_output_enabled:
-        # Nothing decodes here. kill_mpv() still runs, because
-        # switching the feature on mid-session has to take the picture
-        # off the local screen as well as put it on the remote one.
-        kill_mpv()
-        start_network_output(target_url)
-        return
-
-    stop_network_output()
+    global playing_source, playing_source_is_rf
+    playing_source, playing_source_is_rf = target_url, is_rf
     kill_mpv()
 
     # Launch muted so there's no audio pop/glitch as the new process
@@ -2352,8 +2147,8 @@ def _reapply_refresh_rate(reason: str = "came back") -> Optional[bool]:
     not change, only the rate, which this already did on every screen
     return. Returns True if changed, False if refused, None if nothing
     needed doing (or no screen to ask)."""
-    if lynx_screen_output.settings(config)["mode"] in ("srt", "both"):
-        return None     # the screen output sets the mode (its own format)
+    if lynx_screen_output.settings(config)["mode"] == "srt":
+        return None     # the virtual screen's mode is set by lynx_screen_output
     try:
         want = int((config.get('display') or {}).get('refresh_hz', 50) or 50)
     except (TypeError, ValueError):
@@ -2397,8 +2192,8 @@ def _reapply_refresh_rate(reason: str = "came back") -> Optional[bool]:
 def _check_mpv_after_mode_change(why: str):
     """After the screen mode changes under a playing mpv: if it has lost
     its picture, restart it on the same source, as a screen return does."""
-    src, is_rf = network_output_source, network_output_source_is_rf
-    if network_output_enabled or not src:
+    src, is_rf = playing_source, playing_source_is_rf
+    if not src:
         return
     time.sleep(2)
     if not _mpv_has_picture_problem():
@@ -2483,10 +2278,10 @@ def screen_return_monitor():
                 time.sleep(4)   # let the compositor set the output up first
                 _reapply_refresh_rate("came back")
                 time.sleep(2)
-                src = network_output_source
-                is_rf = network_output_source_is_rf
+                src = playing_source
+                is_rf = playing_source_is_rf
                 why, event = None, None
-                if not network_output_enabled and src:
+                if src:
                     if _mpv_has_picture_problem():
                         why, event = "mpv has sound but no picture", "screen_back_restart"
                     else:
@@ -3525,16 +3320,6 @@ def rf_mpv_lifecycle_monitor():
             # check. So readings start counting 1.5 s after a tune.
             if time.time() - rf_tuned_at < 1.5:
                 raw_locked = False
-
-            # Network output means there is deliberately no player
-            # here, so "mpv is not running" is the intended state
-            # rather than a fault to correct. Without this the monitor
-            # sees a lock with no mpv, restarts the forwarder, waits
-            # for a player that will never appear, and goes round
-            # again - which looked like the feature working for a few
-            # seconds and then giving up.
-            if network_output_enabled:
-                continue
 
             if raw_locked:
                 loss_streak = 0
@@ -5100,14 +4885,6 @@ def hdhomerun_monitor():
                                   "restarting mpv")
                             restart_mpv(f"udp://@:{HDHR_VIDEO_PORT}",
                                         is_rf=False)
-                            # Network output: the forwarder restarted with the over
-                            # too, so it sees the H.264 headers at its start - see
-                            # patch_netout_relock.py. restart_mpv() starts no
-                            # player while network output is on.
-                            if network_output_enabled:
-                                print("[netout] re-lock - restarting the forwarder",
-                                      flush=True)
-                                start_network_output(f"udp://@:{HDHR_VIDEO_PORT}")
                             end_transition_cover()
                         except Exception as e:
                             print(f"[hdhr] restart failed: "
@@ -5959,11 +5736,6 @@ class RemoteSourceConfigUpdate(BaseModel):
     status_port: int = 10997
 
 
-class NetworkOutputConfigUpdate(BaseModel):
-    host: str = ""
-    port: int = 9950
-
-
 class HdhomerunConfigUpdate(BaseModel):
     """The HDHomeRun card on the config page. There was no such section
     before, so its Save button saved nothing (patch_hdhr_after_atsc3.py)."""
@@ -5974,7 +5746,6 @@ class HdhomerunConfigUpdate(BaseModel):
 
 class ConfigUpdateRequest(BaseModel):
     site: Optional[SiteConfigUpdate] = None
-    network_output: Optional[NetworkOutputConfigUpdate] = None
     picotuner: Optional[PicotunerConfigUpdate] = None
     diversity: Optional[DiversityConfigUpdate] = None
     notifications_qrz: Optional[QrzConfigUpdate] = None
@@ -8406,10 +8177,6 @@ def get_status():
     status = {
         "lynx": {
             "mode": current_mode,
-            # Read by lynx_start.sh's watchdog, which shuts the whole
-            # stack down when no mpv is running. With network output on
-            # that is the intended state, not a crash.
-            "network_output": network_output_enabled,
             # Lynx+ step 2: the registry's own view, for comparison
             # against everything else in this payload. Off by default,
             # and nothing consumes it - it is here to be looked at.
@@ -12660,7 +12427,7 @@ def _restart_on_programme(why: str):
     """Restart mpv on the programme in programme_wanted (or the first). Up
     to 15 s for a picture: the carousel's keyframes are 10 s apart."""
     global programme_switched_at, mpv_last_started_at, mpv_running_for_rf
-    src, is_rf = network_output_source, network_output_source_is_rf
+    src, is_rf = playing_source, playing_source_is_rf
     if not src:
         return
     # Waits for a restart already under way (up to 15 s for a carousel
@@ -12722,7 +12489,7 @@ def hdhomerun_programs(device_id: str = None):
 
 
 class ScreenOutputRequest(BaseModel):
-    mode: Optional[str] = None          # hdmi | srt | both
+    mode: Optional[str] = None          # hdmi | srt
     format: Optional[str] = None        # 1080p50 | 1080p25 | 2160p25 | 2160p50
     host: Optional[str] = None
     port: Optional[int] = None
@@ -12734,13 +12501,13 @@ class ScreenOutputRequest(BaseModel):
 
 
 @app.get("/api/screen_output", tags=["Configuration"],
-         summary="Where the finished screen goes: HDMI, SRT or both")
+         summary="Where the finished screen goes: HDMI or SRT")
 def get_screen_output():
     return screen_output.status()
 
 
 @app.post("/api/screen_output", tags=["Configuration"],
-          summary="Send the finished screen over SRT, to HDMI, or both",
+          summary="Send the finished screen over SRT, or show it on HDMI",
           description="SRT carries what is on the screen, overlay and "
                       "chat included, encoded in hardware (ROCK). In SRT "
                       "mode Lynx draws on a virtual 1920x1080 screen at "
@@ -12750,7 +12517,7 @@ def set_screen_output(req: ScreenOutputRequest):
     cur = dict(config.get('screen_output') or {})
     new = req.model_dump(exclude_none=True)
     if 'mode' in new and new['mode'] not in lynx_screen_output.MODES:
-        raise HTTPException(status_code=400, detail="mode must be hdmi, srt or both")
+        raise HTTPException(status_code=400, detail="mode must be hdmi or srt")
     if 'format' in new and new['format'] not in lynx_screen_output.FORMATS:
         raise HTTPException(status_code=400, detail="format must be one of "
                             + ", ".join(lynx_screen_output.FORMATS))
@@ -12777,98 +12544,6 @@ def set_screen_output(req: ScreenOutputRequest):
         print(f"[srt] could not save: {e}")
     screen_output.apply_now()
     return screen_output.status()
-
-
-class NetworkOutputRequest(BaseModel):
-    enabled: bool
-
-
-@app.get("/api/network_output/playlist.xspf", tags=["Configuration"],
-         summary="A playlist file that opens the stream in VLC",
-         description="Click it in a browser and the operating system "
-                     "hands it to whatever plays .m3u files, which on "
-                     "any machine with VLC installed is VLC. Exists "
-                     "because VLC's own Open Network dialogue mangles a "
-                     "udp:// URL typed into it - the @ is stripped on "
-                     "macOS and the whole address truncated on tvOS - "
-                     "while the identical URL inside a playlist file "
-                     "works every time.")
-def network_output_playlist():
-    cfg = config.get('network_output', {}) or {}
-    port = cfg.get('port', 9950)
-    # XSPF rather than M3U: macOS hands an .m3u to Music, which is
-    # not what anybody wanted. Nothing else claims .xspf, so it goes
-    # to VLC.
-    body = ('<?xml version="1.0" encoding="UTF-8"?>\n'
-            '<playlist version="1" xmlns="http://xspf.org/ns/0/" xmlns:vlc="http://www.videolan.org/vlc/playlist/ns/0/">\n'
-            '  <title>Lynx DATV</title>\n'
-            '  <trackList>\n'
-            '    <track>\n'
-            f'      <location>udp://@:{port}</location>\n'
-            '      <title>Lynx DATV</title>\n'
-            '      <extension application="http://www.videolan.org/vlc/playlist/0">\n'
-            '        <vlc:id>0</vlc:id>\n'
-            '        <vlc:option>input-repeat=65535</vlc:option>\n'
-            '        <vlc:option>video-on-top</vlc:option>\n'
-            '      </extension>\n'
-            '    </track>\n'
-            '  </trackList>\n'
-            '</playlist>\n')
-    return Response(content=body, media_type="application/xspf+xml",
-                    headers={"Content-Disposition":
-                             'attachment; filename="lynx.xspf"'})
-
-
-@app.post("/api/network_output", tags=["Configuration"],
-          summary="Send the picture to another machine instead of decoding it",
-          description="When on, nothing is decoded here: the transport "
-                      "stream is forwarded to the configured address and "
-                      "the Pi keeps only its overlay - frequency, MER, "
-                      "callsign, magic eye. The picture goes to VLC on a "
-                      "PC, an Apple TV, a Fire Stick or anything else "
-                      "that can open a UDP stream. Recommended for 4K, "
-                      "which a Pi 5 decodes only just and a Pi 4 not at "
-                      "all, while almost any modern television has a "
-                      "hardware decoder sitting idle a few feet away.")
-def set_network_output(req: NetworkOutputRequest):
-    global network_output_enabled
-    network_output_enabled = bool(req.enabled)
-    # Saved, so the switch means the same after a reboot.
-    try:
-        config.setdefault('network_output', {})['enabled'] = network_output_enabled
-        save_config(config)
-    except Exception as e:
-        print(f"[netout] could not save the switch: {e}")
-
-    # Take effect now rather than at the next tune. Switching this on
-    # mid-contact should move the picture across immediately, not leave
-    # the operator wondering whether it worked.
-    # current_rf_target_port() already knows about diversity and the
-    # Slave, so this works for all of them without asking which.
-    if current_mode in ("rf", "dvbt"):
-        _src = f"udp://@:{current_rf_target_port()}"
-    else:
-        _src = ""
-
-    _is_rf = True
-    if not _src and network_output_source:
-        # A stream or other non-RF source: the same move, with
-        # whatever was last playing - to VLC when switched on, back
-        # to this screen when switched off.
-        _src = network_output_source
-        _is_rf = network_output_source_is_rf
-
-    if _src:
-        start_transition_cover()
-        restart_mpv(_src, is_rf=_is_rf)
-        end_transition_cover()
-    elif not network_output_enabled:
-        stop_network_output()
-
-    return {"success": True,
-            "enabled": network_output_enabled,
-            "target": network_output_target(),
-            "vlc_url": network_output_url()}
 
 
 @app.post("/api/hdhomerun/stop", tags=["RF Reception"],
@@ -14117,9 +13792,6 @@ def update_config(req: ConfigUpdateRequest):
         picotuner_changed = False
         if req.site is not None:
             on_disk.setdefault('site', {}).update(req.site.model_dump())
-        if req.network_output is not None:
-            on_disk.setdefault('network_output', {}).update(
-                req.network_output.model_dump())
         if req.picotuner is not None:
             new_pt = req.picotuner.model_dump(exclude_none=True)
             if new_pt.get('receivers') not in (None, 'share', 'protect'):
@@ -14656,21 +14328,19 @@ def web_ui():
 
         <!-- Control & Config -->
         <div class="col-md-4">
-            <!-- Screen output: HDMI, SRT or both (lynx_screen_output.py). -->
+            <!-- Screen output: HDMI or SRT (lynx_screen_output.py). -->
             <div class="card mb-3">
                 <div class="card-header">&#x1F4E1; Screen output</div>
                 <div class="card-body">
                     <div class="btn-group btn-group-sm w-100 mb-2" role="group" id="scrout-mode">
                         <button class="btn btn-outline-light" data-mode="hdmi" onclick="setScreenOutputMode('hdmi')">HDMI</button>
                         <button class="btn btn-outline-light" data-mode="srt" onclick="setScreenOutputMode('srt')">SRT</button>
-                        <button class="btn btn-outline-light" data-mode="both" onclick="setScreenOutputMode('both')">Both</button>
                     </div>
                     <p class="text-muted small mb-2">
                         SRT sends the finished screen (picture, overlay and chat)
                         to another machine. In SRT mode Lynx draws on a virtual
                         screen in the format chosen below, so nothing need be
-                        plugged in. Both sends what the HDMI screen shows, set to
-                        that format if the screen offers it.
+                        plugged in; the HDMI screen is switched off meanwhile.
                     </p>
                     <label class="small text-muted mb-1" for="scrout-host">Send to (SRT listener)</label>
                     <div class="input-group input-group-sm mb-2">
@@ -14686,7 +14356,7 @@ def web_ui():
                         <option value="1080p50">1080p50</option>
                         <option value="1080p25">1080p25</option>
                         <option value="2160p25">2160p25 (4K)</option>
-                        <option value="2160p50">2160p50 (4K, SRT mode)</option>
+                        <option value="2160p50">2160p50 (4K)</option>
                     </select>
                     <div class="row g-2 mb-2">
                         <div class="col-6">
@@ -14721,75 +14391,6 @@ def web_ui():
                 </div>
             </div>
 
-            <!-- Network video output. First in this column deliberately:
-                 it changes what the receiver is doing right now, which
-                 is what an operator reaches for mid-contact. -->
-            <div class="card mb-3">
-                <div class="card-header">&#x1F4FA; Picture to another screen</div>
-                <div class="card-body">
-                    <div class="form-check form-switch mb-2">
-                        <input class="form-check-input" type="checkbox" role="switch"
-                               id="netout-toggle" onchange="setNetworkOutput(this.checked)"
-                               style="transform:scale(1.4); margin-right:0.6em;">
-                        <label class="form-check-label" for="netout-toggle"
-                               style="font-size:1.05em">Send picture over the network</label>
-                    </div>
-                    <p class="text-muted small mb-2">
-                        Nothing is decoded here: the transport stream goes to the
-                        machine below and VLC draws the picture there. This screen
-                        keeps the overlay &mdash; frequency, MER, callsign, magic eye
-                        &mdash; over a dark background.
-                    </p>
-                    <p class="text-muted small mb-2">
-                        Worth using for 4K, which a Pi&nbsp;5 decodes only just and a
-                        Pi&nbsp;4 not at all, while almost any television, Apple TV or
-                        Fire Stick has a hardware decoder sitting idle.
-                    </p>
-                    <label class="small text-muted mb-1" for="netout-host">Machine to send to</label>
-                    <div class="input-group input-group-sm mb-1">
-                        <input type="text" class="form-control bg-dark text-light border-secondary" id="netout-host"
-                               placeholder="192.168.1.50" onchange="saveNetworkOutputHost()">
-                        <span class="input-group-text">:</span>
-                        <input type="number" class="form-control bg-dark text-light border-secondary" id="netout-port"
-                               style="max-width:6em" value="9950" onchange="saveNetworkOutputHost()">
-                    </div>
-                    <div class="small mb-2" id="netout-subnet-warning" style="display:none; color:#e8a33d;">
-                        That address is on a different subnet from this receiver. It
-                        may still work if your network routes between them &mdash; but
-                        if nothing appears, that is the first thing to check.
-                    </div>
-                    <label class="small text-muted mb-1">Open this in VLC</label>
-                    <div class="input-group input-group-sm mb-1">
-                        <input type="text" class="form-control bg-dark text-light border-secondary" id="netout-url"
-                               readonly value="udp://@:9950">
-                        <button class="btn btn-outline-light" onclick="copyNetworkOutputUrl()"
-                                title="Copy the URL">Copy</button>
-                    </div>
-                    <a class="btn btn-sm btn-primary w-100 mb-1"
-                       href="/api/network_output/playlist.xspf"
-                       title="Downloads a playlist your machine hands straight to VLC">
-                       &#x25B6;&#xFE0F; Open in VLC
-                    </a>
-                    <div class="text-muted small">
-                        Downloads a small playlist file &mdash; open it and
-                        VLC plays the stream, reopens it by itself when the
-                        source changes, and stays on top of other windows.
-                        Browsers will not launch a download on their own, so
-                        it is two clicks rather than one, but it beats typing
-                        the URL, which VLC's own Open Network box mangles.
-                    </div>
-                    <div class="small mt-2" style="color:#e8a33d;">
-                        One setting VLC only takes from its own preferences:
-                        to stop the window resizing whenever the picture size
-                        changes, untick this once on each computer.<br>
-                        <b>Mac:</b> Settings &rarr; Show All &rarr; Interface
-                        &rarr; Main interfaces &rarr; macOS &rarr;
-                        &ldquo;Resize interface to the native video size&rdquo;<br>
-                        <b>Windows / Linux:</b> Tools &rarr; Preferences &rarr;
-                        Interface &rarr; &ldquo;Resize interface to video size&rdquo;
-                    </div>
-                </div>
-            </div>
 
             <div class="card">
                 <div class="card-header">&#x2699;&#xFE0F; Control</div>
@@ -16237,7 +15838,7 @@ function showToast(text, isError) {
     box._hide = setTimeout(() => { box.style.opacity = '0'; }, isError ? 6000 : 3000);
 }
 
-        // ── Screen output: HDMI, SRT or both ──────────────────
+        // ── Screen output: HDMI or SRT ────────────────────────
 let screenOutputLoaded = false;
 function showScreenOutput(st) {
     if (!st) return;
@@ -16305,8 +15906,7 @@ async function setScreenOutputMode(mode) {
     }
     try {
         showScreenOutput(await screenOutputCall('POST', {mode: mode}));
-        showToast(mode === 'hdmi' ? 'Picture on HDMI' :
-                  mode === 'srt' ? 'Picture going out over SRT' : 'Picture on HDMI and SRT');
+        showToast(mode === 'hdmi' ? 'Picture on HDMI' : 'Picture going out over SRT');
     } catch (e) {
         showToast('Could not change screen output: ' + e.message, true);
     }
@@ -16338,69 +15938,6 @@ async function saveScreenOutput(withPass) {
 
 loadScreenOutput();
 setInterval(loadScreenOutput, 3000);
-
-        // ── Network video output ──────────────────────────────
-//
-// The host and port are saved to config, the switch is not:
-// where the picture goes is a property of the installation,
-// whether it is going there right now is not, and a receiver
-// that came back from a power cut with its own screen dark
-// would be a puzzle rather than a convenience.
-async function setNetworkOutput(on) {
-    try {
-        const r = await api('POST', '/api/network_output', {enabled: !!on});
-        if (r && r.vlc_url) {
-            document.getElementById('netout-url').value = r.vlc_url;
-        }
-        showToast(on
-            ? 'Picture now going to ' + (r.target || 'the network')
-            : 'Picture back on this screen');
-    } catch (e) {
-        showToast('Could not change network output: ' + e, true);
-        document.getElementById('netout-toggle').checked = !on;
-    }
-}
-
-async function saveNetworkOutputHost() {
-    const host = document.getElementById('netout-host').value.trim();
-    const port = parseInt(document.getElementById('netout-port').value, 10) || 9950;
-    document.getElementById('netout-url').value = 'udp://@:' + port;
-    checkNetworkOutputSubnet(host);
-    try {
-        await api('POST', '/api/config', {network_output: {host: host, port: port}});
-    } catch (e) {
-        showToast('Could not save: ' + e, true);
-    }
-}
-
-// A /24 comparison rather than anything cleverer: the browser
-// cannot see the receiver's netmask, and on the networks this
-// runs on a /24 is right often enough to be a useful warning
-// and never a refusal. Routed networks exist, and telling
-// somebody their working setup is impossible would be worse
-// than saying nothing.
-function checkNetworkOutputSubnet(host) {
-    const warn = document.getElementById('netout-subnet-warning');
-    if (!warn) return;
-    const here = window.location.hostname;
-    const a = (host || '').split('.');
-    const b = (here || '').split('.');
-    const looksLikeIp = a.length === 4 && b.length === 4 && !isNaN(+b[0]);
-    warn.style.display = (looksLikeIp &&
-                          (a[0] !== b[0] || a[1] !== b[1] || a[2] !== b[2]))
-                         ? 'block' : 'none';
-}
-
-function copyNetworkOutputUrl() {
-    const el = document.getElementById('netout-url');
-    // No select() first: selecting the field then writing the
-    // clipboard was picking up whatever else was selected on the page
-    // rather than the URL. Writing the value straight out is both
-    // simpler and correct.
-    navigator.clipboard.writeText(el.value).then(
-        () => showToast('Copied - paste into VLC'),
-        () => showToast('Select and copy it by hand', true));
-}
 
 async function shutdownPi() {
     if (!confirm('Shut down the Pi completely? Unlike Reboot, it will NOT come back up on ' +
@@ -16733,7 +16270,6 @@ if __name__ == "__main__":
     quality_b.start()
     freshness = threading.Thread(target=rf_mpv_lifecycle_monitor, daemon=True)
     freshness.start()
-    threading.Thread(target=network_output_watchdog, daemon=True).start()
     screen_output.start()
     threading.Thread(target=programme_keeper, daemon=True).start()
     diversity_stuck = threading.Thread(target=diversity_stuck_lock_monitor, daemon=True)
