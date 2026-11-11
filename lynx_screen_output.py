@@ -182,15 +182,43 @@ def virtual_name(outs):
     return None
 
 
-def null_sink_exists():
+def _sink_ids():
+    """PipeWire object ids of nodes named lynx_srt."""
     rc, out = _run(["pw-cli", "ls", "Node"])
-    return rc == 0 and f'node.name = "{NULL_SINK}"' in out
+    if rc != 0:
+        return []
+    ids, cur = [], None
+    for line in out.splitlines():
+        m = re.match(r"\s*id (\d+), type PipeWire:Interface:Node", line)
+        if m:
+            cur = m.group(1)
+        elif cur and f'node.name = "{NULL_SINK}"' in line:
+            ids.append(cur)
+    return ids
+
+
+def null_sink_exists():
+    return bool(_sink_ids())
+
+
+_sink_fresh = [False]
 
 
 def ensure_null_sink():
     """A PipeWire sink nobody listens to, for mpv's sound in SRT mode.
     object.linger keeps it after pw-cli exits; it lasts until PipeWire
-    restarts, so the watchdog checks it each time round."""
+    restarts, so the watchdog checks it each time round.
+
+    node.latency 1024/48000: the quantum HDMI runs at. Without it the
+    graph ran at 2048, and mpv (RF's low-latency profile, almost no
+    audio buffer) filled only every other block: alternate 2048-sample
+    gaps, a scrubbing sound on the SRT feed (5C, 11 Nov 2026). The
+    first call after Lynx starts replaces any sink left from before,
+    so a change here takes effect."""
+    if not _sink_fresh[0]:
+        for i in _sink_ids():
+            _run(["pw-cli", "destroy", i])
+        _sink_fresh[0] = True
     if null_sink_exists():
         return True
     rc, out = _run(["pw-cli", "create-node", "adapter",
@@ -198,6 +226,7 @@ def ensure_null_sink():
                     f"node.name={NULL_SINK} "
                     "node.description=\"Lynx SRT output\" "
                     "media.class=Audio/Sink object.linger=true "
+                    "node.latency=1024/48000 "
                     "audio.rate=48000 audio.position=[ FL FR ] }"])
     if rc != 0:
         print(f"[srt] could not make the {NULL_SINK} sink: {out.strip()}",

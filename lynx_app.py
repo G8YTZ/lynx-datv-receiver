@@ -1004,6 +1004,12 @@ def restart_mpv(target_url: str, is_rf: bool = True):
         f"{audio_device_flag()}"
         f"--audio-pitch-correction=no --script={DRIFT_SCRIPT_PATH} "
         f"{source_flags}"
+        # SRT mode: a 100 ms audio buffer, after source_flags so RF's
+        # low-latency profile cannot reset it. With almost none, mpv
+        # missed every other block into the lynx_srt sink (a scrubbing
+        # sound on the SRT feed, 5C, 11 Nov 2026). mpv allows for it in
+        # lip-sync.
+        f"{'--audio-buffer=0.1 ' if screen_output.mpv_audio_device() else ''}"
         f"--keep-open=yes --idle=yes "
         f"{_programme_track_flags()}"
         f"--input-ipc-server={MPV_SOCKET} "
@@ -1303,6 +1309,7 @@ def audio_device_flag():
     srt_dev = screen_output.mpv_audio_device()
     if srt_dev:
         # SRT mode: sound into the lynx_srt sink, which is captured.
+        # (Its audio buffer is set after the source flags, below.)
         return f"--audio-device={shlex.quote(srt_dev)} "
     dev = str(config.get('display', {}).get('audio_device', 'hdmi')).strip()
     if not dev or dev.lower() == 'auto':
