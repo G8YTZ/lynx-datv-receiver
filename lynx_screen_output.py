@@ -606,7 +606,9 @@ class ScreenOutput:
             "missing": self.available(),
             "hardware_encoder": HARDWARE_ENCODER,
             "formats": list(FORMATS) if HARDWARE_ENCODER else list(SOFTWARE_FORMATS),
-            "settings": {k: v for k, v in s.items() if k != "passphrase"},
+            # The passphrase too: the page shows it masked, with an eye
+            # button, as it does the QRZ password.
+            "settings": dict(s),
             "has_passphrase": bool(s.get("passphrase")),
             "bitrate_set": bool((self.get_config().get("screen_output") or {})
                                 .get("bitrate_kbps")),
