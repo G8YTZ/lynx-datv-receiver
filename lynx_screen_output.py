@@ -234,6 +234,7 @@ class ScreenOutput:
         self.capture_since = 0.0
         self.last_error = ""
         self.screen = None          # the output being captured
+        self.restore_mode = {}      # {output: (w, h, hz)} Both mode changed
         self.thread = None
         self.stopping = False
 
@@ -293,6 +294,16 @@ class ScreenOutput:
             screen = real[0] if real else None
             if mode == "hdmi":
                 screen = None
+                # Put back any mode Both chose (the LG back to its own
+                # 4K 30 Hz, 11 Nov 2026).
+                for n, m in list(self.restore_mode.items()):
+                    if n in outs and m:
+                        _run(["wlr-randr", "--output", n,
+                              "--mode", f"{m[0]}x{m[1]}@{m[2]:.6f}Hz"])
+                        print(f"[srt] {n} back to {m[0]}x{m[1]} {m[2]:g} Hz",
+                              flush=True)
+                        changed = True
+                self.restore_mode.clear()
             elif screen:
                 # Both: the SRT feed runs at the screen's rate, so ask
                 # for 1920x1080 50 Hz if the screen offers it (the LG on
@@ -300,6 +311,7 @@ class ScreenOutput:
                 o = outs[screen]
                 offered = next((m for m in o["modes"] if _is(m, w, h, hz)), None)
                 if offered and not _is(o["current"], w, h, hz):
+                    self.restore_mode.setdefault(screen, o["current"])
                     _run(["wlr-randr", "--output", screen,
                           "--mode", f"{w}x{h}@{offered[2]:.6f}Hz"])
                     changed = True
