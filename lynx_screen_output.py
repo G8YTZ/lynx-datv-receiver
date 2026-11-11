@@ -371,6 +371,8 @@ class ScreenOutput:
                 url]
 
     def _backoff(self, fails):
+        if fails < 0:
+            return 0.5
         return (2, 5, 10, 20)[min(fails, 3)]
 
     def tick(self):
@@ -444,6 +446,11 @@ class ScreenOutput:
                 if self.sender is not None:
                     up = now - self.sender_since
                     self.sender_fails = 0 if up > 60 else self.sender_fails + 1
+                    if s.get("srt_mode") == "listener":
+                        # A viewer leaving ends the listener; listen
+                        # again at once rather than backing off (it was
+                        # up to 20 s, and the next viewer waited).
+                        self.sender_fails = -1
                     self.last_error = (f"SRT link closed after {int(up)} s "
                                        f"(code {self.sender.returncode}); "
                                        f"see {LOG}")
@@ -502,7 +509,7 @@ class ScreenOutput:
                 self.tick()
             except Exception as e:
                 print(f"[srt] watchdog: {e}", flush=True)
-            time.sleep(2)
+            time.sleep(1)
 
     def start(self):
         if self.thread is None:
