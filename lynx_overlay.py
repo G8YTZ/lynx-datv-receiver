@@ -547,8 +547,12 @@ def audio_ppm_monitor():
         try:
             # Re-resolve when the configured device changes, so altering
             # it on the Config page moves the meter with it rather than
-            # needing a restart.
-            current_device = state.get("audio_device", "hdmi")
+            # needing a restart - and when what it resolves to changes:
+            # SRT screen output moves mpv to the lynx_srt sink and back
+            # without touching the setting, and the meter stayed on the
+            # silent SRT sink after a return to HDMI (5C, 11 Nov 2026).
+            current_device = (state.get("audio_device", "hdmi"),
+                              state.get("audio_device_resolved"))
             if target is None or current_device != target_for_device:
                 target = ppm_monitor_target()
                 target_for_device = current_device
