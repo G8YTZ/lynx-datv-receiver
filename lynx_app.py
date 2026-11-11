@@ -14352,7 +14352,7 @@ def web_ui():
                         screen in the format chosen below, so nothing need be
                         plugged in; the HDMI screen is switched off meanwhile.
                     </p>
-                    <label class="small text-muted mb-1" for="scrout-host">Send to (SRT listener)</label>
+                    <label class="small text-muted mb-1" for="scrout-host">Port, and the far end's address if Lynx calls it</label>
                     <div class="input-group input-group-sm mb-2">
                         <input type="text" class="form-control bg-dark text-light border-secondary" id="scrout-host"
                                placeholder="192.168.1.50" onchange="saveScreenOutput()">
@@ -14392,8 +14392,8 @@ def web_ui():
                             <label class="small text-muted mb-1" for="scrout-srtmode">Who connects</label>
                             <select class="form-select form-select-sm mb-2 bg-dark text-light border-secondary"
                                     id="scrout-srtmode" onchange="saveScreenOutput()">
-                                <option value="caller">Lynx calls the far end (caller)</option>
                                 <option value="listener">The far end calls Lynx (listener)</option>
+                                <option value="caller">Lynx calls the far end (caller)</option>
                             </select>
                             <label class="small text-muted mb-1" for="scrout-pass">Passphrase (10 to 79 characters, blank for none)</label>
                             <!-- Masked with an eye button, like the other passwords;
@@ -15890,7 +15890,7 @@ function showScreenOutput(st) {
         document.getElementById('scrout-bitrate').placeholder =
             'automatic (' + set.bitrate_kbps + ')';
         document.getElementById('scrout-latency').value = set.latency_ms || 500;
-        document.getElementById('scrout-srtmode').value = set.srt_mode || 'caller';
+        document.getElementById('scrout-srtmode').value = set.srt_mode || 'listener';
         document.getElementById('scrout-streamid').value = set.streamid || '';
         document.getElementById('scrout-pass').value = set.passphrase || '';
         screenOutputLoaded = true;

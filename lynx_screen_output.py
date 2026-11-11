@@ -86,7 +86,8 @@ DEFAULTS = {
     "codec": "hevc",           # hevc (H.265, Justin 11 Nov 2026) or h264
     "host": "",
     "port": 9000,
-    "srt_mode": "caller",      # caller (Lynx dials) or listener
+    "srt_mode": "listener",    # listener (the far end calls; default,
+                               # Justin 11 Nov 2026) or caller (Lynx dials)
     "latency_ms": 500,
     "bitrate_kbps": None,      # None: by codec and format (see settings())
     "passphrase": "",
