@@ -20,16 +20,16 @@ A DATV receiver for the Picotuner (WinterHill firmware), on a Raspberry Pi 5 or 
 
 ## Getting started
 
-See [`lynx_install_guide.docx`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/docs/lynx_install_guide.docx) for the full, step-by-step setup guide, from a blank SD card to a working receiver, or use the one-line installer described in that guide's Section 4.1. The same installer works on every board: it finds out whether it is on a Raspberry Pi or a ROCK 5T or 5C, and on a ROCK also builds the hardware video stack (about 20 minutes the first time).
+See [`lynx_install_guide.docx`](./docs/lynx_install_guide.docx) for the full, step-by-step setup guide, from a blank SD card to a working receiver, or use the one-line installer described in that guide's Section 4.1. The same installer works on every board: it finds out whether it is on a Raspberry Pi or a ROCK 5T or 5C, and on a ROCK also builds the hardware video stack (about 20 minutes the first time).
 
 Start Lynx, then set your Picotuner's IP address and your site details from the Web Control Portal's Configuration page (⚙️ Config → Picotuner Network Settings). There is no need to hand-edit the config file for this.
 
 ## Documentation
 
-- [`lynx_install_guide.docx`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/docs/lynx_install_guide.docx): full setup guide, blank SD card to working receiver
-- [`lynx_webui_manual.docx`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/docs/lynx_webui_manual.docx): what every button and field on the Web Control Portal does
-- [`lynx_overlay_annotated.pdf`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/docs/lynx_overlay_annotated.pdf): annotated guide to the on-screen display overlay
-- [`lynx_diversity_overview.docx`](https://github.com/G8YTZ/lynx-datv-receiver/raw/main/docs/lynx_diversity_overview.docx): how diversity reception works, and what's next
+- [`lynx_install_guide.docx`](./docs/lynx_install_guide.docx): full setup guide, blank SD card to working receiver
+- [`lynx_webui_manual.docx`](./docs/lynx_webui_manual.docx): what every button and field on the Web Control Portal does
+- [`lynx_overlay_annotated.pdf`](./docs/lynx_overlay_annotated.pdf): annotated guide to the on-screen display overlay
+- [`lynx_diversity_overview.docx`](./docs/lynx_diversity_overview.docx): how diversity reception works, and what's next
 - [`docs/SRT_OUTPUT.md`](./docs/SRT_OUTPUT.md): the SRT output, the Screen output card, and watching it in VLC
 - [`CHANGELOG.md`](./CHANGELOG.md): what's changed recently, in one place
 - [`docs/ROADMAP.md`](./docs/ROADMAP.md): what's being worked on next
