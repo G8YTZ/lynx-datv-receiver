@@ -54,7 +54,7 @@ A viewer joining between two keyframes sees a broken picture for up to a second,
 
 ## Boards
 
-- **ROCK 5T and 5C:** Everything, 2160p50 included. The RK3588's hardware encoder does the work, and the screen is captured without a copy through the processor.
+- **ROCK 5C:** Everything, 2160p50 included. Its hardware encoder does the work, and the screen is captured without a copy through the processor.
 - **Raspberry Pi 5:** No hardware encoder, so H.264 in software, 720p and 1080p only: **SRT on a Pi is for sources up to 1080p.** A 4K source still plays on the Pi, but its SRT sound and picture drift apart. Use a ROCK for 4K over SRT.
 
 ## Sound
