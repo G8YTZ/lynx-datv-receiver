@@ -1111,6 +1111,8 @@ def restart_mpv(target_url: str, is_rf: bool = True):
     covered window deliberately wider than just this restart."""
     global network_output_source, network_output_source_is_rf
     network_output_source, network_output_source_is_rf = target_url, is_rf
+    if is_rf and target_url.endswith(f":{FCC_OUT_PORT}"):
+        _fcc_send("HOLD")          # nothing live reaches the new mpv before its burst
     if network_output_enabled:
         # Nothing decodes here. kill_mpv() still runs, because
         # switching the feature on mid-session has to take the picture
@@ -5636,6 +5638,15 @@ def fcc_active() -> bool:
             and not diversity_enabled and not tri_watch_enabled)
 
 
+def _fcc_send(msg: str):
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.sendto(msg.encode(), ("127.0.0.1", FCC_CTL_PORT))
+        s.close()
+    except OSError as e:
+        print(f"[fcc] {msg} not sent: {e}")
+
+
 def _fcc_burst_when_listening(programme):
     """Ask the relay for a burst once mpv is listening on its port (a burst
     sent before that would be thrown away by the kernel)."""
@@ -5649,12 +5660,7 @@ def _fcc_burst_when_listening(programme):
         except OSError:
             pass
         time.sleep(0.05)
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.sendto(f"BURST {programme}".strip().encode(), ("127.0.0.1", FCC_CTL_PORT))
-        s.close()
-    except OSError as e:
-        print(f"[fcc] burst request failed: {e}")
+    _fcc_send(f"BURST {programme}".strip())
 
 
 def stop_diversity_combiner():

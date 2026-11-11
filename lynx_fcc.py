@@ -22,8 +22,17 @@ Single receiver only: in diversity the combiner holds these ports.
 
     python3 lynx_fcc.py --in-port 9941 --out-port 9947 --control-port 9948
 
-Control (UDP, from 127.0.0.1): "BURST <programme number>" or "BURST" for the
-first programme.
+Control (UDP, from 127.0.0.1):
+  "HOLD"  stop passing live packets on (Lynx sends it just before restarting
+          mpv); everything is still stored. Lifted by the next BURST, or by
+          itself after 8 s.
+  "BURST <programme number>" (or "BURST" for the first programme): the PAT,
+          every PMT, the programme from its last keyframe, then live again,
+          continuing exactly where the store ended.
+
+The hold matters: without it, the new mpv got a fraction of a second of live
+packets first and the older burst after them, timestamps going backwards in
+its first second, and a programme 2 change failed (11 Nov 2026).
 """
 import argparse
 import select
@@ -127,6 +136,11 @@ def take(p):
         del st[:len(st) - STORE_MAX]
 
 
+HOLD_MAX = 8.0
+held_since = None            # set while live packets are held back
+held_live = []               # live datagrams received while held: sent after the burst
+
+
 def burst(out, prog):
     if prog is None:
         prog = min(progs) if progs else None
@@ -144,7 +158,18 @@ def burst(out, prog):
         f"({len(held) * TS // 1024} kB)")
 
 
+def release(out):
+    """Live again. The store already holds every held packet of the chosen
+    programme, so only datagrams that arrived after the burst was built are
+    owed; simplest and safe is to drop the held queue (the store covered
+    it) and carry on live from the next datagram."""
+    global held_since
+    held_since = None
+    held_live.clear()
+
+
 def main():
+    global held_since
     rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     rx.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 * 1024 * 1024)
@@ -157,14 +182,21 @@ def main():
         r, _, _ = select.select([rx, ctl], [], [], 1.0)
         if ctl in r:
             msg = ctl.recv(256).decode(errors="replace").split()
-            if msg and msg[0] == "BURST":
+            if msg and msg[0] == "HOLD":
+                held_since = time.time()
+            elif msg and msg[0] == "BURST":
                 try:
                     burst(out, int(msg[1]) if len(msg) > 1 else None)
                 except Exception as e:
                     log(f"burst failed: {e}")
+                release(out)
+        if held_since is not None and time.time() - held_since > HOLD_MAX:
+            log("held for 8 s with no burst asked for: live again")
+            release(out)
         if rx in r:
             d = rx.recv(65535)
-            out.sendto(d, (a.out_ip, a.out_port))
+            if held_since is None:
+                out.sendto(d, (a.out_ip, a.out_port))
             for n in range(0, len(d) - TS + 1, TS):
                 p = d[n:n + TS]
                 if p[0] == 0x47:
