@@ -12,6 +12,7 @@ A DATV receiver for the Picotuner (WinterHill firmware), on a Raspberry Pi 5 or 
 - Web Control Portal for tuning, memory presets, live BATC stream browsing, and volume control
 - **SRT output**: the finished screen (picture, overlay, chat and sound) sent over SRT, to VLC or a transmitter, with nothing plugged into HDMI. Up to 2160p50 H.265 on a ROCK, 1080p H.264 on a Pi 5. See [`docs/SRT_OUTPUT.md`](./docs/SRT_OUTPUT.md)
 - DVB-T/T2/C reception via a SiliconDust HDHomeRun network tuner, found automatically on the local network, including narrowband DVB-T2 at 1 and 2 MHz on 2m and 70cm as well as full-bandwidth broadcast multiplexes
+- ATSC 3.0 reception via an ATSC model HDHomeRun (the Flex 4K): the receive end of Lynx-Tx's ATSC 3.0 mode, live 4K H.265 with sound, on any frequency the tuner reaches (70cm directly, 23cm through a down-converter)
 - Optional two-tuner diversity combining, with automatic source switching based on signal quality
 - Repeater/receiver-activity notifications (QRZ Logbook, Slack, Bitfocus Companion, GPIO Tx control)
 - **Pathfinder**: an end-of-contact station map, a full-screen card showing where a station was, the path back to the receiver, and the signal figures from the contact, drawn from their QRZ locator
@@ -42,6 +43,7 @@ Start Lynx, then set your Picotuner's IP address and your site details from the 
   - The **ROCK 5T** is Lynx-Tx's board (the transmitter), not a receiver.
 - A Picotuner (WinterHill firmware) on the same network
 - Optionally, a SiliconDust HDHomeRun for DVB-T/T2/C. The narrow amateur bandwidths are available only on the **HDHR5-2DT** (two tuners) and **HDHR5-4DT** (four tuners), **both now discontinued**, so second-hand only. No other model has them, and SiliconDust know of no other demodulator supporting anything narrower than 1.7 MHz as standard. They have said they would like to make a new model for this. Tuning range 44 to 866 MHz, so 2m and 70cm are usable and 23cm is out of reach
+- Optionally, an ATSC model HDHomeRun (the **Flex 4K**) for ATSC 3.0. It tunes any frequency from 44 to 1002 MHz, not just the US channel plan. A DVB-T2 box and an ATSC box can be on the network together; each tune goes to the one that can receive it
 - See the install guide for the full system/Python dependency list (`pyshp` is required for the station map)
 - Recommended: disable Wi-Fi and Bluetooth and use wired Ethernet
 
