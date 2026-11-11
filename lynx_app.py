@@ -998,9 +998,19 @@ def restart_mpv(target_url: str, is_rf: bool = True):
         # what was confirmed working in a direct hand-run test.
         source_flags = ""
 
+    # A Pi in SRT mode draws natively on Wayland, not through XWayland:
+    # XWayland held frames for a while labwc then captured, so the SRT
+    # picture ran 300 ms (BBC HD) to 475 ms (4K) behind its sound; native
+    # it was right with no delay (Pi 5, 11 Nov 2026). HDMI mode keeps the
+    # Pi's proven XWayland path. An explicit LYNX_MPV_VIDEO_FLAGS wins.
+    pi_srt_native = (not lynx_platform.IS_ROCK
+                     and screen_output.mpv_audio_device() is not None
+                     and not os.environ.get("LYNX_MPV_VIDEO_FLAGS"))
+    video_flags = ("--vo=gpu --gpu-context=wayland --hwdec=drm-copy"
+                   if pi_srt_native else lynx_platform.MPV_VIDEO_FLAGS)
     cmd = (
         f"mpv --fullscreen --ontop --border=no --no-osc --no-input-default-bindings "
-        f"--cursor-autohide=always --force-window=yes {lynx_platform.MPV_VIDEO_FLAGS} --mute=yes "
+        f"--cursor-autohide=always --force-window=yes {video_flags} --mute=yes "
         f"{audio_device_flag()}"
         f"--audio-pitch-correction=no --script={DRIFT_SCRIPT_PATH} "
         f"{source_flags}"
@@ -1046,7 +1056,7 @@ def restart_mpv(target_url: str, is_rf: bool = True):
     #
     # Pi only. On the ROCK 5T mpv is Wayland-only (dmabuf-wayland),
     # so it must keep the variable - see lynx_platform.py.
-    if lynx_platform.KEEP_WAYLAND_DISPLAY:
+    if lynx_platform.KEEP_WAYLAND_DISPLAY or pi_srt_native:
         env.setdefault("WAYLAND_DISPLAY", "wayland-0")
     else:
         env.pop("WAYLAND_DISPLAY", None)
@@ -14417,6 +14427,11 @@ def web_ui():
                                    id="scrout-streamid" onchange="saveScreenOutput()">
                         </div>
                     </details>
+                    <div class="small text-muted mb-1" id="scrout-note" style="display:none">
+                        This receiver encodes in software: SRT is for sources up to 1080p.
+                        A 4K source plays here, but its SRT sound and picture drift apart;
+                        for 4K over SRT use a ROCK.
+                    </div>
                     <div class="small" id="scrout-status">&nbsp;</div>
                 </div>
             </div>
@@ -15881,7 +15896,9 @@ function showScreenOutput(st) {
     if (!screenOutputLoaded) {
         document.getElementById('scrout-host').value = set.host || '';
         document.getElementById('scrout-port').value = set.port || 9000;
-        // A Pi has no hardware encoder: H.264 and 1080p only.
+        // A Pi has no hardware encoder: H.264, sources up to 1080p.
+        document.getElementById('scrout-note').style.display =
+            st.hardware_encoder ? 'none' : 'block';
         const fmts = st.formats || [];
         document.querySelectorAll('#scrout-format option').forEach(o => {
             o.hidden = fmts.length && !fmts.includes(o.value);
