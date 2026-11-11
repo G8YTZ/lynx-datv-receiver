@@ -178,7 +178,8 @@ WF_RECORDER_TAG=v0.6.0
 wf_recorder_ok() {
   [ -x /usr/local/bin/wf-recorder ] || return 1
   ldd /usr/local/bin/wf-recorder 2>/dev/null | grep -q '/usr/local/lib/libavcodec' || return 1
-  /usr/local/bin/wf-recorder --version 2>/dev/null | grep -q "${WF_RECORDER_TAG#v}"
+  /usr/local/bin/wf-recorder --version 2>/dev/null | grep -q "${WF_RECORDER_TAG#v}" || return 1
+  grep -qa 'rkmpp: DMA-BUF capture' /usr/local/bin/wf-recorder   # the zero-copy patch
 }
 if wf_recorder_ok; then
   say "wf-recorder already installed ($WF_RECORDER_TAG)"
@@ -196,6 +197,8 @@ else
   cd wf-recorder || exit 1
   # FFmpeg 8 removed AVCodec.pix_fmts/sample_fmts/ch_layouts (11 Nov 2026).
   git apply "$LYNX_DIR/patches/wf-recorder-0.6.0-ffmpeg8.patch" || exit 1
+  # Zero-copy capture into the rkmpp encoder (DRM_PRIME), for 4K (11 Nov 2026).
+  git apply "$LYNX_DIR/patches/wf-recorder-0.6.0-rkmpp-dmabuf.patch" || exit 1
   meson setup build --prefix=/usr/local --buildtype=release \
     -Ddefault_codec=h264_rkmpp -Ddefault_pixel_format=bgr0 \
     -Ddefault_audio_backend=pipewire || exit 1
