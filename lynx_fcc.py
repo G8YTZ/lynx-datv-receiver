@@ -91,18 +91,18 @@ def parse_section(pid, p, i):
         prog = (body[0] << 8) | body[1]
         pcr = ((body[5] & 0x1F) << 8) | body[6]
         info = ((body[7] & 0x0F) << 8) | body[8]
-        j, pids, video = 9 + info, {pcr}, None
+        j, pids, video, vtype = 9 + info, {pcr}, None, None
         while j + 5 <= len(body) - 4:
             st = body[j]
             spid = ((body[j + 1] & 0x1F) << 8) | body[j + 2]
             es = ((body[j + 3] & 0x0F) << 8) | body[j + 4]
             pids.add(spid)
             if video is None and st in VIDEO_TYPES:
-                video = spid
+                video, vtype = spid, st
             j += 5 + es
         old = progs.get(prog)
         if not old or old["pids"] != pids or old["video"] != video:
-            progs[prog] = {"pids": pids, "video": video}
+            progs[prog] = {"pids": pids, "video": video, "vtype": vtype, "params_seen": False}
             for k in [k for k, v in pid_prog.items() if v == prog]:
                 del pid_prog[k]
             for x in pids:
@@ -110,6 +110,35 @@ def parse_section(pid, p, i):
             store.setdefault(prog, [])
             log(f"programme {prog}: picture on 0x{(video or 0):04x}, PIDs "
                 + ", ".join(f"0x{x:04x}" for x in sorted(pids)))
+
+
+def starts_with_params(p, i, vtype):
+    """Does this PES start (payload_unit_start) carry the codec's parameter
+    sets, i.e. is it a keyframe a decoder can start from? HEVC: VPS or SPS
+    (NAL types 32, 33); H.264 and MPEG-2: SPS (7) or a sequence header.
+
+    The random access flag alone was not enough: a burst starting at it
+    still gave "PPS id out of range" on Lynx-Tx's carousel and failed one
+    change in three (11 Nov 2026), so the store now starts where the
+    parameter sets are."""
+    pl = p[i:]
+    if len(pl) < 9 or pl[0:3] != b"\x00\x00\x01":
+        return False
+    data = pl[9 + pl[8]:]
+    k = data.find(b"\x00\x00\x01")
+    while 0 <= k < len(data) - 3:
+        b = data[k + 3]
+        if vtype in (0x24, 0x33):                  # HEVC
+            if (b >> 1) & 0x3F in (32, 33):
+                return True
+        elif vtype == 0x1B:                        # H.264
+            if b & 0x1F == 7:
+                return True
+        elif vtype in (0x01, 0x02):                # MPEG-1/2 sequence header
+            if b == 0xB3:
+                return True
+        k = data.find(b"\x00\x00\x01", k + 3)
+    return False
 
 
 def take(p):
@@ -129,8 +158,13 @@ def take(p):
     if prog is None:
         return
     st = store[prog]
-    if rai and pid == progs[prog]["video"]:
-        st.clear()              # a keyframe: start this programme's store again
+    pr = progs[prog]
+    if pid == pr["video"] and p[1] & 0x40 and afc in (1, 3) \
+            and starts_with_params(p, i, pr["vtype"]):
+        pr["params_seen"] = True
+        st.clear()              # a keyframe with its parameter sets: start again here
+    elif rai and pid == pr["video"] and not pr["params_seen"]:
+        st.clear()              # no parameter sets found yet: the flag is the best guess
     st.append(p)
     if len(st) > STORE_MAX:     # no keyframe for a long time: keep the newest
         del st[:len(st) - STORE_MAX]
