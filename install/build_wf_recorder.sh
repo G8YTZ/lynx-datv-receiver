@@ -9,6 +9,11 @@
 # Patches: FFmpeg 8 (removed AVCodec fields; guarded by version, so a
 # no-op on older FFmpeg) and zero-copy DRM_PRIME capture (rkmpp only).
 # A failed build costs SRT output, not the install: always exits 0.
+# Default sound backend pulse, which Lynx uses (through pipewire-pulse):
+# set to pipewire, meson refused to configure where PipeWire is older
+# than 1.0.5 (Debian 12 based systems), so wf-recorder never built
+# (Thomas DL5BCA, 11 Nov 2026). Its PipeWire backend still builds where
+# it can; Lynx asks for pulse explicitly either way.
 LYNX_DIR="${LYNX_DIR:-$HOME/lynx}"
 SRC_DIR="${SRC_DIR:-$HOME/src}"
 TAG=v0.6.0
@@ -49,7 +54,7 @@ echo "--- Building wf-recorder $TAG for SRT screen output (about a minute) ---"
   git apply "$LYNX_DIR/patches/wf-recorder-0.6.0-ffmpeg8.patch" || exit 1
   git apply "$LYNX_DIR/patches/wf-recorder-0.6.0-rkmpp-dmabuf.patch" || exit 1
   meson setup build --prefix=/usr/local --buildtype=release \
-    -Ddefault_codec="$CODEC" -Ddefault_audio_backend=pipewire || exit 1
+    -Ddefault_codec="$CODEC" -Ddefault_audio_backend=pulse || exit 1
   ninja -C build || exit 1
   sudo ninja -C build install && sudo ldconfig
 ) || true
