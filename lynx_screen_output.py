@@ -73,11 +73,12 @@ FORMATS = {
 DEFAULTS = {
     "mode": "hdmi",
     "format": "1080p50",
+    "codec": "hevc",           # hevc (H.265, Justin 11 Nov 2026) or h264
     "host": "",
     "port": 9000,
     "srt_mode": "caller",      # caller (Lynx dials) or listener
     "latency_ms": 500,
-    "bitrate_kbps": None,      # None: 6000 at 1080p, 16000 at 2160p
+    "bitrate_kbps": None,      # None: by codec and format (see settings())
     "passphrase": "",
     "streamid": "",
 }
@@ -92,8 +93,13 @@ def settings(config):
     if s.get("format") not in FORMATS:
         s["format"] = "1080p50"
     s["width"], s["height"], s["fps"] = FORMATS[s["format"]]
+    if s.get("codec") not in ("hevc", "h264"):
+        s["codec"] = "hevc"
     if not s.get("bitrate_kbps"):
-        s["bitrate_kbps"] = 16000 if s["height"] > 1080 else 6000
+        # H.265 needs about two thirds of H.264's rate for the same look.
+        uhd = s["height"] > 1080
+        s["bitrate_kbps"] = ({"hevc": 12000, "h264": 16000} if uhd else
+                             {"hevc": 4000, "h264": 6000})[s["codec"]]
     if s["mode"] not in MODES:
         s["mode"] = "hdmi"      # includes a saved "both" (removed)
     return s
@@ -343,11 +349,13 @@ class ScreenOutput:
         node = NULL_SINK
         kbps = int(s["bitrate_kbps"])
         fps = int(s.get("fps") or 50)
+        hevc = s.get("codec") == "hevc"
         cmd = ["wf-recorder", "-o", screen,
-               "-c", "h264_rkmpp", "-x", "bgr0", "-b", "0",
+               "-c", "hevc_rkmpp" if hevc else "h264_rkmpp",
+               "-x", "bgr0", "-b", "0",
                "-r", str(fps), "-B", str(fps),
                "-p", "rc_mode=CBR", "-p", f"b={kbps * 1000}",
-               "-p", f"g={fps}", "-p", "profile=high",
+               "-p", f"g={fps}", "-p", "profile=main" if hevc else "profile=high",
                "--audio-backend=pipewire",
                f"--audio={node}",
                "-C", "aac", "-P", "b=192000", "-R", "48000",

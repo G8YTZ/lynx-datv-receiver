@@ -12491,6 +12491,7 @@ def hdhomerun_programs(device_id: str = None):
 class ScreenOutputRequest(BaseModel):
     mode: Optional[str] = None          # hdmi | srt
     format: Optional[str] = None        # 1080p50 | 1080p25 | 2160p25 | 2160p50
+    codec: Optional[str] = None         # hevc | h264
     host: Optional[str] = None
     port: Optional[int] = None
     srt_mode: Optional[str] = None      # caller | listener
@@ -12521,6 +12522,8 @@ def set_screen_output(req: ScreenOutputRequest):
     if 'format' in new and new['format'] not in lynx_screen_output.FORMATS:
         raise HTTPException(status_code=400, detail="format must be one of "
                             + ", ".join(lynx_screen_output.FORMATS))
+    if 'codec' in new and new['codec'] not in ("hevc", "h264"):
+        raise HTTPException(status_code=400, detail="codec must be hevc or h264")
     if new.get('bitrate_kbps') == 0:
         new['bitrate_kbps'] = None      # 0 from the page: back to the default
         cur.pop('bitrate_kbps', None)
@@ -14358,6 +14361,12 @@ def web_ui():
                         <option value="2160p25">2160p25 (4K)</option>
                         <option value="2160p50">2160p50 (4K)</option>
                     </select>
+                    <label class="small text-muted mb-1" for="scrout-codec">Coding</label>
+                    <select class="form-select form-select-sm mb-2 bg-dark text-light border-secondary"
+                            id="scrout-codec" onchange="saveScreenOutput()">
+                        <option value="hevc">H.265 (HEVC)</option>
+                        <option value="h264">H.264</option>
+                    </select>
                     <div class="row g-2 mb-2">
                         <div class="col-6">
                             <label class="small text-muted mb-1" for="scrout-bitrate">Bit rate (kb/s)</label>
@@ -15852,6 +15861,7 @@ function showScreenOutput(st) {
         document.getElementById('scrout-host').value = set.host || '';
         document.getElementById('scrout-port').value = set.port || 9000;
         document.getElementById('scrout-format').value = set.format || '1080p50';
+        document.getElementById('scrout-codec').value = set.codec || 'hevc';
         document.getElementById('scrout-bitrate').value =
             (st.bitrate_set ? set.bitrate_kbps : '');
         document.getElementById('scrout-bitrate').placeholder =
@@ -15917,6 +15927,7 @@ async function saveScreenOutput(withPass) {
         host: document.getElementById('scrout-host').value.trim(),
         port: parseInt(document.getElementById('scrout-port').value, 10) || 9000,
         format: document.getElementById('scrout-format').value,
+        codec: document.getElementById('scrout-codec').value,
         bitrate_kbps: parseInt(document.getElementById('scrout-bitrate').value, 10) || 0,
         latency_ms: parseInt(document.getElementById('scrout-latency').value, 10) || 500,
         srt_mode: document.getElementById('scrout-srtmode').value,
