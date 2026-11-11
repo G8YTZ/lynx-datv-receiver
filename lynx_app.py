@@ -15860,6 +15860,14 @@ function showScreenOutput(st) {
     if (!screenOutputLoaded) {
         document.getElementById('scrout-host').value = set.host || '';
         document.getElementById('scrout-port').value = set.port || 9000;
+        // A Pi has no hardware encoder: H.264 and 1080p only.
+        const fmts = st.formats || [];
+        document.querySelectorAll('#scrout-format option').forEach(o => {
+            o.hidden = fmts.length && !fmts.includes(o.value);
+        });
+        document.querySelectorAll('#scrout-codec option').forEach(o => {
+            o.hidden = !st.hardware_encoder && o.value === 'hevc';
+        });
         document.getElementById('scrout-format').value = set.format || '1080p50';
         document.getElementById('scrout-codec').value = set.codec || 'hevc';
         document.getElementById('scrout-bitrate').value =

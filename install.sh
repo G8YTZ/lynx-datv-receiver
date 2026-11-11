@@ -108,6 +108,7 @@ sudo apt install -y \
   iw \
   chrony \
   pipewire-bin \
+  pipewire-pulse \
   wlr-randr \
   git \
   hdhomerun-config
@@ -534,6 +535,12 @@ if [ "$1" = "--deps-only" ] || [ "$1" = "--kiosk" ]; then
   if [ "$LYNX_ROCK" = "1" ] && [ -f ~/lynx/install/rock5t.sh ]; then
     LYNX_DIR=~/lynx bash ~/lynx/install/rock5t.sh
   fi
+  # The Pi's SRT screen output pieces (a ROCK's come with rock5t.sh):
+  # wf-recorder built from source and labwc's virtual-screen keys.
+  if [ "$LYNX_ROCK" != "1" ] && [ -f ~/lynx/install/build_wf_recorder.sh ]; then
+    LYNX_DIR=~/lynx bash ~/lynx/install/build_wf_recorder.sh
+    python3 ~/lynx/install/lynx_labwc_srt_keys.py || true
+  fi
   echo "--- Dependencies confirmed ($1) ---"
   exit 0
 fi
@@ -703,6 +710,13 @@ else
 </openbox_config>
 RCXML
   echo "Created."
+fi
+
+# --- SRT screen output (Pi) -------------------------------------
+# After the cursor keybind above, which may have just made rc.xml.
+if [ "$LYNX_ROCK" != "1" ] && [ -f ~/lynx/install/build_wf_recorder.sh ]; then
+  LYNX_DIR=~/lynx bash ~/lynx/install/build_wf_recorder.sh
+  python3 ~/lynx/install/lynx_labwc_srt_keys.py || true
 fi
 
 # A ROCK: its own platform set-up now, after everything above, because

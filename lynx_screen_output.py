@@ -44,6 +44,12 @@ import subprocess
 import threading
 import time
 
+try:
+    import lynx_platform
+    HARDWARE_ENCODER = bool(lynx_platform.IS_ROCK)
+except Exception:
+    HARDWARE_ENCODER = False
+
 MODES = ("hdmi", "srt")
 VIRTUAL = "LYNX-SRT"
 NULL_SINK = "lynx_srt"
@@ -70,6 +76,10 @@ FORMATS = {
     "2160p50": (3840, 2160, 50),
 }
 
+# What a board without a hardware encoder (the Pi) can offer: H.264 in
+# software (libx264), 1080p only. H.265 in software is far too slow.
+SOFTWARE_FORMATS = ("1080p25", "1080p50")
+
 DEFAULTS = {
     "mode": "hdmi",
     "format": "1080p50",
@@ -92,9 +102,13 @@ def settings(config):
     # Refresh rate setting stands aside (lynx_app._reapply_refresh_rate).
     if s.get("format") not in FORMATS:
         s["format"] = "1080p50"
+    if not HARDWARE_ENCODER:
+        if s["format"] not in SOFTWARE_FORMATS:
+            s["format"] = "1080p25"
+        s["codec"] = "h264"
     s["width"], s["height"], s["fps"] = FORMATS[s["format"]]
     if s.get("codec") not in ("hevc", "h264"):
-        s["codec"] = "hevc"
+        s["codec"] = "hevc" if HARDWARE_ENCODER else "h264"
     if not s.get("bitrate_kbps"):
         # H.265 needs about two thirds of H.264's rate for the same look.
         uhd = s["height"] > 1080
@@ -349,18 +363,33 @@ class ScreenOutput:
         node = NULL_SINK
         kbps = int(s["bitrate_kbps"])
         fps = int(s.get("fps") or 50)
-        hevc = s.get("codec") == "hevc"
-        cmd = ["wf-recorder", "-o", screen,
-               "-c", "hevc_rkmpp" if hevc else "h264_rkmpp",
-               "-x", "bgr0", "-b", "0",
-               "-r", str(fps), "-B", str(fps),
-               "-p", "rc_mode=CBR", "-p", f"b={kbps * 1000}",
-               "-p", f"g={fps}", "-p", "profile=main" if hevc else "profile=high",
-               "--audio-backend=pipewire",
-               f"--audio={node}",
-               "-C", "aac", "-P", "b=192000", "-R", "48000",
-               "-m", "mpegts", "-y",
-               "-f", f"udp://127.0.0.1:{LOOP_PORT}?pkt_size=1316"]
+        cmd = ["wf-recorder", "-o", screen, "-b", "0",
+               "-r", str(fps), "-B", str(fps)]
+        if HARDWARE_ENCODER:
+            # RK3588: rkmpp, the screen's RGB straight in (zero-copy
+            # DRM_PRIME with Lynx's wf-recorder patch, else bgr0 copied).
+            hevc = s.get("codec") == "hevc"
+            cmd += ["-c", "hevc_rkmpp" if hevc else "h264_rkmpp",
+                    "-x", "bgr0",
+                    "-p", "rc_mode=CBR", "-p", f"b={kbps * 1000}",
+                    "-p", f"g={fps}",
+                    "-p", "profile=main" if hevc else "profile=high"]
+        else:
+            # Pi: libx264 in software. crf=-1 turns off wf-recorder's
+            # default constant quality so the bit rate holds; the VBV
+            # (maxrate, bufsize of one second) keeps it near constant.
+            cmd += ["-c", "libx264", "-x", "yuv420p",
+                    "-p", "preset=superfast", "-p", "tune=zerolatency",
+                    "-p", "crf=-1", "-p", f"b={kbps * 1000}",
+                    "-p", f"maxrate={kbps * 1000}",
+                    "-p", f"bufsize={kbps * 1000}",
+                    "-p", f"g={fps}", "-p", "profile=high"]
+        # PulseAudio backend (through pipewire-pulse): wf-recorder's
+        # PipeWire backend needs PipeWire 1.0.5, which older Pi OS lacks.
+        cmd += ["--audio-backend=pulse", f"--audio={node}.monitor",
+                "-C", "aac", "-P", "b=192000", "-R", "48000",
+                "-m", "mpegts", "-y",
+                "-f", f"udp://127.0.0.1:{LOOP_PORT}?pkt_size=1316"]
         return cmd
 
     def _sender_cmd(self, s):
@@ -536,6 +565,8 @@ class ScreenOutput:
             "url": srt_url_public(s),
             "error": self.last_error,
             "missing": self.available(),
+            "hardware_encoder": HARDWARE_ENCODER,
+            "formats": list(FORMATS) if HARDWARE_ENCODER else list(SOFTWARE_FORMATS),
             "settings": {k: v for k, v in s.items() if k != "passphrase"},
             "has_passphrase": bool(s.get("passphrase")),
             "bitrate_set": bool((self.get_config().get("screen_output") or {})
