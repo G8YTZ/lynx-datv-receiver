@@ -2352,8 +2352,8 @@ def _reapply_refresh_rate(reason: str = "came back") -> Optional[bool]:
     not change, only the rate, which this already did on every screen
     return. Returns True if changed, False if refused, None if nothing
     needed doing (or no screen to ask)."""
-    if lynx_screen_output.settings(config)["mode"] == "srt":
-        return None     # the virtual screen is set by lynx_screen_output
+    if lynx_screen_output.settings(config)["mode"] in ("srt", "both"):
+        return None     # the screen output sets the mode (its own format)
     try:
         want = int((config.get('display') or {}).get('refresh_hz', 50) or 50)
     except (TypeError, ValueError):
@@ -12723,6 +12723,7 @@ def hdhomerun_programs(device_id: str = None):
 
 class ScreenOutputRequest(BaseModel):
     mode: Optional[str] = None          # hdmi | srt | both
+    format: Optional[str] = None        # 1080p50 | 1080p25 | 2160p25 | 2160p50
     host: Optional[str] = None
     port: Optional[int] = None
     srt_mode: Optional[str] = None      # caller | listener
@@ -12750,6 +12751,12 @@ def set_screen_output(req: ScreenOutputRequest):
     new = req.model_dump(exclude_none=True)
     if 'mode' in new and new['mode'] not in lynx_screen_output.MODES:
         raise HTTPException(status_code=400, detail="mode must be hdmi, srt or both")
+    if 'format' in new and new['format'] not in lynx_screen_output.FORMATS:
+        raise HTTPException(status_code=400, detail="format must be one of "
+                            + ", ".join(lynx_screen_output.FORMATS))
+    if new.get('bitrate_kbps') == 0:
+        new['bitrate_kbps'] = None      # 0 from the page: back to the default
+        cur.pop('bitrate_kbps', None)
     if 'srt_mode' in new and new['srt_mode'] not in ("caller", "listener"):
         raise HTTPException(status_code=400, detail="srt_mode must be caller or listener")
     if 'passphrase' in new and new['passphrase'] and not 10 <= len(new['passphrase']) <= 79:
@@ -12757,8 +12764,9 @@ def set_screen_output(req: ScreenOutputRequest):
                             detail="An SRT passphrase is 10 to 79 characters")
     if 'latency_ms' in new:
         new['latency_ms'] = max(20, min(8000, int(new['latency_ms'])))
-    if 'bitrate_kbps' in new:
-        new['bitrate_kbps'] = max(500, min(40000, int(new['bitrate_kbps'])))
+    if new.get('bitrate_kbps'):
+        new['bitrate_kbps'] = max(500, min(60000, int(new['bitrate_kbps'])))
+    new = {k: v for k, v in new.items() if v is not None}
     if 'host' in new:
         new['host'] = new['host'].strip()
     cur.update(new)
@@ -14660,8 +14668,9 @@ def web_ui():
                     <p class="text-muted small mb-2">
                         SRT sends the finished screen (picture, overlay and chat)
                         to another machine. In SRT mode Lynx draws on a virtual
-                        1920x1080 screen at the Refresh rate setting, so nothing
-                        need be plugged in. Both sends what the HDMI screen shows.
+                        screen in the format chosen below, so nothing need be
+                        plugged in. Both sends what the HDMI screen shows, set to
+                        that format if the screen offers it.
                     </p>
                     <label class="small text-muted mb-1" for="scrout-host">Send to (SRT listener)</label>
                     <div class="input-group input-group-sm mb-2">
@@ -14671,11 +14680,19 @@ def web_ui():
                         <input type="number" class="form-control bg-dark text-light border-secondary" id="scrout-port"
                                style="max-width:6em" value="9000" onchange="saveScreenOutput()">
                     </div>
+                    <label class="small text-muted mb-1" for="scrout-format">Picture</label>
+                    <select class="form-select form-select-sm mb-2 bg-dark text-light border-secondary"
+                            id="scrout-format" onchange="saveScreenOutput()">
+                        <option value="1080p50">1080p50</option>
+                        <option value="1080p25">1080p25</option>
+                        <option value="2160p25">2160p25 (4K)</option>
+                        <option value="2160p50">2160p50 (4K, SRT mode)</option>
+                    </select>
                     <div class="row g-2 mb-2">
                         <div class="col-6">
                             <label class="small text-muted mb-1" for="scrout-bitrate">Bit rate (kb/s)</label>
                             <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary"
-                                   id="scrout-bitrate" value="6000" step="500" onchange="saveScreenOutput()">
+                                   id="scrout-bitrate" placeholder="automatic" step="500" onchange="saveScreenOutput()">
                         </div>
                         <div class="col-6">
                             <label class="small text-muted mb-1" for="scrout-latency">Latency (ms)</label>
@@ -16233,7 +16250,11 @@ function showScreenOutput(st) {
     if (!screenOutputLoaded) {
         document.getElementById('scrout-host').value = set.host || '';
         document.getElementById('scrout-port').value = set.port || 9000;
-        document.getElementById('scrout-bitrate').value = set.bitrate_kbps || 6000;
+        document.getElementById('scrout-format').value = set.format || '1080p50';
+        document.getElementById('scrout-bitrate').value =
+            (st.bitrate_set ? set.bitrate_kbps : '');
+        document.getElementById('scrout-bitrate').placeholder =
+            'automatic (' + set.bitrate_kbps + ')';
         document.getElementById('scrout-latency').value = set.latency_ms || 500;
         document.getElementById('scrout-srtmode').value = set.srt_mode || 'caller';
         document.getElementById('scrout-streamid').value = set.streamid || '';
@@ -16295,7 +16316,8 @@ async function saveScreenOutput(withPass) {
     const body = {
         host: document.getElementById('scrout-host').value.trim(),
         port: parseInt(document.getElementById('scrout-port').value, 10) || 9000,
-        bitrate_kbps: parseInt(document.getElementById('scrout-bitrate').value, 10) || 6000,
+        format: document.getElementById('scrout-format').value,
+        bitrate_kbps: parseInt(document.getElementById('scrout-bitrate').value, 10) || 0,
         latency_ms: parseInt(document.getElementById('scrout-latency').value, 10) || 500,
         srt_mode: document.getElementById('scrout-srtmode').value,
         streamid: document.getElementById('scrout-streamid').value.trim(),

@@ -57,30 +57,40 @@ LOG_MAX = 512 * 1024
 KEY_ADD = "F9"
 KEY_REMOVE = "F10"
 
+# Picture formats for the SRT feed: (width, height, frames a second).
+# 2160p25 is what the LG on the 5C offers at 4K, so Both works there;
+# 2160p50 is for SRT mode's virtual screen (11 Nov 2026).
+FORMATS = {
+    "1080p50": (1920, 1080, 50),
+    "1080p25": (1920, 1080, 25),
+    "2160p25": (3840, 2160, 25),
+    "2160p50": (3840, 2160, 50),
+}
+
 DEFAULTS = {
     "mode": "hdmi",
+    "format": "1080p50",
     "host": "",
     "port": 9000,
     "srt_mode": "caller",      # caller (Lynx dials) or listener
     "latency_ms": 500,
-    "bitrate_kbps": 6000,
+    "bitrate_kbps": None,      # None: 6000 at 1080p, 16000 at 2160p
     "passphrase": "",
     "streamid": "",
-    "width": 1920,
-    "height": 1080,
-    "fps": 50,
 }
 
 
 def settings(config):
     s = dict(DEFAULTS)
     s.update((config.get("screen_output") or {}))
-    # One rate setting, not two that could fight: the SRT feed runs at
-    # Lynx's own Refresh rate (Display settings, 50 Hz by default).
-    try:
-        s["fps"] = int((config.get("display") or {}).get("refresh_hz", 50) or 50)
-    except (TypeError, ValueError):
-        s["fps"] = 50
+    # Its own format, not Lynx's Refresh rate (50 or 60 only): in SRT
+    # and Both modes the screen output owns the screen mode, and the
+    # Refresh rate setting stands aside (lynx_app._reapply_refresh_rate).
+    if s.get("format") not in FORMATS:
+        s["format"] = "1080p50"
+    s["width"], s["height"], s["fps"] = FORMATS[s["format"]]
+    if not s.get("bitrate_kbps"):
+        s["bitrate_kbps"] = 16000 if s["height"] > 1080 else 6000
     if s["mode"] not in MODES:
         s["mode"] = "hdmi"
     return s
@@ -360,7 +370,7 @@ class ScreenOutput:
     def _capture_cmd(self, screen, s):
         mode = s["mode"]
         node = NULL_SINK if mode == "srt" else self.audio_node()
-        kbps = int(s.get("bitrate_kbps") or 6000)
+        kbps = int(s["bitrate_kbps"])
         fps = int(s.get("fps") or 50)
         cmd = ["wf-recorder", "-o", screen,
                "-c", "h264_rkmpp", "-x", "bgr0", "-b", "0",
@@ -542,4 +552,6 @@ class ScreenOutput:
             "missing": self.available(),
             "settings": {k: v for k, v in s.items() if k != "passphrase"},
             "has_passphrase": bool(s.get("passphrase")),
+            "bitrate_set": bool((self.get_config().get("screen_output") or {})
+                                .get("bitrate_kbps")),
         }
