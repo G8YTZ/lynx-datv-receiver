@@ -2,11 +2,6 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
-## 2026-11-11
-
-**New (testing, opt-in)**
-- Fast programme change (Justin's idea): `lynx_fcc.py` relays the Picotuner's stream to mpv and keeps each programme from its last keyframe. When mpv starts (a new lock, a change of programme) it gets that programme's keyframe at once, and every programme's table in its first second. Single receiver only. On with `systemctl --user set-environment LYNX_FCC=1`, then restart Lynx.
-
 ## 2026-11-10
 
 **Faster**

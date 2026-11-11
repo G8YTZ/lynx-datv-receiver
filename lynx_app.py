@@ -832,8 +832,6 @@ def current_rf_target_port():
         return cfg['ts_port_b']
     elif diversity_enabled:
         return config['diversity']['combiner_out_port']
-    elif fcc_active():
-        return FCC_OUT_PORT
     else:
         return cfg['ts_port']
 
@@ -1055,13 +1053,7 @@ def _udp_url_for_mpv(url: str) -> str:
     stopped altogether. overrun_nonfatal keeps the thread reading and
     loses only what did not fit."""
     if url.startswith("udp://") and "overrun_nonfatal" not in url:
-        url += ("&" if "?" in url else "?") + "overrun_nonfatal=1"
-        # A 4 MB socket buffer: the fast programme change relay sends a
-        # programme's last keyframe onwards in one burst (300 kB and more),
-        # faster than mpv reads it while starting up. The kernel grants it
-        # only up to net.core.rmem_max (raised by the installer).
-        if url.endswith(f":{FCC_OUT_PORT}?overrun_nonfatal=1"):
-            url += "&buffer_size=4194304"
+        return url + ("&" if "?" in url else "?") + "overrun_nonfatal=1"
     return url
 
 
@@ -1117,8 +1109,6 @@ def restart_mpv(target_url: str, is_rf: bool = True):
     covered window deliberately wider than just this restart."""
     global network_output_source, network_output_source_is_rf
     network_output_source, network_output_source_is_rf = target_url, is_rf
-    if is_rf and target_url.endswith(f":{FCC_OUT_PORT}"):
-        _fcc_send("HOLD")          # nothing live reaches the new mpv before its burst
     if network_output_enabled:
         # Nothing decodes here. kill_mpv() still runs, because
         # switching the feature on mid-session has to take the picture
@@ -1264,12 +1254,6 @@ def restart_mpv(target_url: str, is_rf: bool = True):
             break
         time.sleep(0.05)
     time.sleep(0.3)  # small safety margin after the socket first appears
-    # Fast programme change: the relay bursts the chosen programme from its
-    # last keyframe as soon as this new mpv is listening (lynx_fcc.py).
-    if is_rf and target_url.endswith(f":{FCC_OUT_PORT}"):
-        _want = programme_wanted
-        threading.Thread(target=_fcc_burst_when_listening,
-                         args=((_want or {}).get("program") or "",), daemon=True).start()
 
     # Unmute and reapply the CURRENT SESSION volume now that it's
     # settled — NOT the config default. Previously always used the
@@ -5598,76 +5582,6 @@ def start_diversity_combiner():
         stderr=subprocess.STDOUT,
         preexec_fn=os.setsid
     )
-
-# ── Fast programme change (lynx_fcc.py) ─────────────────────────────
-# Justin's idea, 11 Nov 2026: a relay between the Picotuner and mpv that
-# holds each programme from its last keyframe, and bursts it to a newly
-# started mpv, so a picture comes at once rather than at the next keyframe,
-# and mpv sees every programme's table in its first second. Single
-# receiver only (diversity has the combiner there). Opt-in while tested:
-#   systemctl --user set-environment LYNX_FCC=1
-#   systemctl --user restart lynx
-# and back:  systemctl --user unset-environment LYNX_FCC
-FCC_ENABLED = os.environ.get("LYNX_FCC") == "1"
-FCC_OUT_PORT = 9947
-FCC_CTL_PORT = 9948
-FCC_PROC = None
-
-
-def start_fcc_relay(in_port: int):
-    global FCC_PROC
-    if FCC_PROC is not None and FCC_PROC.poll() is None:
-        return
-    subprocess.run(["pkill", "-9", "-f", "lynx_fcc.py"], capture_output=True)
-    kill_mpv()                     # it may hold the Picotuner's port from before
-    time.sleep(0.3)
-    script = Path(__file__).parent / "lynx_fcc.py"
-    FCC_PROC = subprocess.Popen(
-        ["python3", "-u", str(script), "--in-port", str(in_port),
-         "--out-port", str(FCC_OUT_PORT), "--control-port", str(FCC_CTL_PORT)],
-        stdin=subprocess.DEVNULL, stdout=open("/tmp/lynx_fcc.log", "a"),
-        stderr=subprocess.STDOUT, preexec_fn=os.setsid)
-    print(f"[fcc] relay started: UDP {in_port} -> {FCC_OUT_PORT}")
-
-
-def stop_fcc_relay():
-    global FCC_PROC
-    if FCC_PROC is None:
-        return
-    _kill_process_reliably(FCC_PROC, pkill_pattern="lynx_fcc.py")
-    FCC_PROC = None
-    print("[fcc] relay stopped")
-
-
-def fcc_active() -> bool:
-    return (FCC_ENABLED and FCC_PROC is not None and FCC_PROC.poll() is None
-            and not diversity_enabled and not tri_watch_enabled)
-
-
-def _fcc_send(msg: str):
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.sendto(msg.encode(), ("127.0.0.1", FCC_CTL_PORT))
-        s.close()
-    except OSError as e:
-        print(f"[fcc] {msg} not sent: {e}")
-
-
-def _fcc_burst_when_listening(programme):
-    """Ask the relay for a burst once mpv is listening on its port (a burst
-    sent before that would be thrown away by the kernel)."""
-    port_hex = f":{FCC_OUT_PORT:04X}"
-    deadline = time.time() + 6
-    while time.time() < deadline:
-        try:
-            with open("/proc/net/udp") as f:
-                if any(line.split()[1].endswith(port_hex) for line in f.readlines()[1:]):
-                    break
-        except OSError:
-            pass
-        time.sleep(0.05)
-    _fcc_send(f"BURST {programme}".strip())
-
 
 def stop_diversity_combiner():
     """Stops the combiner process if running. Safe no-op otherwise."""
@@ -12136,7 +12050,6 @@ def _tune_impl(req: TuneRequest):
         record_commanded_tune(2, req.freq, req.sr, req.lnb_lo_khz,
                               div_cfg.get('rcv2_plug', 'b'))
         kill_mpv()
-        stop_fcc_relay()
         start_diversity_combiner()
         diversity_enabled = True
     else:
@@ -12163,8 +12076,6 @@ def _tune_impl(req: TuneRequest):
             # sockets for no reason.
             stop_diversity_combiner()
         diversity_enabled = False
-        if FCC_ENABLED and not tri_watch_enabled:
-            start_fcc_relay(cfg['ts_port'])
     
     global rf_tuned_at
     rf_tuned_at = time.time()
