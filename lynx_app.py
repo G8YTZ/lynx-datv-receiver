@@ -14396,8 +14396,14 @@ def web_ui():
                                 <option value="listener">The far end calls Lynx (listener)</option>
                             </select>
                             <label class="small text-muted mb-1" for="scrout-pass">Passphrase (10 to 79 characters, blank for none)</label>
-                            <input type="password" class="form-control form-control-sm mb-2 bg-dark text-light border-secondary"
-                                   id="scrout-pass" placeholder="unchanged" onchange="saveScreenOutput(true)">
+                            <div class="input-group input-group-sm mb-2">
+                                <input type="password" class="form-control bg-dark text-light border-secondary"
+                                       id="scrout-pass" placeholder="unchanged" onchange="saveScreenOutput(true)">
+                                <!-- Leaving the box empty is no change, so it could
+                                     never clear a phrase (5C, 11 Nov 2026). -->
+                                <button class="btn btn-outline-light" type="button"
+                                        onclick="clearScreenOutputPass()" title="No passphrase">Clear</button>
+                            </div>
                             <label class="small text-muted mb-1" for="scrout-streamid">Stream ID (if the far end wants one)</label>
                             <input type="text" class="form-control form-control-sm bg-dark text-light border-secondary"
                                    id="scrout-streamid" onchange="saveScreenOutput()">
@@ -15884,10 +15890,10 @@ function showScreenOutput(st) {
         document.getElementById('scrout-latency').value = set.latency_ms || 500;
         document.getElementById('scrout-srtmode').value = set.srt_mode || 'caller';
         document.getElementById('scrout-streamid').value = set.streamid || '';
-        document.getElementById('scrout-pass').placeholder =
-            st.has_passphrase ? 'set (type to change)' : 'none';
         screenOutputLoaded = true;
     }
+    document.getElementById('scrout-pass').placeholder =
+        st.has_passphrase ? 'set (type to change)' : 'none';
     const el = document.getElementById('scrout-status');
     let txt, colour = '';
     if (st.missing && st.missing.length && st.mode !== 'hdmi') {
@@ -15935,6 +15941,11 @@ async function setScreenOutputMode(mode) {
     } catch (e) {
         showToast('Could not change screen output: ' + e.message, true);
     }
+}
+
+async function clearScreenOutputPass() {
+    document.getElementById('scrout-pass').value = '';
+    await saveScreenOutput(true);
 }
 
 async function saveScreenOutput(withPass) {
