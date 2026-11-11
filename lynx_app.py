@@ -710,14 +710,14 @@ def start_transition_cover():
     # The cover has genuinely been up continuously the whole time, so the
     # original timestamp is the honest one. Nesting starts is normal here
     # and should extend a cover, never restart it.
-    # For testing without the cover (Justin, 10 Nov 2026): the overlay is
-    # never told, so it shows what it would anyway (the logo screen and
-    # the status until a picture is confirmed in RF; mpv itself on a
-    # stream). Everything else here still happens.
-    #   systemctl --user set-environment LYNX_NO_COVER=1
+    # No cover by default (Justin, 11 Nov 2026, after testing on a Pi 5 and
+    # the ROCK 5C: "no need for a cover"). The overlay is never told, so it
+    # shows what it would anyway: the logo screen and the status until a
+    # picture is confirmed in RF, mpv itself on a stream. Everything else
+    # here still happens. To bring the cover back:
+    #   systemctl --user set-environment LYNX_COVER=1
     #   systemctl --user restart lynx
-    # and back:  systemctl --user unset-environment LYNX_NO_COVER
-    if os.environ.get("LYNX_NO_COVER") != "1":
+    if os.environ.get("LYNX_COVER") == "1":
         try:
             os.close(os.open(MPV_TRANSITION_MARKER,
                              os.O_CREAT | os.O_EXCL | os.O_WRONLY))
