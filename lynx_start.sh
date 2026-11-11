@@ -603,6 +603,9 @@ while true; do
         case "$_st_file" in *Writeback*) continue ;; esac
         [ -r "$_st_file" ] && _screen_states="$_screen_states $(cat "$_st_file")"
     done
+    # The SRT virtual screen asks for frames like a real one
+    # (lynx_screen_output.py leaves this marker while it is in use).
+    [ -e /tmp/lynx_virtual_screen ] && _screen_states="connected"
     if [ -n "$_screen_states" ] && ! echo "$_screen_states" | grep -qw connected; then
         [ -z "$LYNX_NO_SCREEN_AT" ] && \
             echo -e "${AMBER}No screen connected - overlay heartbeat check paused.${NC}"

@@ -1,0 +1,512 @@
+"""Screen output: HDMI, SRT or both (ROCK first; 11 Nov 2026).
+
+What goes out over SRT is the finished screen, the picture with the
+overlay, chat and PPM on it, not the received transport stream. That is
+what a viewer at the far end (a transmitter's input, VLC, mpv) wants to
+see, and it is the first step towards Lynx feeding Lynx-Tx directly.
+
+How it works
+------------
+  mpv + overlay --> labwc output --> wf-recorder (screen copy,
+  RK3588 hardware H.264, AAC from PipeWire) --> MPEG-TS over UDP on
+  the loopback --> ffmpeg -c copy --> SRT (caller by default).
+
+The two halves are joined by loopback UDP rather than a pipe, so the
+SRT side can drop and reconnect (the far end is restarted, the
+internet hiccups) without touching the capture, and the capture can
+restart without tearing down the SRT link's process.
+
+Modes
+-----
+  hdmi : As before; nothing is captured.
+  srt  : labwc adds a virtual screen, LYNX-SRT, at 1920x1080 50 Hz and
+         the HDMI screen is switched off, so a receiver with nothing
+         plugged in still has a screen to draw on, at 50 Hz (no EDID
+         dummy needed). mpv locks to it as it would to a television.
+         Sound goes to a PipeWire null sink, lynx_srt, which is what
+         is captured.
+  both : The HDMI screen is captured as it is, at whatever rate the
+         television gave. Sound is taken from mpv's own output.
+
+labwc has no IPC, so the virtual screen is made with its own
+VirtualOutputAdd action, bound to a key in rc.xml (install/rock5t.sh)
+and pressed with wtype, as Lynx already does for other labwc actions.
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import threading
+import time
+
+MODES = ("hdmi", "srt", "both")
+VIRTUAL = "LYNX-SRT"
+NULL_SINK = "lynx_srt"
+LOOP_PORT = 9960
+LOG = "/tmp/lynx-srt.log"
+# Present while the virtual screen is the one in use: lynx_app's
+# screen_connected() and lynx_start.sh's heartbeat check read it, as
+# the HDMI connector says "disconnected" but something is still asking
+# for frames.
+VIRTUAL_MARKER = "/tmp/lynx_virtual_screen"
+LOG_MAX = 512 * 1024
+
+# Keys bound in labwc's rc.xml (install/rock5t.sh): Super+Alt+Shift+F9
+# adds the virtual screen, F10 removes it.
+KEY_ADD = "F9"
+KEY_REMOVE = "F10"
+
+DEFAULTS = {
+    "mode": "hdmi",
+    "host": "",
+    "port": 9000,
+    "srt_mode": "caller",      # caller (Lynx dials) or listener
+    "latency_ms": 500,
+    "bitrate_kbps": 6000,
+    "passphrase": "",
+    "streamid": "",
+    "width": 1920,
+    "height": 1080,
+    "fps": 50,
+}
+
+
+def settings(config):
+    s = dict(DEFAULTS)
+    s.update((config.get("screen_output") or {}))
+    # One rate setting, not two that could fight: the SRT feed runs at
+    # Lynx's own Refresh rate (Display settings, 50 Hz by default).
+    try:
+        s["fps"] = int((config.get("display") or {}).get("refresh_hz", 50) or 50)
+    except (TypeError, ValueError):
+        s["fps"] = 50
+    if s["mode"] not in MODES:
+        s["mode"] = "hdmi"
+    return s
+
+
+def wayland_env():
+    env = os.environ.copy()
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    env.setdefault("WAYLAND_DISPLAY", "wayland-0")
+    return env
+
+
+def _run(cmd, timeout=5):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           timeout=timeout, env=wayland_env())
+        return r.returncode, r.stdout + r.stderr
+    except Exception as e:
+        return 1, str(e)
+
+
+def outputs():
+    """{name: {"enabled", "modes": [(w, h, hz)], "current": (w, h, hz)}}
+    from wlr-randr, or None if it cannot be asked."""
+    rc, out = _run(["wlr-randr"])
+    if rc != 0:
+        return None
+    found = {}
+    cur = None
+    for line in out.splitlines():
+        if line and not line[0].isspace():
+            cur = {"enabled": False, "modes": [], "current": None}
+            found[line.split()[0]] = cur
+            continue
+        if cur is None:
+            continue
+        t = line.strip()
+        if t.startswith("Enabled:"):
+            cur["enabled"] = t.split(":", 1)[1].strip() == "yes"
+        m = re.match(r"(\d+)x(\d+) px, ([\d.]+) Hz(.*)", t)
+        if m:
+            mode = (int(m.group(1)), int(m.group(2)), round(float(m.group(3)), 2))
+            cur["modes"].append(mode)
+            if "current" in m.group(4):
+                cur["current"] = mode
+    return found
+
+
+def _is(mode, w, h, hz):
+    return bool(mode) and mode[0] == w and mode[1] == h and abs(mode[2] - hz) < 0.05
+
+
+def _press(key):
+    return _run(["wtype", "-M", "logo", "-M", "alt", "-M", "shift",
+                 "-k", key, "-m", "shift", "-m", "alt", "-m", "logo"])
+
+
+def virtual_name(outs):
+    """The virtual screen's name: LYNX-SRT if labwc named it as asked,
+    else the first HEADLESS-n (older labwc ignores output_name)."""
+    if VIRTUAL in outs:
+        return VIRTUAL
+    for n in outs:
+        if n.startswith("HEADLESS-"):
+            return n
+    return None
+
+
+def null_sink_exists():
+    rc, out = _run(["pw-cli", "ls", "Node"])
+    return rc == 0 and f'node.name = "{NULL_SINK}"' in out
+
+
+def ensure_null_sink():
+    """A PipeWire sink nobody listens to, for mpv's sound in SRT mode.
+    object.linger keeps it after pw-cli exits; it lasts until PipeWire
+    restarts, so the watchdog checks it each time round."""
+    if null_sink_exists():
+        return True
+    rc, out = _run(["pw-cli", "create-node", "adapter",
+                    "{ factory.name=support.null-audio-sink "
+                    f"node.name={NULL_SINK} "
+                    "node.description=\"Lynx SRT output\" "
+                    "media.class=Audio/Sink object.linger=true "
+                    "audio.rate=48000 audio.position=[ FL FR ] }"])
+    if rc != 0:
+        print(f"[srt] could not make the {NULL_SINK} sink: {out.strip()}",
+              flush=True)
+    return null_sink_exists()
+
+
+def _log_file():
+    try:
+        if os.path.getsize(LOG) > LOG_MAX:
+            os.replace(LOG, LOG + ".1")
+    except OSError:
+        pass
+    return open(LOG, "ab")
+
+
+def srt_url(s):
+    host = (s.get("host") or "").strip()
+    port = int(s.get("port") or 9000)
+    mode = "listener" if s.get("srt_mode") == "listener" else "caller"
+    if mode == "listener":
+        host = "0.0.0.0"
+    if not host:
+        return ""
+    q = [f"mode={mode}",
+         f"latency={int(s.get('latency_ms') or 500) * 1000}",
+         "pkt_size=1316", "connect_timeout=5000"]
+    if s.get("passphrase"):
+        q.append(f"passphrase={s['passphrase']}")
+        q.append("pbkeylen=16")
+    if s.get("streamid"):
+        q.append(f"streamid={s['streamid']}")
+    return f"srt://{host}:{port}?" + "&".join(q)
+
+
+def srt_url_public(s):
+    """The address for show: no passphrase."""
+    return re.sub(r"passphrase=[^&]*", "passphrase=***", srt_url(s))
+
+
+class ScreenOutput:
+    """Keeps the screens and the capture chain as the settings say.
+
+    get_config() returns Lynx's config dict; audio_node() returns the
+    PipeWire node mpv is playing to in 'both' mode (or None for the
+    default sink); service_name() names the programme in the stream;
+    on_screen_change() is called after the screens change (Lynx
+    restarts mpv once, so it settles on the new screen).
+    """
+
+    def __init__(self, get_config, audio_node=None, service_name=None,
+                 on_screen_change=None):
+        self.get_config = get_config
+        self.audio_node = audio_node or (lambda: None)
+        self.service_name = service_name or (lambda: "Lynx")
+        self.on_screen_change = on_screen_change or (lambda: None)
+        self.lock = threading.RLock()
+        self.capture = None
+        self.sender = None
+        self.capture_key = None
+        self.sender_key = None
+        self.capture_fails = 0
+        self.sender_fails = 0
+        self.capture_next = 0.0
+        self.sender_next = 0.0
+        self.sender_since = 0.0
+        self.capture_since = 0.0
+        self.last_error = ""
+        self.screen = None          # the output being captured
+        self.thread = None
+        self.stopping = False
+
+    # ---- what mpv needs ---------------------------------------------
+    def mpv_audio_device(self):
+        """pipewire/lynx_srt in SRT mode, else None (Lynx's own choice)."""
+        if settings(self.get_config())["mode"] == "srt":
+            return f"pipewire/{NULL_SINK}"
+        return None
+
+    def available(self):
+        missing = [t for t in ("wf-recorder", "wlr-randr", "wtype",
+                               "ffmpeg", "pw-cli") if not shutil.which(t)]
+        return missing
+
+    # ---- screens ----------------------------------------------------
+    def _arrange(self, mode, s):
+        """Bring the screens to what the mode needs. Returns the name of
+        the screen to capture (None in hdmi mode, or if not ready)."""
+        outs = outputs()
+        if outs is None:
+            return None
+        w, h, hz = int(s["width"]), int(s["height"]), int(s["fps"])
+        changed = False
+        virt = virtual_name(outs)
+        real = [n for n in outs if n != virt]
+
+        if mode == "srt":
+            if not virt:
+                _press(KEY_ADD)
+                time.sleep(0.5)
+                outs = outputs() or {}
+                virt = virtual_name(outs)
+                if not virt:
+                    self.last_error = ("labwc made no virtual screen: is the "
+                                       "VirtualOutputAdd key in rc.xml?")
+                    return None
+                changed = True
+            if not _is(outs[virt]["current"], w, h, hz):
+                _run(["wlr-randr", "--output", virt,
+                      "--custom-mode", f"{w}x{h}@{hz}Hz"])
+                changed = True
+            for n in real:
+                if outs[n]["enabled"]:
+                    _run(["wlr-randr", "--output", n, "--off"])
+                    changed = True
+            screen = virt
+        else:
+            # hdmi or both: real screens on, virtual one gone.
+            for n in real:
+                if not outs[n]["enabled"]:
+                    _run(["wlr-randr", "--output", n, "--on"])
+                    changed = True
+            if virt:
+                _press(KEY_REMOVE)
+                changed = True
+            screen = real[0] if real else None
+            if mode == "hdmi":
+                screen = None
+            elif screen:
+                # Both: the SRT feed runs at the screen's rate, so ask
+                # for 1920x1080 50 Hz if the screen offers it (the LG on
+                # the 5C picks 4K 30 Hz by itself, but lists 1080p50).
+                o = outs[screen]
+                offered = next((m for m in o["modes"] if _is(m, w, h, hz)), None)
+                if offered and not _is(o["current"], w, h, hz):
+                    _run(["wlr-randr", "--output", screen,
+                          "--mode", f"{w}x{h}@{offered[2]:.6f}Hz"])
+                    changed = True
+                elif not offered and not getattr(self, "_warned_rate", False):
+                    self._warned_rate = True
+                    print(f"[srt] {screen} offers no {w}x{h} {hz} Hz: the SRT "
+                          f"feed runs at {o['current']}", flush=True)
+        if changed:
+            print(f"[srt] screens arranged for {mode}: capturing "
+                  f"{screen or 'nothing'}", flush=True)
+            time.sleep(1.0)
+            try:
+                self.on_screen_change()
+            except Exception as e:
+                print(f"[srt] screen change hook: {e}", flush=True)
+        return screen
+
+    # ---- processes --------------------------------------------------
+    @staticmethod
+    def _alive(p):
+        return p is not None and p.poll() is None
+
+    def _stop_proc(self, p):
+        if p is None:
+            return
+        try:
+            p.terminate()
+            p.wait(timeout=3)
+        except Exception:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    def _capture_cmd(self, screen, s):
+        mode = s["mode"]
+        node = NULL_SINK if mode == "srt" else self.audio_node()
+        kbps = int(s.get("bitrate_kbps") or 6000)
+        fps = int(s.get("fps") or 50)
+        cmd = ["wf-recorder", "-o", screen,
+               "-c", "h264_rkmpp", "-x", "bgr0", "-b", "0",
+               "-r", str(fps), "-B", str(fps),
+               "-p", "rc_mode=CBR", "-p", f"b={kbps * 1000}",
+               "-p", f"g={fps}", "-p", "profile=high",
+               "--audio-backend=pipewire",
+               f"--audio={node}" if node else "--audio",
+               "-C", "aac", "-P", "b=192000", "-R", "48000",
+               "-m", "mpegts", "-y",
+               "-f", f"udp://127.0.0.1:{LOOP_PORT}?pkt_size=1316"]
+        return cmd
+
+    def _sender_cmd(self, s):
+        url = srt_url(s)
+        if not url:
+            return None
+        return ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-nostdin",
+                "-fflags", "+nobuffer",
+                "-i", f"udp://127.0.0.1:{LOOP_PORT}?overrun_nonfatal=1"
+                      "&fifo_size=100000&buffer_size=4194304&timeout=5000000",
+                "-map", "0", "-c", "copy",
+                "-f", "mpegts", "-mpegts_service_id", "1",
+                "-metadata", f"service_name={self.service_name()}",
+                "-metadata", "service_provider=Lynx",
+                "-mpegts_flags", "+resend_headers",
+                url]
+
+    def _backoff(self, fails):
+        return (2, 5, 10, 20)[min(fails, 3)]
+
+    def tick(self):
+        """One pass of the watchdog: arrange screens, keep both
+        processes running, stop them when not wanted."""
+        cfg = self.get_config()
+        s = settings(cfg)
+        mode = s["mode"]
+        with self.lock:
+            if mode == "srt":
+                ensure_null_sink()
+            screen = self._arrange(mode, s)
+            self.screen = screen
+            self._mark(mode == "srt" and screen is not None)
+            if mode == "hdmi" or not screen:
+                self._stop_all()
+                return
+            now = time.time()
+
+            ckey = tuple(self._capture_cmd(screen, s))
+            if self._alive(self.capture) and ckey != self.capture_key:
+                self._stop_proc(self.capture)
+                self.capture = None
+            if not self._alive(self.capture):
+                if self.capture is not None:
+                    self.capture_fails += 1
+                    self.last_error = ("screen capture stopped (code "
+                                       f"{self.capture.returncode}); see {LOG}")
+                    print(f"[srt] {self.last_error}", flush=True)
+                    self.capture = None
+                    self.capture_next = now + self._backoff(self.capture_fails)
+                if now >= self.capture_next:
+                    try:
+                        log = _log_file()
+                        log.write(f"\n=== {time.strftime('%F %T')} capture: "
+                                  f"{' '.join(ckey)}\n".encode())
+                        log.flush()
+                        self.capture = subprocess.Popen(
+                            list(ckey), stdout=log, stderr=log,
+                            stdin=subprocess.DEVNULL, env=wayland_env())
+                        self.capture_key = ckey
+                        self.capture_since = now
+                        print(f"[srt] capturing {screen}", flush=True)
+                    except Exception as e:
+                        self.last_error = f"could not start wf-recorder: {e}"
+                        self.capture_fails += 1
+                        self.capture_next = now + self._backoff(self.capture_fails)
+            elif now - self.capture_since > 60:
+                self.capture_fails = 0
+
+            scmd = self._sender_cmd(s)
+            skey = tuple(scmd) if scmd else None
+            if self._alive(self.sender) and skey != self.sender_key:
+                self._stop_proc(self.sender)
+                self.sender = None
+            if skey is None:
+                self.last_error = "no SRT address set"
+                return
+            if not self._alive(self.sender):
+                if self.sender is not None:
+                    up = now - self.sender_since
+                    self.sender_fails = 0 if up > 60 else self.sender_fails + 1
+                    self.last_error = (f"SRT link closed after {int(up)} s "
+                                       f"(code {self.sender.returncode}); "
+                                       f"see {LOG}")
+                    print(f"[srt] {self.last_error}", flush=True)
+                    self.sender = None
+                    self.sender_next = now + self._backoff(self.sender_fails)
+                if now >= self.sender_next:
+                    try:
+                        log = _log_file()
+                        log.write(f"\n=== {time.strftime('%F %T')} sender: "
+                                  f"{srt_url_public(s)}\n".encode())
+                        log.flush()
+                        self.sender = subprocess.Popen(
+                            list(skey), stdout=log, stderr=log,
+                            stdin=subprocess.DEVNULL)
+                        self.sender_key = skey
+                        self.sender_since = now
+                        print(f"[srt] sending to {srt_url_public(s)}",
+                              flush=True)
+                    except Exception as e:
+                        self.last_error = f"could not start ffmpeg: {e}"
+                        self.sender_fails += 1
+                        self.sender_next = now + self._backoff(self.sender_fails)
+            elif now - self.sender_since > 10:
+                self.last_error = ""
+
+    @staticmethod
+    def _mark(on):
+        try:
+            if on:
+                open(VIRTUAL_MARKER, "w").close()
+            elif os.path.exists(VIRTUAL_MARKER):
+                os.remove(VIRTUAL_MARKER)
+        except OSError:
+            pass
+
+    def _stop_all(self):
+        for attr in ("sender", "capture"):
+            p = getattr(self, attr)
+            if p is not None:
+                self._stop_proc(p)
+                setattr(self, attr, None)
+        self.capture_key = self.sender_key = None
+
+    def apply_now(self):
+        """After a settings change: act at once, not at the next tick."""
+        threading.Thread(target=self.tick, daemon=True).start()
+
+    def run(self):
+        missing = self.available()
+        if missing:
+            print(f"[srt] not available, missing: {', '.join(missing)}",
+                  flush=True)
+        while not self.stopping:
+            try:
+                if not missing or settings(self.get_config())["mode"] == "hdmi":
+                    self.tick()
+            except Exception as e:
+                print(f"[srt] watchdog: {e}", flush=True)
+            time.sleep(2)
+
+    def start(self):
+        if self.thread is None:
+            self.thread = threading.Thread(target=self.run, daemon=True)
+            self.thread.start()
+
+    def status(self):
+        s = settings(self.get_config())
+        up = self._alive(self.sender)
+        return {
+            "mode": s["mode"],
+            "screen": self.screen,
+            "capturing": self._alive(self.capture),
+            "sending": up,
+            "connected_for_s": int(time.time() - self.sender_since) if up else 0,
+            "url": srt_url_public(s),
+            "error": self.last_error,
+            "missing": self.available(),
+            "settings": {k: v for k, v in s.items() if k != "passphrase"},
+            "has_passphrase": bool(s.get("passphrase")),
+        }

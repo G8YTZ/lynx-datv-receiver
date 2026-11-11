@@ -169,6 +169,42 @@ else
   echo "Media stack installed."
 fi
 
+# --- Screen output over SRT: wf-recorder on our FFmpeg ------------------
+# Debian's wf-recorder is linked to Debian's FFmpeg, which has no rkmpp
+# encoder. Built here against ffmpeg-rockchip in /usr/local, it captures
+# the screen and encodes it on the RK3588's hardware (h264_rkmpp). See
+# lynx_screen_output.py. Small: about a minute.
+WF_RECORDER_TAG=v0.6.0
+wf_recorder_ok() {
+  [ -x /usr/local/bin/wf-recorder ] || return 1
+  ldd /usr/local/bin/wf-recorder 2>/dev/null | grep -q '/usr/local/lib/libavcodec' || return 1
+  /usr/local/bin/wf-recorder --version 2>/dev/null | grep -q "${WF_RECORDER_TAG#v}"
+}
+if wf_recorder_ok; then
+  say "wf-recorder already installed ($WF_RECORDER_TAG)"
+else
+  say "Building wf-recorder $WF_RECORDER_TAG for SRT screen output"
+  # In a subshell: a failed build costs SRT output, not the install.
+  (
+  sudo apt install -y build-essential pkg-config meson ninja-build \
+    libwayland-dev wayland-protocols libgbm-dev libdrm-dev \
+    libpulse-dev libpipewire-0.3-dev || exit 1
+  export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib/aarch64-linux-gnu/pkgconfig
+  mkdir -p "$SRC_DIR"; cd "$SRC_DIR"
+  rm -rf wf-recorder
+  git clone --depth 1 -b "$WF_RECORDER_TAG" https://github.com/ammen99/wf-recorder.git || exit 1
+  cd wf-recorder || exit 1
+  meson setup build --prefix=/usr/local --buildtype=release \
+    -Ddefault_codec=h264_rkmpp -Ddefault_pixel_format=bgr0 \
+    -Ddefault_audio_backend=pipewire || exit 1
+  ninja -C build || exit 1
+  sudo ninja -C build install && sudo ldconfig
+  ) || true
+  cd "$SRC_DIR" 2>/dev/null || cd ~
+  wf_recorder_ok && echo "wf-recorder installed." || \
+    echo ">>> wf-recorder did not build: SRT screen output will be unavailable."
+fi
+
 # --- Audio: PipeWire user session -----------------------------------
 # Raspberry Pi OS Desktop runs this already. Armbian minimal does not,
 # and without it mpv has no HDMI audio and Lynx's level meter reports
@@ -235,6 +271,34 @@ elif [ ! -f ~/.config/labwc/rc.xml ]; then
   printf '<?xml version="1.0"?>\n<openbox_config>\n</openbox_config>\n' > ~/.config/labwc/rc.xml
 fi
 python3 "$LYNX_DIR/install/lynx_blank_cursor.py"
+
+# --- labwc: keys for the SRT virtual screen ------------------------------
+# labwc has no IPC, so lynx_screen_output.py makes and removes its
+# virtual 1920x1080 screen by pressing these with wtype. <default/>
+# keeps labwc's own keybinds alongside.
+say "labwc keys for SRT screen output"
+python3 - <<'PYEOF'
+import os, re
+p = os.path.expanduser("~/.config/labwc/rc.xml")
+s = open(p).read()
+s = re.sub(r"\s*<!-- Lynx SRT -->.*?<!-- /Lynx SRT -->", "", s, flags=re.S)
+block = """
+  <!-- Lynx SRT -->
+  <keyboard>
+    <default />
+    <keybind key="W-A-S-F9"><action name="VirtualOutputAdd" output_name="LYNX-SRT" /></keybind>
+    <keybind key="W-A-S-F10"><action name="VirtualOutputRemove" /></keybind>
+  </keyboard>
+  <!-- /Lynx SRT -->"""
+if re.search(r"<keyboard[\s>]", s):
+    print("rc.xml already has a <keyboard> section: add the Lynx SRT keys to it by hand "
+          "(see install/rock5t.sh).")
+else:
+    s = s.replace("</openbox_config>", block + "\n</openbox_config>", 1)
+    open(p, "w").write(s)
+    print("Added the SRT virtual screen keys to rc.xml.")
+PYEOF
+pkill -HUP -x labwc 2>/dev/null || true   # labwc rereads rc.xml
 
 # labwc's autostart runs every time labwc starts:
 #  - any old wtype cursor-hide line is retired (see above)

@@ -56,6 +56,7 @@ from pydantic import BaseModel
 
 import lynx_notifications
 import lynx_platform   # what differs between boards - see that file
+import lynx_screen_output   # HDMI, SRT or both - see that file
 import lynx_gnss
 import lynx_map
 import lynx_relay
@@ -980,6 +981,45 @@ def start_network_output(source_url: str):
             network_output_running_src = ""
 
 
+# Screen output: HDMI, SRT or both (lynx_screen_output.py, 11 Nov 2026).
+# The finished screen (picture, overlay, chat) captured, hardware
+# encoded and sent over SRT. Built here, started with the other
+# watchdogs; the lambdas look their functions up when called.
+def _screen_output_audio_node():
+    dev = _cached_audio_device_resolved()
+    return dev[len("pipewire/"):] if dev.startswith("pipewire/") else None
+
+
+def _screen_output_service_name():
+    call = str((config.get('site') or {}).get('callsign', '') or '').strip()
+    return f"Lynx {call}" if call and call.upper() != "XXXXX" else "Lynx"
+
+
+def _screen_output_changed():
+    """The screens changed under mpv (virtual screen added or removed,
+    HDMI on or off, its mode changed): one restart on the same source,
+    so mpv settles on the new screen at its rate and, in SRT mode,
+    plays its sound into the lynx_srt sink."""
+    src, is_rf = network_output_source, network_output_source_is_rf
+    if network_output_enabled or not src:
+        return
+    if tune_lock.acquire(timeout=10):
+        try:
+            print(f"[srt] screens changed - restarting mpv on {src}", flush=True)
+            restart_mpv(src, is_rf=is_rf)
+            wait_for_mpv_rendering()
+        finally:
+            tune_lock.release()
+
+
+screen_output = lynx_screen_output.ScreenOutput(
+    get_config=lambda: config,
+    audio_node=lambda: _screen_output_audio_node(),
+    service_name=lambda: _screen_output_service_name(),
+    on_screen_change=lambda: threading.Thread(
+        target=_screen_output_changed, daemon=True).start())
+
+
 def network_output_watchdog():
     """Keep the forwarder matching the switch, whatever happens.
 
@@ -1441,6 +1481,9 @@ def _cached_audio_device_resolved():
     that often to answer a question whose answer almost never changes
     would be silly.
     """
+    srt_dev = screen_output.mpv_audio_device()
+    if srt_dev:
+        return srt_dev
     dev = str(config.get('display', {}).get('audio_device', 'hdmi')).strip()
     if dev.lower() != 'hdmi':
         return dev
@@ -1462,6 +1505,10 @@ def audio_device_flag():
     cause. A receiver driving a television should send its audio to the
     television unless told otherwise.
     """
+    srt_dev = screen_output.mpv_audio_device()
+    if srt_dev:
+        # SRT mode: sound into the lynx_srt sink, which is captured.
+        return f"--audio-device={shlex.quote(srt_dev)} "
     dev = str(config.get('display', {}).get('audio_device', 'hdmi')).strip()
     if not dev or dev.lower() == 'auto':
         return ""
@@ -2257,7 +2304,10 @@ def screen_connected() -> bool:
     """True unless the kernel says no display is connected. Connector
     status files present and none "connected" means no screen - a
     monitor switched to another input or asleep. No status files at
-    all means assume a screen, i.e. behave exactly as before."""
+    all means assume a screen, i.e. behave exactly as before.
+    The SRT virtual screen counts as a screen: it asks for frames."""
+    if os.path.exists(lynx_screen_output.VIRTUAL_MARKER):
+        return True
     states = []
     try:
         for name in os.listdir(DRM_SYSFS):
@@ -2302,6 +2352,8 @@ def _reapply_refresh_rate(reason: str = "came back") -> Optional[bool]:
     not change, only the rate, which this already did on every screen
     return. Returns True if changed, False if refused, None if nothing
     needed doing (or no screen to ask)."""
+    if lynx_screen_output.settings(config)["mode"] == "srt":
+        return None     # the virtual screen is set by lynx_screen_output
     try:
         want = int((config.get('display') or {}).get('refresh_hz', 50) or 50)
     except (TypeError, ValueError):
@@ -12669,6 +12721,56 @@ def hdhomerun_programs(device_id: str = None):
         return {"programs": [], "error": str(e)}
 
 
+class ScreenOutputRequest(BaseModel):
+    mode: Optional[str] = None          # hdmi | srt | both
+    host: Optional[str] = None
+    port: Optional[int] = None
+    srt_mode: Optional[str] = None      # caller | listener
+    latency_ms: Optional[int] = None
+    bitrate_kbps: Optional[int] = None
+    passphrase: Optional[str] = None    # None keeps it; "" clears it
+    streamid: Optional[str] = None
+
+
+@app.get("/api/screen_output", tags=["Configuration"],
+         summary="Where the finished screen goes: HDMI, SRT or both")
+def get_screen_output():
+    return screen_output.status()
+
+
+@app.post("/api/screen_output", tags=["Configuration"],
+          summary="Send the finished screen over SRT, to HDMI, or both",
+          description="SRT carries what is on the screen, overlay and "
+                      "chat included, encoded in hardware (ROCK). In SRT "
+                      "mode Lynx draws on a virtual 1920x1080 screen at "
+                      "the Refresh rate setting, so no monitor is needed. "
+                      "Lynx calls the far end by default (caller).")
+def set_screen_output(req: ScreenOutputRequest):
+    cur = dict(config.get('screen_output') or {})
+    new = req.model_dump(exclude_none=True)
+    if 'mode' in new and new['mode'] not in lynx_screen_output.MODES:
+        raise HTTPException(status_code=400, detail="mode must be hdmi, srt or both")
+    if 'srt_mode' in new and new['srt_mode'] not in ("caller", "listener"):
+        raise HTTPException(status_code=400, detail="srt_mode must be caller or listener")
+    if 'passphrase' in new and new['passphrase'] and not 10 <= len(new['passphrase']) <= 79:
+        raise HTTPException(status_code=400,
+                            detail="An SRT passphrase is 10 to 79 characters")
+    if 'latency_ms' in new:
+        new['latency_ms'] = max(20, min(8000, int(new['latency_ms'])))
+    if 'bitrate_kbps' in new:
+        new['bitrate_kbps'] = max(500, min(40000, int(new['bitrate_kbps'])))
+    if 'host' in new:
+        new['host'] = new['host'].strip()
+    cur.update(new)
+    config['screen_output'] = cur
+    try:
+        save_config(config)
+    except Exception as e:
+        print(f"[srt] could not save: {e}")
+    screen_output.apply_now()
+    return screen_output.status()
+
+
 class NetworkOutputRequest(BaseModel):
     enabled: bool
 
@@ -14546,6 +14648,62 @@ def web_ui():
 
         <!-- Control & Config -->
         <div class="col-md-4">
+            <!-- Screen output: HDMI, SRT or both (lynx_screen_output.py). -->
+            <div class="card mb-3">
+                <div class="card-header">&#x1F4E1; Screen output</div>
+                <div class="card-body">
+                    <div class="btn-group btn-group-sm w-100 mb-2" role="group" id="scrout-mode">
+                        <button class="btn btn-outline-light" data-mode="hdmi" onclick="setScreenOutputMode('hdmi')">HDMI</button>
+                        <button class="btn btn-outline-light" data-mode="srt" onclick="setScreenOutputMode('srt')">SRT</button>
+                        <button class="btn btn-outline-light" data-mode="both" onclick="setScreenOutputMode('both')">Both</button>
+                    </div>
+                    <p class="text-muted small mb-2">
+                        SRT sends the finished screen (picture, overlay and chat)
+                        to another machine. In SRT mode Lynx draws on a virtual
+                        1920x1080 screen at the Refresh rate setting, so nothing
+                        need be plugged in. Both sends what the HDMI screen shows.
+                    </p>
+                    <label class="small text-muted mb-1" for="scrout-host">Send to (SRT listener)</label>
+                    <div class="input-group input-group-sm mb-2">
+                        <input type="text" class="form-control bg-dark text-light border-secondary" id="scrout-host"
+                               placeholder="192.168.1.50" onchange="saveScreenOutput()">
+                        <span class="input-group-text">:</span>
+                        <input type="number" class="form-control bg-dark text-light border-secondary" id="scrout-port"
+                               style="max-width:6em" value="9000" onchange="saveScreenOutput()">
+                    </div>
+                    <div class="row g-2 mb-2">
+                        <div class="col-6">
+                            <label class="small text-muted mb-1" for="scrout-bitrate">Bit rate (kb/s)</label>
+                            <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary"
+                                   id="scrout-bitrate" value="6000" step="500" onchange="saveScreenOutput()">
+                        </div>
+                        <div class="col-6">
+                            <label class="small text-muted mb-1" for="scrout-latency">Latency (ms)</label>
+                            <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary"
+                                   id="scrout-latency" value="500" step="50" onchange="saveScreenOutput()">
+                        </div>
+                    </div>
+                    <details class="mb-2">
+                        <summary class="small text-muted">More SRT settings</summary>
+                        <div class="mt-2">
+                            <label class="small text-muted mb-1" for="scrout-srtmode">Who connects</label>
+                            <select class="form-select form-select-sm mb-2 bg-dark text-light border-secondary"
+                                    id="scrout-srtmode" onchange="saveScreenOutput()">
+                                <option value="caller">Lynx calls the far end (caller)</option>
+                                <option value="listener">The far end calls Lynx (listener)</option>
+                            </select>
+                            <label class="small text-muted mb-1" for="scrout-pass">Passphrase (10 to 79 characters, blank for none)</label>
+                            <input type="password" class="form-control form-control-sm mb-2 bg-dark text-light border-secondary"
+                                   id="scrout-pass" placeholder="unchanged" onchange="saveScreenOutput(true)">
+                            <label class="small text-muted mb-1" for="scrout-streamid">Stream ID (if the far end wants one)</label>
+                            <input type="text" class="form-control form-control-sm bg-dark text-light border-secondary"
+                                   id="scrout-streamid" onchange="saveScreenOutput()">
+                        </div>
+                    </details>
+                    <div class="small" id="scrout-status">&nbsp;</div>
+                </div>
+            </div>
+
             <!-- Network video output. First in this column deliberately:
                  it changes what the receiver is doing right now, which
                  is what an operator reaches for mid-contact. -->
@@ -16040,6 +16198,125 @@ async function stopApp() {
     }
 }
 
+        // ── Short messages at the foot of the page ────────────
+// The network output card called showToast() from the start, but it
+// was never defined, so its messages were lost to the console. Now
+// shared by that card and the Screen output card.
+function showToast(text, isError) {
+    let box = document.getElementById('lynx-toast');
+    if (!box) {
+        box = document.createElement('div');
+        box.id = 'lynx-toast';
+        box.style.cssText = 'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);' +
+            'z-index:2000;padding:10px 18px;border-radius:8px;font-size:0.95em;' +
+            'box-shadow:0 4px 16px rgba(0,0,0,.5);transition:opacity .3s;max-width:90vw';
+        document.body.appendChild(box);
+    }
+    box.textContent = text;
+    box.style.background = isError ? '#8b2d2d' : '#2d5f3a';
+    box.style.color = '#fff';
+    box.style.opacity = '1';
+    clearTimeout(box._hide);
+    box._hide = setTimeout(() => { box.style.opacity = '0'; }, isError ? 6000 : 3000);
+}
+
+        // ── Screen output: HDMI, SRT or both ──────────────────
+let screenOutputLoaded = false;
+function showScreenOutput(st) {
+    if (!st) return;
+    document.querySelectorAll('#scrout-mode button').forEach(b => {
+        const on = b.dataset.mode === st.mode;
+        b.classList.toggle('btn-light', on);
+        b.classList.toggle('btn-outline-light', !on);
+    });
+    const set = st.settings || {};
+    if (!screenOutputLoaded) {
+        document.getElementById('scrout-host').value = set.host || '';
+        document.getElementById('scrout-port').value = set.port || 9000;
+        document.getElementById('scrout-bitrate').value = set.bitrate_kbps || 6000;
+        document.getElementById('scrout-latency').value = set.latency_ms || 500;
+        document.getElementById('scrout-srtmode').value = set.srt_mode || 'caller';
+        document.getElementById('scrout-streamid').value = set.streamid || '';
+        document.getElementById('scrout-pass').placeholder =
+            st.has_passphrase ? 'set (type to change)' : 'none';
+        screenOutputLoaded = true;
+    }
+    const el = document.getElementById('scrout-status');
+    let txt, colour = '';
+    if (st.missing && st.missing.length && st.mode !== 'hdmi') {
+        txt = 'Missing on this receiver: ' + st.missing.join(', ') + '. Run the installer again.';
+        colour = '#e8a33d';
+    } else if (st.mode === 'hdmi') {
+        txt = 'Picture on HDMI only.';
+    } else if (st.sending && st.connected_for_s >= 5) {
+        txt = 'Sending ' + (st.screen || '') + ' to ' + (set.host || 'listener') +
+              ' for ' + st.connected_for_s + ' s.';
+        colour = '#5cb85c';
+    } else {
+        txt = st.error ? st.error : 'Connecting...';
+        colour = st.error ? '#e8a33d' : '';
+    }
+    el.textContent = txt;
+    el.style.color = colour;
+}
+
+// api() returns the JSON whatever the status: a refusal comes back
+// as {detail: "..."}, which is shown rather than taken as a status.
+async function screenOutputCall(method, body) {
+    const r = await api(method, '/api/screen_output', body);
+    if (r && r.detail) throw new Error(r.detail);
+    return r;
+}
+
+async function loadScreenOutput() {
+    try { showScreenOutput(await screenOutputCall('GET')); } catch (e) {}
+}
+
+async function setScreenOutputMode(mode) {
+    if (mode === 'srt' && !document.getElementById('scrout-host').value.trim() &&
+        document.getElementById('scrout-srtmode').value === 'caller') {
+        showToast('Enter the address to send to first', true);
+        return;
+    }
+    if (mode === 'srt' && !confirm('SRT mode switches this receiver\\'s HDMI screen off ' +
+                                   'and draws on a virtual screen instead. Carry on?')) {
+        return;
+    }
+    try {
+        showScreenOutput(await screenOutputCall('POST', {mode: mode}));
+        showToast(mode === 'hdmi' ? 'Picture on HDMI' :
+                  mode === 'srt' ? 'Picture going out over SRT' : 'Picture on HDMI and SRT');
+    } catch (e) {
+        showToast('Could not change screen output: ' + e.message, true);
+    }
+}
+
+async function saveScreenOutput(withPass) {
+    const body = {
+        host: document.getElementById('scrout-host').value.trim(),
+        port: parseInt(document.getElementById('scrout-port').value, 10) || 9000,
+        bitrate_kbps: parseInt(document.getElementById('scrout-bitrate').value, 10) || 6000,
+        latency_ms: parseInt(document.getElementById('scrout-latency').value, 10) || 500,
+        srt_mode: document.getElementById('scrout-srtmode').value,
+        streamid: document.getElementById('scrout-streamid').value.trim(),
+    };
+    if (withPass) {
+        body.passphrase = document.getElementById('scrout-pass').value;
+    }
+    try {
+        showScreenOutput(await screenOutputCall('POST', body));
+        if (withPass) {
+            document.getElementById('scrout-pass').value = '';
+            showToast(body.passphrase ? 'Passphrase saved' : 'Passphrase cleared');
+        }
+    } catch (e) {
+        showToast('Could not save: ' + e, true);
+    }
+}
+
+loadScreenOutput();
+setInterval(loadScreenOutput, 3000);
+
         // ── Network video output ──────────────────────────────
 //
 // The host and port are saved to config, the switch is not:
@@ -16435,6 +16712,7 @@ if __name__ == "__main__":
     freshness = threading.Thread(target=rf_mpv_lifecycle_monitor, daemon=True)
     freshness.start()
     threading.Thread(target=network_output_watchdog, daemon=True).start()
+    screen_output.start()
     threading.Thread(target=programme_keeper, daemon=True).start()
     diversity_stuck = threading.Thread(target=diversity_stuck_lock_monitor, daemon=True)
     diversity_stuck.start()
