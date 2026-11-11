@@ -12605,10 +12605,9 @@ def api_programme(req: ProgrammeRequest):
 
 
 def _restart_on_programme(why: str):
-    """Restart mpv on the programme in programme_wanted (or the first),
-    behind the cover. Up to 15 s for a picture: the carousel's keyframes
-    are 10 s apart."""
-    global programme_switched_at, mpv_last_started_at
+    """Restart mpv on the programme in programme_wanted (or the first). Up
+    to 15 s for a picture: the carousel's keyframes are 10 s apart."""
+    global programme_switched_at, mpv_last_started_at, mpv_running_for_rf
     src, is_rf = network_output_source, network_output_source_is_rf
     if not src:
         return
@@ -12625,13 +12624,25 @@ def _restart_on_programme(why: str):
             why = f"chosen: programme {programme_wanted['program']} (latest choice)"
         print(f"[programme] restarting mpv ({why}) {_programme_track_flags().strip() or 'programme 1'}")
         programme_switched_at = time.time()
-        start_transition_cover()
-        time.sleep(0.3)
-        restart_mpv(src, is_rf=is_rf)
         if is_rf:
+            # RF: no cover. Marking mpv as not yet running makes the overlay
+            # show what it shows while a receiver acquires: the logo and the
+            # status, frequency, lock and MER, which all still hold on the
+            # same carrier (Justin, 11 Nov 2026: "no orange overlay between
+            # channels"). Back to the picture once mpv has one; if it never
+            # does, rf_mpv_lifecycle_monitor() starts it again as on a lock.
+            mpv_running_for_rf = False
+            restart_mpv(src, is_rf=True)
             mpv_last_started_at = time.time()
-        wait_for_mpv_rendering(timeout=15)
-        end_transition_cover()
+            if wait_for_mpv_rendering(timeout=15):
+                time.sleep(0.3)
+                mpv_running_for_rf = True
+        else:
+            start_transition_cover()
+            time.sleep(0.3)
+            restart_mpv(src, is_rf=is_rf)
+            wait_for_mpv_rendering(timeout=15)
+            end_transition_cover()
     finally:
         tune_lock.release()
 
