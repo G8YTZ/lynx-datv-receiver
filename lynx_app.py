@@ -12448,7 +12448,8 @@ def api_programmes():
     progs = mpv_programmes()
     key = _programme_key_str()
     known = _programmes_known().get(key) or []
-    if len(progs) >= 2 and _programmes_strip(progs) != known:
+    if len(progs) >= 2 and (_programmes_strip(progs) != known or
+                            time.time() - (_programmes_cache or {}).get(key, {}).get("seen", 0) > 3600):
         _programmes_remember(key, progs)
         known = _programmes_strip(progs)
     if len(progs) < len(known):
@@ -12461,7 +12462,10 @@ def api_programmes():
     return {"programmes": progs}
 
 
-PROGRAMMES_PATH = Path(__file__).parent / "config" / "lynx_programmes.json"
+# In /tmp: forgotten at every reboot, as Justin wanted (11 Nov 2026), and
+# kept across a restart of Lynx. An entry not seen again for 7 days goes too.
+PROGRAMMES_PATH = Path("/tmp/lynx_programmes.json")
+PROGRAMMES_KEEP_SECS = 7 * 24 * 3600
 _programmes_cache = None
 
 
@@ -12476,7 +12480,11 @@ def _programmes_known() -> dict:
             _programmes_cache = json.loads(PROGRAMMES_PATH.read_text())
         except Exception:
             _programmes_cache = {}
-    return _programmes_cache
+    now = time.time()
+    for k in [k for k, v in _programmes_cache.items()
+              if not isinstance(v, dict) or now - v.get("seen", 0) > PROGRAMMES_KEEP_SECS]:
+        del _programmes_cache[k]
+    return {k: v["programmes"] for k, v in _programmes_cache.items()}
 
 
 def _programmes_strip(progs: list) -> list:
@@ -12485,8 +12493,9 @@ def _programmes_strip(progs: list) -> list:
 
 
 def _programmes_remember(key: str, progs: list):
-    known = _programmes_known()
-    known[key] = _programmes_strip(progs)
+    _programmes_known()                       # loads, and drops the expired
+    known = _programmes_cache
+    known[key] = {"programmes": _programmes_strip(progs), "seen": time.time()}
     try:
         PROGRAMMES_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = PROGRAMMES_PATH.with_suffix(".tmp")
@@ -12534,19 +12543,22 @@ def programme_keeper():
                 programme_wanted = None
                 print("[programme] something else tuned - back to programme 1")
                 continue
+            # Never restarts mpv by itself (Justin, 11 Nov 2026: one restart
+            # per choice, no automatic ones). It only keeps the record true.
             progs = mpv_programmes()
+            if not progs or time.time() - programme_switched_at < 20:
+                continue
             p = next((x for x in progs if x["program"] == want["program"]), None)
-            if p is None and not want.get("first") and mpv_programmes_known(progs) \
-                    and time.time() - programme_switched_at > 20:
-                # mpv started without finding the programme at all (its
-                # table came too late for mpv's first second): try again.
-                _restart_on_programme(f"programme {want['program']} not found: trying again")
-            elif p and not p["selected"] and time.time() - programme_switched_at > 20:
-                # mpv numbers its tracks in the order it finds them, which
-                # can change from one start to the next: started on the wrong
-                # numbers, start again on the right ones (at most every 20 s).
+            if p is None and not want.get("first"):
+                programme_wanted = None
+                print(f"[programme] programme {want['program']} is not on air: choice "
+                      f"dropped (choose it again once it is)")
+            elif p and not p["selected"] and (want.get("video"), want.get("audio")) != (p["video"], p["audio"]):
+                # mpv numbered its tracks differently this time: remember the
+                # right numbers for the next start (no restart now).
                 want["video"], want["audio"] = p["video"], p["audio"]
-                _restart_on_programme(f"track numbers changed: programme {want['program']}")
+                print(f"[programme] programme {want['program']} has new track numbers "
+                      f"(video {p['video']}): used from the next start")
         except Exception as e:
             print(f"[programme] {type(e).__name__}: {e}")
 
