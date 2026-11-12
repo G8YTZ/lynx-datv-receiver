@@ -52,6 +52,18 @@ A viewer joining between two keyframes sees a broken picture for up to a second,
 
 **Not VLC:** Homebrew's FFmpeg and mpv on a Mac are built without SRT. On Linux, `ffplay "srt://192.168.0.106:9000"` works, as does mpv.
 
+## Watching in OBS
+
+Add a **Media Source**, untick "Local File", and enter as the input
+
+    srt://<receiver address>:9000?mode=caller
+
+leaving "Input Format" empty. With a passphrase, add `&passphrase=your%20phrase` (spaces written as `%20`).
+
+**Network Buffering:** OBS buffers by size, not time (2 MB by default). At a low bit rate that is a long delay: 2 MB is about 16 seconds at 1 Mb/s, but only 1 to 4 seconds at 4 to 12 Mb/s. Set it to 0 or 1 MB. Untick "Restart playback when source becomes active" too, or OBS starts again from scratch at every scene change.
+
+Lynx itself adds about a second plus the latency setting: it sends a keyframe every second and holds no more than a second waiting to send. If OBS runs much further behind than that, check against `ffplay -fflags nobuffer -flags low_delay "srt://<receiver address>:9000?mode=caller"`; if ffplay is close behind the receiver's HDMI output, the delay is in OBS.
+
 ## Boards
 
 - **ROCK 5C:** Everything, 2160p50 included. Its hardware encoder does the work, and the screen is captured without a copy through the processor.
