@@ -13473,13 +13473,44 @@ def refresh_dependencies(context):
                                 f"{context}: dependency refresh skipped - "
                                 "no passwordless sudo",
                                 count_as_mpv_restart=False)
+        try:
+            p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "logs", "update.log")
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(f"--- {datetime.now():%Y-%m-%d %H:%M:%S} {context}: "
+                        "dependency refresh SKIPPED, no passwordless sudo. "
+                        "Run ~/lynx/install.sh --deps-only in a terminal.\n")
+        except Exception:
+            pass
         return
 
+    # The output goes to ~/lynx/logs/update.log (the one before kept as
+    # update.prev.log), not to Lynx's log in /tmp: the reboot straight
+    # after wiped /tmp, so a failed refresh left no trace (Gareth's Pi 5,
+    # 12 Nov 2026: Update Now ran, wf-recorder never built, and nothing
+    # said why).
+    here = os.path.dirname(os.path.abspath(__file__))
+    log_path = os.path.join(here, "logs", "update.log")
     try:
-        install_script = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "install.sh")
-        env = os.environ.copy()
-        env["DEBIAN_FRONTEND"] = "noninteractive"
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        if os.path.exists(log_path):
+            os.replace(log_path, log_path.replace(".log", ".prev.log"))
+        log = open(log_path, "w", buffering=1)
+    except Exception:
+        log = None
+
+    def note(line):
+        print(f"[{context}] {line}")
+        if log:
+            log.write(f"--- {datetime.now():%Y-%m-%d %H:%M:%S} {line}\n")
+
+    env = os.environ.copy()
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    env["LYNX_DIR"] = here
+    out = log or subprocess.DEVNULL
+
+    def run(cmd, timeout):
         # stdin closed, belt and braces. The blanket check above says
         # this user has sudo, but it does not promise every command
         # install.sh runs is covered by the same rule - and a sudo that
@@ -13487,12 +13518,38 @@ def refresh_dependencies(context):
         # that cannot come. With no stdin it fails immediately instead,
         # which the timeout then does not have to catch twenty minutes
         # later.
-        subprocess.run(["bash", install_script, "--deps-only"],
-                       env=env, timeout=1200,
-                       stdin=subprocess.DEVNULL)
-    except Exception as e:
-        print(f"[{context}] Dependency check failed or timed out ({e}) "
-              "- rebooting anyway with whatever succeeded so far.")
+        try:
+            rc = subprocess.run(cmd, env=env, timeout=timeout,
+                                stdin=subprocess.DEVNULL, stdout=out,
+                                stderr=subprocess.STDOUT).returncode
+        except Exception as e:
+            note(f"{' '.join(cmd)}: did not finish ({e})")
+            return False
+        note(f"{' '.join(cmd)}: exit {rc}")
+        return rc == 0
+
+    note(f"dependency refresh ({context})")
+    installer_ok = run(["bash", os.path.join(here, "install.sh"),
+                        "--deps-only"], 1200)
+
+    # install.sh runs under `set -e`, and the SRT screen output's pieces
+    # come at the very end of its --deps-only path: any earlier step
+    # failing (apt, pip), or the timeout above, stopped it before they
+    # were built. They depend on none of those steps, so when the
+    # installer did not finish they are run here on their own. Each
+    # checks first and returns at once when already done.
+    if not installer_ok:
+        note("installer did not finish: building the SRT screen output on its own")
+        if lynx_platform.IS_ROCK:
+            run(["bash", os.path.join(here, "install", "rock5t.sh")], 1800)
+        else:
+            run(["bash", os.path.join(here, "install",
+                                      "build_wf_recorder.sh")], 900)
+            run(["python3", os.path.join(here, "install",
+                                         "lynx_labwc_srt_keys.py")], 60)
+    note("dependency refresh done")
+    if log:
+        log.close()
 
 @app.post("/api/update/apply", tags=["Configuration"],
           summary="Pull the latest code and reboot",

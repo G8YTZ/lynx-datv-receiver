@@ -2,6 +2,12 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-11-12
+
+**Fixed**
+- Update Now could leave SRT output without wf-recorder: the build came last in the installer, so any earlier step failing stopped it. It now runs on its own when the installer does not finish, and each update's output is kept in `~/lynx/logs/update.log` (it was lost at the reboot).
+- "missing on this receiver" on the Screen output card now says the command that fixes it.
+
 ## 2026-11-11 (afternoon)
 
 **New**

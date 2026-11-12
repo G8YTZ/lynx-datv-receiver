@@ -515,8 +515,12 @@ class ScreenOutput:
         mode = s["mode"]
         missing = self.available()
         if missing and mode != "hdmi":
+            script = ("install/rock5t.sh" if lynx_platform.IS_ROCK
+                      else "install/build_wf_recorder.sh")
             self.last_error = ("missing on this receiver: " + ", ".join(missing)
-                               + " (run the installer again)")
+                               + f". Run Update Now, or in a terminal on the "
+                               f"receiver: bash ~/lynx/{script} (what the last "
+                               "update did: ~/lynx/logs/update.log)")
             with self.lock:
                 self._stop_all()
             return
