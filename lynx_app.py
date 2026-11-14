@@ -826,11 +826,11 @@ def current_rf_target_port():
     if receiver_is_remote(active_receiver_id() or 0):
         return REMOTE_VIDEO_OUT_PORT
     if tri_watch_enabled and tri_watch_target_rcv == 2:
-        return cfg['ts_port_b']
+        return picotuner_ts_port('b', cfg)
     elif diversity_enabled:
         return config['diversity']['combiner_out_port']
     else:
-        return cfg['ts_port']
+        return picotuner_ts_port('a', cfg)
 
 # What mpv was last asked to play, whatever asked (restart_mpv records
 # it): the screen-return check and the SRT output's screen change
