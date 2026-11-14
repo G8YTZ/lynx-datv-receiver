@@ -204,6 +204,39 @@ class TunerStatus:
         }
 
 
+def target_host(target: str) -> str:
+    """The host a tuner target points at, or "" for none.
+    "udp://192.168.0.160:9941" -> "192.168.0.160"."""
+    t = (target or "").strip()
+    if not t or t.lower() == "none":
+        return ""
+    t = t.split("://", 1)[-1]
+    if t.startswith("["):                       # [ipv6]:port
+        return t[1:].split("]", 1)[0]
+    return t.rsplit(":", 1)[0] if t.count(":") == 1 else t
+
+
+_tuner_counts: dict[str, int] = {}
+
+
+def tuner_count(device_id: str, binary: str = None) -> int:
+    """How many tuners the box has (asked once, then remembered): the
+    first /tunerN/target that the box refuses ends the count."""
+    if device_id in _tuner_counts:
+        return _tuner_counts[device_id]
+    n = 0
+    for i in range(8):
+        try:
+            HDHomeRunTuner(device_id=device_id, tuner=i,
+                           **({"binary": binary} if binary else {})).target()
+        except HDHomeRunError:
+            break
+        n = i + 1
+    if n:
+        _tuner_counts[device_id] = n
+    return n or 1
+
+
 # --------------------------------------------------------------------------
 # Tuner
 # --------------------------------------------------------------------------
@@ -421,6 +454,26 @@ class HDHomeRunTuner:
             "and that nothing is filtering UDP between here and there"
         )
         return status
+
+    def target(self) -> str:
+        """Where this tuner is sending: "none", or a URL such as
+        "udp://192.168.0.160:9941" (another client's, possibly)."""
+        return self.get(self._path("target")).strip()
+
+    def release_if_ours(self, our_host: str) -> bool:
+        """Stop the tuner only if it is sending to our_host (or to
+        nothing). Two receivers can share a box: releasing every tuner
+        on leaving cut off the other receiver's picture (14 Nov 2026).
+        Returns True if released or already idle."""
+        try:
+            owner = target_host(self.target())
+        except HDHomeRunError as exc:
+            log.debug("release check failed (ignored): %s", exc)
+            return False
+        if owner and owner != our_host:
+            return False
+        self.release()
+        return True
 
     def release(self) -> None:
         """Stop streaming and free the tuner. Safe to call repeatedly."""

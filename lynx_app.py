@@ -4661,6 +4661,58 @@ def hdhr_programme_name(programs, wanted) -> str:
     return ""
 
 
+def _hdhr_release_ours(st):
+    """Stop this box's tuner only if it is sending to us. A box can be
+    shared by several receivers; stopping every tuner on leaving cut
+    off the other receiver's picture (Pi and ROCK 5C, 14 Nov 2026)."""
+    device_id = st["device_id"]
+    try:
+        ours = hdhr_local_address(st.get("address") or device_id)
+        lynx_hdhomerun.HDHomeRunTuner(
+            device_id=device_id, tuner=st.get("tuner", 0)).release_if_ours(ours)
+    except Exception as e:
+        print(f"[hdhr] release {device_id} failed: {type(e).__name__}: {e}")
+
+
+def hdhr_choose_tuner(device_id):
+    """Pick the tuner this receiver tunes, before every tune.
+
+    Every receiver used tuner 0, so two sharing a box retuned each
+    other's channel and the second tuner sat idle (14 Nov 2026). Now:
+    the tuner this receiver had, if it is free or still ours; else the
+    first free one; else a refusal naming who has them, never a tuner
+    taken from someone else. Free = no target; ours = target is our
+    address."""
+    with hdhr_lock:
+        st = dict(hdhr_states.get(device_id) or {})
+    ours = hdhr_local_address(st.get("address") or device_id)
+    count = lynx_hdhomerun.tuner_count(device_id)
+    current = int(st.get("tuner", 0) or 0)
+    owners = {}
+    for n in [current] + [i for i in range(count) if i != current]:
+        try:
+            owner = lynx_hdhomerun.target_host(
+                lynx_hdhomerun.HDHomeRunTuner(device_id=device_id, tuner=n).target())
+        except lynx_hdhomerun.HDHomeRunError as e:
+            owners[n] = f"unreadable ({e})"
+            continue
+        if not owner or owner == ours:
+            if n != current:
+                print(f"[hdhr] {device_id}: tuner {current} is in use by "
+                      f"{owners.get(current, '?')} - using tuner {n}", flush=True)
+            with hdhr_lock:
+                live = hdhr_states.get(device_id)
+                if live is not None:
+                    live["tuner"] = n
+            return n
+        owners[n] = owner
+    busy = ", ".join(f"tuner {n} by {o}" for n, o in sorted(owners.items()))
+    raise HTTPException(
+        status_code=409,
+        detail=f"Every tuner on this HDHomeRun is in use ({busy}). "
+               "Stop it on the other receiver first.")
+
+
 def hdhr_release_others(keep_device_id):
     """Stop every OTHER device streaming to us.
 
@@ -4671,10 +4723,7 @@ def hdhr_release_others(keep_device_id):
     for st in hdhr_devices():
         if st["device_id"] == keep_device_id:
             continue
-        try:
-            hdhr_source(st["device_id"]).stop()
-        except Exception as e:
-            print(f"[hdhr] release {st['device_id']} failed: {type(e).__name__}: {e}")
+        _hdhr_release_ours(st)
 
 
 def _hdhr_apply_names():
@@ -5011,10 +5060,7 @@ def hdhr_stop_all():
     the day it matters.
     """
     for st in hdhr_devices():
-        try:
-            hdhr_source(st["device_id"]).stop()
-        except Exception as e:
-            print(f"[hdhr] stop failed: {type(e).__name__}: {e}")
+        _hdhr_release_ours(st)
 # --- end HDHomeRun ---------------------------------------------------
 
 remote_states: list = []
@@ -12069,6 +12115,7 @@ def _tune_dvbt_impl(req: DvbtTuneRequest):
     # so every step below - the cover, the OSD state, the tune, the saved
     # state - talks about the same box.
     _dev = hdhr_device_for(req.modulation, req.device_id)
+    hdhr_choose_tuner(_dev)
     source = hdhr_source(_dev)
     global hdhr_active_device
     hdhr_active_device = _dev
@@ -12533,10 +12580,11 @@ def hdhomerun_programs(device_id: str = None):
         # The DVB box when none is named: the service list is the DVB-T2
         # card's, and an ATSC box carrying TS has no programmes to list.
         _dvb = _hdhr_pick("dvb")
-        tuner = lynx_hdhomerun.HDHomeRunTuner(
-            device_id=device_id or (_dvb or {}).get("device_id")
-                      or hdhr_default_device_id() or "",
-            tuner=0)
+        _did = (device_id or (_dvb or {}).get("device_id")
+                or hdhr_default_device_id() or "")
+        with hdhr_lock:
+            _t = int((hdhr_states.get(_did) or {}).get("tuner", 0) or 0)
+        tuner = lynx_hdhomerun.HDHomeRunTuner(device_id=_did, tuner=_t)
         return {"programs": tuner.stream_info()}
     except lynx_hdhomerun.HDHomeRunError as e:
         return {"programs": [], "error": str(e)}
@@ -12605,12 +12653,23 @@ def set_screen_output(req: ScreenOutputRequest):
 
 
 @app.post("/api/hdhomerun/stop", tags=["RF Reception"],
-          summary="Stop all HDHomeRun streaming",
-          description="Releases every tuner. Useful when a device has been "
-                      "left streaming by an interrupted tune.")
-def hdhomerun_stop():
-    hdhr_stop_all()
-    return {"success": True}
+          summary="Stop HDHomeRun streaming",
+          description="Releases this receiver's tuners. With force=true, "
+                      "every tuner on every box, whoever it is sending to: "
+                      "for a tuner left streaming by a receiver that was "
+                      "switched off, which nothing else will free.")
+def hdhomerun_stop(force: bool = False):
+    if not force:
+        hdhr_stop_all()
+        return {"success": True}
+    for st in hdhr_devices():
+        for n in range(lynx_hdhomerun.tuner_count(st["device_id"])):
+            try:
+                lynx_hdhomerun.HDHomeRunTuner(
+                    device_id=st["device_id"], tuner=n).release()
+            except Exception as e:
+                print(f"[hdhr] forced release {st['device_id']}/{n} failed: {e}")
+    return {"success": True, "forced": True}
 
 
 @app.get("/api/tune", tags=["RF Reception"],

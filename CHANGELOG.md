@@ -10,6 +10,7 @@ All notable changes to Lynx are documented here, in reverse chronological order.
 **Fixed**
 - A Pi could stay at 4K when the monitor woke after Lynx started: the 1080-line cap is now also applied by the running receiver (at start, when a screen comes back, and when the screen settings are saved), not only by the start-up script.
 - ROCK 5C sound very quiet on HDMI: start-up set only the default output to full volume, and on the 5C that is the analogue socket. Every output is now set to full and unmuted.
+- Two receivers sharing an HDHomeRun fought over tuner 0: every Lynx used it, and leaving the HDHomeRun stopped every tuner, the other receiver's included. Lynx now takes a free tuner (keeping its own when it can), refuses with who has them when all are busy, and releases only a tuner sending to itself. `POST /api/hdhomerun/stop?force=true` frees a tuner left streaming by a receiver that was switched off.
 
 ## 2026-11-12
 
