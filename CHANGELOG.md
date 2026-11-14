@@ -2,6 +2,11 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-11-14
+
+**New**
+- `/api/status` gives `lynx.in_use`: `{"active": true/false, "since": <time>}`, the settled "something to show" that the Video Switching card switches on (RF and relayed streams, with its settle times), whether or not Companion or its pin is enabled. For anything that polls Lynx, such as a quad-split controller.
+
 ## 2026-11-12
 
 **Fixed**

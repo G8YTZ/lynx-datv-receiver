@@ -8186,6 +8186,13 @@ def _registry_active_id():
     return None
 
 
+def _in_use_status():
+    nm = globals().get("notification_manager")
+    if nm is None:
+        return {"active": False, "since": None}
+    return {"active": bool(nm.in_use), "since": nm.in_use_since}
+
+
 @app.get("/api/status", tags=["Status"],
          summary="Get current receiver status",
          description="Returns lock state, MER, callsign, frequency and more. "
@@ -8301,6 +8308,10 @@ def get_status():
             # SWITCHING caption) when Pathfinder has no map to show.
             "pathfinder_placeholder": bool((config.get('pathfinder') or {}).get('placeholder_card', True)),
             "squeak": _squeak_status(),
+            # Something to show, settled with the Video Switching card's
+            # settle times: what it switches on, whether or not Companion
+            # or its pin is enabled. RF and relayed streams alike.
+            "in_use": _in_use_status(),
             # Cached by video_badge_monitor(); never waits on mpv or wlr-randr.
             "video_in": video_in_info,
             "video_out": video_out_info,
