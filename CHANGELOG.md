@@ -7,6 +7,9 @@ All notable changes to Lynx are documented here, in reverse chronological order.
 **New**
 - `/api/status` gives `lynx.in_use`: `{"active": true/false, "since": <time>}`, the settled "something to show" that the Video Switching card switches on (RF and relayed streams, with its settle times), whether or not Companion or its pin is enabled. For anything that polls Lynx, such as a quad-split controller.
 
+**Fixed**
+- A Pi could stay at 4K when the monitor woke after Lynx started: the 1080-line cap is now also applied by the running receiver (at start, when a screen comes back, and when the screen settings are saved), not only by the start-up script.
+
 ## 2026-11-12
 
 **Fixed**

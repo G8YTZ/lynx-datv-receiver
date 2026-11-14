@@ -2189,7 +2189,33 @@ def _reapply_refresh_rate(reason: str = "came back") -> Optional[bool]:
         if m:
             modes.append((m.group(1), float(m.group(2)), "current" in m.group(3)))
     current = next((m for m in modes if m[2]), None)
-    if not name or not current or round(current[1]) == want:
+    if not name or not current:
+        return None
+    # The height cap first. lynx_start.sh applies it before anything
+    # draws, but only if the screen has finished its HDMI handshake by
+    # then; this path only ever changed the rate, so a monitor that woke
+    # late stayed at its preferred mode (Pi 5 into an LG 4K, 14 Nov 2026:
+    # 3840x2160 at 60 Hz with max_height 1080 and 50 Hz saved). The same
+    # rule as lynx_start.sh: the wanted rate at the capped height if
+    # listed, else the highest rate listed there.
+    cap = display_max_height()
+    if int(current[0].split("x")[1]) > cap:
+        at_cap = [m for m in modes if int(m[0].split("x")[1]) == cap]
+        if not at_cap:
+            print(f"[screen] {name} at {current[0]} ({reason}) - no {cap}p mode "
+                  f"listed, leaving it", flush=True)
+            return False
+        exact = [m for m in at_cap if round(m[1]) == want]
+        pick = (max(exact, key=lambda m: int(m[0].split("x")[0])) if exact
+                else max(at_cap, key=lambda m: (m[1], int(m[0].split("x")[0]))))
+        r = subprocess.run(["wlr-randr", "--output", name, "--mode",
+                            f"{pick[0]}@{pick[1]:.6f}Hz"],
+                           capture_output=True, text=True, timeout=5, env=env)
+        print(f"[screen] {name} at {current[0]} {current[1]:g} Hz ({reason}) - over the "
+              f"{cap}p cap, asked for {pick[0]} {pick[1]:g} Hz: "
+              f"{'ok' if r.returncode == 0 else 'not accepted'}", flush=True)
+        return r.returncode == 0
+    if round(current[1]) == want:
         return None
     res = current[0]
     listed = next((m for m in modes if m[0] == res and round(m[1]) == want), None)
