@@ -9,6 +9,7 @@ All notable changes to Lynx are documented here, in reverse chronological order.
 
 **Fixed**
 - A Pi could stay at 4K when the monitor woke after Lynx started: the 1080-line cap is now also applied by the running receiver (at start, when a screen comes back, and when the screen settings are saved), not only by the start-up script.
+- ROCK 5C sound very quiet on HDMI: start-up set only the default output to full volume, and on the 5C that is the analogue socket. Every output is now set to full and unmuted.
 
 ## 2026-11-12
 

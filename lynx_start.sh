@@ -393,6 +393,16 @@ echo -e "${GREEN}OK — http://${MY_IP}:8080${NC}"
 # sink actually is, since its numeric ID isn't guaranteed stable
 # across reboots.
 wpctl set-volume @DEFAULT_AUDIO_SINK@ 1.0 2>/dev/null || true
+# Every sink, not only the default: on a ROCK 5C the default is the
+# analogue socket, and mpv plays to the HDMI, which was left at 40%
+# (14 Nov 2026: about 24 dB down, with the PPM, which reads before the
+# sink's volume, looking normal). Lynx's level is mpv's own control.
+for _sink in $(wpctl status 2>/dev/null \
+        | awk '/^Video/ {exit} /Sinks:/ {f=1; next} /Sources:|Filters:|Streams:/ {f=0} f' \
+        | sed -nE 's/^[^0-9]*([0-9]+)\. .*/\1/p'); do
+    wpctl set-volume "$_sink" 1.0 2>/dev/null || true
+    wpctl set-mute "$_sink" 0 2>/dev/null || true
+done
 
 # ── mpv is started by lynx_app.py itself, not here ─────────────
 # See rf_mpv_lifecycle_monitor() in lynx_app.py: mpv is only ever
