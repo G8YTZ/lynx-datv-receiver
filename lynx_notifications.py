@@ -807,6 +807,14 @@ class NotificationManager:
         # few seconds later would have given.
         self._qrz_mer_retries = {}
 
+        # "In use": the same settled answer the Video Switching card acts
+        # on (something to show, held for the Companion settle times),
+        # kept whether or not Companion or its GPIO pin is enabled, so
+        # anything polling /api/status can follow it (Thomas DL5BCA,
+        # 12 Nov 2026: picotuner.locked alone flickers and knows nothing
+        # of streams).
+        self.in_use = False
+        self.in_use_since = None
         self._actions = {}   # {name: SettlingAction} - persistent, keyed store so a
                               # later event (e.g. unlock) can find and cancel an earlier
                               # one's (e.g. lock's) still-pending timer. Confirmed as a
@@ -1175,6 +1183,7 @@ class NotificationManager:
         """
         self._cancel_action('companion_unlock')
         self._cancel_action('companion_gpio_unlock')
+        self._settle_in_use(True, notif_cfg)
 
         if stream_only and cfg is not None:
             slack_cfg = notif_cfg.get('slack', {})
@@ -1202,10 +1211,32 @@ class NotificationManager:
                 self._arm_action('companion_gpio_lock', delay,
                                   lambda: gpio.set(True), "Companion-GPIO-lock")
 
+    def _settle_in_use(self, active, notif_cfg):
+        """Move self.in_use towards `active` after the Companion settle
+        time for that direction; a change back before it fires cancels
+        it quietly (no diagnostics entry: brief gaps are routine)."""
+        other = self._actions.get('in_use_off' if active else 'in_use_on')
+        if other:
+            other.cancel()
+        key = 'in_use_on' if active else 'in_use_off'
+        pending = self._actions.get(key)
+        if self.in_use == active or (pending and pending.pending):
+            return
+        comp_cfg = notif_cfg.get('companion', {})
+        delay = float(comp_cfg.get('lock_settle_secs' if active
+                                   else 'unlock_settle_secs', 5.0))
+
+        def flip():
+            self.in_use = active
+            self.in_use_since = datetime.datetime.now(
+                datetime.timezone.utc).isoformat(timespec="seconds")
+        self._arm_action(key, delay, flip, "in-use")
+
     def _on_confirmed_inactive(self, notif_cfg):
         self._cancel_action('companion_lock')
         self._cancel_action('companion_gpio_lock')
         self._cancel_action('slack_stream')
+        self._settle_in_use(False, notif_cfg)
 
         comp_cfg = notif_cfg.get('companion', {})
         if comp_cfg.get('enabled', False) and comp_cfg.get('unlock_url'):
