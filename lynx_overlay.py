@@ -72,6 +72,7 @@ import time
 import subprocess
 import re
 import struct
+import select
 import signal
 import faulthandler
 
@@ -542,6 +543,8 @@ def audio_ppm_monitor():
     proc = None
     target = None
     target_for_device = None
+    carry = b""
+    resolved = False
 
     while True:
         try:
@@ -553,7 +556,12 @@ def audio_ppm_monitor():
             # silent SRT sink after a return to HDMI (5C, 11 Nov 2026).
             current_device = (state.get("audio_device", "hdmi"),
                               state.get("audio_device_resolved"))
-            if target is None or current_device != target_for_device:
+            # Compare against the device seen last time, not target: None
+            # is a real answer (the default sink), and testing "target is
+            # None" re-resolved and killed pw-cat on every pass whenever
+            # the meter fell back to the default, so it never settled.
+            if not resolved or current_device != target_for_device:
+                resolved = True
                 target = ppm_monitor_target()
                 target_for_device = current_device
                 print(f"[ppm] monitoring {target or 'default sink'}")
@@ -563,6 +571,7 @@ def audio_ppm_monitor():
                     except Exception:
                         pass
                     proc = None
+                    carry = b""
 
             if proc is None or proc.poll() is not None:
                 proc = subprocess.Popen(
@@ -572,10 +581,32 @@ def audio_ppm_monitor():
                     stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
                 )
 
-            chunk = proc.stdout.read(FRAME_BYTES * READ_FRAMES)
+            # Wait for audio with a timeout. PipeWire sends nothing at all
+            # from a monitor whose sink isn't playing, and a blocking read
+            # then froze the needles at their last reading, so on a Pi 5
+            # watching the wrong HDMI output they sat on 5 and 6 on every
+            # station (Gareth G4XAT, 16 Nov 2026). No audio is silence:
+            # let the needles fall as a real PPM's would.
+            ready, _, _ = select.select([proc.stdout], [], [], 0.05)
+            if not ready:
+                quiet = int(SAMPLE_RATE * 0.05)
+                meter_l.update(0.0, quiet * dt)
+                meter_r.update(0.0, quiet * dt)
+                state["ppm_position_l"] = meter_l.ppm_position()
+                state["ppm_level_dbfs_l"] = meter_l.level_dbfs
+                state["ppm_position_r"] = meter_r.ppm_position()
+                state["ppm_level_dbfs_r"] = meter_r.level_dbfs
+                continue
+            chunk = os.read(proc.stdout.fileno(), FRAME_BYTES * READ_FRAMES)
             if not chunk:
                 time.sleep(0.05)
                 continue
+            # os.read can return part of a frame; keep the remainder for
+            # next time so left and right never swap places.
+            chunk = carry + chunk
+            whole = len(chunk) - len(chunk) % FRAME_BYTES
+            carry = chunk[whole:]
+            chunk = chunk[:whole]
 
             n_frames = len(chunk) // FRAME_BYTES
             if n_frames == 0:
