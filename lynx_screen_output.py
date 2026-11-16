@@ -206,8 +206,8 @@ def virtual_name(outs):
     return None
 
 
-def _sink_ids():
-    """PipeWire object ids of nodes named lynx_srt."""
+def _sink_ids(name=NULL_SINK):
+    """PipeWire object ids of nodes with this name (lynx_srt by default)."""
     rc, out = _run(["pw-cli", "ls", "Node"])
     if rc != 0:
         return []
@@ -216,9 +216,35 @@ def _sink_ids():
         m = re.match(r"\s*id (\d+), type PipeWire:Interface:Node", line)
         if m:
             cur = m.group(1)
-        elif cur and f'node.name = "{NULL_SINK}"' in line:
+        elif cur and f'node.name = "{name}"' in line:
             ids.append(cur)
     return ids
+
+
+METER_SINK = "lynx_meter"
+
+
+def ensure_meter_sink():
+    """A silent sink for mpv's sound when there is no audio output.
+
+    A screen without speakers tells the Pi it has no sound, so PipeWire
+    makes no HDMI sink at all, only "Dummy Output". mpv then had nowhere
+    to play, the PPM nothing to read, and its needles sat still (Gareth
+    G4XAT's Pi 5, 16 Nov 2026). Playing into this sink keeps the meter
+    honest: real levels, no speakers needed. Same make-up as lynx_srt.
+    Returns "pipewire/lynx_meter", or None if it could not be made."""
+    if not _sink_ids(METER_SINK):
+        rc, out = _run(["pw-cli", "create-node", "adapter",
+                        "{ factory.name=support.null-audio-sink "
+                        f"node.name={METER_SINK} "
+                        "node.description=\"Lynx meter (no audio output)\" "
+                        "media.class=Audio/Sink object.linger=true "
+                        "node.latency=1024/48000 "
+                        "audio.rate=48000 audio.position=[ FL FR ] }"])
+        if rc != 0:
+            print(f"[audio] could not make the {METER_SINK} sink: "
+                  f"{out.strip()}", flush=True)
+    return f"pipewire/{METER_SINK}" if _sink_ids(METER_SINK) else None
 
 
 def null_sink_exists():

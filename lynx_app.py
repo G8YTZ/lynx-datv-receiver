@@ -1447,13 +1447,41 @@ def _friendly_audio_name(key, description):
 
 
 def _first_hdmi_device():
-    """The first HDMI output mpv reports, or None."""
+    """The first HDMI output mpv reports, or None.
+
+    On a PipeWire system with no HDMI sink at all (a screen without
+    speakers), the silent lynx_meter sink instead, so the PPM still
+    reads the programme's sound rather than sitting still."""
     # Uses the same filtered list the Config page offers, so the
     # automatic choice and the visible choice can never disagree.
-    for d in physical_audio_devices():
+    devices = physical_audio_devices()
+    for d in devices:
         if "hdmi" in (d["name"] + " " + d["description"]).lower():
             return d["name"]
+    # Only when PipeWire has no real output at all: its "Dummy Output"
+    # placeholder (node auto_null) and Lynx's own silent sinks don't count.
+    not_real = ("auto_null", lynx_screen_output.METER_SINK,
+                lynx_screen_output.NULL_SINK)
+    if _pipewire_running() and not any(
+            d["name"].startswith("pipewire/")
+            and not any(n in d["name"] for n in not_real)
+            and "dummy" not in d["description"].lower()
+            for d in devices):
+        meter = lynx_screen_output.ensure_meter_sink()
+        if meter:
+            print("[audio] no audio output on this screen - playing into "
+                  "the silent lynx_meter sink so the PPM still works",
+                  flush=True)
+            return meter
     return None
+
+
+def _pipewire_running():
+    try:
+        return subprocess.run(["pw-cli", "info", "0"], capture_output=True,
+                              timeout=5).returncode == 0
+    except Exception:
+        return False
 
 
 def mpv_cmd(cmd: dict):
