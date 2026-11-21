@@ -27,6 +27,7 @@ repeater restart heals by itself: the Slave is the end nobody can reach.
 """
 
 import socket
+import shutil
 import subprocess
 import sys
 import threading
@@ -148,10 +149,33 @@ class SrtSender(threading.Thread):
             self.starts += 1
             print(f"[srt] calling {self.cmd[2]}")
             try:
-                # Its own messages go to the journal: connect, disconnect
-                # and errors are exactly what a remote fault report needs.
-                self.proc = subprocess.Popen(self.cmd)
-                self.proc.wait()
+                # Its messages are read here and passed to the journal:
+                # connect, disconnect and errors are exactly what a remote
+                # fault report needs. Line-buffered so we see them at once.
+                cmd = self.cmd
+                if shutil.which("stdbuf"):
+                    cmd = ["stdbuf", "-oL", "-eL"] + cmd
+                self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                             stderr=subprocess.STDOUT,
+                                             text=True, bufsize=1)
+                for line in self.proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        print(line, flush=True)
+                    # srt-live-transmit does not call again once the far end
+                    # has gone (a reboot of the receiver, a broken link): it
+                    # carries on reading UDP and throwing it away for ever.
+                    # So a disconnect means start a fresh caller.
+                    if "disconnected" in line.lower():
+                        print("[srt] receiver went away - calling again",
+                              flush=True)
+                        self.proc.terminate()
+                        break
+                try:
+                    self.proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.proc.kill()
+                    self.proc.wait()
                 rc = self.proc.returncode
             except FileNotFoundError:
                 print("[srt] srt-live-transmit not found: sudo apt install srt-tools",
@@ -160,7 +184,7 @@ class SrtSender(threading.Thread):
             if self.stop.is_set():
                 break
             print(f"[srt] srt-live-transmit exited (rc={rc}) - "
-                  f"calling again in {RESTART_DELAY_SECS:.0f}s")
+                  f"calling again in {RESTART_DELAY_SECS:.0f}s", flush=True)
             time.sleep(RESTART_DELAY_SECS)
 
     def terminate(self):
