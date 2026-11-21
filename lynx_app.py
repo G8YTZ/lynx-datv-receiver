@@ -963,8 +963,17 @@ def restart_mpv(target_url: str, is_rf: bool = True):
         source_flags = (
             "--demuxer=lavf --demuxer-lavf-format=mpegts "
             "--demuxer-max-bytes=512KiB --demuxer-max-back-bytes=128KiB "
-            "--profile=low-latency --cache-pause=no "
-            # low-latency sets analyzeduration to zero, which means mpv
+            # No --profile=low-latency (21 Nov 2026). It is a webcam
+            # profile: no input buffering (fflags=nobuffer, a 4k stream
+            # buffer), one decoding thread (H.264 is software on a Pi 5)
+            # and latency hacks that assume a tidy stream. Two of its
+            # settings had already been overridden below because they
+            # broke things. A weak QO-100 signal from a home-made
+            # transmitter needs the opposite: half a second in hand to
+            # ride out bursts of errors and gaps, as Ryde/VLC have.
+            # cache-pause=no stays, so a live stream never stops to fill.
+            "--cache-pause=no --demuxer-readahead-secs=0.5 "
+            # The profile set analyzeduration to zero, which means mpv
             # decides what the stream contains from whatever bytes turn
             # up first. Joining a live stream lands mid-GOP, so it
             # starts decoding slices before it has the PPS describing
@@ -979,7 +988,7 @@ def restart_mpv(target_url: str, is_rf: bool = True):
             # already waits far longer than that for rendering, and
             # adds nothing to running latency.
             "--demuxer-lavf-analyzeduration=1 "
-            # The low-latency profile also sets probe-info=nostreams: no
+            # The profile also set probe-info=nostreams: no
             # probing at all once the first table names a stream, so a
             # second programme in the stream (Lynx-Tx's 4K carousel) never
             # became a track and could not be chosen. "yes" probes for the
@@ -1015,7 +1024,7 @@ def restart_mpv(target_url: str, is_rf: bool = True):
         f"--audio-pitch-correction=no --script={DRIFT_SCRIPT_PATH} "
         f"{source_flags}"
         # SRT mode: a 100 ms audio buffer, after source_flags so RF's
-        # low-latency profile cannot reset it. With almost none, mpv
+        # source flags cannot reset it. With almost none, mpv
         # missed every other block into the lynx_srt sink (a scrubbing
         # sound on the SRT feed, 5C, 11 Nov 2026). mpv allows for it in
         # lip-sync.
