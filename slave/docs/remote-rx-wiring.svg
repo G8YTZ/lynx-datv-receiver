@@ -100,16 +100,13 @@
   <text x="758" y="562" text-anchor="middle" class="s">corner port: power</text>
   <rect x="735" y="574" width="46" height="20" rx="3" fill="#b7791f"/>
 
-  <!-- USB: Minitiouner -> its usual cable -> OTG adapter -> Zero USB -->
-  <path d="M967,270 L967,380" class="usb"/>
-  <rect x="880" y="380" width="150" height="50" rx="8" class="box"/>
-  <text x="955" y="401" text-anchor="middle" class="t">Your usual</text>
-  <text x="955" y="419" text-anchor="middle" class="t">Minitiouner USB cable</text>
-  <path d="M967,430 L967,560" class="usb"/>
-  <rect x="880" y="560" width="150" height="50" rx="8" class="box"/>
-  <text x="955" y="581" text-anchor="middle" class="t">OTG adapter</text>
-  <text x="955" y="599" text-anchor="middle" class="s">USB-A socket to micro-USB</text>
-  <path d="M967,610 L967,690 L643,690 L643,600" class="usb" marker-end="url(#arr)"/>
+  <!-- USB: Minitiouner mini-USB -> OTG cable -> Zero micro-USB -->
+  <path d="M967,270 L967,470" class="usb"/>
+  <rect x="870" y="470" width="160" height="66" rx="8" class="box"/>
+  <text x="950" y="492" text-anchor="middle" class="t">Micro-USB to</text>
+  <text x="950" y="510" text-anchor="middle" class="t">mini-USB OTG cable</text>
+  <text x="950" y="527" text-anchor="middle" class="s">mini-USB end here</text>
+  <path d="M967,536 L967,690 L643,690 L643,600" class="usb" marker-end="url(#arr)"/>
 
   <!-- Zero PSU -->
   <rect x="698" y="626" width="120" height="34" rx="6" class="pwr"/>

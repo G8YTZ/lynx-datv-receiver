@@ -18,8 +18,7 @@ It needs no ports opening at the remote site: The Remote Rx always calls out to 
 | microSD card, 8 GB or larger | |
 | 5 V 2.5 A micro-USB power supply | The official Zero supply is ideal. |
 | Minitiouner | Any version Longmynd supports, with its own DC supply. Do not try to power it from the Pi. |
-| USB cable for the Minitiouner | The one you already use. |
-| OTG adapter | Micro-USB plug to USB-A socket, sold as "OTG". Or skip the adapter and use a one-piece micro-USB to USB-B OTG cable (often sold as an "OTG printer cable"), if your Minitiouner has a USB-B socket. |
+| Micro-USB to mini-USB OTG cable | Micro-USB plug for the Zero, mini-USB plug for the Minitiouner, sold as "OTG", [for example this one](https://www.amazon.co.uk/dp/B0D9HMQQY9). Or use the Minitiouner's usual USB cable with an OTG adapter (micro-USB plug to USB-A socket). |
 | Masthead LNA for the band | Mounted at the antenna. |
 | Bias-T and a supply for the LNA | Feeds DC up the coax to the LNA. |
 | SAW band-pass filter for the band | Protects the Minitiouner's front end from strong signals outside the band. |
@@ -27,7 +26,7 @@ It needs no ports opening at the remote site: The Remote Rx always calls out to 
 ## Wiring
 
 1. **Antenna to Minitiouner:** Antenna, masthead LNA, coax, bias-T, SAW filter, then the Minitiouner's **TOP** RF input. The Minitiouner never puts voltage on its RF input here (Lynx doesn't turn on LNB power), so the bias-T is what powers the LNA. Put the bias-T between the coax and the SAW filter: Most SAW filters block DC.
-2. **Minitiouner to the Pi:** The Minitiouner's usual USB cable, into the OTG adapter, into the Zero's **middle** micro-USB port, marked USB. That's the data port.
+2. **Minitiouner to the Pi:** The micro-USB to mini-USB OTG cable, from the Minitiouner's mini-USB socket to the Zero's **middle** micro-USB port, marked USB. That's the data port.
 3. **Power:** The 5 V supply goes into the Zero's **corner** micro-USB port, marked PWR IN. The Minitiouner gets its own DC supply as usual.
 4. **Network:** Wi-Fi to the router at the remote site. The Zero 2 W only does 2.4 GHz Wi-Fi.
 
