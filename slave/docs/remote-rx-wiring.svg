@@ -1,0 +1,146 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1040 720" font-family="Helvetica, Arial, sans-serif" font-size="13">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#333"/>
+    </marker>
+    <style>
+      .box{fill:#fff;stroke:#333;stroke-width:1.6;rx:8}
+      .rf{fill:#fdecea;stroke:#c0392b;stroke-width:1.6}
+      .pi{fill:#e8f5e9;stroke:#2e7d32;stroke-width:1.6}
+      .net{fill:#e8eef9;stroke:#1f5fbf;stroke-width:1.6}
+      .pwr{fill:#fff8e1;stroke:#b7791f;stroke-width:1.6}
+      .t{fill:#222}
+      .h{font-weight:bold;font-size:14px}
+      .s{font-size:11.5px;fill:#555}
+      .coax{stroke:#c0392b;stroke-width:3;fill:none}
+      .usb{stroke:#2e7d32;stroke-width:3;fill:none}
+      .dc{stroke:#b7791f;stroke-width:2.5;fill:none;stroke-dasharray:6 4}
+      .ip{stroke:#1f5fbf;stroke-width:2.5;fill:none;stroke-dasharray:2 5;stroke-linecap:round}
+    </style>
+  </defs>
+
+  <rect width="1040" height="720" fill="#ffffff"/>
+  <text x="520" y="34" text-anchor="middle" class="t" font-size="20" font-weight="bold">Lynx Remote Rx: wiring</text>
+  <text x="520" y="56" text-anchor="middle" class="s">Raspberry Pi Zero 2 W + Minitiouner, sending to the Lynx at the repeater over SRT</text>
+
+  <!-- ===== RF chain ===== -->
+  <text x="30" y="96" class="t h" fill="#c0392b">1  Antenna to Minitiouner</text>
+
+  <!-- antenna (yagi) -->
+  <g transform="translate(60,120)">
+    <line x1="0" y1="40" x2="90" y2="40" stroke="#333" stroke-width="2.5"/>
+    <line x1="10" y1="18" x2="10" y2="62" stroke="#333" stroke-width="2.5"/>
+    <line x1="30" y1="22" x2="30" y2="58" stroke="#333" stroke-width="2.5"/>
+    <line x1="50" y1="24" x2="50" y2="56" stroke="#333" stroke-width="2.5"/>
+    <line x1="70" y1="26" x2="70" y2="54" stroke="#333" stroke-width="2.5"/>
+    <line x1="88" y1="27" x2="88" y2="53" stroke="#333" stroke-width="2.5"/>
+    <line x1="45" y1="40" x2="45" y2="110" stroke="#333" stroke-width="3"/>
+    <text x="45" y="0" text-anchor="middle" class="t h">Antenna</text>
+  </g>
+
+  <!-- LNA -->
+  <rect x="200" y="140" width="130" height="70" rx="8" class="rf"/>
+  <text x="265" y="168" text-anchor="middle" class="t h">Masthead LNA</text>
+  <text x="265" y="186" text-anchor="middle" class="s">at the antenna,</text>
+  <text x="265" y="200" text-anchor="middle" class="s">powered up the coax</text>
+  <path d="M150,175 L198,175" class="coax" marker-end="url(#arr)"/>
+
+  <!-- coax run -->
+  <path d="M330,175 L390,175" class="coax" marker-end="url(#arr)"/>
+  <text x="360" y="165" text-anchor="middle" class="s">coax</text>
+
+  <!-- Bias-T -->
+  <rect x="392" y="140" width="120" height="70" rx="8" class="rf"/>
+  <text x="452" y="168" text-anchor="middle" class="t h">Bias-T</text>
+  <text x="452" y="186" text-anchor="middle" class="s">feeds DC up the</text>
+  <text x="452" y="200" text-anchor="middle" class="s">coax to the LNA</text>
+  <rect x="397" y="245" width="110" height="34" rx="6" class="pwr"/>
+  <text x="452" y="267" text-anchor="middle" class="t">LNA supply</text>
+  <path d="M452,245 L452,212" class="dc" marker-end="url(#arr)"/>
+
+  <!-- SAW -->
+  <path d="M512,175 L560,175" class="coax" marker-end="url(#arr)"/>
+  <rect x="562" y="140" width="140" height="70" rx="8" class="rf"/>
+  <text x="632" y="164" text-anchor="middle" class="t h">SAW band-pass</text>
+  <text x="632" y="182" text-anchor="middle" class="s">filter for the band</text>
+  <text x="632" y="196" text-anchor="middle" class="s">(23 cm or 70 cm)</text>
+
+  <!-- Minitiouner -->
+  <path d="M702,175 L752,175" class="coax" marker-end="url(#arr)"/>
+  <rect x="754" y="110" width="250" height="190" rx="10" class="box"/>
+  <text x="879" y="136" text-anchor="middle" class="t h">Minitiouner</text>
+  <rect x="754" y="160" width="62" height="30" rx="4" fill="#c0392b"/>
+  <text x="785" y="180" text-anchor="middle" fill="#fff" font-weight="bold">TOP</text>
+  <text x="828" y="180" class="t">RF in: use this one</text>
+  <rect x="754" y="200" width="62" height="26" rx="4" fill="#ddd"/>
+  <text x="785" y="218" text-anchor="middle" fill="#777">BOTTOM</text>
+  <text x="828" y="218" class="s">not used</text>
+  <rect x="930" y="244" width="74" height="26" rx="4" fill="#2e7d32"/>
+  <text x="967" y="262" text-anchor="middle" fill="#fff" font-weight="bold">USB</text>
+  <rect x="854" y="244" width="70" height="26" rx="4" fill="#b7791f"/>
+  <text x="889" y="262" text-anchor="middle" fill="#fff" font-weight="bold">DC in</text>
+  <rect x="824" y="320" width="130" height="34" rx="6" class="pwr"/>
+  <text x="889" y="342" text-anchor="middle" class="t">Its own DC supply</text>
+  <path d="M889,320 L889,272" class="dc" marker-end="url(#arr)"/>
+
+  <!-- ===== Pi Zero 2 W ===== -->
+  <text x="430" y="424" class="t h" fill="#2e7d32">2  Minitiouner to the Pi Zero 2 W</text>
+
+  <rect x="430" y="440" width="380" height="150" rx="14" class="pi"/>
+  <text x="620" y="470" text-anchor="middle" class="t h">Raspberry Pi Zero 2 W</text>
+  <text x="620" y="489" text-anchor="middle" class="s">Raspberry Pi OS Lite, Wi-Fi 2.4 GHz only</text>
+  <!-- ports on the bottom edge, left to right; labels inside the board -->
+  <text x="505" y="548" text-anchor="middle" class="s">mini HDMI</text>
+  <text x="505" y="562" text-anchor="middle" class="s">not needed</text>
+  <rect x="470" y="574" width="70" height="20" rx="3" fill="#888"/>
+  <text x="643" y="548" text-anchor="middle" class="t" font-weight="bold">USB</text>
+  <text x="643" y="562" text-anchor="middle" class="s">middle port: data</text>
+  <rect x="620" y="574" width="46" height="20" rx="3" fill="#2e7d32"/>
+  <text x="758" y="548" text-anchor="middle" class="t" font-weight="bold">PWR IN</text>
+  <text x="758" y="562" text-anchor="middle" class="s">corner port: power</text>
+  <rect x="735" y="574" width="46" height="20" rx="3" fill="#b7791f"/>
+
+  <!-- USB: Minitiouner -> its usual cable -> OTG adapter -> Zero USB -->
+  <path d="M967,270 L967,380" class="usb"/>
+  <rect x="880" y="380" width="150" height="50" rx="8" class="box"/>
+  <text x="955" y="401" text-anchor="middle" class="t">Your usual</text>
+  <text x="955" y="419" text-anchor="middle" class="t">Minitiouner USB cable</text>
+  <path d="M967,430 L967,560" class="usb"/>
+  <rect x="880" y="560" width="150" height="50" rx="8" class="box"/>
+  <text x="955" y="581" text-anchor="middle" class="t">OTG adapter</text>
+  <text x="955" y="599" text-anchor="middle" class="s">USB-A socket to micro-USB</text>
+  <path d="M967,610 L967,690 L643,690 L643,600" class="usb" marker-end="url(#arr)"/>
+
+  <!-- Zero PSU -->
+  <rect x="698" y="626" width="120" height="34" rx="6" class="pwr"/>
+  <text x="758" y="648" text-anchor="middle" class="t">5 V 2.5 A PSU</text>
+  <path d="M758,626 L758,600" class="dc" marker-end="url(#arr)"/>
+
+  <!-- ===== Network ===== -->
+  <text x="30" y="424" class="t h" fill="#1f5fbf">3  Wi-Fi to the repeater</text>
+  <!-- wifi arcs -->
+  <g transform="translate(430,515)" stroke="#1f5fbf" stroke-width="2.5" fill="none">
+    <path d="M-14,-14 A20,20 0 0 0 -14,14"/>
+    <path d="M-24,-24 A34,34 0 0 0 -24,24"/>
+  </g>
+  <rect x="200" y="492" width="150" height="50" rx="8" class="net"/>
+  <text x="275" y="514" text-anchor="middle" class="t h">Router</text>
+  <text x="275" y="531" text-anchor="middle" class="s">at the remote site</text>
+  <path d="M396,517 L352,517" class="ip" marker-end="url(#arr)"/>
+  <path d="M200,517 L130,517 L130,560" class="ip" marker-end="url(#arr)"/>
+  <rect x="30" y="562" width="200" height="34" rx="8" class="net"/>
+  <text x="130" y="584" text-anchor="middle" class="t">Internet or SD-WAN</text>
+  <path d="M130,596 L130,620" class="ip" marker-end="url(#arr)"/>
+  <rect x="30" y="622" width="290" height="66" rx="8" class="net"/>
+  <text x="175" y="643" text-anchor="middle" class="t h">Lynx at the repeater</text>
+  <text x="175" y="661" text-anchor="middle" class="s">UDP in: 10947 SRT video, 10997 status,</text>
+  <text x="175" y="676" text-anchor="middle" class="s">10901 quality, and the replies back</text>
+
+  <!-- notes -->
+  <g class="s">
+    <text x="30" y="300">No voltage comes out of the Minitiouner's RF input: Lynx never</text>
+    <text x="30" y="316">turns on LNB power, so the bias-T is what powers the LNA.</text>
+    <text x="30" y="340">One input only: Longmynd drives one input of the NIM. For a</text>
+    <text x="30" y="356">second band at the same site, build a second Remote Rx.</text>
+  </g>
+</svg>

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Installs the Lynx Slave Rx from this checkout.
+# Installs the Lynx Remote Rx from this checkout, Longmynd included.
 #
 #   cd ~/lynx-datv-receiver/slave && ./install.sh
 #
@@ -15,13 +15,32 @@ if ! command -v srt-live-transmit >/dev/null; then
     sudo apt-get install -y srt-tools
 fi
 
+# Longmynd, the BATC's open-source Minitiouner driver, built in ~/longmynd.
+# Skipped if it is already there, so running this again is harmless.
+lm_dir=/home/pi/longmynd
+if [ ! -x "$lm_dir/longmynd" ]; then
+    echo "Building Longmynd in $lm_dir"
+    sudo apt-get install -y git make gcc libusb-1.0-0-dev libasound2-dev
+    if [ ! -d "$lm_dir" ]; then
+        git clone --depth 1 https://github.com/BritishAmateurTelevisionClub/longmynd.git "$lm_dir"
+    fi
+    make -C "$lm_dir"
+fi
+# Lets Longmynd open the Minitiouner without root. Takes effect the next
+# time the Minitiouner is plugged in (or after a reboot).
+if [ ! -f /etc/udev/rules.d/minitiouner.rules ]; then
+    sudo cp "$lm_dir/minitiouner.rules" /etc/udev/rules.d/
+    sudo udevadm control --reload-rules
+    echo "Installed the Minitiouner udev rule: unplug and replug it, or reboot"
+fi
+
 sudo install -m 755 "$here/lynx-slave" /usr/local/bin/lynx-slave
 sudo install -m 644 "$here/lynx-slave.service" /etc/systemd/system/lynx-slave.service
 
 conf=/etc/lynx-slave.conf
 if [ ! -f "$conf" ]; then
     sudo install -m 644 "$here/lynx-slave.conf.example" "$conf"
-    echo "Created $conf from the example: edit LYNX_HOST, FREQ, SR and NAME"
+    echo "Created $conf from the example: edit LYNX_HOST, NAME and LOCATOR"
 else
     sudo cp "$conf" "$conf.bak-$(date +%Y%m%d%H%M%S)"
     for key in TRANSPORT SRT_LATENCY; do
@@ -40,7 +59,7 @@ if ! grep -q '^KEY=' "$conf"; then
     key="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
     echo "KEY=\"$key\"" | sudo tee -a "$conf" >/dev/null
     echo
-    echo "This Remote Rx's key (enter it in Lynx: Config, Slave Rx, Key):"
+    echo "This Remote Rx's key (enter it in Lynx: Config, Remote Rx, Key):"
     echo "    $key"
     echo
 fi
