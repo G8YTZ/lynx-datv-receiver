@@ -34,6 +34,12 @@ From a receiver at the repeater site, so Lynx-Tx becomes a repeater: receive, SR
 - First as an off-air quality monitor: is it good on air?
 - Later, pre-correction. Suggested route: sample the PA output through a coupler into the SDR's own receive side (PlutoSky and LibreSDR both have one), so Lynx-Tx compares the real transmitted constellation with what it meant to send, on the same box and clock. A DVB receiver's MER says that something is wrong but not what, so it suits the monitor rather than the correction.
 
+## 5. Remote Rx: versions, safe updates, finding the repeater
+
+- **Version in the heartbeat:** The Remote Rx reports its code and Longmynd versions; the panel's Firmware row shows them, and the repeater warns when a Remote Rx is older than it expects. Needed before the Remote Rx could ever move to its own repository.
+- **A/B software updates:** Two copies of the Remote Rx code and a pointer to the working one. An update from the repeater's panel (signed with the Remote Rx's key, beta or main versions only) goes into the spare copy; the pointer swaps, and a small watchdog the update never touches swaps it back unless heartbeats and video arrive within about 5 minutes. Also survives a power cut part-way through an update. The key, settings and Wi-Fi are never touched by an update, and Raspberry Pi OS is never updated remotely. Test on a bench Zero, including pushing a deliberately broken version to prove the rollback. Full A/B partitions with Raspberry Pi tryboot only if remote OS updates are ever needed.
+- **Repeater directory:** The builder enters a repeater's callsign instead of its address; the Remote Rx looks it up in a small file over HTTPS (on the GB3OO site first, the BATC's later), keeps the last address it found in case the site is down, and could later join with a keeper's Accept instead of a typed key. Further on: a BATC SRT relay, so the repeater needs no ports forwarded either.
+
 ## Also open
 
 - Lynx-Tx chat on air: merge `chat-on-air` into main once Justin is happy with it.
