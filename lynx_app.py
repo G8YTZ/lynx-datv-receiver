@@ -10583,13 +10583,16 @@ async function loadCurrentConfig() {
             }
         } catch (e) { /* the card still works without it */ }
 
-        const rs = cfg.remote_source || {};
-        document.getElementById('rs-enabled').checked = rs.enabled === true;
-        document.getElementById('rs-status-port').value = rs.status_port ?? 10997;
-        document.getElementById('rs-srt-port').value = rs.srt_port ? rs.srt_port : '';
-        // The first Slave's settings: remote_sources[0] once saved,
-        // remote_source on an older config.
-        const rs0 = (cfg.remote_sources && cfg.remote_sources[0]) || rs;
+        // The first Remote Rx: remote_sources[0] once saved, remote_source
+        // on an older config. Every field must come from the same place:
+        // saving moves the config to remote_sources and drops
+        // remote_source, so reading Enabled from the old key showed it
+        // off after a save, and the next save wrote it off for real -
+        // the Remote Rx then vanished at the next restart (21 Nov 2026).
+        const rs0 = (cfg.remote_sources && cfg.remote_sources[0]) || cfg.remote_source || {};
+        document.getElementById('rs-enabled').checked = rs0.enabled === true;
+        document.getElementById('rs-status-port').value = rs0.status_port ?? 10997;
+        document.getElementById('rs-srt-port').value = rs0.srt_port ? rs0.srt_port : '';
         document.getElementById('rs-freq').value = rs0.freq_khz ? (rs0.freq_khz / 1000).toFixed(3) : '';
         document.getElementById('rs-sr').value = rs0.sr || '';
         document.getElementById('rs-name').value = rs0.name || '';
