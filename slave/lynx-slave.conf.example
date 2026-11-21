@@ -1,0 +1,29 @@
+# Lynx Slave Rx settings.
+#
+# Sourced as shell, so anything with a space in it must be quoted.
+# Rewritten by hand today; by Lynx later, once remote configuration
+# exists — which is why it is a plain file rather than arguments
+# buried in a systemd unit.
+#
+# After editing:  sudo systemctl restart lynx-slave
+
+# Where the repeater's Lynx receiver is.
+LYNX_HOST="192.168.0.160"
+
+# What to tune. Frequency in kHz, symbol rate in kS/s.
+FREQ="1304000"
+SR="2000"
+
+# How this Slave introduces itself.
+NAME="Bench Tuner"
+LOCATOR="JO01AJ"
+
+# Ports. The quality port is derived as STATUS_PORT minus 96 unless
+# set here, and Lynx derives it the same way — changing one end only
+# is how you get a Slave that reports lock but no MER.
+STATUS_PORT="10997"
+VIDEO_PORT="10998"
+#QUALITY_PORT="10901"
+
+# Heartbeat cadence in seconds.
+INTERVAL="2.0"

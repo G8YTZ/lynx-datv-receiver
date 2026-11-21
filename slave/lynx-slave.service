@@ -1,0 +1,31 @@
+[Unit]
+Description=Lynx Slave Rx (Longmynd)
+# The Slave sends to a host on the network, so starting before there is
+# one only produces a burst of failed sends in the journal.
+After=network-online.target
+Wants=network-online.target
+
+# Belongs in [Unit], not [Service] — systemd ignores it in [Service]
+# and says so, which is easy to miss in a busy journal. Without it the
+# default rate limit applies and enough quick restarts put the service
+# into a failed state, leaving a remote Slave off the air until
+# somebody visits it.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi
+ExecStart=/usr/local/bin/lynx-slave
+
+# Longmynd has been seen to segfault. The supervisor already restarts
+# Longmynd itself; this is the outer net for the supervisor going down.
+Restart=always
+RestartSec=5
+
+# Longmynd talks to USB and needs a moment to release the device.
+TimeoutStopSec=15
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target
