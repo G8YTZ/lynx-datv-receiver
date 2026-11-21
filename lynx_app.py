@@ -14741,10 +14741,10 @@ def web_ui():
 
             <!-- Slave Receivers -->
             <div class="card mt-3">
-                <div class="card-header">&#x1F4E1; Slave Receivers</div>
+                <div class="card-header">&#x1F4E1; Remote Receivers</div>
                 <div class="card-body p-0">
                     <div id="slave-list" style="max-height: 300px; overflow-y: auto;">
-                        <div class="text-muted small p-3">Loading Slaves...</div>
+                        <div class="text-muted small p-3">Loading Remote Rx...</div>
                     </div>
                 </div>
             </div>
@@ -15521,22 +15521,32 @@ async function updateStatus() {
                 panel.className = 'card mt-2';
                 panel.id = id;
                 panel.innerHTML =
-                    '<div class="card-header" id="' + id + '-header">&#x1F4E1; Slave Rx</div>' +
-                    '<div class="card-body" id="' + id + '-status"></div>';
+                    '<div class="card-header" id="' + id + '-header">&#x1F4E1; Remote Rx</div>' +
+                    '<div class="card-body" id="' + id + '-status"></div>' +
+                    '<div class="card-footer py-2" id="' + id + '-actions"></div>';
                 remoteHost.appendChild(panel);
             }
-            // A configured but disabled Slave is hidden rather than
-            // shown as offline: it is switched off deliberately, which
-            // is not a fault and should not look like one.
-            if (!rem.enabled) { panel.style.display = 'none'; return; }
-            panel.style.display = '';
-            const st = !rem.online ? 'offline' : (rem.locked ? 'locked' : 'idle');
             // Locator in the header rather than as a row: it is the one
             // thing a Slave has that a local receiver does not, and putting
             // it in the rows is what stopped the two panels looking alike.
             const label = '&#x1F4E1; ' + (rem.name || 'Remote Rx')
                         + (rem.locator ? ' — ' + rem.locator : '');
+            // Shown like every other panel, used or not (21 Nov 2026). A
+            // Remote Rx switched off in Config says so instead of vanishing,
+            // which looked exactly like a fault.
+            if (!rem.enabled) {
+                setPanelState(id + '-header', id + '-status', label, 'offline');
+                document.getElementById(id + '-status').innerHTML =
+                    '<div class="text-muted small">Switched off in Config (Remote Rx: Enabled), then restart Lynx.</div>';
+                setRemoteActions(id, rem, false, 'off');
+                return;
+            }
+            const st = !rem.online ? 'offline' : (rem.locked ? 'locked' : 'idle');
             setPanelState(id + '-header', id + '-status', label, st);
+            const onScreen = (L_.remote_selected ?? s.remote_selected) === rem.index
+                && (L_.active_receiver ?? s.active_receiver) === 11 + rem.index;
+            setRemoteActions(id, rem, onScreen,
+                onScreen ? 'on' : (!rem.online ? 'offline' : ((rem.video && rem.video.live) ? 'ready' : 'novideo')));
             // Deliberately the local receiver's row set, in its order and
             // with its units. A Slave sends the same fields under the same
             // tags, so anything that reads differently here is a fault
@@ -15787,7 +15797,7 @@ async function loadSlaves() {
         const s = await api('GET', '/api/status');
         const remotes = s.remotes || [];
         if (!remotes.length) {
-            el.innerHTML = '<div class="text-muted small p-3">No Slaves configured</div>';
+            el.innerHTML = '<div class="text-muted small p-3">No Remote Rx configured</div>';
             return;
         }
         el.innerHTML = remotes.map(function (r) {
@@ -15806,13 +15816,31 @@ async function loadSlaves() {
             return '<div class="stream-item p-2 border-bottom border-secondary d-flex justify-content-between align-items-center"'
                  + (clickable ? ' style="cursor:pointer" onclick="playSlave(' + r.index + ')"'
                               : ' style="opacity:0.55"')
-                 + '><span class="small text-light">' + (r.name || ('Slave Rx ' + (r.index + 1)))
+                 + '><span class="small text-light">' + (r.name || ('Remote Rx ' + (r.index + 1)))
                  + (r.callsign ? ' <span class="text-muted">' + r.callsign + '</span>' : '')
                  + '</span><span class="d-flex align-items-center gap-2">'
                  + '<span class="text-muted small">' + kbps + '</span>' + badge + '</span></div>';
         }).join('');
     } catch (e) {
-        el.innerHTML = '<div class="text-danger small p-3">Slave list unavailable</div>';
+        el.innerHTML = '<div class="text-danger small p-3">Remote Rx list unavailable</div>';
+    }
+}
+
+// The Watch control on a Remote Rx panel. Rebuilt only when its state
+// changes, not on every poll, so a click is never lost to a redraw.
+function setRemoteActions(id, rem, onScreen, state) {
+    const el = document.getElementById(id + '-actions');
+    if (!el || el.dataset.state === state) return;
+    el.dataset.state = state;
+    const why = {off: 'Switched off in Config', offline: 'Not heard from',
+                 novideo: 'No video arriving yet'}[state];
+    if (state === 'on') {
+        el.innerHTML = '<span class="badge bg-success">&#x25B6; On screen</span>';
+    } else if (state === 'ready') {
+        el.innerHTML = '<button class="btn btn-sm btn-outline-success" onclick="playSlave(' + rem.index + ')">&#x25B6; Watch</button>';
+    } else {
+        el.innerHTML = '<button class="btn btn-sm btn-outline-secondary" disabled>&#x25B6; Watch</button>'
+                     + ' <span class="text-muted small ms-2">' + why + '</span>';
     }
 }
 
@@ -15820,7 +15848,7 @@ async function playSlave(index) {
     try {
         await api('POST', '/api/remote/' + index + '/select');
     } catch (e) {
-        alert('Could not select that Slave: ' + e);
+        alert('Could not select that Remote Rx: ' + e);
     }
 }
 
