@@ -6,7 +6,7 @@ It needs no ports opening at the remote site: The Remote Rx always calls out to 
 
 ![Off-air picture from a Remote Rx](docs/remote-rx-off-air.jpg)
 
-*Received at Lenham (JO01IF) on 438 MHz and shown on the Lynx at home: The overlay says **REMOTE** and the Remote Rx's locator.*
+*A test card from a Portsdown on 438 MHz, received by the Remote Rx (JO01IF) and shown on the Lynx at home over SRT: The overlay says **REMOTE** and the Remote Rx's locator.*
 
 ![Remote Rx wiring](docs/remote-rx-wiring.svg)
 
