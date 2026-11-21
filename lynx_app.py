@@ -4395,7 +4395,7 @@ def _slave_link_for(i: int) -> dict:
 
 def start_slave_srt_listeners():
     for i, cfg in enumerate(remote_sources_cfg()):
-        if not cfg.get('enabled'):
+        if not cfg.get('enabled') or i in slave_srt_by_index:
             continue
         status_port = int(cfg.get('status_port', REMOTE_DEFAULT_STATUS_PORT))
         srt_port = int(cfg.get('srt_port') or status_port - lynx_relay.SRT_PORT_OFFSET)
@@ -5228,6 +5228,56 @@ def init_remote_states():
     """Build the state list from config. Called once at startup."""
     global remote_states
     remote_states = [_blank_remote_state(c) for c in remote_sources_cfg()]
+
+
+_remote_threads_started = set()
+
+
+def remote_start_enabled():
+    """Start the status and quality threads for each enabled Remote Rx
+    that has none yet. At startup, and again when one is switched on in
+    Config, so switching on needs no restart (21 Nov 2026). Threads are
+    never stopped: switching off just marks the state, which refuses
+    selection and hides nothing else."""
+    for i, st in enumerate(remote_states):
+        if not st["enabled"] or i in _remote_threads_started:
+            continue
+        _remote_threads_started.add(i)
+        threading.Thread(target=remote_source_monitor, args=(i,),
+                         daemon=True).start()
+        # Separate thread from remote_source_monitor rather than parsing
+        # both formats in one: the two ports update at different rates and
+        # a stall on either must not hold up the other.
+        threading.Thread(target=remote_quality_monitor, args=(i,),
+                         daemon=True).start()
+
+
+def remote_start_video():
+    """SRT listeners and the video relay, for whatever is enabled. Safe to
+    call again: running parts are left alone. A failed bind is not fatal;
+    the reason is on the console and in /api/status."""
+    if not remote_any_enabled():
+        return
+    # SRT first, so each loopback port is in place before the relay
+    # watches its sockets (it picks up new ones while running, too).
+    start_slave_srt_listeners()
+    was_running = slave_relay.stats()["running"]
+    if slave_relay.start():
+        if not was_running:
+            print(f"[relay] Slave video ingress listening on {REMOTE_VIDEO_INGRESS_PORT}")
+    else:
+        print(f"[relay] NOT listening: {slave_relay.bind_error}")
+
+
+def remote_apply_enabled():
+    """After a Config save: take up the Enabled switches now."""
+    cfgs = remote_sources_cfg()
+    while len(remote_states) < len(cfgs):
+        remote_states.append(_blank_remote_state(cfgs[len(remote_states)]))
+    for i, c in enumerate(cfgs):
+        remote_states[i]["enabled"] = bool(c.get('enabled'))
+    remote_start_enabled()
+    remote_start_video()
 
 
 def remote_any_enabled() -> bool:
@@ -11141,7 +11191,7 @@ async function saveRemoteSource() {
             method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
         });
         if (!r.ok) throw new Error(await r.text());
-        statusEl.textContent = 'Saved. Settings go to the Remote Rx within seconds; a new port needs a restart.';
+        statusEl.textContent = 'Saved. Enabled and the settings take effect within seconds; a changed port needs a restart.';
         statusEl.className = 'save-status text-success';
     } catch (e) {
         statusEl.textContent = 'Save failed - see console.';
@@ -14412,6 +14462,11 @@ def update_config(req: ConfigUpdateRequest):
         os.replace(tmp_path, CONFIG_PATH)
 
         config = on_disk  # reload in-memory immediately - site fields take effect right away
+        if req.remote_source is not None:
+            try:
+                remote_apply_enabled()
+            except Exception as e:
+                print(f"[remote] could not apply Enabled: {type(e).__name__}: {e}")
         # Refresh rate: live, on save (3 Nov 2026). Only the rate changes,
         # not the size, which a screen return has always done live.
         if req.display is not None:
@@ -15522,8 +15577,7 @@ async function updateStatus() {
                 panel.id = id;
                 panel.innerHTML =
                     '<div class="card-header" id="' + id + '-header">&#x1F4E1; Remote Rx</div>' +
-                    '<div class="card-body" id="' + id + '-status"></div>' +
-                    '<div class="card-footer py-2" id="' + id + '-actions"></div>';
+                    '<div class="card-body" id="' + id + '-status"></div>';
                 remoteHost.appendChild(panel);
             }
             // Locator in the header rather than as a row: it is the one
@@ -15537,16 +15591,11 @@ async function updateStatus() {
             if (!rem.enabled) {
                 setPanelState(id + '-header', id + '-status', label, 'offline');
                 document.getElementById(id + '-status').innerHTML =
-                    '<div class="text-muted small">Switched off in Config (Remote Rx: Enabled), then restart Lynx.</div>';
-                setRemoteActions(id, rem, false, 'off');
+                    '<div class="text-muted small">Switched off in Config (Remote Rx: Enabled).</div>';
                 return;
             }
             const st = !rem.online ? 'offline' : (rem.locked ? 'locked' : 'idle');
             setPanelState(id + '-header', id + '-status', label, st);
-            const onScreen = (L_.remote_selected ?? s.remote_selected) === rem.index
-                && (L_.active_receiver ?? s.active_receiver) === 11 + rem.index;
-            setRemoteActions(id, rem, onScreen,
-                onScreen ? 'on' : (!rem.online ? 'offline' : ((rem.video && rem.video.live) ? 'ready' : 'novideo')));
             // Deliberately the local receiver's row set, in its order and
             // with its units. A Slave sends the same fields under the same
             // tags, so anything that reads differently here is a fault
@@ -15800,47 +15849,44 @@ async function loadSlaves() {
             el.innerHTML = '<div class="text-muted small p-3">No Remote Rx configured</div>';
             return;
         }
-        el.innerHTML = remotes.map(function (r) {
+        const L_ = s.lynx || {};
+        const onAir = L_.active_receiver ?? s.active_receiver;
+        const html = remotes.map(function (r) {
             // Three states, same meanings as the panel badges: video
             // arriving, heard from but no video, nothing at all.
             var live = r.video && r.video.live;
-            var badge = !r.online
-                ? '<span class="badge bg-danger" style="font-size:0.65em">OFFLINE</span>'
-                : (live
-                    ? '<span class="badge bg-success" style="font-size:0.65em">VIDEO</span>'
-                    : '<span class="badge bg-warning text-dark" style="font-size:0.65em">NO VIDEO</span>');
-            // Only a Slave that is actually sending video can be chosen —
-            // selecting one that is not would just black the screen.
-            var clickable = r.enabled && r.online && live;
+            var onScreen = onAir === 11 + r.index;
+            var badge = !r.enabled
+                ? '<span class="badge bg-secondary" style="font-size:0.65em">OFF</span>'
+                : (!r.online
+                    ? '<span class="badge bg-danger" style="font-size:0.65em">OFFLINE</span>'
+                    : (live
+                        ? '<span class="badge bg-success" style="font-size:0.65em">VIDEO</span>'
+                        : '<span class="badge bg-warning text-dark" style="font-size:0.65em">NO VIDEO</span>'));
+            // A Watch button, like a preset (21 Nov 2026). Only a Remote Rx
+            // that is actually sending video can be chosen: selecting one
+            // that is not would just black the screen, so the greyed
+            // button says why instead.
+            var why = !r.enabled ? 'Switched off in Config'
+                    : (!r.online ? 'Not heard from' : (live ? '' : 'No video arriving yet'));
+            var btn = onScreen
+                ? '<span class="badge bg-success">&#x25B6; On screen</span>'
+                : (why
+                    ? '<button class="btn btn-sm btn-outline-secondary py-0" disabled title="' + why + '">&#x25B6; Watch</button>'
+                    : '<button class="btn btn-sm btn-outline-success py-0" onclick="playSlave(' + r.index + ')">&#x25B6; Watch</button>');
             var kbps = live ? (r.video.kbps + ' kbps') : '';
-            return '<div class="stream-item p-2 border-bottom border-secondary d-flex justify-content-between align-items-center"'
-                 + (clickable ? ' style="cursor:pointer" onclick="playSlave(' + r.index + ')"'
-                              : ' style="opacity:0.55"')
-                 + '><span class="small text-light">' + (r.name || ('Remote Rx ' + (r.index + 1)))
-                 + (r.callsign ? ' <span class="text-muted">' + r.callsign + '</span>' : '')
+            return '<div class="stream-item p-2 border-bottom border-secondary d-flex justify-content-between align-items-center gap-2">'
+                 + '<span class="small text-light">' + (r.name || ('Remote Rx ' + (r.index + 1)))
+                 + (r.locator ? ' <span class="text-muted">' + r.locator + '</span>' : '')
+                 + (r.callsign ? '<br><span class="text-muted">' + r.callsign + '</span>' : '')
+                 + (why && !onScreen ? '<br><span class="text-muted" style="font-size:0.8em">' + why + '</span>' : '')
                  + '</span><span class="d-flex align-items-center gap-2">'
-                 + '<span class="text-muted small">' + kbps + '</span>' + badge + '</span></div>';
+                 + '<span class="text-muted small">' + kbps + '</span>' + badge + btn + '</span></div>';
         }).join('');
+        // Redrawn only when something changed, so a click is never lost.
+        if (el.innerHTML !== html) el.innerHTML = html;
     } catch (e) {
         el.innerHTML = '<div class="text-danger small p-3">Remote Rx list unavailable</div>';
-    }
-}
-
-// The Watch control on a Remote Rx panel. Rebuilt only when its state
-// changes, not on every poll, so a click is never lost to a redraw.
-function setRemoteActions(id, rem, onScreen, state) {
-    const el = document.getElementById(id + '-actions');
-    if (!el || el.dataset.state === state) return;
-    el.dataset.state = state;
-    const why = {off: 'Switched off in Config', offline: 'Not heard from',
-                 novideo: 'No video arriving yet'}[state];
-    if (state === 'on') {
-        el.innerHTML = '<span class="badge bg-success">&#x25B6; On screen</span>';
-    } else if (state === 'ready') {
-        el.innerHTML = '<button class="btn btn-sm btn-outline-success" onclick="playSlave(' + rem.index + ')">&#x25B6; Watch</button>';
-    } else {
-        el.innerHTML = '<button class="btn btn-sm btn-outline-secondary" disabled>&#x25B6; Watch</button>'
-                     + ' <span class="text-muted small ms-2">' + why + '</span>';
     }
 }
 
@@ -15850,6 +15896,7 @@ async function playSlave(index) {
     } catch (e) {
         alert('Could not select that Remote Rx: ' + e);
     }
+    setTimeout(loadSlaves, 1500);
 }
 
 async function refreshLiveStreams() {
@@ -16842,25 +16889,7 @@ if __name__ == "__main__":
     # but disabled Slave still has a state record, so it appears in the
     # UI as switched off rather than vanishing.
     init_remote_states()
-    for _i, _st in enumerate(remote_states):
-        if not _st["enabled"]:
-            continue
-        threading.Thread(target=remote_source_monitor, args=(_i,),
-                         daemon=True).start()
-        # Per Slave, like the line above. This had been dropped into
-        # the HDHomeRun block below instead, where _i does not exist -
-        # so any receiver that actually found an HDHomeRun died at
-        # startup with "NameError: name '_i' is not defined", while one
-        # without found nothing, never entered that block, and ran
-        # perfectly. It is a Slave's quality feed and has nothing to do
-        # with DVB-T2 at all.
-        #
-        # Separate thread from remote_source_monitor rather than
-        # parsing both formats in one: the two ports update at
-        # different rates and a stall on either must not hold up the
-        # other.
-        threading.Thread(target=remote_quality_monitor, args=(_i,),
-                         daemon=True).start()
+    remote_start_enabled()
     # One sweep rather than a background discovery thread: an HDHomeRun
     # is installed once, not plugged in and out, and a receiver with
     # none should run no thread and send no broadcast - absent hardware
@@ -16875,14 +16904,7 @@ if __name__ == "__main__":
     # fatal — status, panels and every local source carry on exactly
     # as before; only Slave video would be unavailable, and the reason
     # is on the console and in /api/status rather than silent.
-    if remote_any_enabled():
-        # SRT first, so each Slave's loopback port is in place before the
-        # relay thread starts watching its sockets.
-        start_slave_srt_listeners()
-        if slave_relay.start():
-            print(f"[relay] Slave video ingress listening on {REMOTE_VIDEO_INGRESS_PORT}")
-        else:
-            print(f"[relay] NOT listening: {slave_relay.bind_error}")
+    remote_start_video()
     # Always started: BATC reachability is not conditional on anything
     # being configured, and it is what tells "nothing playing" apart
     # from "no internet" on the Stream panel.
