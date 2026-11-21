@@ -1172,8 +1172,12 @@ def _mpv_play_position() -> Optional[int]:
 
 
 # How long the HEVC join noise may last before the decoder counts as
-# wedged: a few GOPs of a slow QO-100 station (see wait_for_mpv_rendering).
-HEVC_SETTLE_MAX_SECS = 10.0
+# wedged (see wait_for_mpv_rendering). It only has to outlast the wait for
+# the first keyframe, at most one GOP; 20 s covers GOPs up to about 18 s,
+# as slow QO-100 stations may use. A normal station confirms as soon as
+# the decoder goes quiet, so only a truly wedged decoder waits it out
+# (21 Nov 2026; was 10 s).
+HEVC_SETTLE_MAX_SECS = 20.0
 
 
 def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
