@@ -5484,11 +5484,20 @@ def remote_source_monitor(index: int):
                 unlocked_states = {"search", "lost", ""}
                 if len(parts) >= 2 and parts[-1] not in unlocked_states:
                     st["locked"] = True
-                    st["callsign"] = parts[-1]
+                    # The first callsign-like word, as for a Picotuner
+                    # (rx_line_callsign), and the whole name as the
+                    # service. The Slave sends the service name, which
+                    # can be several words: "GB3OO HD" gave the callsign
+                    # "HD" and a blank Service (Bench Tuner, 21 Nov 2026).
+                    # "LOCKED" (no SDT) is a lock with neither.
+                    name = " ".join(parts[1:])
+                    st["callsign"] = rx_line_callsign(parts, unlocked_states)
+                    st["service"] = "" if name == "LOCKED" else name
                     st["frequency"] = parts[0].rstrip("TB")
                 else:
                     st["locked"] = False
                     st["callsign"] = ""
+                    st["service"] = ""
                     if parts:
                         st["frequency"] = parts[0].rstrip("TB")
         except socket.timeout:
