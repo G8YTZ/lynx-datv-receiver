@@ -342,6 +342,8 @@ state = {
     # mode-enumerating logic runs. True/False is the registry's answer.
     "sources_showing_picture": None,
     "portable_locator": "",
+    # The Remote Rx's locator while one is on screen; "" otherwise.
+    "remote_locator": "",
     "tri_watch_notification": None,   # the current "someone else wants in" message text, or None
     "pathfinder": None,              # end-of-contact card dict, or None if none is due
     # How long the switch cover waits before drawing anything - the same
@@ -876,6 +878,7 @@ def poll_status():
                 _srcs.get('showing_picture') if isinstance(_srcs, dict)
                 and 'showing_picture' in _srcs else None)
             state["portable_locator"] = lynx.get('portable_locator', '')
+            state["remote_locator"] = ""
             state["site_locator"] = lynx.get('site_locator', '')
             state["audio_device"] = lynx.get('audio_device', 'hdmi')
             state["audio_device_resolved"] = lynx.get('audio_device_resolved', '')
@@ -957,7 +960,13 @@ def poll_status():
             # design. Blank when the Slave has not reported one:
             # the line is then dropped, which beats confidently
             # showing somewhere else.
-            state["portable_locator"] = rem.get('locator', '')
+            #
+            # Its own line, "REMOTE: JO01IF" (21 Nov 2026). It used the
+            # portable line, so watching the Lenham Remote Rx said
+            # "PORTABLE: JO01IF", as if this receiver had been taken out
+            # portable, with GNSS off and no portable locator set.
+            state["portable_locator"] = ""
+            state["remote_locator"] = rem.get('locator', '')
             if rem.get('symbol_rate'):
                 state["sr_ks"] = rem['symbol_rate']
             # Two local tuners' worth of state, describing hardware
@@ -1647,6 +1656,8 @@ class LynxOverlay(Gtk.Window):
             # accident after a portable session ends.
             if state["portable_locator"]:
                 lines.append(f"PORTABLE: {state['portable_locator']}")
+            elif state.get("remote_locator"):
+                lines.append(f"REMOTE: {state['remote_locator']}")
 
             if state["diversity_enabled"]:
                 # Compact per-tuner MER/margin - one row per tuner,
