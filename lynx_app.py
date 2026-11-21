@@ -9706,13 +9706,13 @@ def config_page():
                     </div>
                 </div>
                 <div class="card mb-3">
-                    <div class="card-header">&#x1F4E1; Slave Rx (remote receiver)</div>
+                    <div class="card-header">&#x1F4E1; Remote Rx</div>
                     <div class="card-body">
                         <p class="text-muted small">
-                            Accepts tuner status from a receiver at another site, sent over
-                            the network, so a repeater can have an RF input somewhere it has
-                            no antenna. The remote end is a converted MiniTiouner and a Pi
-                            running the Lynx-Slave-Rx software.
+                            A receiver at another site, sending its picture and tuner status
+                            here over the network, so a repeater can have an RF input somewhere
+                            it has no antenna. The remote end is a Minitiouner and a Pi Zero 2 W:
+                            see slave/README.md in the Lynx repository.
                         </p>
                         <div class="form-check form-switch mb-3">
                             <input class="form-check-input" type="checkbox" id="rs-enabled">
@@ -9722,12 +9722,12 @@ def config_page():
                             <div class="col-6">
                                 <label class="form-label small mb-1" for="rs-status-port">Status port</label>
                                 <input type="number" min="1024" max="65535" step="1" class="form-control form-control-sm" id="rs-status-port">
-                                <div class="small text-muted mt-1">Must not be 9997</div>
+                                <div class="small text-muted mt-1">Not 9997: that is this receiver's own Picotuner.</div>
                             </div>
                             <div class="col-6">
                                 <label class="form-label small mb-1" for="rs-srt-port">SRT port</label>
                                 <input type="number" min="0" max="65535" step="1" class="form-control form-control-sm" id="rs-srt-port" placeholder="status port − 50">
-                                <div class="small text-muted mt-1">Blank: status port minus 50 (10947). Forward this UDP port for a Slave off-site.</div>
+                                <div class="small text-muted mt-1">Blank: status port minus 50 (10947). Forward this UDP port for a Remote Rx off-site.</div>
                             </div>
                         </div>
                         <div class="fw-semibold small mt-3 mb-1">Settings sent to the Remote Rx</div>
@@ -9758,11 +9758,7 @@ def config_page():
                             </div>
                         </div>
                         <div id="rs-warning" class="alert alert-warning py-2 px-2 small mb-2" style="display:none;"></div>
-                        <div class="text-muted small mb-2">
-                            9997 is the port this receiver's own Picotuner uses. A Slave
-                            sending there would collide with it, so the Slave gets its own.
-                        </div>
-                        <button class="btn btn-save" onclick="saveRemoteSource()">Save Slave Rx settings</button>
+                        <button class="btn btn-save" onclick="saveRemoteSource()">Save Remote Rx settings</button>
                         <span id="rs-status" class="save-status ms-2"></span>
                     </div>
                 </div>

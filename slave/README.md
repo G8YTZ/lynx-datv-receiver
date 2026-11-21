@@ -4,6 +4,10 @@ A Remote Rx is a small receiver at another site, built from a Raspberry Pi Zero 
 
 It needs no ports opening at the remote site: The Remote Rx always calls out to the repeater. Once it is built, everything else (frequency, symbol rate, name and locator) is set from the Lynx at the repeater, and the Remote Rx keeps those settings through a power cut.
 
+![Off-air picture from a Remote Rx](docs/remote-rx-off-air.jpg)
+
+*Received at Lenham (JO01IF) on 438 MHz and shown on the Lynx at home: The overlay says **REMOTE** and the Remote Rx's locator.*
+
 ![Remote Rx wiring](docs/remote-rx-wiring.svg)
 
 ## What you need
@@ -104,7 +108,9 @@ On the Lynx at the repeater, open the web page, then **Config**, **Remote Rx**:
 3. Paste the **key** from step 3.
 4. Click **Save**.
 
-Within a few seconds the Remote Rx panel appears with Settings: **Applied**, and the Remote Rx retunes. In the **Remote Receivers** box on the main page, click **Watch** to put it on screen. The overlay shows **REMOTE** and the locator.
+Within a few seconds the Remote Rx panel appears with Settings: **Applied**, and the Remote Rx retunes.
+
+![The Remote Rx panel at the repeater](docs/remote-rx-panel.png) In the **Remote Receivers** box on the main page, click **Watch** to put it on screen. The overlay shows **REMOTE** and the locator.
 
 ### Ports at the repeater
 
