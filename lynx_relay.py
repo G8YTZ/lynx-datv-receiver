@@ -28,6 +28,7 @@ Integration contract with lynx_app.py:
     relay.stop()
 """
 
+import json
 import logging
 import select
 import socket
@@ -486,6 +487,13 @@ SRT_LOOPBACK_BASE = 11100
 # broadband) normally wins; this is the floor for a Slave on the LAN.
 SRT_LISTEN_LATENCY_MS = 120
 
+# A statistics line every this many packets: about every 2.5 s at a
+# 2 MS/s Slave's rate, about every 15 s at 333 kS/s.
+STATS_EVERY_PACKETS = 600
+
+# No statistics for this long means the caller has gone.
+LINK_STALE_SECS = 20.0
+
 
 class SrtListener:
     """Keeps one srt-live-transmit listener running for one Slave:
@@ -504,12 +512,17 @@ class SrtListener:
         self.srt_port = srt_port
         self.loopback_port = loopback_port
         self.label = label
+        # -s:N -pf:json: a JSON statistics line every N packets, about every
+        # 2.5 s at a 2 MS/s Slave's rate. Read below for the panel.
         self.cmd = ["srt-live-transmit",
                     f"srt://:{srt_port}?mode=listener&latency={int(latency_ms)}",
-                    f"udp://127.0.0.1:{loopback_port}"]
+                    f"udp://127.0.0.1:{loopback_port}",
+                    f"-s:{STATS_EVERY_PACKETS}", "-pf:json"]
         self.proc = None
         self.starts = 0
         self.error = None
+        self._slock = threading.Lock()
+        self._reset_link()
         self._running = False
         self._thread = None
 
@@ -521,6 +534,83 @@ class SrtListener:
                                         name=f"srt-listener-{self.srt_port}")
         self._thread.start()
 
+    def _reset_link(self):
+        with self._slock:
+            self.connected = False
+            self.connected_since = None
+            self.connections = getattr(self, "connections", 0)
+            self.last_stats_at = 0.0
+            self.rtt_ms = None
+            self.mbps = None
+            self.latency_ms = None
+            self.buffer_ms = None
+            self.lost = 0
+            self.resent = 0
+            self.dropped = 0
+
+    def _line(self, line):
+        """One line of srt-live-transmit output: statistics, a connection
+        event, or a message worth keeping in the log."""
+        if line.startswith("{"):
+            try:
+                st = json.loads(line)
+            except ValueError:
+                return
+            link, recv = st.get("link", {}), st.get("recv", {})
+            with self._slock:
+                self.connected = True
+                self.connected_since = self.connected_since or time.time()
+                self.last_stats_at = time.time()
+                if "rtt" in link:
+                    self.rtt_ms = round(float(link["rtt"]), 1)
+                if "mbitRate" in recv:
+                    self.mbps = round(float(recv["mbitRate"]), 2)
+                self.latency_ms = recv.get("msTsbPdDelay", self.latency_ms)
+                self.buffer_ms = recv.get("msBuf", self.buffer_ms)
+                # Each report counts its own interval, so add them up.
+                self.lost += int(recv.get("packetsLost", 0))
+                self.resent += int(recv.get("packetsRetransmitted", 0))
+                self.dropped += int(recv.get("packetsDropped", 0))
+            return
+        if "Accepted SRT source connection" in line:
+            with self._slock:
+                self.connected = True
+                self.connected_since = time.time()
+                self.connections += 1
+        elif "disconnect" in line.lower() or "connection lost" in line.lower():
+            with self._slock:
+                self.connected = False
+                self.connected_since = None
+        # libsrt's own internal grumbles (epoll bookkeeping, "IPE") are
+        # noise in a repeater's log; everything else is kept.
+        if "IPE:" in line or "remove_usock" in line:
+            return
+        print(f"[srt {self.label}] {line}", flush=True)
+
+    def link(self):
+        """The link's state for the panel: connected, round trip, rate,
+        and lost, resent and dropped packets since this Slave connected."""
+        with self._slock:
+            # No statistics for a while means the caller has gone, even
+            # if srt-live-transmit has not said so yet.
+            live = self.connected and (
+                self.last_stats_at == 0 or time.time() - self.last_stats_at < LINK_STALE_SECS)
+            return {
+                "transport": "SRT",
+                "port": self.srt_port,
+                "connected": live,
+                "since": self.connected_since if live else None,
+                "connections": self.connections,
+                "rtt_ms": self.rtt_ms if live else None,
+                "mbps": self.mbps if live else None,
+                "latency_ms": self.latency_ms,
+                "buffer_ms": self.buffer_ms if live else None,
+                "lost": self.lost,
+                "resent": self.resent,
+                "dropped": self.dropped,
+                "error": self.error,
+            }
+
     def _run(self):
         while self._running:
             self.starts += 1
@@ -531,13 +621,16 @@ class SrtListener:
                 for line in self.proc.stdout:
                     line = line.strip()
                     if line:
-                        print(f"[srt {self.label}] {line}", flush=True)
+                        self._line(line)
                 self.proc.wait()
                 rc = self.proc.returncode
             except FileNotFoundError:
                 self.error = "srt-live-transmit not installed (sudo apt install srt-tools)"
                 print(f"[srt {self.label}] {self.error}", flush=True)
                 rc = None
+            with self._slock:
+                self.connected = False
+                self.connected_since = None
             if not self._running:
                 break
             print(f"[srt {self.label}] listener on {self.srt_port} exited (rc={rc}) - "

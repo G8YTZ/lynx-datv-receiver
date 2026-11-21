@@ -4372,6 +4372,25 @@ slave_relay = lynx_relay.SlaveVideoRelay(
 slave_srt_listeners = []
 
 
+slave_srt_by_index = {}
+
+
+def _slave_link_for(i: int) -> dict:
+    """SRT link figures for Slave i when it is connected over SRT;
+    otherwise "UDP" if video is arriving on the shared port, else None."""
+    lst = slave_srt_by_index.get(i)
+    if lst is not None:
+        link = lst.link()
+        if link["connected"]:
+            return link
+    vid = _relay_video_for(i) or {}
+    if vid.get("live"):
+        return {"transport": "UDP", "connected": True}
+    if lst is not None:
+        return lst.link()
+    return None
+
+
 def start_slave_srt_listeners():
     for i, cfg in enumerate(remote_sources_cfg()):
         if not cfg.get('enabled'):
@@ -4384,6 +4403,7 @@ def start_slave_srt_listeners():
         listener = lynx_relay.SrtListener(srt_port, loopback, f"slave {i}")
         listener.start()
         slave_srt_listeners.append(listener)
+        slave_srt_by_index[i] = listener
         print(f"[srt] Slave {i}: listening for SRT on port {srt_port}")
 
 
@@ -5919,6 +5939,9 @@ class RemoteSourceConfigUpdate(BaseModel):
     """
     enabled: bool = False
     status_port: int = 10997
+    # The SRT listener's port; 0 = the status port minus 50 (10947), which
+    # is what the Slave assumes too unless its conf says otherwise.
+    srt_port: int = 0
 
 
 class HdhomerunConfigUpdate(BaseModel):
@@ -8536,8 +8559,12 @@ def get_status():
                 "online": remote_online(i),
                 "locked": st["locked"],
                 "callsign": st["callsign"],
+                "service": st.get("service", ""),
                 "frequency": st["frequency"],
                 "rx1": st["rx1_raw"],
+                # How the video is arriving: SRT with its link figures, or
+                # plain UDP on the shared port (21 Nov 2026).
+                "link": _slave_link_for(i),
                 "name": remote_display_name(i),
                 "locator": st["locator"],
                 "status_port": st["status_port"],
@@ -9555,6 +9582,11 @@ def config_page():
                                 <input type="number" min="1024" max="65535" step="1" class="form-control form-control-sm" id="rs-status-port">
                                 <div class="small text-muted mt-1">Must not be 9997</div>
                             </div>
+                            <div class="col-6">
+                                <label class="form-label small mb-1" for="rs-srt-port">SRT port</label>
+                                <input type="number" min="0" max="65535" step="1" class="form-control form-control-sm" id="rs-srt-port" placeholder="status port − 50">
+                                <div class="small text-muted mt-1">Blank: status port minus 50 (10947). Forward this UDP port for a Slave off-site.</div>
+                            </div>
                         </div>
                         <div id="rs-warning" class="alert alert-warning py-2 px-2 small mb-2" style="display:none;"></div>
                         <div class="text-muted small mb-2">
@@ -10435,6 +10467,7 @@ async function loadCurrentConfig() {
         const rs = cfg.remote_source || {};
         document.getElementById('rs-enabled').checked = rs.enabled === true;
         document.getElementById('rs-status-port').value = rs.status_port ?? 10997;
+        document.getElementById('rs-srt-port').value = rs.srt_port ? rs.srt_port : '';
         updateRemoteSourceWarning();
         document.getElementById('rs-status-port').addEventListener('input', updateRemoteSourceWarning);
 
@@ -10966,7 +10999,8 @@ async function saveRemoteSource() {
     try {
         const body = { remote_source: {
             enabled: document.getElementById('rs-enabled').checked,
-            status_port: parseInt(document.getElementById('rs-status-port').value, 10)
+            status_port: parseInt(document.getElementById('rs-status-port').value, 10),
+            srt_port: parseInt(document.getElementById('rs-srt-port').value, 10) || 0
         }};
         const r = await fetch('/api/config', {
             method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
@@ -15358,7 +15392,7 @@ async function updateStatus() {
             // Locator in the header rather than as a row: it is the one
             // thing a Slave has that a local receiver does not, and putting
             // it in the rows is what stopped the two panels looking alike.
-            const label = '&#x1F4E1; ' + (rem.name || 'Slave Rx')
+            const label = '&#x1F4E1; ' + (rem.name || 'Remote Rx')
                         + (rem.locator ? ' — ' + rem.locator : '');
             setPanelState(id + '-header', id + '-status', label, st);
             // Deliberately the local receiver's row set, in its order and
@@ -15382,6 +15416,22 @@ async function updateStatus() {
                 // says so more honestly than something invented.
                 ['Firmware',    '—'],
             ];
+            // The link back to here (21 Nov 2026): SRT with its health,
+            // or plain UDP on the LAN.
+            const lk = rem.link;
+            if (lk && lk.transport === 'SRT') {
+                if (lk.connected) {
+                    rows.push(['Link', 'SRT, port ' + lk.port]);
+                    rows.push(['Round trip', lk.rtt_ms != null ? lk.rtt_ms + ' ms' : '—']);
+                    rows.push(['Link rate', lk.mbps != null ? lk.mbps.toFixed(2) + ' Mb/s' : '—']);
+                    rows.push(['SRT latency', lk.latency_ms != null ? lk.latency_ms + ' ms' : '—']);
+                    rows.push(['Lost / resent / dropped', lk.lost + ' / ' + lk.resent + ' / ' + lk.dropped]);
+                } else {
+                    rows.push(['Link', 'SRT, waiting on port ' + lk.port + (lk.error ? ' (' + lk.error + ')' : '')]);
+                }
+            } else if (lk && lk.transport === 'UDP') {
+                rows.push(['Link', 'UDP (LAN)']);
+            }
             document.getElementById(id + '-status').innerHTML = rows.map(r =>
                 '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;"><span>' + r[0] + '</span>' +
                 '<span class="status-value">' + r[1] + '</span></div>'

@@ -15,7 +15,8 @@ FREQ="1304000"
 SR="2000"
 
 # How this Slave introduces itself.
-NAME="Bench Tuner"
+# Shown on the repeater's panel, followed by the locator.
+NAME="Remote Rx"
 LOCATOR="JO01AJ"
 
 # Ports. The quality port is derived as STATUS_PORT minus 96 unless
