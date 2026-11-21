@@ -1171,6 +1171,11 @@ def _mpv_play_position() -> Optional[int]:
     return int(h) * 3600 + int(m) * 60 + int(sec)
 
 
+# How long the HEVC join noise may last before the decoder counts as
+# wedged: a few GOPs of a slow QO-100 station (see wait_for_mpv_rendering).
+HEVC_SETTLE_MAX_SECS = 10.0
+
+
 def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
     """Polls mpv's own log (freshly truncated by restart_mpv() just
     before this is called) for concrete evidence it has actually
@@ -1251,15 +1256,32 @@ def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
                 # wedged decoder putting out purple frames still has a
                 # moving clock, so that test passed a purple picture and
                 # left it on screen. Five beta testers saw exactly that.
+                #
+                # Keep looking for that quiet 2 s for up to
+                # HEVC_SETTLE_MAX_SECS after the markers, not just once.
+                # Join noise lasts until the first keyframe, and a low-rate
+                # station sends one only every few seconds: Martin G8KOE's
+                # own 333 kS SDR TV signal (3 s GOP) was still joining at
+                # the single 2 s look, so every start was judged wedged
+                # and restarted, for ever, with no picture (21 Nov 2026).
+                # A truly wedged decoder never goes quiet, so it is still
+                # caught, just a few seconds later.
                 still_erroring = False
                 if _recent_hevc_decoder_error(start_up):
-                    look_from = _kernel_uptime()
-                    time.sleep(2.0)
-                    if not _recent_hevc_decoder_error(look_from):
-                        print(f"[mpv_render] confirmed rendering after {elapsed:.1f}s "
-                              f"(HEVC decoder settled after joining between keyframes)")
-                        return True
                     still_erroring = True
+                    settle_by = time.time() + HEVC_SETTLE_MAX_SECS
+                    while time.time() < settle_by:
+                        if switch_generation != gen:
+                            print("[mpv_render] a newer tune or stream was asked for: "
+                                  "no longer waiting")
+                            return False
+                        look_from = _kernel_uptime()
+                        time.sleep(2.0)
+                        if not _recent_hevc_decoder_error(look_from):
+                            print(f"[mpv_render] confirmed rendering after "
+                                  f"{time.time() - start:.1f}s (HEVC decoder settled "
+                                  f"after joining between keyframes)")
+                            return True
                 if still_erroring:
                     print(f"[mpv_render] mpv log shows rendering markers after {elapsed:.1f}s, "
                           f"but a hardware HEVC decoder error was also just logged - treating "
