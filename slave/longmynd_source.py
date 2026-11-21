@@ -60,6 +60,7 @@ import threading
 import time
 
 import agc_table
+import srt_link
 
 # Lynx binds 9997 on all interfaces for its own local Picotuner, so a
 # Slave sending there would collide with the receiver's own tuner.
@@ -438,9 +439,21 @@ def main():
                     help="where the longmynd binary and its status fifo live")
     ap.add_argument("--tuner-timeout", type=float, default=0.6,
                     help="Longmynd -S scan width, its own default is 0.6")
+    ap.add_argument("--transport", choices=("udp", "srt"), default="udp",
+                    help="how the video reaches the repeater: plain UDP on a LAN, "
+                         "SRT anywhere else (status always stays UDP)")
+    ap.add_argument("--srt-port", type=int, default=None,
+                    help="the repeater's SRT listener for this Slave; defaults to "
+                         f"the status port minus {srt_link.SRT_PORT_OFFSET}, which "
+                         "is what Lynx derives")
+    ap.add_argument("--srt-latency", type=int, default=300,
+                    help="SRT latency in ms; about four round trips. 300 suits "
+                         "most broadband, a LAN needs far less")
     args = ap.parse_args()
     if args.quality_port is None:
         args.quality_port = args.status_port - QUALITY_PORT_OFFSET
+    if args.srt_port is None:
+        args.srt_port = args.status_port - srt_link.SRT_PORT_OFFSET
 
     if args.status_port == 9997:
         print("Refusing port 9997: Lynx binds that for its own local Picotuner.",
@@ -469,23 +482,40 @@ def main():
 
     threading.Thread(target=read_fifo, args=(fifo, tuner, stop), daemon=True).start()
 
+    sender = None
+    if args.transport == "srt":
+        srt_link.AlignerThread(stop).start()
+        sender = srt_link.SrtSender(args.host, args.srt_port, args.srt_latency,
+                                    args.name, stop)
+        sender.start()
+
     # TS straight to the repeater rather than to localhost and forwarded.
     # One fewer process, and Longmynd only emits a transport stream while
     # it is locked, so the "send video only when there is something to
     # send" rule needs no code here.
     #
-    # Plain UDP: the relay at the repeater end demuxes Slaves by source
-    # address, which SRT would hide. Fine on a LAN. A Slave across the
-    # internet needs SRT, and that wants deciding at both ends rather
-    # than bodged here.
+    # UDP: straight to the repeater's shared video port, told apart by
+    # source address. Fine on a LAN.
+    #
+    # SRT (21 Nov 2026): Longmynd sends to loopback, srt_link lines the
+    # stream up into whole 1316-byte groups and srt-live-transmit calls
+    # the repeater's listener for this Slave, which identifies it by
+    # port. Works across the internet and through NAT; status stays UDP.
+    if args.transport == "srt":
+        ts_host, ts_port = "127.0.0.1", srt_link.LONGMYND_LOCAL_PORT
+    else:
+        ts_host, ts_port = args.host, args.video_port
     cmd = [binary,
-           "-i", args.host, str(args.video_port),
+           "-i", ts_host, str(ts_port),
            "-S", str(args.tuner_timeout),
            str(args.freq), str(args.sr)]
 
     print(f"Slave Rx (Longmynd) -> {args.host}")
     print(f"  tuner  : {args.freq} kHz, {args.sr} kS/s")
-    print(f"  video  : UDP port {args.video_port}")
+    if args.transport == "srt":
+        print(f"  video  : SRT to port {args.srt_port}, latency {args.srt_latency} ms")
+    else:
+        print(f"  video  : UDP port {args.video_port}")
     print(f"  status : UDP port {args.status_port}, every {args.interval}s")
     print(f"  quality: UDP port {args.quality_port}")
     print(f"  name   : {args.name or '(not set - repeater will show a generic label)'}")
@@ -499,6 +529,8 @@ def main():
         stopping = True
         stop.set()
         status.running = False
+        if sender:
+            sender.terminate()
         if proc and proc.poll() is None:
             try:
                 os.killpg(os.getpgid(proc.pid), signal.SIGTERM)

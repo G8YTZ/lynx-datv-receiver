@@ -4363,6 +4363,30 @@ slave_relay = lynx_relay.SlaveVideoRelay(
 )
 
 
+# One SRT listener per enabled Slave (21 Nov 2026). A Slave set to SRT
+# calls its own port, the status port minus 50 (10947 for the first),
+# unless its config names srt_port; the listener hands the stream to the
+# relay on a loopback port of that Slave's own, so the relay knows whose
+# it is without looking at addresses. A Slave still on plain UDP keeps
+# using the shared port 10998: both work side by side.
+slave_srt_listeners = []
+
+
+def start_slave_srt_listeners():
+    for i, cfg in enumerate(remote_sources_cfg()):
+        if not cfg.get('enabled'):
+            continue
+        status_port = int(cfg.get('status_port', REMOTE_DEFAULT_STATUS_PORT))
+        srt_port = int(cfg.get('srt_port') or status_port - lynx_relay.SRT_PORT_OFFSET)
+        loopback = lynx_relay.SRT_LOOPBACK_BASE + i
+        if not slave_relay.bind_slave_port(loopback, i):
+            continue
+        listener = lynx_relay.SrtListener(srt_port, loopback, f"slave {i}")
+        listener.start()
+        slave_srt_listeners.append(listener)
+        print(f"[srt] Slave {i}: listening for SRT on port {srt_port}")
+
+
 def relay_refresh_sources():
     """Hand the relay the current address -> Slave index mapping.
 
@@ -16625,6 +16649,9 @@ if __name__ == "__main__":
     # as before; only Slave video would be unavailable, and the reason
     # is on the console and in /api/status rather than silent.
     if remote_any_enabled():
+        # SRT first, so each Slave's loopback port is in place before the
+        # relay thread starts watching its sockets.
+        start_slave_srt_listeners()
         if slave_relay.start():
             print(f"[relay] Slave video ingress listening on {REMOTE_VIDEO_INGRESS_PORT}")
         else:

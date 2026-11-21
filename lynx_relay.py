@@ -29,7 +29,9 @@ Integration contract with lynx_app.py:
 """
 
 import logging
+import select
 import socket
+import subprocess
 import threading
 import time
 
@@ -130,6 +132,11 @@ class SlaveVideoRelay:
 
         self.bind_error = None    # human-readable reason if the bind failed
 
+        # SRT Slaves (21 Nov 2026): each has its own loopback port, fed by
+        # its SRT listener, so the port says which Slave it is. Source
+        # addresses mean nothing here: everything comes from 127.0.0.1.
+        self._fixed = {}          # socket -> slave_id
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -173,11 +180,41 @@ class SlaveVideoRelay:
         self._thread.start()
         return True
 
+    def bind_slave_port(self, port, slave_id):
+        """Receive one Slave's video on a loopback port of its own.
+
+        For SRT Slaves: their listener writes here, and everything on this
+        port is that Slave's, whatever address it seems to come from.
+        Returns True if bound; a clash is logged, not fatal.
+        """
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF_BYTES)
+            except OSError:
+                pass
+            sock.bind(("127.0.0.1", port))
+        except OSError as exc:
+            log.error("relay: could not bind loopback port %d for %s: %s",
+                      port, slave_id, exc)
+            return False
+        with self._lock:
+            self._fixed[sock] = slave_id
+            self._stats.setdefault(slave_id, _SourceStats())
+        log.info("relay: Slave %s on loopback port %d", slave_id, port)
+        return True
+
     def stop(self):
         self._running = False
         if self._thread:
             self._thread.join(timeout=2.0)
             self._thread = None
+        for sock in list(self._fixed):
+            try:
+                sock.close()
+            except OSError:
+                pass
+        self._fixed.clear()
         for sock in (self._sock, self._out):
             if sock:
                 try:
@@ -203,8 +240,9 @@ class SlaveVideoRelay:
             self._sources = dict(mapping)
             for slave_id in self._sources.values():
                 self._stats.setdefault(slave_id, _SourceStats())
+            fixed_ids = set(self._fixed.values())
             for slave_id in list(self._stats):
-                if slave_id not in self._sources.values():
+                if slave_id not in self._sources.values() and slave_id not in fixed_ids:
                     del self._stats[slave_id]
             self._selected_ip = self._resolve_locked(self._selected)
 
@@ -280,25 +318,49 @@ class SlaveVideoRelay:
 
         while self._running:
             try:
-                data, addr = sock.recvfrom(RECV_SIZE)
-            except socket.timeout:
+                ready, _, _ = select.select([sock] + list(self._fixed), [], [], 0.5)
+            except (OSError, ValueError) as exc:
+                if self._running:
+                    log.error("relay select failed: %s", exc)
+                break
+            if not ready:
                 self._maybe_sample(next_sample)
                 next_sample = self._advance(next_sample)
                 continue
-            except OSError as exc:
-                if self._running:
-                    log.error("relay recv failed: %s", exc)
-                break
+            for rsock in ready:
+                try:
+                    data, addr = rsock.recvfrom(RECV_SIZE)
+                except OSError as exc:
+                    if self._running:
+                        log.debug("relay recv failed: %s", exc)
+                    continue
+                self._handle(rsock, data, addr, out)
 
-            ip = addr[0]
             now = time.time()
+            if now >= next_sample:
+                self._maybe_sample(next_sample)
+                next_sample = self._advance(next_sample)
 
+        log.info("relay thread exiting")
+
+    def _handle(self, rsock, data, addr, out):
+        """One datagram: count it against its Slave and forward it if that
+        Slave is selected. A loopback port belongs to one SRT Slave; on the
+        shared port, the source address says who sent it."""
+        ip = addr[0]
+        now = time.time()
+        if True:
             # Hot path: read the small amount of shared state under the lock,
             # then do the sendto outside it so a slow socket can't block the
             # plug switch or the status monitor.
             with self._lock:
-                slave_id = self._sources.get(ip)
-                forward = (ip == self._selected_ip)
+                fixed_id = self._fixed.get(rsock)
+                if fixed_id is not None:
+                    slave_id = fixed_id
+                    forward = (fixed_id == self._selected)
+                else:
+                    slave_id = self._sources.get(ip)
+                    forward = (ip == self._selected_ip)
                 if slave_id is not None:
                     st = self._stats.get(slave_id)
                     if st is None:
@@ -315,12 +377,6 @@ class SlaveVideoRelay:
                         out.sendto(datagram, self.mpv_addr)
                     except OSError as exc:
                         log.debug("forward to mpv failed: %s", exc)
-
-            if now >= next_sample:
-                self._maybe_sample(next_sample)
-                next_sample = self._advance(next_sample)
-
-        log.info("relay thread exiting")
 
     def _align(self, data):
         """Turn arbitrary-length chunks into whole, sync-aligned TS
@@ -411,6 +467,90 @@ if __name__ == "__main__":
             print(relay.stats())
     except KeyboardInterrupt:
         relay.stop()
+
+
+# ──────────────────────────────────────────────────────────────────
+# SRT listener for one Slave
+# ──────────────────────────────────────────────────────────────────
+
+# A Slave's SRT arrives on its status port minus this, derived the same
+# way at both ends (slave/srt_link.py), as the quality port is.
+SRT_PORT_OFFSET = 50
+
+# Loopback ports the listeners hand video to the relay on: this plus the
+# Slave's index. Never on the network.
+SRT_LOOPBACK_BASE = 11100
+
+# The listener's own latency. SRT uses the larger of the two ends, so the
+# Slave's setting (300 ms by default, about four round trips on
+# broadband) normally wins; this is the floor for a Slave on the LAN.
+SRT_LISTEN_LATENCY_MS = 120
+
+
+class SrtListener:
+    """Keeps one srt-live-transmit listener running for one Slave:
+    SRT in on the Slave's port, plain UDP out to its loopback port.
+
+    One per Slave rather than one shared port: srt-live-transmit, and
+    GStreamer's srtsrc, take one caller at a time, and the port is what
+    identifies the Slave once everything arrives from loopback. Restarted
+    whenever it exits, so a Slave dropping off and calling again is
+    picked up without anyone touching the repeater.
+    """
+
+    RESTART_DELAY_SECS = 2.0
+
+    def __init__(self, srt_port, loopback_port, label, latency_ms=SRT_LISTEN_LATENCY_MS):
+        self.srt_port = srt_port
+        self.loopback_port = loopback_port
+        self.label = label
+        self.cmd = ["srt-live-transmit",
+                    f"srt://:{srt_port}?mode=listener&latency={int(latency_ms)}",
+                    f"udp://127.0.0.1:{loopback_port}"]
+        self.proc = None
+        self.starts = 0
+        self.error = None
+        self._running = False
+        self._thread = None
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name=f"srt-listener-{self.srt_port}")
+        self._thread.start()
+
+    def _run(self):
+        while self._running:
+            self.starts += 1
+            try:
+                self.proc = subprocess.Popen(self.cmd, stdout=subprocess.PIPE,
+                                             stderr=subprocess.STDOUT, text=True)
+                self.error = None
+                for line in self.proc.stdout:
+                    line = line.strip()
+                    if line:
+                        print(f"[srt {self.label}] {line}", flush=True)
+                self.proc.wait()
+                rc = self.proc.returncode
+            except FileNotFoundError:
+                self.error = "srt-live-transmit not installed (sudo apt install srt-tools)"
+                print(f"[srt {self.label}] {self.error}", flush=True)
+                rc = None
+            if not self._running:
+                break
+            print(f"[srt {self.label}] listener on {self.srt_port} exited (rc={rc}) - "
+                  f"listening again in {self.RESTART_DELAY_SECS:.0f}s", flush=True)
+            time.sleep(self.RESTART_DELAY_SECS)
+
+    def stop(self):
+        self._running = False
+        if self.proc and self.proc.poll() is None:
+            try:
+                self.proc.terminate()
+            except OSError:
+                pass
 
 
 # ──────────────────────────────────────────────────────────────────

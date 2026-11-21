@@ -27,3 +27,12 @@ VIDEO_PORT="10998"
 
 # Heartbeat cadence in seconds.
 INTERVAL="2.0"
+
+# How the video reaches the repeater: "udp" on a LAN, "srt" anywhere
+# else. Status always stays UDP. The repeater listens for this Slave's
+# SRT on its status port minus 50 (10947 here) unless set; set it only
+# if Lynx's Slave settings say otherwise.
+TRANSPORT="udp"
+#SRT_PORT="10947"
+# SRT latency in ms: about four round trips. 300 suits most broadband.
+SRT_LATENCY="300"

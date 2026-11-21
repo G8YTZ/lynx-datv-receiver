@@ -19,7 +19,13 @@ ARGS=("$LYNX_HOST" --freq "$FREQ" --sr "$SR")
 [ -n "${VIDEO_PORT:-}" ]   && ARGS+=(--video-port "$VIDEO_PORT")
 [ -n "${QUALITY_PORT:-}" ] && ARGS+=(--quality-port "$QUALITY_PORT")
 [ -n "${INTERVAL:-}" ]     && ARGS+=(--interval "$INTERVAL")
+[ -n "${TRANSPORT:-}" ]    && ARGS+=(--transport "$TRANSPORT")
+[ -n "${SRT_PORT:-}" ]     && ARGS+=(--srt-port "$SRT_PORT")
+[ -n "${SRT_LATENCY:-}" ]  && ARGS+=(--srt-latency "$SRT_LATENCY")
 
 # -u so output reaches the journal as it happens rather than when a
 # buffer fills. Without it a crash can lose the lines explaining it.
-exec /usr/bin/python3 -u "/home/pi/longmynd_source.py" "${ARGS[@]}"
+# From the repo checkout, so a git pull updates the Slave. LYNX_SLAVE_DIR
+# in the conf points elsewhere if the checkout lives somewhere else.
+SLAVE_DIR="${LYNX_SLAVE_DIR:-/home/pi/lynx-datv-receiver/slave}"
+exec /usr/bin/python3 -u "$SLAVE_DIR/longmynd_source.py" "${ARGS[@]}"
