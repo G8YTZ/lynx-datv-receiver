@@ -31,6 +31,8 @@
 
 import asyncio
 import faulthandler
+import hashlib
+import hmac
 import json
 import threading
 import base64
@@ -5463,6 +5465,76 @@ def remote_quality_monitor(index: int):
             time.sleep(2)
 
 
+# ── Remote configuration of a Slave (21 Nov 2026) ──────────────────────
+# The Master answers a Slave's heartbeat with that Slave's settings
+# whenever the Slave is running an older version. Signed with the key
+# shared at build time, so nobody else can retune a Slave; versioned with
+# the time Save was pressed, so a replayed old packet cannot wind it back.
+REMOTE_CFG_MAGIC = "LYNXCFG1"
+REMOTE_CFG_FIELDS = ("freq_khz", "sr", "name", "locator")
+
+
+def remote_wanted_settings(i: int):
+    """The settings this Master wants Slave i to run, or None when it has
+    none to give (no key, or no frequency and symbol rate yet)."""
+    cfgs = remote_sources_cfg()
+    if i >= len(cfgs):
+        return None
+    cfg = cfgs[i]
+    key = str(cfg.get("key") or "").strip()
+    try:
+        freq, sr = int(cfg.get("freq_khz") or 0), int(cfg.get("sr") or 0)
+    except (TypeError, ValueError):
+        return None
+    if not key or freq <= 0 or sr <= 0:
+        return None
+    return {
+        "key": key,
+        "body": {"v": int(cfg.get("settings_version") or 0), "freq_khz": freq, "sr": sr,
+                 "name": str(cfg.get("name") or ""), "locator": str(cfg.get("locator") or "")},
+    }
+
+
+def remote_settings_packet(body: dict, key: str) -> bytes:
+    """MAGIC, the settings as JSON, and an HMAC-SHA256 of both, one per line."""
+    head = REMOTE_CFG_MAGIC + "\n" + json.dumps(body, separators=(",", ":"))
+    sig = hmac.new(key.encode(), head.encode(), hashlib.sha256).hexdigest()
+    return (head + "\n" + sig + "\n").encode()
+
+
+def remote_send_settings_if_due(i: int, sock, addr):
+    st = remote_states[i]
+    if not st.get("cfg_capable"):
+        return   # an older Slave, or one with no key: nothing it could apply
+    want = remote_wanted_settings(i)
+    if want is None or st.get("cfg_version") == want["body"]["v"]:
+        return
+    try:
+        sock.sendto(remote_settings_packet(want["body"], want["key"]), addr)
+        if st.get("cfg_sent_v") != want["body"]["v"]:
+            st["cfg_sent_v"] = want["body"]["v"]
+            print(f"[remote {i}] sending settings version {want['body']['v']} "
+                  f"(Slave has {st.get('cfg_version')})")
+    except OSError as e:
+        print(f"[remote {i}] could not send settings: {e}")
+
+
+def remote_settings_state(i: int) -> dict:
+    """For the panel: is the Slave running what this Master wants?"""
+    st = remote_states[i]
+    want = remote_wanted_settings(i)
+    if not st.get("cfg_capable"):
+        state = "no key on the Slave" if st.get("cfg_capable") is False else "not reported"
+    elif want is None:
+        state = "not set here"
+    elif st.get("cfg_version") == want["body"]["v"]:
+        state = "applied"
+    else:
+        state = "sending"
+    return {"state": state, "applied": st.get("cfg_version"),
+            "wanted": want["body"]["v"] if want else None}
+
+
 def remote_source_monitor(index: int):
     """Background thread: reads one Slave Rx's status on its own port.
 
@@ -5505,6 +5577,14 @@ def remote_source_monitor(index: int):
 
             for line in data.decode(errors='replace').splitlines():
                 line = line.strip()
+                if line.startswith("CFG"):
+                    # "CFG <version>": the settings the Slave is running,
+                    # or "CFG -" for a Slave with no key, which cannot be
+                    # configured from here (21 Nov 2026).
+                    v = line[3:].strip()
+                    st["cfg_version"] = int(v) if v.isdigit() else None
+                    st["cfg_capable"] = v != "-"
+                    continue
                 if line.startswith("SITE"):
                     # "SITE <locator> <name>" - locator first because a
                     # name contains spaces and a locator does not, so
@@ -5544,6 +5624,10 @@ def remote_source_monitor(index: int):
                     st["service"] = ""
                     if parts:
                         st["frequency"] = parts[0].rstrip("TB")
+            # The reply goes back to the address and port the heartbeat came
+            # from: the Slave's router keeps that path open, so this works
+            # behind NAT with no port forwarding at the Slave's site.
+            remote_send_settings_if_due(index, sock, addr)
         except socket.timeout:
             pass
         except Exception as e:
@@ -5942,6 +6026,13 @@ class RemoteSourceConfigUpdate(BaseModel):
     # The SRT listener's port; 0 = the status port minus 50 (10947), which
     # is what the Slave assumes too unless its conf says otherwise.
     srt_port: int = 0
+    # Remote configuration: the key shared with the Slave at build time,
+    # and the settings sent to it. A settings_version is stamped on save.
+    key: str = ""
+    freq_khz: int = 0
+    sr: int = 0
+    name: str = ""
+    locator: str = ""
 
 
 class HdhomerunConfigUpdate(BaseModel):
@@ -8565,6 +8656,7 @@ def get_status():
                 # How the video is arriving: SRT with its link figures, or
                 # plain UDP on the shared port (21 Nov 2026).
                 "link": _slave_link_for(i),
+                "settings": remote_settings_state(i),
                 "name": remote_display_name(i),
                 "locator": st["locator"],
                 "status_port": st["status_port"],
@@ -9588,6 +9680,33 @@ def config_page():
                                 <div class="small text-muted mt-1">Blank: status port minus 50 (10947). Forward this UDP port for a Slave off-site.</div>
                             </div>
                         </div>
+                        <div class="fw-semibold small mt-3 mb-1">Settings sent to the Remote Rx</div>
+                        <p class="text-muted small mb-2">
+                            Sent in reply to its heartbeat, so no port is needed at its site. It keeps them
+                            through a power cut. Needs the key printed when the Remote Rx was installed.
+                        </p>
+                        <div class="row g-2 mb-2">
+                            <div class="col-6">
+                                <label class="form-label small mb-1" for="rs-freq">Frequency (MHz)</label>
+                                <input type="number" min="0" step="0.001" class="form-control form-control-sm" id="rs-freq" placeholder="1304.000">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label small mb-1" for="rs-sr">Symbol rate (kS/s)</label>
+                                <input type="number" min="0" step="1" class="form-control form-control-sm" id="rs-sr" placeholder="2000">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label small mb-1" for="rs-name">Name</label>
+                                <input type="text" maxlength="40" class="form-control form-control-sm" id="rs-name" placeholder="Remote Rx">
+                            </div>
+                            <div class="col-6">
+                                <label class="form-label small mb-1" for="rs-locator">Locator</label>
+                                <input type="text" maxlength="10" class="form-control form-control-sm" id="rs-locator" placeholder="JO01AJ">
+                            </div>
+                            <div class="col-12">
+                                <label class="form-label small mb-1" for="rs-key">Key</label>
+                                <input type="password" autocomplete="off" class="form-control form-control-sm" id="rs-key" placeholder="from the Remote Rx's install">
+                            </div>
+                        </div>
                         <div id="rs-warning" class="alert alert-warning py-2 px-2 small mb-2" style="display:none;"></div>
                         <div class="text-muted small mb-2">
                             9997 is the port this receiver's own Picotuner uses. A Slave
@@ -10468,6 +10587,14 @@ async function loadCurrentConfig() {
         document.getElementById('rs-enabled').checked = rs.enabled === true;
         document.getElementById('rs-status-port').value = rs.status_port ?? 10997;
         document.getElementById('rs-srt-port').value = rs.srt_port ? rs.srt_port : '';
+        // The first Slave's settings: remote_sources[0] once saved,
+        // remote_source on an older config.
+        const rs0 = (cfg.remote_sources && cfg.remote_sources[0]) || rs;
+        document.getElementById('rs-freq').value = rs0.freq_khz ? (rs0.freq_khz / 1000).toFixed(3) : '';
+        document.getElementById('rs-sr').value = rs0.sr || '';
+        document.getElementById('rs-name').value = rs0.name || '';
+        document.getElementById('rs-locator').value = rs0.locator || '';
+        document.getElementById('rs-key').value = rs0.key || '';
         updateRemoteSourceWarning();
         document.getElementById('rs-status-port').addEventListener('input', updateRemoteSourceWarning);
 
@@ -11000,13 +11127,18 @@ async function saveRemoteSource() {
         const body = { remote_source: {
             enabled: document.getElementById('rs-enabled').checked,
             status_port: parseInt(document.getElementById('rs-status-port').value, 10),
-            srt_port: parseInt(document.getElementById('rs-srt-port').value, 10) || 0
+            srt_port: parseInt(document.getElementById('rs-srt-port').value, 10) || 0,
+            freq_khz: Math.round((parseFloat(document.getElementById('rs-freq').value) || 0) * 1000),
+            sr: parseInt(document.getElementById('rs-sr').value, 10) || 0,
+            name: document.getElementById('rs-name').value.trim(),
+            locator: document.getElementById('rs-locator').value.trim().toUpperCase(),
+            key: document.getElementById('rs-key').value.trim()
         }};
         const r = await fetch('/api/config', {
             method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
         });
         if (!r.ok) throw new Error(await r.text());
-        statusEl.textContent = 'Saved - restart required.';
+        statusEl.textContent = 'Saved. Settings go to the Remote Rx within seconds; a new port needs a restart.';
         statusEl.className = 'save-status text-success';
     } catch (e) {
         statusEl.textContent = 'Save failed - see console.';
@@ -14260,7 +14392,14 @@ def update_config(req: ConfigUpdateRequest):
             if not isinstance(srcs, list) or not srcs:
                 existing = on_disk.get('remote_source')
                 srcs = [dict(existing)] if isinstance(existing, dict) and existing else [{}]
-            srcs[0].update(req.remote_source.model_dump())
+            new = req.remote_source.model_dump()
+            # Stamp the time of saving as the settings version whenever
+            # anything the Slave runs (or its key) changes. Time always goes
+            # up, even after a config restore, and the Slave only ever
+            # accepts a newer version.
+            if any(srcs[0].get(k) != new.get(k) for k in REMOTE_CFG_FIELDS + ("key",)):
+                new["settings_version"] = int(time.time())
+            srcs[0].update(new)
             on_disk['remote_sources'] = srcs
             on_disk.pop('remote_source', None)
 
@@ -15431,6 +15570,13 @@ async function updateStatus() {
                 }
             } else if (lk && lk.transport === 'UDP') {
                 rows.push(['Link', 'UDP (LAN)']);
+            }
+            const se = rem.settings;
+            if (se && se.state !== 'not reported') {
+                const word = {applied: 'Applied', sending: 'Sending…',
+                              'not set here': 'Not set on this receiver',
+                              'no key on the Slave': 'No key on the Remote Rx'}[se.state] || se.state;
+                rows.push(['Settings', word]);
             }
             document.getElementById(id + '-status').innerHTML = rows.map(r =>
                 '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;"><span>' + r[0] + '</span>' +

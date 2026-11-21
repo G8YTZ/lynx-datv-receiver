@@ -50,6 +50,9 @@ the repeater.
 """
 
 import argparse
+import hashlib
+import hmac
+import json
 import os
 import re
 import signal
@@ -151,6 +154,71 @@ RESTART_DELAY_SECS = 5.0
 LOCKED_STATES = {3, 4}
 
 STATUS_RE = re.compile(r"^\$(\d+),(.*)$")
+
+# Remote configuration (21 Nov 2026). The repeater answers our heartbeat
+# with our settings when we are running an older version; we check its
+# signature with the key shared at install, save them so a power cut
+# brings us back the same, and restart to apply them.
+SETTINGS_MAGIC = "LYNXCFG1"
+DEFAULT_SETTINGS_FILE = "/var/lib/lynx-slave/settings.json"
+
+
+def load_settings(path):
+    """The last settings the repeater sent, or {} if there are none."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(path, data):
+    """Write the settings so that a power cut at any moment leaves either
+    the old file or the new one, never half of one: write a temporary
+    file, flush it to the card, rename it over the old one, flush the
+    directory. The previous version is kept beside it."""
+    d = os.path.dirname(path)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    if os.path.exists(path):
+        try:
+            os.replace(path, path + ".prev")
+        except OSError:
+            pass
+    os.replace(tmp, path)
+    fd = os.open(d, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def parse_settings_packet(data: bytes, key: str):
+    """The settings in a reply from the repeater, or None if it is not
+    one, is not signed with our key, or is malformed."""
+    try:
+        magic, body, sig = data.decode().split("\n")[:3]
+    except (UnicodeDecodeError, ValueError):
+        return None
+    if magic != SETTINGS_MAGIC:
+        return None
+    want = hmac.new(key.encode(), (magic + "\n" + body).encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(want, sig.strip()):
+        return None
+    try:
+        st = json.loads(body)
+        st["v"], st["freq_khz"], st["sr"] = int(st["v"]), int(st["freq_khz"]), int(st["sr"])
+    except (ValueError, KeyError, TypeError):
+        return None
+    if st["freq_khz"] <= 0 or st["sr"] <= 0:
+        return None
+    st["name"] = str(st.get("name", ""))[:40]
+    st["locator"] = str(st.get("locator", ""))[:10]
+    return st
 
 
 class TunerState:
@@ -367,14 +435,24 @@ class StatusSender(threading.Thread):
         self.tuner = tuner
         self.running = True
         self.sent = 0
+        # Bound now, so the settings receiver can listen on it from the
+        # start: the repeater replies to the address and port our
+        # heartbeat comes from, which is what gets through NAT.
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("", 0))
 
     def run(self):
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock = self.sock
         site = build_site_line(self.args.name, self.args.locator) if self.args.name else None
+        # "CFG <version>": the settings we are running, so the repeater
+        # knows whether to send newer ones. "CFG -": no key, so none can
+        # be applied here.
+        cfg_line = f"CFG {self.args.settings_version}" if self.args.key else "CFG -"
         while self.running:
             snap = self.tuner.snapshot()
             rx = build_status_line(snap, self.args)
             payload = f"{site}\n{rx}" if site else rx
+            payload += "\n" + cfg_line
             try:
                 sock.sendto((payload + "\n").encode(),
                             (self.args.host, self.args.status_port))
@@ -393,6 +471,43 @@ class StatusSender(threading.Thread):
                 # it is the end nobody can reach to restart anything.
                 print(f"[status] send failed ({e}) - continuing", file=sys.stderr)
             time.sleep(self.args.interval)
+
+
+class SettingsReceiver(threading.Thread):
+    """Listens on the heartbeat's own socket for settings from the
+    repeater. A newer, correctly signed set is saved, then the service
+    restarts itself to apply it (systemd brings it back in about five
+    seconds, reading the saved file)."""
+
+    def __init__(self, args, sock, on_new):
+        super().__init__(daemon=True, name="settings")
+        self.args = args
+        self.sock = sock
+        self.on_new = on_new
+
+    def run(self):
+        while True:
+            try:
+                data, addr = self.sock.recvfrom(4096)
+            except OSError:
+                time.sleep(1)
+                continue
+            st = parse_settings_packet(data, self.args.key)
+            if st is None:
+                continue
+            if st["v"] <= self.args.settings_version:
+                continue   # what we have, or older: a late or replayed packet
+            try:
+                save_settings(self.args.settings_file, st)
+            except OSError as e:
+                print(f"[settings] could not save {self.args.settings_file}: {e}",
+                      file=sys.stderr)
+                continue
+            print(f"[settings] version {st['v']} from {addr[0]}: "
+                  f"{st['freq_khz']} kHz, {st['sr']} kS/s, name {st['name']!r}, "
+                  f"locator {st['locator']!r} - saved, restarting to apply")
+            self.on_new()
+            return
 
 
 def read_fifo(path: str, tuner: TunerState, stop: threading.Event):
@@ -446,6 +561,13 @@ def main():
                     help="the repeater's SRT listener for this Slave; defaults to "
                          f"the status port minus {srt_link.SRT_PORT_OFFSET}, which "
                          "is what Lynx derives")
+    ap.add_argument("--key", default="",
+                    help="shared with the repeater, which signs the settings it "
+                         "sends with it; without one the Slave cannot be configured "
+                         "remotely")
+    ap.add_argument("--settings-file", default=DEFAULT_SETTINGS_FILE,
+                    help="where settings from the repeater are kept, so a power "
+                         "cut brings the Slave back the same")
     ap.add_argument("--srt-latency", type=int, default=300,
                     help="SRT latency in ms; about four round trips. 300 suits "
                          "most broadband, a LAN needs far less")
@@ -454,6 +576,18 @@ def main():
         args.quality_port = args.status_port - QUALITY_PORT_OFFSET
     if args.srt_port is None:
         args.srt_port = args.status_port - srt_link.SRT_PORT_OFFSET
+
+    # Settings from the repeater win over the conf: they are the latest
+    # thing anyone asked for, and they survive a power cut on the card.
+    saved = load_settings(args.settings_file) if args.key else {}
+    args.settings_version = int(saved.get("v", 0) or 0)
+    if saved:
+        args.freq = int(saved.get("freq_khz") or args.freq)
+        args.sr = int(saved.get("sr") or args.sr)
+        if saved.get("name"):
+            args.name = saved["name"]
+        if "locator" in saved:
+            args.locator = saved["locator"]
 
     if args.status_port == 9997:
         print("Refusing port 9997: Lynx binds that for its own local Picotuner.",
@@ -519,6 +653,8 @@ def main():
     print(f"  status : UDP port {args.status_port}, every {args.interval}s")
     print(f"  quality: UDP port {args.quality_port}")
     print(f"  name   : {args.name or '(not set - repeater will show a generic label)'}")
+    print(f"  config : " + (f"remote, settings version {args.settings_version}"
+                            if args.key else "local only (no KEY in the conf)"))
     print("Ctrl-C to stop.\n")
 
     proc = None
@@ -539,6 +675,11 @@ def main():
 
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
+
+    if args.key:
+        # New settings: stop cleanly; systemd restarts us with them.
+        SettingsReceiver(args, status.sock,
+                         lambda: os.kill(os.getpid(), signal.SIGTERM)).start()
 
     last_reported = None
     while not stopping:

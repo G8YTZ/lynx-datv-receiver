@@ -33,6 +33,18 @@ else
     done
 fi
 
+# Remote configuration: a key shared with the repeater, and somewhere
+# the service (running as pi) can keep the settings it is sent.
+sudo install -d -o pi -g pi -m 755 /var/lib/lynx-slave
+if ! grep -q '^KEY=' "$conf"; then
+    key="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+    echo "KEY=\"$key\"" | sudo tee -a "$conf" >/dev/null
+    echo
+    echo "This Remote Rx's key (enter it in Lynx: Config, Slave Rx, Key):"
+    echo "    $key"
+    echo
+fi
+
 # The wrapper runs the Python from this checkout. Say so in the conf if
 # the checkout is somewhere other than the default.
 default_dir=/home/pi/lynx-datv-receiver/slave

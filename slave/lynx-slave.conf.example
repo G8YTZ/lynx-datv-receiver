@@ -37,3 +37,11 @@ TRANSPORT="udp"
 #SRT_PORT="10947"
 # SRT latency in ms: about four round trips. 300 suits most broadband.
 SRT_LATENCY="300"
+
+# Remote configuration. The repeater signs the settings it sends with
+# this key; enter the same key in Lynx's Config page, Slave Rx section.
+# install.sh makes one if there is none. Settings received are kept in
+# /var/lib/lynx-slave/settings.json and win over FREQ, SR, NAME and
+# LOCATOR above, so after a power cut the Slave comes back as it was
+# last told. Delete that file to go back to the values above.
+#KEY=""

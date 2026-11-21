@@ -22,6 +22,7 @@ ARGS=("$LYNX_HOST" --freq "$FREQ" --sr "$SR")
 [ -n "${TRANSPORT:-}" ]    && ARGS+=(--transport "$TRANSPORT")
 [ -n "${SRT_PORT:-}" ]     && ARGS+=(--srt-port "$SRT_PORT")
 [ -n "${SRT_LATENCY:-}" ]  && ARGS+=(--srt-latency "$SRT_LATENCY")
+[ -n "${KEY:-}" ]          && ARGS+=(--key "$KEY")
 
 # -u so output reaches the journal as it happens rather than when a
 # buffer fills. Without it a crash can lose the lines explaining it.
