@@ -202,6 +202,33 @@ def save_settings(path, data):
         os.close(fd)
 
 
+def local_version(slave_dir: str):
+    """This checkout's short commit and branch, or ("-", "-").
+
+    Read once at start-up rather than per heartbeat: it only changes
+    when the Remote Rx is updated, and that restarts the service.
+
+    A Remote Rx installed by copying files rather than by cloning has
+    no git metadata, and a repeater that cannot be told what the remote
+    is running simply says so instead of guessing.
+    """
+    def git(*a):
+        try:
+            out = subprocess.run(["git", "-C", slave_dir, *a],
+                                 capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return ""
+        return out.stdout.strip() if out.returncode == 0 else ""
+
+    commit = git("rev-parse", "--short", "HEAD")
+    branch = git("rev-parse", "--abbrev-ref", "HEAD")
+    # A dirty checkout is worth flagging: it means somebody edited the
+    # Remote Rx in place, and an update would overwrite their work.
+    if commit and git("status", "--porcelain"):
+        commit += "+"
+    return (commit or "-", branch or "-")
+
+
 def parse_settings_packet(data: bytes, key: str):
     """The settings in a reply from the repeater, or None if it is not
     one, is not signed with our key, or is malformed."""
@@ -453,11 +480,15 @@ class StatusSender(threading.Thread):
         # knows whether to send newer ones. "CFG -": no key, so none can
         # be applied here.
         cfg_line = f"CFG {self.args.settings_version}" if self.args.key else "CFG -"
+        # "VER <commit> <branch>": what code this Remote Rx is running,
+        # so the repeater can say whether it is behind. Fixed two
+        # fields, "-" when unknown, so the parser never has to guess.
+        ver_line = f"VER {self.args.version_commit} {self.args.version_branch}"
         while self.running:
             snap = self.tuner.snapshot()
             rx = build_status_line(snap, self.args)
             payload = f"{site}\n{rx}" if site else rx
-            payload += "\n" + cfg_line
+            payload += "\n" + cfg_line + "\n" + ver_line
             try:
                 sock.sendto((payload + "\n").encode(),
                             (self.args.host, self.args.status_port))
@@ -585,6 +616,11 @@ def main():
     # Settings from the repeater win over the conf: they are the latest
     # thing anyone asked for, and they survive a power cut on the card.
     saved = load_settings(args.settings_file) if args.key else {}
+    # What code this Remote Rx is running, read once from its own
+    # checkout rather than per heartbeat.
+    args.version_commit, args.version_branch = local_version(
+        os.path.dirname(os.path.abspath(__file__)))
+
     args.settings_version = int(saved.get("v", 0) or 0)
     if saved:
         args.freq = int(saved.get("freq_khz") or args.freq)
@@ -658,6 +694,7 @@ def main():
     print(f"  status : UDP port {args.status_port}, every {args.interval}s")
     print(f"  quality: UDP port {args.quality_port}")
     print(f"  name   : {args.name or '(not set - repeater will show a generic label)'}")
+    print(f"  version: {args.version_commit} on {args.version_branch}")
     print(f"  config : " + (f"remote, settings version {args.settings_version}"
                             if args.key else "local only (no KEY in the conf)"))
     print("Ctrl-C to stop.\n")

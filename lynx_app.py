@@ -5569,6 +5569,44 @@ def remote_send_settings_if_due(i: int, sock, addr):
         print(f"[remote {i}] could not send settings: {e}")
 
 
+def lynx_local_version():
+    """This receiver's own short commit and branch, or ("-", "-").
+
+    Uses git_cmd rather than its own subprocess call, so it inherits
+    the non-interactive environment that stops git trying to prompt for
+    credentials where there is no terminal to prompt on.
+    """
+    ok_c, commit = git_cmd("rev-parse", "--short", "HEAD")
+    ok_b, branch = git_cmd("rev-parse", "--abbrev-ref", "HEAD")
+    return (commit if ok_c and commit else "-",
+            branch if ok_b and branch else "-")
+
+
+def remote_version_state(i: int) -> dict:
+    """For the panel: what the Remote Rx runs, against what we run.
+
+    Only compares when both ends are on the same branch and both
+    reported a commit. A Remote Rx deliberately held on another branch
+    is not "behind", and neither is one whose version we do not know:
+    saying so would put an Update button in front of somebody with
+    nothing to go on.
+    """
+    st = remote_states[i]
+    theirs, their_branch = st.get("version"), st.get("branch")
+    ours, our_branch = lynx_local_version()
+    comparable = bool(theirs and theirs != "-" and ours != "-"
+                      and their_branch == our_branch)
+    return {
+        "remote": theirs or None,
+        "remote_branch": their_branch or None,
+        "local": ours,
+        "local_branch": our_branch,
+        "comparable": comparable,
+        "behind": comparable and theirs.rstrip("+") != ours,
+        "modified": bool(theirs and theirs.endswith("+")),
+    }
+
+
 def remote_settings_state(i: int) -> dict:
     """For the panel: is the Slave running what this Master wants?"""
     st = remote_states[i]
@@ -5634,6 +5672,15 @@ def remote_source_monitor(index: int):
                     v = line[3:].strip()
                     st["cfg_version"] = int(v) if v.isdigit() else None
                     st["cfg_capable"] = v != "-"
+                    continue
+                if line.startswith("VER"):
+                    # "VER <commit> <branch>": the code the Remote Rx is
+                    # running, so the panel can say whether it is behind
+                    # this receiver. Two fixed fields, "-" when the
+                    # remote has no git metadata to report.
+                    parts = line.split()
+                    st["version"] = parts[1] if len(parts) >= 2 else None
+                    st["branch"] = parts[2] if len(parts) >= 3 else None
                     continue
                 if line.startswith("SITE"):
                     # "SITE <locator> <name>" - locator first because a
@@ -8707,6 +8754,11 @@ def get_status():
                 # plain UDP on the shared port (21 Nov 2026).
                 "link": _slave_link_for(i),
                 "settings": remote_settings_state(i),
+                # What the Remote Rx is running, and whether that
+                # matches this receiver. "behind" is only ever True when
+                # both ends actually reported a commit: an unknown
+                # version is not evidence of being out of date.
+                "version": remote_version_state(i),
                 "name": remote_display_name(i),
                 "locator": st["locator"],
                 "status_port": st["status_port"],
@@ -15644,6 +15696,19 @@ async function updateStatus() {
                               'not set here': 'Not set on this receiver',
                               'no key on the Slave': 'No key on the Remote Rx'}[se.state] || se.state;
                 rows.push(['Settings', word]);
+            }
+            // What the Remote Rx is running. Shown only once it has
+            // reported one: a dash here would suggest the feature is
+            // broken on a Remote Rx too old to send it.
+            const vr = rem.version;
+            if (vr && vr.remote) {
+                let v = vr.remote;
+                if (vr.remote_branch && vr.remote_branch !== '-') {
+                    v += ' on ' + vr.remote_branch;
+                }
+                if (vr.modified) { v += ' (edited here)'; }
+                if (vr.behind)   { v += ' — this receiver has ' + vr.local; }
+                rows.push(['Version', v]);
             }
             document.getElementById(id + '-status').innerHTML = rows.map(r =>
                 '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;"><span>' + r[0] + '</span>' +
