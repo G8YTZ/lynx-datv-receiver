@@ -64,6 +64,7 @@ import time
 
 import agc_table
 import srt_link
+import updater
 
 # Lynx binds 9997 on all interfaces for its own local Picotuner, so a
 # Slave sending there would collide with the receiver's own tuner.
@@ -521,12 +522,39 @@ class SettingsReceiver(threading.Thread):
         self.sock = sock
         self.on_new = on_new
 
+    def handle_update(self, cmd, addr):
+        """Act on an update command, once.
+
+        Runs on this thread: it takes a minute or two and the heartbeat
+        is on its own thread, so the repeater keeps hearing from the
+        Remote Rx throughout. A failed update is reported and life goes
+        on with the code that is already running.
+        """
+        if cmd["v"] <= self.args.update_version:
+            return   # already done, or a replayed packet
+        self.args.update_version = cmd["v"]
+        print(f"[update] asked by {addr[0]} to update to {cmd['ref']}")
+        ok, msg, restart = updater.perform_update(
+            self.args.slave_dir, self.args.slave_dir, cmd["ref"],
+            self.args.update_file)
+        print(f"[update] {msg}")
+        if ok and restart:
+            self.on_new()
+
     def run(self):
         while True:
             try:
                 data, addr = self.sock.recvfrom(4096)
             except OSError:
                 time.sleep(1)
+                continue
+            # An update command, on the same socket and signed the same
+            # way, under its own magic. Checked first: both parsers
+            # reject anything that is not theirs, so order only decides
+            # which does the rejecting.
+            cmd = updater.parse_command_packet(data, self.args.key)
+            if cmd is not None:
+                self.handle_update(cmd, addr)
                 continue
             st = parse_settings_packet(data, self.args.key)
             if st is None:
@@ -616,10 +644,23 @@ def main():
     # Settings from the repeater win over the conf: they are the latest
     # thing anyone asked for, and they survive a power cut on the card.
     saved = load_settings(args.settings_file) if args.key else {}
+    args.slave_dir = os.path.dirname(os.path.abspath(__file__))
+    args.update_file = updater.DEFAULT_UPDATE_FILE
+    args.update_version = 0
+
+    # Before anything else: was the last start a new version that has
+    # not yet proved itself? Each start counts against it, and past the
+    # limit the previous commit is restored and we exit so systemd
+    # brings us back on the old code. This is the net under a bad
+    # update that got past the compile and start checks.
+    rolled, why = updater.startup_check(args.slave_dir, args.update_file)
+    if rolled:
+        print(f"[update] {why} - restarting on the restored version")
+        return 0
+
     # What code this Remote Rx is running, read once from its own
     # checkout rather than per heartbeat.
-    args.version_commit, args.version_branch = local_version(
-        os.path.dirname(os.path.abspath(__file__)))
+    args.version_commit, args.version_branch = local_version(args.slave_dir)
 
     args.settings_version = int(saved.get("v", 0) or 0)
     if saved:
@@ -656,6 +697,14 @@ def main():
     status.start()
 
     threading.Thread(target=read_fifo, args=(fifo, tuner, stop), daemon=True).start()
+
+    # If this start is a new version on probation, take it off once it
+    # has survived. Harmless when there is nothing on probation, which
+    # is almost always, so it is started unconditionally rather than
+    # guarded by a check that could itself be wrong.
+    threading.Thread(target=updater.confirm_after,
+                     args=(args.update_file,),
+                     kwargs={"stop": stop}, daemon=True).start()
 
     sender = None
     if args.transport == "srt":
