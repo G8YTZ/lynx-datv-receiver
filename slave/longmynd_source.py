@@ -147,6 +147,11 @@ STATUS_STALE_SECS = 5.0
 
 RESTART_DELAY_SECS = 5.0
 
+# How often to say it is still searching, when it has not locked.
+# Long enough not to fill the journal on a site that is quiet for
+# hours, short enough that somebody watching sees it is alive.
+SEARCHING_REPORT_SECS = 30.0
+
 # Longmynd state values that count as a lock. 2 is "headers" - carrier
 # found, still acquiring - which is deliberately NOT treated as locked:
 # it comes and goes on a marginal signal and would make the repeater
@@ -693,6 +698,7 @@ def main():
                                 stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
 
+        last_searching = 0.0
         while proc.poll() is None and not stopping:
             snap = tuner.snapshot()
             now = (snap["locked"], snap["callsign"])
@@ -704,6 +710,19 @@ def main():
                 elif last_reported is not None:
                     print("[tuner] lock lost")
                 last_reported = now
+            # A tuner that has never locked changed state never, so the
+            # loop above printed nothing at all and the journal simply
+            # stopped - indistinguishable, over SSH to a loft, from a
+            # crashed service. Say so periodically instead, and say what
+            # it is looking for: the usual cause is that it is tuned
+            # somewhere the signal is not.
+            elif not snap["locked"]:
+                nowt = time.time()
+                if nowt - last_searching >= SEARCHING_REPORT_SECS:
+                    last_searching = nowt
+                    print(f"[tuner] searching - {args.freq / 1000.0:.3f} MHz, "
+                          f"{args.sr} kS/s, no lock for "
+                          f"{nowt - started:.0f}s")
             time.sleep(0.5)
 
         if stopping:
