@@ -514,7 +514,8 @@ def _as_details(value):
 
 
 def submit_qrz_logbook(api_key, station_callsign, rx_callsign, freq_khz,
-                        mode, mer, margin, portable_locator="", comment_override=None):
+                        mode, mer, margin, portable_locator="", comment_override=None,
+                        rst_override=None):
     """Builds and submits one QRZ logbook entry. freq_khz matches Lynx's
     own convention throughout (presets, tuning) - converted to MHz here,
     which is what QRZ's freq field expects (confirmed against the
@@ -547,6 +548,10 @@ def submit_qrz_logbook(api_key, station_callsign, rx_callsign, freq_khz,
     worked station's stale profile instead, which is a different thing
     this field does not attempt.
 
+    rst_override: replaces the "<margin>dB" report entirely. DVB-T2 has
+    no margin figure, so its caller supplies the signal quality figure
+    its own tuner reports instead.
+
     comment_override: replaces the normal, auto-built comment entirely
     when set - used by the /diagnostics test feature to mark its entries
     clearly as test data directly in the logbook itself, not just via the
@@ -567,7 +572,16 @@ def submit_qrz_logbook(api_key, station_callsign, rx_callsign, freq_khz,
     time_on = now.strftime("%H%M%S")
 
     comment = comment_override if comment_override is not None else f"{mode} | {mer}dB MER"
-    rst_sent = f"{margin}dB"
+    # "<margin>dB" is right for DVB-S2. With no margin - DVB-T2 does not
+    # report one - that becomes a bare "dB", which is worse than
+    # useless in a signal-report field. rst_override lets the caller
+    # supply what its own receiver actually measures instead.
+    if rst_override is not None:
+        rst_sent = rst_override
+    elif margin in (None, ""):
+        rst_sent = ""
+    else:
+        rst_sent = f"{margin}dB"
 
     payload = _build_qrz_adif(api_key, "INSERT", call_trunc, band, str(mode),
                                qso_date, time_on, station_callsign,
@@ -793,6 +807,14 @@ class NotificationManager:
         # few seconds later would have given.
         self._qrz_mer_retries = {}
 
+        # "In use": the same settled answer the Video Switching card acts
+        # on (something to show, held for the Companion settle times),
+        # kept whether or not Companion or its GPIO pin is enabled, so
+        # anything polling /api/status can follow it (Thomas DL5BCA,
+        # 12 Nov 2026: picotuner.locked alone flickers and knows nothing
+        # of streams).
+        self.in_use = False
+        self.in_use_since = None
         self._actions = {}   # {name: SettlingAction} - persistent, keyed store so a
                               # later event (e.g. unlock) can find and cancel an earlier
                               # one's (e.g. lock's) still-pending timer. Confirmed as a
@@ -812,6 +834,12 @@ class NotificationManager:
         self._tx_power_up_action = None
         self._tx_power_down_action = None
         self._tx_was_in_window = False
+        self._tx_state = None         # last Tx state actually applied (None = not yet
+                                        # decided since startup/pin change). Gates the
+                                        # on/off URLs so each fires once per real
+                                        # transition, never on a repeated set().
+        self._tx_state_lock = threading.Lock()
+        self._tx_cfg = {}             # latest gpio_tx config, read by _set_tx() at fire time
         # Companion + GPIO Tx run off "is there a picture to transmit",
         # which is NOT the same question as "is RF locked" - see _poll().
         self._confirmed_active = False
@@ -1155,6 +1183,7 @@ class NotificationManager:
         """
         self._cancel_action('companion_unlock')
         self._cancel_action('companion_gpio_unlock')
+        self._settle_in_use(True, notif_cfg)
 
         if stream_only and cfg is not None:
             slack_cfg = notif_cfg.get('slack', {})
@@ -1182,10 +1211,32 @@ class NotificationManager:
                 self._arm_action('companion_gpio_lock', delay,
                                   lambda: gpio.set(True), "Companion-GPIO-lock")
 
+    def _settle_in_use(self, active, notif_cfg):
+        """Move self.in_use towards `active` after the Companion settle
+        time for that direction; a change back before it fires cancels
+        it quietly (no diagnostics entry: brief gaps are routine)."""
+        other = self._actions.get('in_use_off' if active else 'in_use_on')
+        if other:
+            other.cancel()
+        key = 'in_use_on' if active else 'in_use_off'
+        pending = self._actions.get(key)
+        if self.in_use == active or (pending and pending.pending):
+            return
+        comp_cfg = notif_cfg.get('companion', {})
+        delay = float(comp_cfg.get('lock_settle_secs' if active
+                                   else 'unlock_settle_secs', 5.0))
+
+        def flip():
+            self.in_use = active
+            self.in_use_since = datetime.datetime.now(
+                datetime.timezone.utc).isoformat(timespec="seconds")
+        self._arm_action(key, delay, flip, "in-use")
+
     def _on_confirmed_inactive(self, notif_cfg):
         self._cancel_action('companion_lock')
         self._cancel_action('companion_gpio_lock')
         self._cancel_action('slack_stream')
+        self._settle_in_use(False, notif_cfg)
 
         comp_cfg = notif_cfg.get('companion', {})
         if comp_cfg.get('enabled', False) and comp_cfg.get('unlock_url'):
@@ -1290,6 +1341,55 @@ class NotificationManager:
                                    count_as_mpv_restart=False)
                 self._cancel_action(f'tw_qrz_{rcv}')
                 self._cancel_action(f'tw_slack_{rcv}')
+
+    def arm_external_contact(self, src, key="external"):
+        """Log a contact from a source this manager does not poll.
+
+        Built for the DVB-T2 tuner, which is a separate device on the
+        network rather than a tuner this module watches. Everything
+        after the trigger is identical to a Picotuner contact, so the
+        settle timers, the QRZ de-duplication and the Slack path are
+        reused rather than reimplemented - the difference is only in
+        who noticed the station, not in what happens next.
+
+        src is a picotuner_state-shaped dict, optionally carrying
+        mode_name, comment and rst - see submit_qrz_logbook().
+
+        The settle delay still applies: a station that keys up and
+        immediately drops again should not reach the logbook, whatever
+        noticed it.
+        """
+        cfg = self.get_config()
+        notif_cfg = cfg.get('notifications', {})
+        site_callsign = notif_cfg.get('station_callsign', '')
+        qrz_cfg = notif_cfg.get('qrz', {})
+        slack_cfg = notif_cfg.get('slack', {})
+
+        if qrz_cfg.get('enabled', False):
+            delay = float(qrz_cfg.get('settle_secs', 15.0))
+            self._arm_action(
+                f'{key}_qrz', delay,
+                lambda: self._fire_qrz(qrz_cfg, site_callsign,
+                                       source_override=src),
+                f"QRZ ({key})")
+
+        if slack_cfg.get('enabled', False):
+            delay = float(slack_cfg.get('settle_secs', 15.0))
+            self._arm_action(
+                f'{key}_slack', delay,
+                lambda: self._fire_slack(slack_cfg, site_callsign,
+                                         source_override=src),
+                f"Slack ({key})")
+
+    def cancel_external_contact(self, key="external"):
+        """Cancel pending timers for an external source that has gone.
+
+        A station that stops before the settle time expires never
+        happened, as far as the logbook is concerned - the same rule
+        the polled sources follow.
+        """
+        self._cancel_action(f'{key}_qrz')
+        self._cancel_action(f'{key}_slack')
 
     def _fire_qrz(self, qrz_cfg, site_callsign, source_override=None):
         api_key = qrz_cfg.get('api_key', '')
@@ -1403,10 +1503,17 @@ class NotificationManager:
             # DVB-S2's variable-modulation notation, not DVB-S1's simpler,
             # fixed-QPSK one - so this should be safe unless the Picotuner
             # is ever used somewhere that genuinely receives DVB-S1.
-            adif_mode = f"DVB-S2 {src['modcod']}" if src["modcod"] else "DVB-S2"
+            # The assumption flagged above - that every contact is
+            # DVB-S2 - held while the Picotuner was the only source.
+            # A source that knows what it is says so, and this is the
+            # branch that comment anticipated.
+            adif_mode = src.get("mode_name") or (
+                f"DVB-S2 {src['modcod']}" if src["modcod"] else "DVB-S2")
             result = submit_qrz_logbook(api_key, site_callsign, call, src["frequency_khz"],
                                          adif_mode, src["mer"], src["margin"],
-                                         portable_locator=portable_locator)
+                                         portable_locator=portable_locator,
+                                         comment_override=src.get("comment"),
+                                         rst_override=src.get("rst"))
             self._qrz_last_logged[call] = now
             if result["result"] in ("OK", "REPLACE"):
                 self.record_event("qrz_logged",
@@ -1485,9 +1592,11 @@ class NotificationManager:
         tx_cfg = notif_cfg.get('gpio_tx', {})
         if not tx_cfg.get('enabled', False):
             return
+        self._tx_cfg = tx_cfg
         pin = tx_cfg.get('pin')
         if pin is None:
             return
+        has_urls = bool(tx_cfg.get('on_url') or tx_cfg.get('off_url'))
         active_high = (tx_cfg.get('polarity', 'high') == 'high')
 
         cfg_key = (pin, active_high)
@@ -1500,8 +1609,13 @@ class NotificationManager:
             self._cancel_tx_actions()
             self._tx_was_in_window = False
             self._tx_was_locked = False
+            with self._tx_state_lock:
+                self._tx_state = None
 
-        if not self._gpio_tx.available:
+        if not self._gpio_tx.available and not has_urls:
+            # No working pin and no URLs - nothing to drive. With URLs
+            # configured, carry on: a site streaming to Companion may have
+            # no transmitter relay at all (GpioPin.set() is a no-op then).
             return
 
         if now is None:
@@ -1529,7 +1643,7 @@ class NotificationManager:
             # noisy signal needing debounce), cancelling anything the
             # auto logic had pending.
             self._cancel_tx_actions()
-            self._gpio_tx.set(True)
+            self._set_tx(True)
             print("[notifications] Tx: schedule window started - forcing on")
 
         elif not in_window and self._tx_was_in_window:
@@ -1565,6 +1679,15 @@ class NotificationManager:
         self._tx_was_in_window = in_window
         self._tx_was_locked = locked
 
+        # Startup (or pin change) with nothing on air and nothing pending:
+        # the pin is already off from GpioPin's initial_value, but the
+        # far end hasn't been told. Send "off" once so a stream left
+        # running from before a restart is brought into line.
+        if self._tx_state is None and not (
+                self._tx_power_up_action and self._tx_power_up_action.pending):
+            if not in_window and not locked:
+                self._set_tx(False)
+
     def _cancel_tx_actions(self):
         if self._tx_power_up_action:
             self._tx_power_up_action.cancel()
@@ -1575,10 +1698,39 @@ class NotificationManager:
 
     def _arm_tx_power_up(self, delay):
         self._tx_power_up_action = SettlingAction(
-            delay, lambda: self._gpio_tx.set(True), "Tx-power-up")
+            delay, lambda: self._set_tx(True), "Tx-power-up")
         self._tx_power_up_action.trigger()
 
     def _arm_tx_power_down(self, delay):
         self._tx_power_down_action = SettlingAction(
-            delay, lambda: self._gpio_tx.set(False), "Tx-power-down")
+            delay, lambda: self._set_tx(False), "Tx-power-down")
         self._tx_power_down_action.trigger()
+
+    def _set_tx(self, on: bool):
+        """The single place Tx state changes. Sets the pin, then - only on
+        a genuine change of state - fires the matching on/off URL, so a
+        stream (typically via Companion) follows the transmitter exactly,
+        with the same schedule and settle timings. The URLs should be
+        explicit start/stop actions, never a toggle.
+
+        The URL goes out on its own thread: an unreachable Companion must
+        never delay the pin, and trigger_companion() raises on connection
+        failure, which is caught and logged here."""
+        if self._gpio_tx is not None:
+            self._gpio_tx.set(on)
+        with self._tx_state_lock:
+            changed = (self._tx_state != on)
+            self._tx_state = on
+        if not changed:
+            return
+        url = (self._tx_cfg.get('on_url') if on else self._tx_cfg.get('off_url')) or ''
+        url = url.strip()
+        if not url:
+            return
+        label = "on" if on else "off"
+        def _send():
+            try:
+                trigger_companion(url)
+            except Exception as e:
+                print(f"[notifications] Tx {label} URL failed - {type(e).__name__}: {e}")
+        threading.Thread(target=_send, daemon=True, name=f"tx-url-{label}").start()

@@ -48,15 +48,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import lynx_notifications
+import lynx_platform   # what differs between boards - see that file
+import lynx_screen_output   # HDMI, SRT or both - see that file
 import lynx_gnss
 import lynx_map
+import lynx_relay
 
 # Auto-Squeak needs numpy, which older installs may not have - it was
 # added to install.sh at the same time as this feature, and anyone who
@@ -171,6 +174,20 @@ def load_last_state():
         return None
 
 config = load_config()
+
+def display_max_height() -> int:
+    """The display height cap in force: the config's if it sets one,
+    otherwise the board's default (1080 on a Pi, 2160 on a ROCK 5T).
+    lynx_start.sh applies the same rule at start-up."""
+    try:
+        v = (config.get('display') or {}).get('max_height')
+        return int(v) if v is not None else lynx_platform.DEFAULT_MAX_HEIGHT
+    except (TypeError, ValueError):
+        return lynx_platform.DEFAULT_MAX_HEIGHT
+
+print(f"[platform] {lynx_platform.BOARD_NAME} ({lynx_platform.MODEL or 'model unknown'}): "
+      f"mpv {lynx_platform.MPV_VIDEO_FLAGS}, "
+      f"height cap {display_max_height()}")
 
 # ── GNSS (portable locator) ─────────────────────────────────────
 # Waveshare L76K HAT, GPIO header UART - see lynx_gnss.py's own
@@ -327,6 +344,12 @@ current_mode: str = "idle"    # idle | rf | stream
 mpv_running_for_rf: bool = False  # tracks whether mpv has actually been started for the
                                    # current RF tune (as opposed to just tuned-and-waiting-
                                    # for-lock) - see rf_mpv_lifecycle_monitor()
+switch_generation = 0     # bumped by every tune/stream request: a waiting start gives way
+rf_tuned_at: float = 0.0  # when the last RF tune was sent (rf_mpv_lifecycle_monitor)
+programme_wanted = None  # {"program": n, "key": ...}: the programme chosen by hand, kept
+#   across mpv restarts on the same tune (programme_keeper); None = programme 1
+programme_switched_at: float = 0.0  # a programme change in the same stream: the decoder waits for
+#   that programme's next keyframe, so the health monitor gives it the start-up grace too
 mpv_last_started_at: float = 0.0  # timestamp of the most recent mpv start - lets
                                    # mpv_decoder_health_monitor grant a startup grace period
 # Tri-watch (up to 3 sources - any mix of RF-A, RF-B, and a stream
@@ -507,7 +530,7 @@ def detect_current_version():
     pushed. Called once at startup; the result doesn't change while
     this process keeps running (only a restart after a real update
     would pick up a new one)."""
-    ok, out = git_cmd("describe", "--tags", "--always")
+    ok, out = git_cmd("describe", "--tags", "--match", "v*", "--always")
     return out if ok and out else "unknown"
 
 def get_default_branch():
@@ -532,7 +555,27 @@ def get_update_branch():
     also going through get_default_branch()'s own auto-detection -
     there's only ever one beta branch, by definition, so there's
     nothing to detect."""
+    # The branch actually checked out wins over the configured
+    # channel when the two disagree.
+    #
+    # They can: install.sh clones whatever --branch says, while this
+    # reads a config setting, and nothing kept them in step. A receiver
+    # cloned on main with channel: beta compared HEAD against
+    # origin/beta, declared itself behind, and pulled beta commits onto
+    # a main checkout - which is how a receiver ends up running a
+    # mixture and showing the desktop through a half-started overlay.
+    #
+    # Trusting git means a receiver updates from where it actually
+    # lives, and the config setting becomes a preference rather than an
+    # instruction that can be wrong.
     channel = config.get('update', {}).get('channel', 'stable')
+    ok, actual = git_cmd("rev-parse", "--abbrev-ref", "HEAD")
+    if ok and actual and actual != "HEAD":
+        want = 'beta' if channel == 'beta' else get_default_branch()
+        if actual != want:
+            print(f"[update] config says '{channel}' but this receiver is "
+                  f"on branch '{actual}' - following git, not the config")
+        return actual
     if channel == 'beta':
         return 'beta'
     return get_default_branch()
@@ -587,7 +630,12 @@ def ensure_current_version():
             update_state["current_version"] = "unknown"
             print(f"[update-check] version detection failed unexpectedly: {e}")
     if update_state["channel"] is None:
-        update_state["channel"] = config.get('update', {}).get('channel', 'stable')
+        # From git, not from config. A receiver cloned on beta with no
+        # update: section in its config described itself as stable -
+        # what it was told rather than what it is. get_update_branch()
+        # was corrected the same way; this function sits next to it and
+        # was missed.
+        update_state["channel"] = get_update_branch()
 
 
                                # just the initial synchronous part) — both
@@ -624,6 +672,7 @@ FFMPEG_BG_CMD = None
 
 MPV_SOCKET = "/tmp/mpv-socket"
 MPV_TRANSITION_MARKER = "/tmp/lynx_mpv_transitioning"
+
 mpv_transitioning = False  # mirrored to a local marker file (see
                             # MPV_TRANSITION_MARKER) which the overlay
                             # checks directly and instantly on every
@@ -657,11 +706,19 @@ def start_transition_cover():
     # The cover has genuinely been up continuously the whole time, so the
     # original timestamp is the honest one. Nesting starts is normal here
     # and should extend a cover, never restart it.
-    try:
-        os.close(os.open(MPV_TRANSITION_MARKER,
-                         os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-    except FileExistsError:
-        pass
+    # No cover by default (Justin, 11 Nov 2026, after testing on a Pi 5 and
+    # the ROCK 5C: "no need for a cover"). The overlay is never told, so it
+    # shows what it would anyway: the logo screen and the status until a
+    # picture is confirmed in RF, mpv itself on a stream. Everything else
+    # here still happens. To bring the cover back:
+    #   systemctl --user set-environment LYNX_COVER=1
+    #   systemctl --user restart lynx
+    if os.environ.get("LYNX_COVER") == "1":
+        try:
+            os.close(os.open(MPV_TRANSITION_MARKER,
+                             os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        except FileExistsError:
+            pass
     # Mute the OLD process right away — launching the new one with
     # --mute=yes only silences audio from the new source, it does
     # nothing about the old source still being audible for however
@@ -751,12 +808,104 @@ def current_rf_target_port():
     already proven correct and tested, and touching genuinely-working
     code for its own sake adds risk without benefit."""
     cfg = config['picotuner']
+    # Checked before the local cases: a Slave being displayed is
+    # not a mode the receiver puts itself into, it is an explicit
+    # choice, and while it holds neither tri_watch nor diversity
+    # describes what is on screen. Getting this wrong would send
+    # a freeze recovery to a local tuner's port while a Slave is
+    # playing — the same shape of bug this function exists to
+    # prevent.
+    # DVB-T2 first: an HDHomeRun streams to its own port and none of
+    # the cases below describe it. Left out originally because this
+    # function predates it, which meant a freeze recovery during a
+    # DVB-T2 session would restart mpv on a Picotuner port that has
+    # nothing on it - the same shape of bug the Slave case above was
+    # added to prevent.
+    if current_mode == "dvbt":
+        return HDHR_VIDEO_PORT
+    if receiver_is_remote(active_receiver_id() or 0):
+        return REMOTE_VIDEO_OUT_PORT
     if tri_watch_enabled and tri_watch_target_rcv == 2:
-        return cfg['ts_port_b']
+        return picotuner_ts_port('b', cfg)
     elif diversity_enabled:
         return config['diversity']['combiner_out_port']
     else:
-        return cfg['ts_port']
+        return picotuner_ts_port('a', cfg)
+
+# What mpv was last asked to play, whatever asked (restart_mpv records
+# it): the screen-return check and the SRT output's screen change
+# restart mpv on it. Was the UDP network output's record, until that
+# output was removed in favour of SRT (11 Nov 2026).
+playing_source = ""
+playing_source_is_rf = True
+
+
+# Screen output: HDMI or SRT (lynx_screen_output.py, 11 Nov 2026).
+# The finished screen (picture, overlay, chat) captured, hardware
+# encoded and sent over SRT. Built here, started with the other
+# watchdogs; the lambdas look their functions up when called.
+def _screen_output_service_name():
+    call = str((config.get('site') or {}).get('callsign', '') or '').strip()
+    return f"Lynx {call}" if call and call.upper() != "XXXXX" else "Lynx"
+
+
+def _screen_output_changed():
+    """The screens changed under mpv (virtual screen added or removed,
+    HDMI on or off, its mode changed): one restart on the same source,
+    so mpv settles on the new screen at its rate and, in SRT mode,
+    plays its sound into the lynx_srt sink."""
+    src, is_rf = playing_source, playing_source_is_rf
+    if not src:
+        return
+    if tune_lock.acquire(timeout=10):
+        try:
+            print(f"[srt] screens changed - restarting mpv on {src}", flush=True)
+            restart_mpv(src, is_rf=is_rf)
+            wait_for_mpv_rendering()
+        finally:
+            tune_lock.release()
+
+
+screen_output = lynx_screen_output.ScreenOutput(
+    get_config=lambda: config,
+    service_name=lambda: _screen_output_service_name(),
+    on_screen_change=lambda: threading.Thread(
+        target=_screen_output_changed, daemon=True).start())
+
+
+def _programme_track_flags() -> str:
+    """mpv's --vid/--aid for a programme chosen by hand on what is tuned
+    now, or "" for mpv's own choice (the first programme).
+
+    Each programme in a multiplex runs on its own clock: Lynx-Tx's carousel
+    was 104 s behind the live picture (10 Nov 2026). Swapping tracks in a
+    running mpv kept the old programme's clock, so the new one's pictures
+    were all "late" and mostly dropped (a minute for a picture), or held,
+    which stopped mpv reading until FFmpeg's buffer overran. So a programme
+    is chosen by starting mpv on it, as a set-top box restarts its decoder."""
+    want = programme_wanted
+    if not want or want.get("key") != _programme_key():
+        return ""
+    aid = want.get("audio")
+    return f"--vid={want['video']} --aid={aid if aid is not None else 'no'} "
+
+
+def _udp_url_for_mpv(url: str) -> str:
+    """A udp:// source with FFmpeg's overrun made survivable.
+
+    FFmpeg reads a UDP socket in a thread of its own into a 5 MB ring. If
+    mpv stops taking from the ring for a few seconds the ring overruns, and
+    by default the reading thread then STOPS for good: the socket is never
+    read again, the kernel queue sits full (428 kB) and throws everything
+    away, and mpv freezes on its last picture with an empty cache. Seen 10
+    Nov 2026 on a ROCK 5C watching Lynx-Tx's carousel (programme 2):
+    pictures took up to a minute, came in with their bottom missing, then
+    stopped altogether. overrun_nonfatal keeps the thread reading and
+    loses only what did not fit."""
+    if url.startswith("udp://") and "overrun_nonfatal" not in url:
+        return url + ("&" if "?" in url else "?") + "overrun_nonfatal=1"
+    return url
+
 
 def restart_mpv(target_url: str, is_rf: bool = True):
     """Fully kill and restart the mpv process, pointing it at a fresh
@@ -803,6 +952,8 @@ def restart_mpv(target_url: str, is_rf: bool = True):
     start_transition_cover/end_transition_cover) — this function only
     handles the actual process mechanics, so callers can make the
     covered window deliberately wider than just this restart."""
+    global playing_source, playing_source_is_rf
+    playing_source, playing_source_is_rf = target_url, is_rf
     kill_mpv()
 
     # Launch muted so there's no audio pop/glitch as the new process
@@ -813,6 +964,28 @@ def restart_mpv(target_url: str, is_rf: bool = True):
             "--demuxer=lavf --demuxer-lavf-format=mpegts "
             "--demuxer-max-bytes=512KiB --demuxer-max-back-bytes=128KiB "
             "--profile=low-latency --cache-pause=no "
+            # low-latency sets analyzeduration to zero, which means mpv
+            # decides what the stream contains from whatever bytes turn
+            # up first. Joining a live stream lands mid-GOP, so it
+            # starts decoding slices before it has the PPS describing
+            # them — "non-existing PPS 0 referenced", then no picture
+            # until the next keyframe. It also leaves a sparse audio
+            # track unidentified: "0 channels: unspecified sample
+            # format".
+            #
+            # A second is enough to find a keyframe at any sane GOP
+            # length and to identify both tracks properly. It is spent
+            # once per source switch, behind a transition cover that
+            # already waits far longer than that for rendering, and
+            # adds nothing to running latency.
+            "--demuxer-lavf-analyzeduration=1 "
+            # The low-latency profile also sets probe-info=nostreams: no
+            # probing at all once the first table names a stream, so a
+            # second programme in the stream (Lynx-Tx's 4K carousel) never
+            # became a track and could not be chosen. "yes" probes for the
+            # second above as intended (tested 23 Oct 2026, mpv 0.37:
+            # programme 2 listed with it, missing without).
+            "--demuxer-lavf-probe-info=yes "
         )
     else:
         # No format-forcing (let mpv auto-detect the real container —
@@ -825,15 +998,32 @@ def restart_mpv(target_url: str, is_rf: bool = True):
         # what was confirmed working in a direct hand-run test.
         source_flags = ""
 
+    # A Pi in SRT mode draws natively on Wayland, not through XWayland:
+    # XWayland held frames for a while labwc then captured, so the SRT
+    # picture ran 300 ms (BBC HD) to 475 ms (4K) behind its sound; native
+    # it was right with no delay (Pi 5, 11 Nov 2026). HDMI mode keeps the
+    # Pi's proven XWayland path. An explicit LYNX_MPV_VIDEO_FLAGS wins.
+    pi_srt_native = (not lynx_platform.IS_ROCK
+                     and screen_output.mpv_audio_device() is not None
+                     and not os.environ.get("LYNX_MPV_VIDEO_FLAGS"))
+    video_flags = ("--vo=gpu --gpu-context=wayland --hwdec=drm-copy"
+                   if pi_srt_native else lynx_platform.MPV_VIDEO_FLAGS)
     cmd = (
         f"mpv --fullscreen --ontop --border=no --no-osc --no-input-default-bindings "
-        f"--cursor-autohide=always --force-window=yes --vo=gpu --hwdec=drm-copy --mute=yes "
+        f"--cursor-autohide=always --force-window=yes {video_flags} --mute=yes "
         f"{audio_device_flag()}"
         f"--audio-pitch-correction=no --script={DRIFT_SCRIPT_PATH} "
         f"{source_flags}"
+        # SRT mode: a 100 ms audio buffer, after source_flags so RF's
+        # low-latency profile cannot reset it. With almost none, mpv
+        # missed every other block into the lynx_srt sink (a scrubbing
+        # sound on the SRT feed, 5C, 11 Nov 2026). mpv allows for it in
+        # lip-sync.
+        f"{'--audio-buffer=0.1 ' if screen_output.mpv_audio_device() else ''}"
         f"--keep-open=yes --idle=yes "
+        f"{_programme_track_flags()}"
         f"--input-ipc-server={MPV_SOCKET} "
-        f"'{target_url}'"
+        f"'{_udp_url_for_mpv(target_url)}'"
     )
     env = os.environ.copy()
     env["DISPLAY"] = ":0"
@@ -863,7 +1053,13 @@ def restart_mpv(target_url: str, is_rf: bool = True):
     # EGL/Vulkan — confirmed to be the actually-broken path (this is
     # what the "VK_ERROR_OUT_OF_HOST_MEMORY" swapchain failures were).
     # Clearing WAYLAND_DISPLAY here removes that choice entirely.
-    env.pop("WAYLAND_DISPLAY", None)
+    #
+    # Pi only. On the ROCK 5T mpv is Wayland-only (dmabuf-wayland),
+    # so it must keep the variable - see lynx_platform.py.
+    if lynx_platform.KEEP_WAYLAND_DISPLAY or pi_srt_native:
+        env.setdefault("WAYLAND_DISPLAY", "wayland-0")
+    else:
+        env.pop("WAYLAND_DISPLAY", None)
     # Truncate and redirect to a real log file on every restart -
     # confirmed this was previously going to DEVNULL entirely, meaning
     # /tmp/mpv.log never actually reflected the current, running mpv
@@ -922,27 +1118,67 @@ def restart_mpv(target_url: str, is_rf: bool = True):
     mpv_cmd({"command": ["set_property", "volume", current_volume]})
     mpv_cmd({"command": ["set_property", "mute", False]})
 
-def _recent_hevc_decoder_error(since_ts: float) -> bool:
-    """Checks dmesg for the specific hardware HEVC decoder error
-    ("rpi-hevc-dec ... Missing inuse DPB ent") directly tied to a real,
-    confirmed freeze earlier this session - one a plain mpv restart
-    couldn't recover from, only a full Pi reboot could. Scoped to
-    entries from since_ts onwards specifically, not the whole kernel
-    ring buffer (which persists across the entire uptime) - an old,
-    already-resolved occurrence from hours or days ago must not keep
-    incorrectly flagging every future render attempt as failed forever.
-    Best-effort only: dmesg can require elevated permissions on some
-    systems, or simply be unavailable - any failure here is treated as
-    "no error found" rather than blocking rendering confirmation on
-    something that isn't itself the actual video pipeline."""
+def _kernel_uptime() -> float:
+    """Seconds since boot, on the same clock as dmesg's [   159.496] stamps."""
     try:
-        since_str = datetime.fromtimestamp(since_ts).strftime("%Y-%m-%d %H:%M:%S")
-        out = subprocess.run(["dmesg", "-T", "--since", since_str],
-                              capture_output=True, text=True, timeout=2)
-        return "rpi-hevc-dec" in out.stdout and "DPB" in out.stdout
+        with open("/proc/uptime") as f:
+            return float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 0.0
+
+
+_DMESG_STAMP = re.compile(r"^\[\s*(\d+\.\d+)\]")
+
+
+def _recent_hevc_decoder_error(since_uptime: float) -> bool:
+    """Checks dmesg for the hardware HEVC decoder error ("rpi-hevc-dec ...
+    Missing inuse DPB ent") logged AFTER since_uptime, a reading of
+    _kernel_uptime(). Compared on the kernel's own seconds-since-boot
+    stamps (2 Nov 2026): the old "dmesg -T --since <clock time>" worked to
+    the whole second, so the one line the driver logs as mpv joins a
+    stream between keyframes counted again at the "look again" a moment
+    later, every start was failed, and Lynx restarted mpv about once a
+    second for ever (no picture, then a brief one, then the Pathfinder
+    screen). Best-effort only: any failure reading dmesg counts as "no
+    error found"."""
+    try:
+        out = subprocess.run(["dmesg"], capture_output=True, text=True, timeout=2).stdout
     except Exception as e:
         print(f"[mpv_render] dmesg check failed (non-fatal, treating as no error found): {e}")
         return False
+    for line in out.splitlines():
+        if "rpi-hevc-dec" in line and "DPB" in line:
+            m = _DMESG_STAMP.match(line)
+            if m and float(m.group(1)) > since_uptime:
+                return True
+    return False
+
+
+_MPV_AV_TIME = re.compile(r"AV: (\d+):(\d\d):(\d\d)")
+
+
+def _mpv_play_position() -> Optional[int]:
+    """mpv's playing position in seconds, from the last "AV: h:mm:ss" in
+    its log; None if there is none yet."""
+    try:
+        with open('/tmp/mpv.log') as f:
+            found = _MPV_AV_TIME.findall(f.read()[-4000:])
+    except OSError:
+        return None
+    if not found:
+        return None
+    h, m, sec = found[-1]
+    return int(h) * 3600 + int(m) * 60 + int(sec)
+
+
+# How long the HEVC join noise may last before the decoder counts as
+# wedged (see wait_for_mpv_rendering). It only has to outlast the wait for
+# the first keyframe, at most one GOP; 20 s covers GOPs up to about 18 s,
+# as slow QO-100 stations may use. A normal station confirms as soon as
+# the decoder goes quiet, so only a truly wedged decoder waits it out
+# (21 Nov 2026; was 10 s).
+HEVC_SETTLE_MAX_SECS = 20.0
+
 
 def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
     """Polls mpv's own log (freshly truncated by restart_mpv() just
@@ -991,15 +1227,66 @@ def wait_for_mpv_rendering(timeout: float = 8.0) -> bool:
     answered directly from the logs, rather than requiring a fresh
     manual measurement with no earlier data point to compare against."""
     start = time.time()
+    start_up = _kernel_uptime()
     deadline = start + timeout
     markers = ("VO:", "AV:")
+    gen = switch_generation
     while time.time() < deadline:
+        # A newer tune or stream was asked for: stop waiting on this one,
+        # so the new request gets the lock at once. A stream that was not
+        # sending held everything up for 12 + 20 s of render checks (and
+        # the new request gave up after 15 s), so for about a minute
+        # nothing could be tuned (11 Nov 2026, Pi and ROCK).
+        if switch_generation != gen:
+            print("[mpv_render] a newer tune or stream was asked for: no longer waiting")
+            return False
         try:
             with open('/tmp/mpv.log') as f:
                 content = f.read()
             if any(m in content for m in markers):
                 elapsed = time.time() - start
-                if _recent_hevc_decoder_error(start):
+                # A few "Missing inuse DPB ent" lines are what the Pi's HEVC
+                # driver says while it joins a 4K stream between keyframes;
+                # a wedged decoder keeps saying it. Treated as fatal at the
+                # first line, every 4K start failed and was retried: the
+                # player restarted about once a second and motion was never
+                # smooth at 4K (23 Oct 2026). So look again 2 s later: only
+                # an error that is still being logged means wedged.
+                # The kernel's own seconds-since-boot stamps decide what
+                # is new (2 Nov 2026), so the one line logged as mpv joins
+                # is not counted twice.
+                #
+                # NOT "is mpv's clock still moving" (2 Nov to 3 Nov 2026): a
+                # wedged decoder putting out purple frames still has a
+                # moving clock, so that test passed a purple picture and
+                # left it on screen. Five beta testers saw exactly that.
+                #
+                # Keep looking for that quiet 2 s for up to
+                # HEVC_SETTLE_MAX_SECS after the markers, not just once.
+                # Join noise lasts until the first keyframe, and a low-rate
+                # station sends one only every few seconds: Martin G8KOE's
+                # own 333 kS SDR TV signal (3 s GOP) was still joining at
+                # the single 2 s look, so every start was judged wedged
+                # and restarted, for ever, with no picture (21 Nov 2026).
+                # A truly wedged decoder never goes quiet, so it is still
+                # caught, just a few seconds later.
+                still_erroring = False
+                if _recent_hevc_decoder_error(start_up):
+                    still_erroring = True
+                    settle_by = time.time() + HEVC_SETTLE_MAX_SECS
+                    while time.time() < settle_by:
+                        if switch_generation != gen:
+                            print("[mpv_render] a newer tune or stream was asked for: "
+                                  "no longer waiting")
+                            return False
+                        look_from = _kernel_uptime()
+                        time.sleep(2.0)
+                        if not _recent_hevc_decoder_error(look_from):
+                            print(f"[mpv_render] confirmed rendering after "
+                                  f"{time.time() - start:.1f}s (HEVC decoder settled "
+                                  f"after joining between keyframes)")
+                            return True
+                if still_erroring:
                     print(f"[mpv_render] mpv log shows rendering markers after {elapsed:.1f}s, "
                           f"but a hardware HEVC decoder error was also just logged - treating "
                           f"this as NOT genuinely rendering despite mpv's own pipeline appearing "
@@ -1031,6 +1318,9 @@ def _cached_audio_device_resolved():
     that often to answer a question whose answer almost never changes
     would be silly.
     """
+    srt_dev = screen_output.mpv_audio_device()
+    if srt_dev:
+        return srt_dev
     dev = str(config.get('display', {}).get('audio_device', 'hdmi')).strip()
     if dev.lower() != 'hdmi':
         return dev
@@ -1052,6 +1342,11 @@ def audio_device_flag():
     cause. A receiver driving a television should send its audio to the
     television unless told otherwise.
     """
+    srt_dev = screen_output.mpv_audio_device()
+    if srt_dev:
+        # SRT mode: sound into the lynx_srt sink, which is captured.
+        # (Its audio buffer is set after the source flags, below.)
+        return f"--audio-device={shlex.quote(srt_dev)} "
     dev = str(config.get('display', {}).get('audio_device', 'hdmi')).strip()
     if not dev or dev.lower() == 'auto':
         return ""
@@ -1178,13 +1473,41 @@ def _friendly_audio_name(key, description):
 
 
 def _first_hdmi_device():
-    """The first HDMI output mpv reports, or None."""
+    """The first HDMI output mpv reports, or None.
+
+    On a PipeWire system with no HDMI sink at all (a screen without
+    speakers), the silent lynx_meter sink instead, so the PPM still
+    reads the programme's sound rather than sitting still."""
     # Uses the same filtered list the Config page offers, so the
     # automatic choice and the visible choice can never disagree.
-    for d in physical_audio_devices():
+    devices = physical_audio_devices()
+    for d in devices:
         if "hdmi" in (d["name"] + " " + d["description"]).lower():
             return d["name"]
+    # Only when PipeWire has no real output at all: its "Dummy Output"
+    # placeholder (node auto_null) and Lynx's own silent sinks don't count.
+    not_real = ("auto_null", lynx_screen_output.METER_SINK,
+                lynx_screen_output.NULL_SINK)
+    if _pipewire_running() and not any(
+            d["name"].startswith("pipewire/")
+            and not any(n in d["name"] for n in not_real)
+            and "dummy" not in d["description"].lower()
+            for d in devices):
+        meter = lynx_screen_output.ensure_meter_sink()
+        if meter:
+            print("[audio] no audio output on this screen - playing into "
+                  "the silent lynx_meter sink so the PPM still works",
+                  flush=True)
+            return meter
     return None
+
+
+def _pipewire_running():
+    try:
+        return subprocess.run(["pw-cli", "info", "0"], capture_output=True,
+                              timeout=5).returncode == 0
+    except Exception:
+        return False
 
 
 def mpv_cmd(cmd: dict):
@@ -1308,6 +1631,67 @@ picotuner_state = {
     "agc1": "",
     "agc2": "",
 }
+
+def rx_line_callsign(parts, unlocked_states):
+    """The callsign in a tuner's RX line ("1304.072 GB3OO" -> "GB3OO"), or ""
+    when it is not locked. The service name can be more than one word: with
+    a second programme in the stream (Lynx-Tx's "GB3OO 4K") the line read
+    "1304.072 GB3OO 4K", the last word "4K" is no callsign, and the
+    receiver showed SEARCHING at 25 dB MER (23 Oct 2026). So take the first
+    word after the frequency that looks like a callsign, not the last."""
+    if len(parts) < 2 or parts[-1] in unlocked_states:
+        return ""
+    for word in parts[1:]:
+        if looks_like_callsign(word):
+            return word
+    return ""
+
+
+def rx_line_bare_lock(parts):
+    """A tuner line that is a frequency and nothing else ("1316.074B").
+
+    WinterHill always says when it is NOT locked, in words: "search",
+    "lost", "header". A bare frequency is a lock whose service name it is
+    not showing. With two programmes in the multiplex (Lynx-Tx's 4K
+    carousel) the name appears for about a second every half minute or
+    so, and the rest of the time the line is bare (10 Nov 2026, ROCK 5C,
+    both receivers on 1316 MHz at 30 dB MER):
+
+        21:32:59 RX1 1316.074T header      RX2 (blank)
+        21:33:00 RX1 1316.074T G8YTZ       RX2 1316.074B G8YTZ
+        21:33:01 RX1 1316.074T             RX2 1316.074B   ... for 30 s+
+
+    Lynx used to count a lock only once it had seen the name, and kept it
+    through bare lines after that (rx_line_held_callsign). But the blank
+    and "header" lines in between dropped the lock and the held name, so
+    each receiver then read as unlocked for half a minute at a time: mpv
+    stopped and started, and diversity re-tuned a receiver at 30 dB."""
+    if len(parts) != 1 or not parts[0][-1:] in ("T", "B"):
+        return False
+    try:
+        float(parts[0][:-1])
+    except ValueError:
+        return False
+    return True
+
+
+def rx_line_held_callsign(parts, state):
+    """A locked tuner whose line has lost its name: "1304.072B" alone, after
+    "1304.072B G8YTZ" on the same frequency. The tuner's firmware shows one
+    service name; with a second programme in the stream (Lynx-Tx's 4K
+    carousel) it showed the callsign for a second or two and then nothing,
+    while still locked (23 Oct 2026). Search, lost and header always say so
+    in words, so a bare frequency right after a lock is the same lock: keep
+    its callsign rather than drop to SEARCHING."""
+    if len(parts) != 1 or not state.get("locked") or not state.get("callsign"):
+        return ""
+    try:
+        was = float(str(state.get("frequency", "")).rstrip("TB"))
+        now = float(parts[0].rstrip("TB"))
+    except ValueError:
+        return ""
+    return state["callsign"] if abs(now - was) < 0.5 else ""
+
 
 def looks_like_callsign(token):
     """Is this plausibly an amateur callsign?
@@ -1515,6 +1899,22 @@ def picotuner_monitor():
             # and permanently SEARCHING while the tuner is locked and
             # decoding perfectly. Confirmed exactly that way on real
             # hardware.
+            # Where each receiver is sending its stream: "TS target RX1
+            # 192.168.0.188:9941". Labelled with the board's own receiver
+            # numbers, like the RX lines below. Used to tell a receiver
+            # another device has taken over from one that has lost its
+            # tuning (see _picotuner_taken_over).
+            for line in text.splitlines():
+                parts = re.split(r'\s{2,}', line.strip())
+                if len(parts) != 2 or not parts[0].lower().startswith("ts target rx"):
+                    continue
+                num = parts[0][len("TS target RX"):].strip()
+                value = parts[1].strip().split()[0] if parts[1].strip() else ""
+                if num == str(picotuner_rx_numbers['a']):
+                    picotuner_state["ts_target"] = value
+                elif num == str(picotuner_rx_numbers['b']):
+                    picotuner_state_b["ts_target"] = value
+
             rx_label_a = f"RX{picotuner_rx_numbers['a']}"
             rx_label_b = f"RX{picotuner_rx_numbers['b']}"
             for line in text.splitlines():
@@ -1533,10 +1933,12 @@ def picotuner_monitor():
                     # tuned value. It was previously accepted as a
                     # callsign and looked up on QRZ 53 times overnight.
                     unlocked_states = {"search", "lost", "header", ""}
-                    if (len(parts) >= 2 and parts[-1] not in unlocked_states
-                            and looks_like_callsign(parts[-1])):
+                    call = rx_line_callsign(parts, unlocked_states) or \
+                        rx_line_held_callsign(parts, picotuner_state)
+                    if call or rx_line_bare_lock(parts):
                         picotuner_state["locked"] = True
-                        picotuner_state["callsign"] = parts[-1]
+                        picotuner_state["callsign"] = call or (
+                            picotuner_state.get("callsign", "") if picotuner_state.get("locked") else "")
                         picotuner_state["frequency"] = parts[0].rstrip("TB")
                     else:
                         picotuner_state["locked"] = False
@@ -1555,10 +1957,12 @@ def picotuner_monitor():
                     # Same set as RX1 above - see the note there on
                     # "header".
                     unlocked_states = {"search", "lost", "header", ""}
-                    if (len(parts) >= 2 and parts[-1] not in unlocked_states
-                            and looks_like_callsign(parts[-1])):
+                    call = rx_line_callsign(parts, unlocked_states) or \
+                        rx_line_held_callsign(parts, picotuner_state_b)
+                    if call or rx_line_bare_lock(parts):
                         picotuner_state_b["locked"] = True
-                        picotuner_state_b["callsign"] = parts[-1]
+                        picotuner_state_b["callsign"] = call or (
+                            picotuner_state_b.get("callsign", "") if picotuner_state_b.get("locked") else "")
                         picotuner_state_b["frequency"] = parts[0].rstrip("TB")
                     else:
                         picotuner_state_b["locked"] = False
@@ -1605,6 +2009,415 @@ DELAY_RESTART_DIAGNOSTIC_MODE = False  # Diagnostic complete - unlike the HEVC t
 DELAY_DIAGNOSTIC_LOG_PATH = "/tmp/delay_diagnostic.log"
 DELAY_EMERGENCY_THRESHOLD_SECS = 20.0        # a gap this large, sustained, is unambiguously bad
 DELAY_EMERGENCY_CONSECUTIVE_CHECKS = 5        # ...for this many consecutive checks (~10s) always restarts
+
+# ── Video badges: what is received (IN), what HDMI sends (OUT) ───
+# See patch_video_badges.py for the reasoning. One thread polls both
+# every few seconds and caches the answer; /api/status only reads it.
+VIDEO_BADGE_POLL_SECS = 3.0
+video_in_info = None     # dict, or None when nothing is decoding
+video_out_info = []      # one dict per enabled output, [] if unknown
+_video_badge_lock = threading.Lock()
+
+
+def _parse_wlr_randr(text):
+    """Every ENABLED output and its current mode, from plain wlr-randr
+    output. Plain text rather than --json: bookworm's wlr-randr (0.2)
+    has no --json, and the layout below is the same in every version.
+
+        HDMI-A-1 "LG Electronics LG HDR 4K ..."
+          Enabled: yes
+          Modes:
+            3840x2160 px, 50.000000 Hz (current)
+    """
+    outputs, cur = [], None
+    for line in text.splitlines():
+        if line and not line[0].isspace():
+            cur = {"name": line.split()[0], "enabled": True,
+                   "width": None, "height": None, "refresh": None}
+            outputs.append(cur)
+            continue
+        if cur is None:
+            continue
+        s = line.strip()
+        if s.startswith("Enabled:"):
+            cur["enabled"] = s.split(":", 1)[1].strip() == "yes"
+        elif "current" in s and " px" in s:
+            m = re.match(r"(\d+)x(\d+)\s+px,\s+([\d.]+)\s+Hz", s)
+            if m:
+                cur["width"], cur["height"] = int(m.group(1)), int(m.group(2))
+                cur["refresh"] = round(float(m.group(3)), 3)
+    return [o for o in outputs if o["enabled"] and o["height"]]
+
+
+def _read_video_out():
+    env = os.environ.copy()
+    # The service does not always carry the session's variables, so the
+    # same defaults lynx.service itself assumes.
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    env.setdefault("WAYLAND_DISPLAY", "wayland-0")
+    try:
+        out = subprocess.run(["wlr-randr"], capture_output=True, text=True,
+                             timeout=3, env=env)
+        return _parse_wlr_randr(out.stdout) if out.returncode == 0 else []
+    except Exception:
+        return []
+
+
+def _mpv_prop(name):
+    r = mpv_query({"command": ["get_property", name]})
+    if r and r.get("error") == "success":
+        return r.get("data")
+    return None
+
+
+def _read_video_in():
+    params = _mpv_prop("video-params")
+    if not isinstance(params, dict) or not params.get("h"):
+        return None
+    fps = _mpv_prop("container-fps")
+    shown_fps = _mpv_prop("estimated-vf-fps")
+    finfo = _mpv_prop("video-frame-info") or {}
+    # Interlaced if the decoder put out twice the stream's frame
+    # rate (fields bobbed to frames - see patch_badges_interlace.py),
+    # or a frame is still flagged interlaced (not deinterlaced).
+    interlaced = bool(finfo.get("interlaced")) or bool(
+        fps and shown_fps and abs(float(shown_fps) / float(fps) - 2) < 0.05)
+    if not fps:
+        fps = shown_fps
+    gamma = (params.get("gamma") or "").lower()
+    return {
+        "width": params.get("w"),
+        "height": params.get("h"),
+        "fps": round(float(fps), 3) if fps else None,
+        "shown_fps": round(float(shown_fps), 3) if shown_fps else None,
+        "interlaced": interlaced,
+        "display_width": params.get("dw"),
+        "codec": (_mpv_prop("video-format") or "").upper() or None,
+        "hwdec": _mpv_prop("hwdec-current") or "no",
+        # Transfer characteristic: what tells SDR from HDR.
+        "range": "PQ" if gamma == "pq" else "HLG" if gamma == "hlg" else "SDR",
+        "primaries": params.get("primaries"),
+        "pixelformat": params.get("hw-pixelformat") or params.get("pixelformat"),
+    }
+
+
+board_info = None        # processor temperature and fan - see patch_board_badge.py
+THERMAL_SYSFS = os.environ.get("LYNX_THERMAL_SYSFS", "/sys/class")
+
+
+def _read_board():
+    """Processor temperature and fan speed, from the kernel. Prefers the
+    ROCK's soc-thermal or the Pi's cpu-thermal sensor, otherwise the
+    first one. None if there is no sensor at all."""
+    import glob as _glob
+    def _rd(p):
+        with open(p) as f:
+            return f.read().strip()
+    zones = {}
+    for z in sorted(_glob.glob(f"{THERMAL_SYSFS}/thermal/thermal_zone*")):
+        try:
+            zones[_rd(f"{z}/type")] = z
+        except OSError:
+            pass
+    if not zones:
+        return None
+    sensor = next((n for n in ("soc-thermal", "cpu-thermal") if n in zones),
+                  next(iter(zones)))
+    try:
+        temp_c = round(int(_rd(f"{zones[sensor]}/temp")) / 1000.0, 1)
+    except (OSError, ValueError):
+        return None
+    info = {"temp_c": temp_c, "sensor": sensor,
+            "fan_pwm": None, "fan_pct": None, "fan_rpm": None}
+    for h in sorted(_glob.glob(f"{THERMAL_SYSFS}/hwmon/hwmon*")):
+        try:
+            if _rd(f"{h}/name") not in ("pwmfan", "pwm-fan", "cooling_fan"):
+                continue
+            pwm = int(_rd(f"{h}/pwm1"))
+            info["fan_pwm"] = pwm
+            info["fan_pct"] = round(pwm * 100 / 255)
+            try:
+                info["fan_rpm"] = int(_rd(f"{h}/fan1_input"))
+            except (OSError, ValueError):
+                pass
+            break
+        except (OSError, ValueError):
+            continue
+    return info
+
+
+def video_badge_monitor():
+    global video_in_info, video_out_info, board_info
+    while True:
+        try:
+            outs = _read_video_out()
+            vin = _read_video_in()
+            brd = _read_board()
+            with _video_badge_lock:
+                board_info = brd
+                video_out_info = outs
+                video_in_info = vin
+        except Exception as e:
+            print(f"[video_badges] {e}")
+        time.sleep(VIDEO_BADGE_POLL_SECS)
+
+
+# ── Screen presence (see patch_mpv_screen_return.py) ─────────────
+DRM_SYSFS = os.environ.get("LYNX_DRM_SYSFS", "/sys/class/drm")
+
+
+def screen_connected() -> bool:
+    """True unless the kernel says no display is connected. Connector
+    status files present and none "connected" means no screen - a
+    monitor switched to another input or asleep. No status files at
+    all means assume a screen, i.e. behave exactly as before.
+    The SRT virtual screen counts as a screen: it asks for frames."""
+    if os.path.exists(lynx_screen_output.VIRTUAL_MARKER):
+        return True
+    states = []
+    try:
+        for name in os.listdir(DRM_SYSFS):
+            if not name.startswith("card") or "-" not in name or "Writeback" in name:
+                continue
+            try:
+                with open(os.path.join(DRM_SYSFS, name, "status")) as f:
+                    states.append(f.read().strip())
+            except OSError:
+                pass
+    except OSError:
+        return True
+    return (not states) or ("connected" in states)
+
+
+def _mpv_has_picture_problem() -> bool:
+    """mpv is playing something with a video track, but has no picture.
+    False when mpv is not running, the source has no video, or all is
+    well."""
+    vp = mpv_query({"command": ["get_property", "video-params"]})
+    if vp and vp.get("error") == "success" and isinstance(vp.get("data"), dict) \
+            and vp["data"].get("h"):
+        return False
+    tl = mpv_query({"command": ["get_property", "track-list"]})
+    if not tl or tl.get("error") != "success":
+        return False          # no mpv answering: nothing to fix here
+    return any(t.get("type") == "video" for t in (tl.get("data") or []))
+
+
+def _reapply_refresh_rate(reason: str = "came back") -> Optional[bool]:
+    """Puts the screen at the configured refresh rate, at its current size.
+
+    Called when Lynx starts, when the setting is saved, and when a
+    screen comes back (a monitor coming back is driven at its own
+    preferred mode: 60 Hz on an LG 27UK850, 60 Hz on an ATEM). A listed
+    mode at the current size first, then, on the ROCK and Pi 5 only, a
+    custom mode - the same rule as lynx_start.sh.
+
+    Every board for a listed mode (3 Nov 2026): the Refresh rate setting
+    is offered on every board, and a mode the display itself lists is one
+    it has said it accepts. Live, not at the next restart: the size does
+    not change, only the rate, which this already did on every screen
+    return. Returns True if changed, False if refused, None if nothing
+    needed doing (or no screen to ask)."""
+    if lynx_screen_output.settings(config)["mode"] == "srt":
+        return None     # the virtual screen's mode is set by lynx_screen_output
+    try:
+        want = int((config.get('display') or {}).get('refresh_hz', 50) or 50)
+    except (TypeError, ValueError):
+        want = 50
+    env = os.environ.copy()
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    env.setdefault("WAYLAND_DISPLAY", "wayland-0")
+    try:
+        text = subprocess.run(["wlr-randr"], capture_output=True, text=True,
+                              timeout=3, env=env).stdout
+    except Exception:
+        return
+    name, modes = None, []
+    for line in text.splitlines():
+        if line and not line[0].isspace():
+            if name:
+                break          # first output only
+            name = line.split()[0]
+            continue
+        m = re.match(r"\s+(\d+x\d+) px, ([\d.]+) Hz(.*)", line)
+        if m:
+            modes.append((m.group(1), float(m.group(2)), "current" in m.group(3)))
+    current = next((m for m in modes if m[2]), None)
+    if not name or not current:
+        return None
+    # The height cap first. lynx_start.sh applies it before anything
+    # draws, but only if the screen has finished its HDMI handshake by
+    # then; this path only ever changed the rate, so a monitor that woke
+    # late stayed at its preferred mode (Pi 5 into an LG 4K, 14 Nov 2026:
+    # 3840x2160 at 60 Hz with max_height 1080 and 50 Hz saved). The same
+    # rule as lynx_start.sh: the wanted rate at the capped height if
+    # listed, else the highest rate listed there.
+    cap = display_max_height()
+    if int(current[0].split("x")[1]) > cap:
+        at_cap = [m for m in modes if int(m[0].split("x")[1]) == cap]
+        if not at_cap:
+            print(f"[screen] {name} at {current[0]} ({reason}) - no {cap}p mode "
+                  f"listed, leaving it", flush=True)
+            return False
+        exact = [m for m in at_cap if round(m[1]) == want]
+        pick = (max(exact, key=lambda m: int(m[0].split("x")[0])) if exact
+                else max(at_cap, key=lambda m: (m[1], int(m[0].split("x")[0]))))
+        r = subprocess.run(["wlr-randr", "--output", name, "--mode",
+                            f"{pick[0]}@{pick[1]:.6f}Hz"],
+                           capture_output=True, text=True, timeout=5, env=env)
+        print(f"[screen] {name} at {current[0]} {current[1]:g} Hz ({reason}) - over the "
+              f"{cap}p cap, asked for {pick[0]} {pick[1]:g} Hz: "
+              f"{'ok' if r.returncode == 0 else 'not accepted'}", flush=True)
+        return r.returncode == 0
+    if round(current[1]) == want:
+        return None
+    res = current[0]
+    listed = next((m for m in modes if m[0] == res and round(m[1]) == want), None)
+    if not listed and not lynx_platform.CUSTOM_REFRESH_MODES:
+        print(f"[screen] {name} at {res} {current[1]:g} Hz ({reason}) - {want} Hz is not "
+              f"in its mode list, leaving it", flush=True)
+        return False
+    args = (["--mode", f"{res}@{listed[1]:.6f}Hz"] if listed
+            else ["--custom-mode", f"{res}@{want}Hz"])
+    r = subprocess.run(["wlr-randr", "--output", name, *args],
+                       capture_output=True, text=True, timeout=5, env=env)
+    print(f"[screen] {name} at {res} {current[1]:g} Hz ({reason}) - asked for {want} Hz: "
+          f"{'ok' if r.returncode == 0 else 'not accepted'}", flush=True)
+    return r.returncode == 0
+
+
+def _check_mpv_after_mode_change(why: str):
+    """After the screen mode changes under a playing mpv: if it has lost
+    its picture, restart it on the same source, as a screen return does."""
+    src, is_rf = playing_source, playing_source_is_rf
+    if not src:
+        return
+    time.sleep(2)
+    if not _mpv_has_picture_problem():
+        return
+    if tune_lock.acquire(timeout=2):
+        try:
+            print(f"[screen] mpv lost its picture after {why} - restarting it on {src}",
+                  flush=True)
+            record_diagnostic_event("refresh_change_restart",
+                                    f"mpv lost its picture after {why} - restarted it")
+            start_transition_cover()
+            time.sleep(0.3)
+            restart_mpv(src, is_rf=is_rf)
+            wait_for_mpv_rendering()
+            end_transition_cover()
+        finally:
+            tune_lock.release()
+
+
+def refresh_rate_at_start():
+    """Once, as Lynx starts: put the screen at the saved rate. lynx_start.sh
+    asks too, before anything draws, but it can run before the display has
+    finished its HDMI handshake, and what it says goes nowhere a receiver
+    keeps (3 Nov 2026: a Pi 5 into an ATEM sat at 1080p60, its preferred
+    mode, with 50 saved and 50 listed, and nothing to say why). Logged here.
+    Waits up to a minute for a screen; none, and the screen return does it."""
+    deadline = time.time() + 60
+    while time.time() < deadline and not screen_connected():
+        time.sleep(2)
+    time.sleep(5)   # let the compositor finish setting the output up
+    if _reapply_refresh_rate("Lynx starting"):
+        _check_mpv_after_mode_change("the refresh change at start-up")
+
+
+# _mpv_prop() comes from patch_video_badges.py.
+
+
+def _mpv_playback_problem():
+    """None if mpv is playing normally (or not running, or paused).
+    Otherwise a short reason: playback not moving, or no sound output
+    although the source has sound. See patch_screen_return_stall.py."""
+    tracks = _mpv_prop("track-list")
+    if not isinstance(tracks, list):
+        return None                      # no mpv answering
+    if _mpv_prop("pause"):
+        return None                      # paused on purpose
+    has_audio = any(t.get("type") == "audio" and t.get("selected") for t in tracks)
+    reasons = []
+    if has_audio and not _mpv_prop("current-ao"):
+        reasons.append("no sound output")
+    t1 = _mpv_prop("playback-time")
+    time.sleep(3)
+    t2 = _mpv_prop("playback-time")
+    if isinstance(t1, (int, float)) and isinstance(t2, (int, float)):
+        if t2 - t1 < 0.5:
+            reasons.append(f"playback not moving ({t1:.1f}s -> {t2:.1f}s)")
+    elif t1 is None and t2 is None:
+        reasons.append("no playback position")
+    return ", ".join(reasons) or None
+
+
+def _mpv_state_line():
+    """mpv's state in one log line, for working out what went wrong."""
+    names = ("playback-time", "core-idle", "paused-for-cache", "pause",
+             "current-ao", "audio-device", "eof-reached", "demuxer-cache-idle")
+    return " ".join(f"{n}={_mpv_prop(n)!r}" for n in names)
+
+
+def screen_return_monitor():
+    """When a screen comes back: put the refresh rate back, then make
+    sure mpv has its picture. An mpv (re)started while no screen was
+    connected plays sound but never sets up its video output, and
+    nothing else tells it to try again."""
+    global mpv_last_started_at
+    was = screen_connected()
+    while True:
+        time.sleep(2)
+        try:
+            now = screen_connected()
+            if now and not was:
+                print("[screen] screen back - checking mpv has its picture", flush=True)
+                time.sleep(4)   # let the compositor set the output up first
+                _reapply_refresh_rate("came back")
+                time.sleep(2)
+                src = playing_source
+                is_rf = playing_source_is_rf
+                why, event = None, None
+                if src:
+                    if _mpv_has_picture_problem():
+                        why, event = "mpv has sound but no picture", "screen_back_restart"
+                    else:
+                        problem = _mpv_playback_problem()
+                        if problem:
+                            # Log first: this is the evidence for next time.
+                            print(f"[screen] mpv stuck ({problem}): {_mpv_state_line()}",
+                                  flush=True)
+                            mpv_query({"command": ["ao-reload"]})
+                            time.sleep(2)
+                            problem = _mpv_playback_problem()
+                            if problem:
+                                why, event = (f"mpv still stuck after reopening sound "
+                                              f"({problem})"), "screen_back_stall_restart"
+                            else:
+                                print("[screen] reopening mpv's sound output fixed it",
+                                      flush=True)
+                                record_diagnostic_event(
+                                    "screen_back_ao_reload",
+                                    "screen came back with mpv stuck - reopening its "
+                                    "sound output fixed it")
+                if why and tune_lock.acquire(timeout=2):
+                    try:
+                        print(f"[screen] {why} - restarting it on {src}", flush=True)
+                        record_diagnostic_event(event,
+                                                f"screen came back: {why} - restarted it")
+                        start_transition_cover()
+                        time.sleep(0.3)
+                        restart_mpv(src, is_rf=is_rf)
+                        if is_rf:
+                            mpv_last_started_at = time.time()
+                        wait_for_mpv_rendering()
+                        end_transition_cover()
+                    finally:
+                        tune_lock.release()
+            was = now
+        except Exception as e:
+            print(f"[screen] {type(e).__name__}: {e}", flush=True)
+
 
 def mpv_decoder_health_monitor():
     """Background thread, RF mode only: watches mpv's own log for two
@@ -1654,7 +2467,20 @@ def mpv_decoder_health_monitor():
                               # the freeze length rather than mpv's own recovery time. Halved to
                               # reduce worst-case detection latency, now paired with the raised
                               # 10-error threshold above rather than the original 3.
-    DELAY_THRESHOLD_SECS = 3.0   # gap between playback and buffered position...
+    DELAY_THRESHOLD_SECS = 6.0   # gap between playback and buffered position...
+                                 # Was 3.0, which a healthy stream could reach on its own:
+                                 # a Slave in good health measures 2.6-2.7s of cache with
+                                 # no underrun and the clock advancing normally, so routine
+                                 # variation crossed the line and restarted mpv for no
+                                 # reason. Observed as fifteen restarts in a few minutes,
+                                 # each rendering successfully before being restarted again,
+                                 # until the circuit breaker below backed off and let a
+                                 # picture settle. The restart is also counterproductive: it
+                                 # discards the buffer and forces a fresh acquisition, which
+                                 # on a five-second GOP costs more delay than it recovers.
+                                 # 6.0 is about double a healthy working delay and still far
+                                 # below the 20s emergency threshold that catches a gap
+                                 # genuinely running away...
     DELAY_CONSECUTIVE_CHECKS = 2  # ...persisting for this many consecutive checks triggers a restart.
                                     # Was 3 - reduced given this trigger was already confirmed (via
                                     # direct diagnostic testing) to catch a genuine, non-self-recovering
@@ -1696,7 +2522,9 @@ def mpv_decoder_health_monitor():
     while True:
         time.sleep(CHECK_INTERVAL)
         try:
-            if current_mode != "rf" or not mpv_running_for_rf:
+            # No screen: playback stalls by design (nothing asks for
+            # frames), which is not a decoder fault.
+            if current_mode != "rf" or not mpv_running_for_rf or not screen_connected():
                 last_size = 0
                 recent_error_times = []
                 high_delay_streak = 0
@@ -1716,7 +2544,13 @@ def mpv_decoder_health_monitor():
                 emergency_delay_streak = 0
             if size == last_size:
                 continue
-            if time.time() - mpv_last_started_at < STARTUP_GRACE_SECS:
+            # A second programme chosen by hand (Lynx-Tx's stills carousel)
+            # shows a new picture every few seconds and has no sound, so
+            # its playback clock creeps forward in jumps: to these checks
+            # that is a stall, and they restarted mpv every half minute
+            # (10 Nov 2026). Left alone while one is being watched.
+            if (programme_wanted and not programme_wanted.get("first")) or \
+                    time.time() - max(mpv_last_started_at, programme_switched_at) < STARTUP_GRACE_SECS:
                 # Still within the startup grace window - advance our
                 # read position so nothing backlogs, but don't evaluate
                 # anything yet.
@@ -2117,6 +2951,16 @@ def mpv_drift_monitor():
 
             if (hard_freeze_detected_at > 0 and
                     hard_freeze_detected_at != last_handled_hard_freeze_at and
+                    hard_freeze_target and not screen_connected()):
+                # No screen: nothing asks mpv for frames, so playback
+                # stopping is expected. Restarting here would start an
+                # mpv that cannot set up its picture at all - see
+                # patch_mpv_screen_return.py.
+                print("[mpv_drift] playback stopped with no screen connected - "
+                      "expected, not restarting")
+                last_handled_hard_freeze_at = hard_freeze_detected_at
+            if (hard_freeze_detected_at > 0 and
+                    hard_freeze_detected_at != last_handled_hard_freeze_at and
                     hard_freeze_target and
                     mpv_transitioning):
                 # A source switch is in progress. mpv was killed
@@ -2390,6 +3234,22 @@ def diversity_stuck_lock_monitor():
 
             stuck_a = check("a", picotuner_state)
             stuck_b = check("b", picotuner_state_b)
+            # A receiver another device has tuned stops reporting to us,
+            # which can look stuck. It isn't ours to recover.
+            if stuck_a and _picotuner_taken_over(1):
+                stuck_a = False
+            if stuck_b and _picotuner_taken_over(2):
+                stuck_b = False
+
+            # Only when RF is what the receiver is actually showing.
+            # This recovers a stuck tuner by retuning it from the last
+            # saved RF state - which, with another source selected,
+            # drags the player back to RF and away from what the
+            # operator asked for. Confirmed live: selecting DVB-T2 with
+            # nothing transmitting reverted to DVB-S2 about a minute
+            # later, via this path.
+            if current_mode != "rf":
+                continue
 
             if stuck_a or stuck_b:
                 now = time.time()
@@ -2438,18 +3298,25 @@ def rf_mpv_lifecycle_monitor():
     starting mpv (and clearing the cover) from that point on.
     """
     global mpv_running_for_rf, mpv_last_started_at
-    LOCK_CONFIRM_POLLS = 3   # ~3s of sustained lock before starting mpv - avoids reacting to a brief false lock
-    LOSS_CONFIRM_POLLS = 3   # ~3s of sustained loss before stopping mpv - avoids stopping on a brief, normal fade.
+    # 10 Nov 2026: mpv now starts on the FIRST lock reading (was 3 s of
+    # steady lock), at half-second polls. The 3 s cost every start 3 s, and
+    # guarded against false locks that were mostly Lynx misreading the
+    # tuner (a lock shown without its service name, fixed the same day).
+    # A false lock costs nothing on screen: mpv starts behind the cover,
+    # finds no picture, and the cover never lifts.
+    LOCK_CONFIRM_POLLS = 1
+    LOSS_CONFIRM_POLLS = 6   # ~3s of sustained loss before stopping mpv - avoids stopping on a brief, normal fade.
                                # Was ~6s (POLL_SECS=2) - live testing with a co-channel interference edge case
                                # (two overlapping transmissions) showed the receiver can flicker between locked/
                                # unlocked fast enough that the unbroken streak this requires never completed,
                                # leaving mpv stuck on stale content with neither a stop nor a fresh restart ever
                                # triggering. A shorter window helps but doesn't fully close this if flickering is
                                # faster than even this - worth further testing per Justin's plan.
-    POLL_SECS = 1
+    POLL_SECS = 0.5
 
     lock_streak = 0
     loss_streak = 0
+    lock_seen_at = None   # first reading of the current lock: for "lock to picture" timing
 
     while True:
         time.sleep(POLL_SECS)
@@ -2529,23 +3396,47 @@ def rf_mpv_lifecycle_monitor():
                 mpv_running_for_rf = False  # streaming/idle modes manage mpv themselves
                 continue
 
-            raw_locked = picotuner_state.get("locked", False) or \
+            # Whichever receiver is actually on screen. Reading the
+            # local tuner here would stop mpv when IT lost lock while
+            # a Slave was playing quite happily, and restart it onto
+            # the wrong source when it came back.
+            #
+            # This is also what gives a Slave a clean restart when a
+            # transmission ends. Without it nothing tells mpv the
+            # source went away: it holds reference frames from a
+            # stream that stopped and smears them over the new one
+            # until a keyframe arrives.
+            _lifecycle_active = active_receiver()
+            raw_locked = (_lifecycle_active.get("locked", False)
+                          if _lifecycle_active else False) or \
                          (diversity_enabled and picotuner_state_b.get("locked", False))
+            # A lock read in the first moment after a tune can be the old
+            # frequency's: the tuner's next status line (once a second) has
+            # not arrived yet. With mpv now started on the first reading,
+            # that would start it on nothing and wait out the 8 s render
+            # check. So readings start counting 1.5 s after a tune.
+            if time.time() - rf_tuned_at < 1.5:
+                raw_locked = False
 
             if raw_locked:
                 loss_streak = 0
                 lock_streak += 1
+                if lock_seen_at is None:
+                    lock_seen_at = time.time()
                 if lock_streak >= LOCK_CONFIRM_POLLS and not mpv_running_for_rf:
                     if tune_lock.acquire(timeout=2):
                         try:
                             print(f"[rf_mpv_lifecycle] Confirmed lock after "
                                   f"{lock_streak * POLL_SECS}s - starting mpv")
-                            if diversity_enabled:
-                                div_cfg = config['diversity']
-                                restart_mpv(f"udp://@:{div_cfg['combiner_out_port']}")
-                            else:
-                                cfg = config['picotuner']
-                                restart_mpv(f"udp://@:{picotuner_ts_port('a', cfg)}")
+                            mpv_asked_at = time.time()
+                            # Same answer as before for diversity and
+                            # for receiver A, and the right one for a
+                            # Slave. Asking beats deciding again:
+                            # current_rf_target_port() exists because
+                            # call sites making this choice themselves
+                            # is how one of them ended up recovering
+                            # onto the wrong receiver's port.
+                            restart_mpv(f"udp://@:{current_rf_target_port()}")
                             rendering_confirmed = wait_for_mpv_rendering()  # real rendering, not a guess
                             if rendering_confirmed:
                                 # Same safety margin as the other two RF
@@ -2562,8 +3453,13 @@ def rf_mpv_lifecycle_monitor():
                                 end_transition_cover()
                                 mpv_running_for_rf = True
                                 mpv_last_started_at = time.time()
+                                took = time.time() - lock_seen_at
+                                print(f"[rf_mpv_lifecycle] lock to picture {took:.1f}s "
+                                      f"(waiting for lock reading "
+                                      f"{mpv_asked_at - lock_seen_at:.1f}s, mpv to picture "
+                                      f"{time.time() - mpv_asked_at:.1f}s)")
                                 record_diagnostic_event("rf_lock_confirmed_start",
-                                                  f"after {lock_streak * POLL_SECS}s idle")
+                                                  f"lock to picture {took:.1f}s")
                             else:
                                 # mpv never confirmed real rendering within the
                                 # timeout - confirmed live as a genuine bug when
@@ -2586,6 +3482,7 @@ def rf_mpv_lifecycle_monitor():
                     # establish the correct mpv state - try again next poll.
             else:
                 lock_streak = 0
+                lock_seen_at = None
                 loss_streak += 1
                 if loss_streak >= LOSS_CONFIRM_POLLS and mpv_running_for_rf:
                     if tune_lock.acquire(timeout=2):
@@ -2595,6 +3492,14 @@ def rf_mpv_lifecycle_monitor():
                             start_transition_cover()
                             kill_mpv()
                             mpv_running_for_rf = False
+                            # mpv is gone, so nothing is left underneath to
+                            # hide: lower the cover and let the overlay say
+                            # what the receiver is doing (the orange status).
+                            # Left up, it stayed until its 30 s cap, hiding the
+                            # OSD by design for a switch, and the screen sat
+                            # black for half a minute after every loss of
+                            # signal (10 Nov 2026, Justin, ROCK 5C).
+                            end_transition_cover()
                             record_diagnostic_event("rf_loss_confirmed_stop",
                                               f"after {loss_streak * POLL_SECS}s of confirmed loss")
                         finally:
@@ -3065,6 +3970,27 @@ picotuner_state_b = {
 # API, matching the same staleness window picotuner_state itself uses.
 discovered_picotuners = {}
 
+def _rejoin_callsign(parts):
+    """Rejoin a callsign that contains spaces in a Picotuner table row.
+
+    Columns: RX STATUS CALLSIGN MER D FREQUENCY SR ... The FREQUENCY/SR
+    pair (a number >= 50 then an integer) belongs at index 5; if it is
+    found further right, the callsign took that many extra slots. Rows
+    with no such pair (unlocked, acquiring) are returned unchanged.
+    """
+    for f in range(5, len(parts) - 1):
+        try:
+            if float(parts[f]) >= 50 and parts[f + 1].isdigit():
+                extra = f - 5
+                if extra > 0:
+                    return (parts[:2] + [" ".join(parts[2:3 + extra])]
+                            + parts[3 + extra:])
+                return parts
+        except ValueError:
+            continue
+    return parts
+
+
 def picotuner_table_monitor_b():
     """Background thread: reads the rich table-format status from
     Picotuner port 9904 (a confirmed duplicate of 9902). Live-tested
@@ -3181,6 +4107,11 @@ def picotuner_table_monitor_b():
             rx_b = str(picotuner_rx_numbers["b"])
             for line in text.splitlines():
                 parts = line.split()
+                parts = _rejoin_callsign(parts)  # names with spaces
+                # Full service name - the table's CALLSIGN column. Only on
+                # full rows, so a searching tuner cannot post 'search'.
+                if len(parts) >= 16 and parts[0] in (rx_a, rx_b):
+                    (picotuner_state if parts[0] == rx_a else picotuner_state_b)["service"] = parts[2].replace('_', ' ')
                 # Data rows start with the RX number - 1 and 2 on a normal
                 # board, 5 and 6 on a jumpered one, so compared against
                 # what the board reports rather than a literal. Header and
@@ -3286,6 +4217,1281 @@ def picotuner_table_monitor_b():
                 except: pass
                 sock = None
             time.sleep(1)
+
+# ── BATC reachability ────────────────────────────────────────
+# Whether BATC can be reached at all, as distinct from whether a stream
+# happens to be playing. Without it the Stream panel could only say
+# "nothing playing", which reads identically whether the band is quiet
+# or the receiver has lost its internet.
+#
+# Checked by refreshing the BATC stream list rather than by pinging
+# something unrelated. That request has to happen anyway, so the health
+# signal is free, and it answers the question actually being asked -
+# a ping to 8.8.8.8 would report success while BATC itself was down,
+# which is precisely the case worth catching.
+batc_health = {
+    "online": True,      # optimistic until proven otherwise, so a
+                          # receiver does not show red for the first few
+                          # seconds of every boot
+    "last_ok": 0,
+    "last_error": "",
+}
+
+BATC_CHECK_INTERVAL_SECS = 1800.0
+
+
+def batc_health_monitor():
+    """Background thread: refreshes the BATC stream cache every five
+    minutes and records whether it worked.
+
+    Failure is recorded, never raised - BATC being unreachable is a
+    perfectly ordinary condition at a site on a flaky connection, and
+    must not disturb anything else. The previous cache is deliberately
+    left in place on failure: a stale stream list is more useful than
+    an empty one, and the health flag already says it may be old.
+    """
+    global _batc_cache, _batc_cache_time
+    while True:
+        time.sleep(BATC_CHECK_INTERVAL_SECS)
+        try:
+            streams = fetch_batc_streams_from_api()
+            _batc_cache = streams
+            _batc_cache_time = time.time()
+            batc_health["online"] = True
+            batc_health["last_ok"] = time.time()
+            batc_health["last_error"] = ""
+        except Exception as e:
+            batc_health["online"] = False
+            batc_health["last_error"] = f"{type(e).__name__}: {e}"
+            print(f"[batc] unreachable: {batc_health['last_error']}")
+
+
+# ── Remote source (Slave Rx) state ───────────────────────────
+# A Slave Rx is a receiver at another site - a converted MiniTiouner
+# and a Pi - forwarding its tuner status here over the network, so a
+# repeater can have an RF input somewhere it has no antenna. See the
+# Lynx-Slave-Rx repository for the remote end.
+#
+# Shaped as a subset of picotuner_state deliberately: the same field
+# names, so anything downstream that already reads a tuner's state can
+# read this one without a second shape to handle. Fields that only a
+# richer status port can fill (MER, margin, modcod) are absent rather
+# than present-and-empty, so their absence is visible rather than
+# looking like a tuner reporting zeros.
+# ── Remote sources (Slave Rx) ────────────────────────────────
+# A Slave Rx is a receiver at another site - a converted MiniTiouner
+# and a Pi, or a camera, or anything else that can send a transport
+# stream and say whether it has a signal - forwarding its status here
+# over the network. See the Lynx-Slave-Rx repository for the remote
+# end.
+#
+# A LIST, not a single source. A repeater whose coverage is the union
+# of several receive sites is the entire point of the feature, so one
+# Slave was only ever the first case. Making this a list before there
+# are several is far cheaper than retrofitting it afterwards, when
+# every consumer would have to change at once.
+
+# How long without a packet before a Slave counts as gone. The sender's
+# default heartbeat is every 2s, so this allows several to be missed
+# before anything is said - a single dropped UDP packet on a WAN hop is
+# ordinary and should not make a receiver appear to come and go.
+REMOTE_OFFLINE_AFTER_SECS = 15.0
+
+# Not 9997: picotuner_monitor() binds that on all interfaces for the
+# LOCAL Picotuner, and a Slave sending there would collide with the
+# receiver's own tuner status. The Slave's sender refuses 9997 for the
+# same reason at its own end. Subsequent Slaves get their own ports,
+# which is why the config carries one per source rather than deriving
+# them - a derived scheme looks tidy until somebody needs a gap in it.
+REMOTE_DEFAULT_STATUS_PORT = 10997
+
+# Every Slave sends its video to this one port, and the relay tells
+# them apart by source address — the same address that is already
+# sending that Slave's status, so identity comes free and there is no
+# per-Slave port to allocate, configure, or firewall.
+# A Slave's rich status arrives on its status port minus this, the
+# same relationship the Picotuner uses between 9997 and 9901. Derived
+# rather than configured: it has a natural answer, and a configurable
+# one would be a third port per Slave to keep in step at both ends.
+REMOTE_QUALITY_PORT_OFFSET = 96
+
+# How long a resume waits for a saved Slave to report in before
+# giving up. It cannot be selected until its address is known, and
+# at boot nothing has been heard yet. Bounded rather than endless:
+# a site that is off the air should leave the receiver idle and
+# usable, not stuck waiting for it.
+REMOTE_RESUME_WAIT_SECS = 30
+
+# Filled only from the quality port, and only once it has actually sent
+# something. Same names as picotuner_state so a panel or overlay that
+# already reads a tuner can read a Slave without a second shape.
+REMOTE_QUALITY_FIELDS = (
+    "mer", "margin", "symbol_rate", "modcod", "programme",
+    "dbm", "agc1", "agc2", "codec", "audio_codec",
+)
+
+
+def remote_quality_port(i: int) -> int:
+    return remote_states[i]["status_port"] - REMOTE_QUALITY_PORT_OFFSET
+
+
+REMOTE_VIDEO_INGRESS_PORT = 10998
+
+# The relay forwards the selected Slave here, and nothing is selected
+# until a later patch adds that path — so it currently receives, counts
+# and discards. Kept as a module-level singleton because the socket must
+# outlive any one request.
+# Where the relay puts the selected Slave, and the only thing mpv
+# is ever pointed at for a Slave. Its own port rather than sharing
+# one with the Picotuner or a stream: two writers on one port is
+# how you get a picture that is half one source and half another,
+# with nothing in the logs to say so.
+REMOTE_VIDEO_OUT_PORT = 10999
+
+slave_relay = lynx_relay.SlaveVideoRelay(
+    ingress_port=REMOTE_VIDEO_INGRESS_PORT,
+    mpv_port=REMOTE_VIDEO_OUT_PORT,
+)
+
+
+def relay_refresh_sources():
+    """Hand the relay the current address -> Slave index mapping.
+
+    Called whenever an address is learned or changes. Only Slaves that
+    have actually sent something appear, so an unheard-from Slave cannot
+    claim video, and a Slave that moves (DHCP) is followed automatically
+    on its next status packet.
+    """
+    try:
+        slave_relay.set_sources({
+            st["addr"]: i
+            for i, st in enumerate(remote_states)
+            if st.get("addr")
+        })
+    except Exception as e:
+        print(f"[relay] could not refresh sources: {type(e).__name__}: {e}")
+
+
+# One state record per configured Slave, built at startup and indexed
+# in step with remote_sources_cfg(). Built once rather than created on
+# demand so that a Slave which has never sent anything still has a
+# record, and still shows as offline rather than being absent - "not
+# there yet" and "not configured" are different things.
+# --- HDHomeRun (DVB-T/T2/C) ------------------------------------------
+# Imported here rather than in the header block at the top: this is an
+# optional source whose module sits beside the Slave code it most
+# resembles, and keeping the two together means somebody reading one
+# finds the other.
+import lynx_hdhomerun
+import lynx_sources
+
+# Its own port, not 9941. That port is already shared between the RF
+# direct-play path, stop_ffmpeg_bg()'s transcode and the diversity
+# combiner, and has already produced one "Address already in use"
+# crash when two of them overlapped. A third writer would be asking
+# for the same failure, and a tuner that can stay locked while another
+# source is on screen is worth having anyway.
+HDHR_VIDEO_PORT = 10996
+
+# The box sends to the relay, and the relay to mpv on HDHR_VIDEO_PORT,
+# reading the service names on the way (see lynx_relay.HdhrNameRelay):
+# an ATSC 3.0 box passes the SDT through but does not read it.
+hdhr_relay = lynx_relay.HdhrNameRelay(
+    ingress_port=lynx_relay.HDHR_INGRESS_PORT,
+    mpv_port=HDHR_VIDEO_PORT,
+)
+
+# How often each known device is asked for status. It does not
+# broadcast, so this is a request rather than a packet arriving:
+# often enough for the overlay to feel live, not so often that a busy
+# device is being interrogated for no reason.
+HDHR_POLL_INTERVAL_SECS = 2.0
+
+# How long without a successful status read before a device counts as
+# gone. Several polls, so one timeout on a busy network does not make
+# a tuner appear to come and go.
+HDHR_OFFLINE_AFTER_SECS = 15.0
+
+# Deliberately NOT the same names as REMOTE_QUALITY_FIELDS. Those are
+# DVB-S2 measurements; these are DVB-T/T2 ones. Presenting SNQ as MER
+# would make two different things look comparable on one overlay, and
+# somebody would eventually compare them.
+HDHR_QUALITY_FIELDS = (
+    "lock_mode",        # e.g. "t8dvbt2"; "" when unlocked
+    "signal_strength",  # ss,  0-100
+    "signal_quality",   # snq, 0-100
+    "symbol_quality",   # seq, 0-100
+    "bitrate_bps",      # bps
+    "frequency_hz",
+)
+
+# Discovered devices, keyed by device ID. Unlike remote_states this is
+# NOT built from config and NOT a list indexed in step with anything:
+# there is no configured set for a device to be absent from, so one
+# that has never been seen simply is not here. Keyed rather than
+# indexed because a device's identity is its ID, and discovery returns
+# them in whatever order they answer.
+hdhr_states: dict = {}
+hdhr_lock = threading.Lock()
+
+
+def hdhr_presets_cfg() -> list:
+    """The configured presets, as a list.
+
+    Presets are configured because which frequencies and services
+    matter is not discoverable. The devices themselves are not: they
+    announce themselves on the LAN, and anything that announces itself
+    should not also have to be declared.
+    """
+    presets = config.get('hdhomerun_presets')
+    return presets if isinstance(presets, list) else []
+
+
+def hdhr_devices() -> list:
+    """Known devices, newest state, as a list of records.
+
+    Sorted by device ID so the order on screen is stable: discovery
+    returns them in whatever order they answer, which is not an order
+    anybody wants to watch a list re-sort itself into.
+    """
+    with hdhr_lock:
+        return [dict(st) for _, st in sorted(hdhr_states.items())]
+
+
+def hdhr_discover_once() -> int:
+    """Sweep the network for HDHomeRun devices. Returns how many.
+
+    Called once at startup rather than from a background thread: an
+    HDHomeRun is installed once, not plugged in and out, and a
+    receiver with none should run no thread and send no broadcast -
+    absent hardware means absent behaviour, the same principle the
+    Slave threads follow for absent configuration. A device added
+    later is picked up on the next restart.
+
+    Discovery returns one row per ADDRESS, so a device reachable over
+    IPv4 and IPv6 answers three times (global v6, link-local v6, v4).
+    Keyed by device ID so those collapse to one record, and the IPv4
+    address is preferred because that is what the rest of the site is
+    addressed by.
+    """
+    try:
+        found = lynx_hdhomerun.discover()
+    except lynx_hdhomerun.HDHomeRunError as e:
+        # No devices, or hdhomerun_config not installed. Neither is an
+        # error: this source is optional.
+        print(f"[hdhr] discovery: {e}")
+        return 0
+
+    with hdhr_lock:
+        for device in found:
+            device_id = device["device_id"]
+            address = device["address"]
+            st = hdhr_states.setdefault(device_id, {
+                "device_id": device_id,
+                "name": f"HDHomeRun {device_id}",
+                "tuner": 0,
+                "address": address,
+                "online": False,
+                "locked": False,
+                "streaming": False,
+                "last_seen": 0.0,
+                "last_error": "",
+                **{field: None for field in HDHR_QUALITY_FIELDS},
+            })
+            if ":" not in address:
+                st["address"] = address        # prefer IPv4
+        count = len(hdhr_states)
+
+    # A configured address, asked directly. Discovery is a broadcast
+    # and stops at the first router, so a device on another subnet can
+    # never answer it - but it is perfectly reachable once named, and
+    # everything after this point is ordinary unicast.
+    #
+    # Additive rather than exclusive: a receiver may have one tuner on
+    # the local segment and another at a site across a link, and there
+    # is no reason to make it choose.
+    _manual = (config.get('hdhomerun') or {}).get('address', '')
+    if _manual:
+        try:
+            info = lynx_hdhomerun.discover_http(_manual)
+            _did = (info.get('DeviceID') or '').upper()
+            if _did:
+                with hdhr_lock:
+                    st = hdhr_states.setdefault(_did, {
+                        "device_id": _did,
+                        "name": info.get('FriendlyName') or f"HDHomeRun {_did}",
+                        "tuner": 0,
+                        "address": _manual,
+                        "online": False,
+                        "locked": False,
+                        "streaming": False,
+                        "last_seen": 0.0,
+                        "last_error": "",
+                        **{field: None for field in HDHR_QUALITY_FIELDS},
+                    })
+                    # A configured address wins over a discovered one
+                    # for the same device: somebody typed it, which is
+                    # a stronger statement than a broadcast reply.
+                    st["address"] = _manual
+                    st["configured"] = True
+                count = len(hdhr_states)
+        except lynx_hdhomerun.HDHomeRunError as e:
+            print(f"[hdhr] configured address {_manual}: {e}")
+
+    _hdhr_apply_names()
+    if count:
+        for st in hdhr_devices():
+            print(f"[hdhr] found {st['name']} {st['device_id']} at {st['address']}")
+    return count
+
+
+def hdhr_default_device_id():
+    """Which device a tune goes to when none is named.
+
+    A configured preference wins if that device is actually present;
+    otherwise the first one by ID. Returns None when nothing has been
+    found, which the caller reports rather than guessing.
+    """
+    # The box in use first: see patch_hdhr_after_atsc3.py. The lowest ID
+    # alone made the US ATSC box "the HDHomeRun" for the DVB-T2 re-lock
+    # restart and Pathfinder, whichever box was playing.
+    preferred = ((config.get('hdhomerun') or {}).get('prefer_device_id') or "").upper()
+    with hdhr_lock:
+        if hdhr_active_device and hdhr_active_device in hdhr_states:
+            return hdhr_active_device
+        if preferred and preferred in hdhr_states:
+            return preferred
+        ids = sorted(hdhr_states)
+    # Outside the lock: asking a box its kind takes the lock itself.
+    for device_id in ids:
+        if hdhr_device_kind(device_id) == "dvb":
+            return device_id
+    return ids[0] if ids else None
+
+
+_hdhr_features: dict = {}
+_hdhr_features_failed: dict = {}
+# The device Lynx last tuned: the one whose picture is on screen while in
+# DVB-T2 / ATSC 3.0 mode. Set by the tune route.
+hdhr_active_device = None
+
+
+def hdhr_device_modulations(device_id):
+    """The modulations a device says it supports (its /sys/features), or
+    None if it cannot be asked. Cached: a box's features do not change. A
+    failure is remembered for a minute, so a box that does not answer is
+    not asked again on every status poll."""
+    if device_id in _hdhr_features:
+        return _hdhr_features[device_id]
+    if time.time() - _hdhr_features_failed.get(device_id, 0) < 60:
+        return None
+    with hdhr_lock:
+        st = dict(hdhr_states.get(device_id) or {})
+    try:
+        tuner = lynx_hdhomerun.HDHomeRunTuner(device_id=device_id, tuner=st.get("tuner", 0))
+        mods = set()
+        for line in tuner.get("/sys/features").splitlines():
+            key, _, rest = line.partition(":")
+            if key.strip() == "modulation":
+                mods.update(rest.split())
+        _hdhr_features[device_id] = mods
+        return mods
+    except Exception as e:
+        print(f"[hdhr] features of {device_id}: {type(e).__name__}: {e}")
+        _hdhr_features_failed[device_id] = time.time()
+        return None
+
+
+def hdhr_device_kind(device_id) -> str:
+    """"atsc" for an ATSC model (it lists atsc3), "dvb" for anything else -
+    including a box that could not be asked, which is what every HDHomeRun
+    Lynx knew before ATSC 3.0."""
+    mods = hdhr_device_modulations(device_id)
+    return "atsc" if mods and "atsc3" in mods else "dvb"
+
+
+def hdhr_device_supports(device_id, modulation):
+    """True / False, or None when the device could not be asked.
+
+    ATSC modes must be listed by name. A DVB mode is assumed on any box
+    that lists DVB at all: its QAM entries are wildcards, and the DVB-T2
+    bandwidths it accepts are more than it advertises (see
+    lynx_hdhomerun's notes)."""
+    mods = hdhr_device_modulations(device_id)
+    if mods is None:
+        return None
+    if modulation in lynx_hdhomerun.ATSC_MODULATIONS:
+        return modulation in mods
+    return any(("dvb" in m) or ("qam" in m and m.startswith("a")) for m in mods)
+
+
+def hdhr_device_for(modulation, requested=None):
+    """Which device a tune goes to.
+
+    A named device always wins. Otherwise the default - if it can do this
+    modulation - then any other that can. With an ATSC Flex 4K and a DVB-T2
+    box on one network, "the first one found" sent ATSC 3.0 tunes to a box
+    that cannot demodulate it (16 Oct 2026)."""
+    if requested:
+        return requested
+    default = hdhr_default_device_id()
+    with hdhr_lock:
+        others = [d for d in sorted(hdhr_states) if d != default]
+    for d in ([default] if default else []) + others:
+        if hdhr_device_supports(d, modulation):
+            return d
+    return default
+
+
+def _hdhr_pick(which):
+    """A device record for the status payload, or None.
+
+    "dvb" / "atsc": the first device of that kind. "active": the one Lynx
+    tuned last while in DVB-T2 / ATSC 3.0 mode - whose picture is on
+    screen - and otherwise the DVB box, as before ATSC 3.0, then any."""
+    devices = hdhr_devices()
+    if which == "active":
+        if current_mode == "dvbt" and hdhr_active_device:
+            for d in devices:
+                if d["device_id"] == hdhr_active_device:
+                    return d
+        which = "dvb"
+        fallback = devices[0] if devices else None
+    else:
+        fallback = None
+    for d in devices:
+        if hdhr_device_kind(d["device_id"]) == which:
+            return d
+    return fallback
+
+
+def _hdhr_block(d):
+    """One device as the page and the overlay see it."""
+    if not d:
+        return None
+    return {
+        "device_id": d["device_id"],
+        "name": d.get("name", ""),
+        "kind": hdhr_device_kind(d["device_id"]),
+        # Whether this device's picture is the one on screen. The codec
+        # rows come from the player, so they belong to this device only.
+        "active": current_mode == "dvbt" and d["device_id"] == hdhr_active_device,
+        "online": d["online"],
+        "locked": d["locked"],
+        "lock_mode": d["lock_mode"],
+        "level": d["signal_strength"],
+        "snq": d["signal_quality"],
+        "seq": d["symbol_quality"],
+        "bitrate_bps": d["bitrate_bps"],
+        "frequency_hz": d["frequency_hz"],
+        "service_name": d.get("service_name", ""),
+        # Empty unless the tuned frequency was in an amateur band - see
+        # hdhr_is_amateur_band(). The overlay feeds this to the callsign
+        # field, which reaches QRZ and Pathfinder, so a broadcast channel
+        # name must never arrive here.
+        "callsign": d.get("callsign", ""),
+        # The name from QRZ when it is cached, so a DVB-T2 or ATSC 3.0
+        # station reads "Justin - G8YTZ" like any other contact.
+        "callsign_name": qrz_first_name(d.get("callsign", "")),
+    }
+
+
+def hdhr_programme_name(programs, wanted) -> str:
+    """The name the device gives a programme, or "".
+
+    wanted is a programme number, or "*" for an ATSC 3.0 tune, where the
+    box carries one TS and none is chosen: then the first programme the
+    box can actually deliver. Entries it flags ("no data", "encrypted")
+    are never it - an ATSC 3.0 SLT can announce a service that is not
+    present, and taking its name put "W6RZ-DT" over our own stream
+    (16 Oct 2026)."""
+    for prog in programs:
+        if wanted == "*":
+            if prog.get("flags"):
+                continue
+            return prog.get("name", "")
+        if prog.get("program") == wanted:
+            return prog.get("name", "")
+    return ""
+
+
+def _hdhr_release_ours(st):
+    """Stop this box's tuner only if it is sending to us. A box can be
+    shared by several receivers; stopping every tuner on leaving cut
+    off the other receiver's picture (Pi and ROCK 5C, 14 Nov 2026)."""
+    device_id = st["device_id"]
+    try:
+        ours = hdhr_local_address(st.get("address") or device_id)
+        lynx_hdhomerun.HDHomeRunTuner(
+            device_id=device_id, tuner=st.get("tuner", 0)).release_if_ours(ours)
+    except Exception as e:
+        print(f"[hdhr] release {device_id} failed: {type(e).__name__}: {e}")
+
+
+def hdhr_choose_tuner(device_id):
+    """Pick the tuner this receiver tunes, before every tune.
+
+    Every receiver used tuner 0, so two sharing a box retuned each
+    other's channel and the second tuner sat idle (14 Nov 2026). Now:
+    the tuner this receiver had, if it is free or still ours; else the
+    first free one; else a refusal naming who has them, never a tuner
+    taken from someone else. Free = no target; ours = target is our
+    address."""
+    with hdhr_lock:
+        st = dict(hdhr_states.get(device_id) or {})
+    ours = hdhr_local_address(st.get("address") or device_id)
+    count = lynx_hdhomerun.tuner_count(device_id)
+    current = int(st.get("tuner", 0) or 0)
+    owners = {}
+    for n in [current] + [i for i in range(count) if i != current]:
+        try:
+            owner = lynx_hdhomerun.target_host(
+                lynx_hdhomerun.HDHomeRunTuner(device_id=device_id, tuner=n).target())
+        except lynx_hdhomerun.HDHomeRunError as e:
+            owners[n] = f"unreadable ({e})"
+            continue
+        if not owner or owner == ours:
+            if n != current:
+                print(f"[hdhr] {device_id}: tuner {current} is in use by "
+                      f"{owners.get(current, '?')} - using tuner {n}", flush=True)
+            with hdhr_lock:
+                live = hdhr_states.get(device_id)
+                if live is not None:
+                    live["tuner"] = n
+            return n
+        owners[n] = owner
+    busy = ", ".join(f"tuner {n} by {o}" for n, o in sorted(owners.items()))
+    raise HTTPException(
+        status_code=409,
+        detail=f"Every tuner on this HDHomeRun is in use ({busy}). "
+               "Stop it on the other receiver first.")
+
+
+def hdhr_release_others(keep_device_id):
+    """Stop every OTHER device streaming to us.
+
+    All of them send to the same port. A DVB-T2 box left streaming from
+    the last tune kept its H.264 broadcast arriving alongside the new
+    ATSC 3.0 stream, and mpv stayed on the old one: the right figures on
+    the status panel over the wrong picture (16 Oct 2026)."""
+    for st in hdhr_devices():
+        if st["device_id"] == keep_device_id:
+            continue
+        _hdhr_release_ours(st)
+
+
+def _hdhr_apply_names():
+    """Each box's name: the one given on the config page, else one from
+    what it receives. Two boxes with the same default get the end of
+    their ID added. See patch_hdhr_after_atsc3.py."""
+    given = (config.get('hdhomerun') or {}).get('names') or {}
+    kinds = {d["device_id"]: hdhr_device_kind(d["device_id"]) for d in hdhr_devices()}
+    defaults = {did: ("HDHomeRun ATSC 3.0" if k == "atsc" else "HDHomeRun DVB-T2")
+                for did, k in kinds.items()}
+    with hdhr_lock:
+        for did, st in hdhr_states.items():
+            d = defaults.get(did, f"HDHomeRun {did}")
+            if list(defaults.values()).count(d) > 1:
+                d = f"{d} {did[-4:]}"
+            st["default_name"] = d
+            st["name"] = (given.get(did) or "").strip() or d
+
+
+def hdhr_local_address(device_address: str) -> str:
+    """Which of OUR addresses the device should stream to.
+
+    Asked of the kernel rather than configured, and asked again on
+    every tune rather than remembered. A UDP connect() sends nothing -
+    it only consults the routing table - so this costs nothing and is
+    correct on a multi-homed receiver, after a DHCP change, and after
+    a move between Ethernet and Wi-Fi.
+
+    This exists because the first version passed "127.0.0.1", which
+    the device accepted and reported back perfectly while sending the
+    stream to its OWN loopback. Nothing arrived, and nothing said why:
+    status showed locked and streaming, pps was non-zero, and tcpdump
+    on every interface here saw nothing at all. A wrong address that
+    the far end cheerfully confirms is worth guarding against properly.
+    """
+    family = socket.AF_INET6 if ":" in device_address else socket.AF_INET
+    s = socket.socket(family, socket.SOCK_DGRAM)
+    try:
+        # Port 1 is arbitrary: no packet is sent, and the device is
+        # never contacted. Only the routing decision is wanted.
+        s.connect((device_address, 1))
+        return s.getsockname()[0]
+    finally:
+        s.close()
+
+
+# Where a service name is a channel name rather than a callsign, and
+# must never reach QRZ as one. Everything NOT listed here is treated
+# as amateur.
+#
+# Inverted from an allowlist of amateur bands deliberately. A
+# converter puts the tuner somewhere that is not an amateur band at
+# all - the IC-9700's 23cm converter brings 1304 MHz down to 375 MHz -
+# so listing the amateur bands silently refused a callsign, a QRZ
+# lookup and a Pathfinder card to every contact made through one. The
+# same is true of any converter, and of the ATSC 3.0 tuner, which
+# cannot reach 23cm except through one.
+BROADCAST_BANDS = [
+    (174.0, 230.0),   # Band III - DAB and DVB-T
+    (470.0, 694.0),   # Bands IV/V - DVB-T2, post-700MHz-clearance
+]
+
+
+def hdhr_is_amateur_band(freq_hz) -> bool:
+    """Should a service name from this frequency be treated as a callsign?
+
+    True for anything outside the broadcast bands. Not a claim that
+    the frequency IS an amateur allocation - a receiver behind a
+    converter is legitimately tuned to an IF that belongs to nobody -
+    only that a name found there is worth believing.
+    """
+    try:
+        mhz = float(freq_hz) / 1e6
+    except (TypeError, ValueError):
+        return False
+    if mhz <= 0:
+        return False
+    return not any(low <= mhz <= high for low, high in BROADCAST_BANDS)
+
+
+def hdhr_source(device_id=None):
+    """A source object for the named device, or the default one."""
+    device_id = device_id or hdhr_default_device_id()
+    if not device_id:
+        raise HTTPException(status_code=404,
+                            detail="No HDHomeRun found on the network")
+    with hdhr_lock:
+        st = hdhr_states.get(device_id)
+    if not st:
+        raise HTTPException(
+            status_code=404,
+            detail=f"HDHomeRun {device_id} not found on the network")
+    # Through the relay when it is running - started here, so every path
+    # that tunes (the card, a preset, the boot resume) has it - and
+    # straight to mpv if its port could not be bound, as before.
+    port = (lynx_relay.HDHR_INGRESS_PORT if hdhr_relay.start()
+            else HDHR_VIDEO_PORT)
+    return lynx_hdhomerun.HDHomeRunSource(
+        device_id=device_id,
+        lynx_host=hdhr_local_address(st.get("address") or device_id),
+        tuner=st.get("tuner", 0),
+        udp_port=port,
+    )
+
+
+def hdhomerun_monitor():
+    """Background thread: polls each known HDHomeRun for status.
+
+    Polls rather than listens, because unlike the Picotuner and the
+    Slaves an HDHomeRun does not broadcast - it answers when asked.
+    That difference is the whole reason this is a separate monitor
+    rather than another branch inside an existing one.
+
+    Runs regardless of current_mode, deliberately: knowing whether a
+    tuner is locked BEFORE selecting it is more useful than finding
+    out afterwards, and the cost is one small request every couple of
+    seconds.
+    """
+    while True:
+        for st in hdhr_devices():
+            device_id = st["device_id"]
+            try:
+                tuner = lynx_hdhomerun.HDHomeRunTuner(
+                    device_id=device_id, tuner=st.get("tuner", 0))
+                status = tuner.status()
+                pending_program = None
+                pending_freq = None
+                # Captured BEFORE the update below overwrites it: the
+                # transition from not-locked to locked is the whole
+                # signal this monitor acts on.
+                was_locked = bool(st.get("locked"))
+                with hdhr_lock:
+                    live = hdhr_states.get(device_id)
+                    if live is None:
+                        continue
+                    live.update({
+                        "online": True,
+                        "last_error": "",
+                        "last_seen": time.time(),
+                        "locked": status.locked,
+                        "streaming": status.streaming,
+                        "lock_mode": status.lock if status.locked else "",
+                        "signal_strength": status.signal_strength,
+                        "signal_quality": status.signal_quality,
+                        "symbol_quality": status.symbol_quality,
+                        "bitrate_bps": status.bits_per_second,
+                        "frequency_hz": status.frequency_hz,
+                    })
+                    pending_program = live.get("pending_program")
+                    pending_freq = live.get("pending_freq_hz")
+
+                # Outside the lock deliberately: this makes a request to
+                # the device, and holding a lock across network I/O is
+                # how a poller stops everything else in the process.
+                if pending_program and status.locked:
+                    raw = ""
+                    try:
+                        raw = hdhr_programme_name(tuner.stream_info(),
+                                                  pending_program)
+                    except lynx_hdhomerun.HDHomeRunError:
+                        # Not ready yet, most likely. Left to the retry
+                        # below rather than treated as a failure.
+                        raw = ""
+                    # The box's list first, as always; then the stream's own
+                    # SDT, read by the relay. An ATSC 3.0 box lists our TS
+                    # programme with no name ("1: 0") because it reads names
+                    # from the SLT, not the SDT it passes through.
+                    if not raw:
+                        raw = hdhr_relay.name_for(pending_program)[0]
+
+                    # Same truncation as Ryde's logbook code: keep
+                    # characters up to the first non-alphanumeric one,
+                    # so "G8YTZ /P" becomes "G8YTZ".
+                    call = ""
+                    for ch in raw:
+                        if ch.isalnum():
+                            call += ch
+                        else:
+                            break
+
+                    with hdhr_lock:
+                        live = hdhr_states.get(device_id)
+                        if live is not None:
+                            live["service_name"] = raw
+                            live["callsign"] = (
+                                call.upper()
+                                if hdhr_is_amateur_band(pending_freq) else "")
+                            # Cleared on success only. The earlier version
+                            # cleared it either way, so an empty first
+                            # read - which is the usual case, since the
+                            # tables lag the lock - gave up permanently
+                            # and left the callsign blank until the next
+                            # tune. That is what "flaky, works after a
+                            # retune" was.
+                            if raw:
+                                live["pending_program"] = None
+                            else:
+                                _left = int(live.get("pending_attempts", 0)) - 1
+                                live["pending_attempts"] = _left
+                                if _left <= 0:
+                                    live["pending_program"] = None
+
+                    # A callsign, on an amateur frequency, not already
+                    # logged for this transmission: that is a contact.
+                    # Armed here rather than at lock, because at lock
+                    # there is no callsign yet - it arrives with the
+                    # service name a moment later.
+                    _new_call = call.upper() if hdhr_is_amateur_band(
+                        pending_freq) else ""
+                    if (_new_call and current_mode == "dvbt"
+                            and notification_manager is not None):
+                        with hdhr_lock:
+                            _l = hdhr_states.get(device_id)
+                            _already = _l.get("logged_callsign") if _l else ""
+                            if _l is not None:
+                                _l["logged_callsign"] = _new_call
+                        if _already != _new_call:
+                            try:
+                                notification_manager.arm_external_contact(
+                                    _hdhr_contact_source(device_id),
+                                    key="dvbt")
+                            except Exception as e:
+                                print(f"[hdhr] logging: "
+                                      f"{type(e).__name__}: {e}")
+
+                # A station has keyed up. mpv will happily sit there
+                # showing the last frame of whoever was on before -
+                # confirmed on air, and the same stuck-output behaviour
+                # restart_mpv()'s docstring describes. A full restart is
+                # the only thing that reliably clears it.
+                #
+                # Without this, somebody has to re-tune by hand after
+                # every transmission, which is no use at a repeater.
+                if (status.locked and not was_locked
+                        and current_mode == "dvbt"
+                        and device_id == hdhr_default_device_id()):
+                    # Non-blocking: a tune in progress is already
+                    # restarting mpv itself, and two restarts racing
+                    # gives you a dead player rather than a fresh one.
+                    # Ask for the service name again. A different
+                    # station may be on now, and keeping the previous
+                    # one's callsign would log the wrong contact.
+                    with hdhr_lock:
+                        _live = hdhr_states.get(device_id)
+                        if _live is not None:
+                            _live["pending_program"] = _live.get("last_program")
+                            _live["logged_callsign"] = ""
+                    if tune_lock.acquire(blocking=False):
+                        try:
+                            print(f"[hdhr] {device_id} re-locked - "
+                                  "restarting mpv")
+                            restart_mpv(f"udp://@:{HDHR_VIDEO_PORT}",
+                                        is_rf=False)
+                            end_transition_cover()
+                        except Exception as e:
+                            print(f"[hdhr] restart failed: "
+                                  f"{type(e).__name__}: {e}")
+                        finally:
+                            tune_lock.release()
+            except lynx_hdhomerun.HDHomeRunError as e:
+                # An unreachable device is ordinary - unplugged, or a
+                # site link down. Recorded, not logged every two seconds.
+                with hdhr_lock:
+                    live = hdhr_states.get(device_id)
+                    if live is not None:
+                        if (time.time() - live.get("last_seen", 0)
+                                > HDHR_OFFLINE_AFTER_SECS):
+                            live["online"] = False
+                            live["locked"] = False
+                            live["streaming"] = False
+                        live["last_error"] = str(e)
+        time.sleep(HDHR_POLL_INTERVAL_SECS)
+
+
+def _hdhr_contact_source(device_id):
+    """A picotuner_state-shaped source dict for a DVB-T2 contact.
+
+    The notifications module reads a fixed set of field names, so the
+    honest ones are filled and the rest left empty rather than
+    approximated. mer and margin stay None: SNQ is the closest thing
+    this tuner reports and it is still not MER.
+
+    mode_name, comment and rst carry what DVB-T2 actually measures.
+    The comment field is free text, which is where a percentage can go
+    without being mistaken for a dB figure.
+    """
+    st = None
+    for d in hdhr_devices():
+        if d["device_id"] == device_id:
+            st = d
+            break
+    if not st:
+        return {}
+
+    lm = st.get("lock_mode") or ""
+    std = "DVB-T2" if lm.endswith("dvbt2") else ("DVB-T" if "dvbt" in lm else "")
+    bw = lm[1:2]
+    mode_name = f"{std} {bw} MHz" if (std and bw) else (std or "DVB-T2")
+    freq_hz = st.get("frequency_hz") or 0
+
+    snq = st.get("signal_quality")
+    seq = st.get("symbol_quality")
+    lvl = st.get("signal_strength")
+
+    return {
+        "rx_callsign": st.get("callsign", ""),
+        # kHz, matching the module's own convention - it divides by
+        # 1000 again for the ADIF frequency, and a value in the wrong
+        # unit here once put a 437 MHz contact outside every defined
+        # band and had the whole submission rejected.
+        "frequency_khz": freq_hz / 1000.0,
+        "mer": None,
+        "margin": None,
+        "modcod": mode_name,
+        "symbol_rate": "",
+        "mode_name": mode_name,
+        # The mode is already in the MODE column, so repeating it here
+        # just crowds the comment.
+        "comment": f"SNQ {snq}% | SEQ {seq}% | LVL {lvl}%",
+        # RST_SENT is a signal report, and level is the closest thing
+        # this tuner has to one. SNQ and SEQ describe how well the
+        # demodulator coped, which is what the comment is for.
+        "rst": f"{lvl}%",
+    }
+
+
+def hdhr_stop_all():
+    """Stop every known device streaming.
+
+    The device keeps sending until told otherwise, so every path that
+    leaves this source must call this. Without it a tuner stays busy
+    and keeps pushing packets at a port nobody is reading - not
+    harmful, but exactly the kind of thing that stays invisible until
+    the day it matters.
+    """
+    for st in hdhr_devices():
+        _hdhr_release_ours(st)
+# --- end HDHomeRun ---------------------------------------------------
+
+remote_states: list = []
+
+
+def remote_sources_cfg() -> list:
+    """The configured Slaves, as a list.
+
+    Migrates the older single 'remote_source' section transparently, so
+    a receiver configured before this became a list carries on working
+    without anyone editing a file. Config written from here on uses
+    'remote_sources'.
+    """
+    srcs = config.get('remote_sources')
+    if isinstance(srcs, list):
+        return srcs
+    single = config.get('remote_source')
+    if isinstance(single, dict) and single:
+        return [single]
+    return []
+
+
+def _blank_remote_state(cfg: dict) -> dict:
+    """A state record for one Slave.
+
+    Shaped as a subset of picotuner_state deliberately: the same field
+    names, so anything downstream that already reads a tuner's state
+    can read this one without a second shape to handle. Fields only a
+    richer status port can fill (MER, margin, modcod) are absent rather
+    than present-and-empty, so their absence is visible rather than
+    looking like a tuner reporting zeros.
+    """
+    return {
+        "status_port": int(cfg.get('status_port', REMOTE_DEFAULT_STATUS_PORT)),
+        "enabled": bool(cfg.get('enabled')),
+        "locked": False,
+        "callsign": "",
+        "frequency": "",
+        "rx1_raw": "",
+        # What the Slave calls itself, from its own SITE line. Held here
+        # rather than in config: the Slave is the only thing that knows,
+        # and a name typed in at this end would be one more copy to go
+        # out of date. Empty until the first packet arrives.
+        "name": "",
+        "locator": "",
+        # Where this Slave's packets come from, learned from its own
+        # status traffic rather than configured. The video relay uses
+        # it to tell one Slave's stream from another's. Empty until
+        # the first packet arrives.
+        "addr": "",
+        "last_seen": 0,
+    }
+
+
+def init_remote_states():
+    """Build the state list from config. Called once at startup."""
+    global remote_states
+    remote_states = [_blank_remote_state(c) for c in remote_sources_cfg()]
+
+
+def remote_any_enabled() -> bool:
+    return any(s["enabled"] for s in remote_states)
+
+
+def remote_display_name(i: int) -> str:
+    """What to call a Slave on screen.
+
+    Its own announced name when it has sent one, otherwise a generic
+    label - an older sender, or the first couple of seconds before the
+    first packet lands. Numbered when there is more than one, so two
+    unnamed Slaves are still tellable apart. A blank label would look
+    broken; a generic one only looks generic.
+    """
+    st = remote_states[i]
+    if st["name"]:
+        return st["name"]
+    return "Slave Rx" if len(remote_states) == 1 else f"Slave Rx {i + 1}"
+
+
+def _relay_video_for(i: int) -> dict:
+    """Per-Slave video counters, or a blank record if the relay is not
+    running. Always the same shape so a consumer never has to test
+    whether the key exists — the same reasoning as the remotes list
+    itself always being present."""
+    blank = {"live": False, "kbps": 0, "packets": 0}
+    try:
+        s = slave_relay.stats()
+        v = s.get("sources", {}).get(i)
+        if not v:
+            return blank
+        return {"live": v["live"], "kbps": v["kbps"], "packets": v["packets"]}
+    except Exception:
+        return blank
+
+
+# ── Receiver registry ────────────────────────────────────────────
+#
+# Every receiver Lynx can display, under one numbering:
+#
+#     1, 2      local Picotuner receivers
+#     11 - 15   Slaves
+#
+# 3 to 10 are left free for a WinterHill, which presents its own
+# receivers 5 and 6 and would collide with anything numbered into that
+# range.
+REMOTE_RECEIVER_ID_BASE = 11
+MAX_REMOTE_RECEIVERS = 5
+
+# Which receiver is on screen, when it is one that had to be
+# chosen rather than one the receiver arrived at by itself.
+# None means a local tuner, and which local tuner is then a
+# question tri_watch and diversity already answer.
+#
+# Real state, deliberately. This was originally inferred from
+# current_stream_url still holding the relay's port, which is
+# true when a Slave is displayed and stays true afterwards,
+# because nothing clears it when tuning back to RF. The result
+# was a local tuner on the panel and a Slave on the screen.
+displayed_receiver_id = None
+
+
+def receiver_state(rid: int):
+    """The state record for one receiver, or None if there is no such
+    receiver.
+
+    Returns the live dict, not a copy — the monitor threads write to
+    these, and a caller holding a snapshot would be reading a receiver's
+    state from whenever it happened to ask. One record per receiver,
+    one place that hands it out.
+    """
+    if rid == 1:
+        return picotuner_state
+    if rid == 2:
+        return picotuner_state_b
+    if REMOTE_RECEIVER_ID_BASE <= rid < REMOTE_RECEIVER_ID_BASE + MAX_REMOTE_RECEIVERS:
+        i = rid - REMOTE_RECEIVER_ID_BASE
+        if 0 <= i < len(remote_states):
+            return remote_states[i]
+    return None
+
+
+def receiver_ids() -> list:
+    """Every receiver that exists, in display order.
+
+    Local receivers always exist, whether or not anything is connected
+    to them — the hardware is either there or it is a fault worth
+    showing. A Slave exists once it is configured, enabled or not, so a
+    disabled one appears switched off rather than vanishing.
+    """
+    ids = [1, 2]
+    for i in range(min(len(remote_states), MAX_REMOTE_RECEIVERS)):
+        ids.append(REMOTE_RECEIVER_ID_BASE + i)
+    return ids
+
+
+def receiver_is_remote(rid: int) -> bool:
+    return rid >= REMOTE_RECEIVER_ID_BASE
+
+
+def active_receiver_id():
+    """Which receiver is on screen, or None if a stream is.
+
+    THE one derivation point. The port equivalent of this question,
+    current_rf_target_port(), already exists and its docstring records
+    what happened when it did not: the decision was duplicated across
+    call sites, two of them were never taught about tri_watch, and a
+    freeze recovery restarted mpv pointed at the wrong receiver's port
+    for the whole of a tri_watch session. Same question, same reason to
+    answer it in one place.
+
+    Order matters. A Slave is checked first because selecting one is an
+    explicit act by somebody at the front panel, where diversity and
+    tri_watch are modes the receiver puts itself into.
+    """
+    # Set when a Slave is chosen, cleared when anything tunes to
+    # RF. The relay keeps its own selection across a switch to a
+    # local tuner, so what the relay is forwarding and what is on
+    # screen are different questions.
+    if displayed_receiver_id is not None:
+        if receiver_state(displayed_receiver_id) is not None:
+            return displayed_receiver_id
+        # Configured away underneath us — a Slave that no longer
+        # exists is not on screen, whatever was chosen earlier.
+        return None
+
+    if current_mode != "rf":
+        return None
+    if tri_watch_enabled and tri_watch_target_rcv == 2:
+        return 2
+    # Diversity combines both receivers into one output. Reported as 1
+    # because that is the receiver whose tuning and callsign describe
+    # what is being watched; rcv 2 is contributing, not being displayed.
+    return 1
+
+
+def active_receiver():
+    """The state record for whatever is on screen, or None."""
+    rid = active_receiver_id()
+    return receiver_state(rid) if rid is not None else None
+
+
+def remote_online(i: int) -> bool:
+    """Derived from last_seen rather than stored. A Slave that stops
+    sending must stop appearing present, and a flag set True on receipt
+    has no way back to False on its own."""
+    last = remote_states[i]["last_seen"]
+    return bool(last) and (time.time() - last) < REMOTE_OFFLINE_AFTER_SECS
+
+
+def remote_quality_monitor(index: int):
+    """Background thread: rich status for one Slave, tagged $n,m only.
+
+    Deliberately the tagged format and never the 9904-style column
+    table. The comments on picotuner_quality_monitor() and its table
+    counterpart record a real, live-confirmed bug where a column shift
+    fed one receiver's MER and modcod into another receiver's display,
+    with nothing to indicate it. Tagged fields cannot drift: a value is
+    whatever its own tag says it is, and an unrecognised tag is ignored
+    rather than silently adopted as the next field along.
+
+    Values are stored exactly as sent, as strings. The Slave has already
+    done the arithmetic — margin against the modcod threshold, dBm from
+    the AGC table — and re-deriving either at this end would be a second
+    implementation to keep in step with the first.
+    """
+    sock = None
+    bound_port = None
+    while True:
+        try:
+            st = remote_states[index]
+            want_port = st["status_port"] - REMOTE_QUALITY_PORT_OFFSET
+            if sock is None or bound_port != want_port:
+                if sock is not None:
+                    try: sock.close()
+                    except Exception: pass
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                # No SO_REUSEADDR/SO_REUSEPORT here, unlike the Picotuner
+                # monitors. One Slave, one quality port, one reader: with
+                # them set a second process binds the same port and shares
+                # the packets silently, which is how a stray listener once
+                # ate Picotuner status. A clash should be loud.
+                sock.settimeout(5)
+                sock.bind(('', want_port))
+                bound_port = want_port
+                print(f"[remote {index}] quality monitor listening on {want_port}")
+
+            data, addr = sock.recvfrom(4096)
+
+            # Only from the address this Slave's own status comes from.
+            # Until that is known the packet cannot be attributed to
+            # anybody, and adopting it on the strength of the port alone
+            # is how one site's MER ends up on another site's panel.
+            if not st["addr"] or addr[0] != st["addr"]:
+                continue
+
+            fields = {}
+            for line in data.decode(errors='replace').splitlines():
+                line = line.strip()
+                if line.startswith('$'):
+                    parts = line.split(',', 1)
+                    if len(parts) == 2:
+                        fields[parts[0]] = parts[1].strip()
+            if not fields:
+                continue
+
+            # Each field written only if the sender actually included it,
+            # so a sender that emits a subset leaves the rest absent
+            # rather than blanking values it never mentioned.
+            if '$12' in fields: st["mer"]         = fields['$12']
+            if '$30' in fields: st["margin"]      = fields['$30']
+            if '$9'  in fields: st["symbol_rate"] = fields['$9']
+            if '$18' in fields: st["modcod"]      = fields['$18']
+            if '$14' in fields: st["programme"]   = fields['$14'].replace('_', ' ')
+            if '$85' in fields: st["dbm"]         = fields['$85']
+            if '$26' in fields: st["agc1"]        = fields['$26']
+            if '$27' in fields: st["agc2"]        = fields['$27']
+            # Same tags the Picotuner uses, so a Slave and a local
+            # tuner fill these rows by the same route.
+            if '$31' in fields: st["codec"]       = fields['$31']
+            if '$34' in fields: st["audio_codec"] = fields['$34']
+
+        except socket.timeout:
+            # Silence is normal and says nothing on its own: the status
+            # port decides online/offline, and duplicating that judgement
+            # here would give two answers to one question.
+            continue
+        except Exception as e:
+            print(f"[remote {index}] quality monitor: {type(e).__name__}: {e}")
+            if sock is not None:
+                try: sock.close()
+                except Exception: pass
+                sock = None
+            time.sleep(2)
+
+
+def remote_source_monitor(index: int):
+    """Background thread: reads one Slave Rx's status on its own port.
+
+    One thread per Slave, each with its own socket. They could have
+    been multiplexed with select(), but a thread that only ever deals
+    with one Slave cannot confuse two of them, and the cost is a
+    sleeping thread per remote site.
+
+    The parsing is deliberately identical to picotuner_monitor()'s RX1
+    handling, because the Slave sends that exact format - the whole
+    point of the remote end speaking WinterHill rather than inventing
+    something is that no new parser is needed here.
+
+    Same socket handling as the local monitors: REUSEADDR/REUSEPORT, a
+    timeout so the loop can notice a closed socket, and a rebuild on
+    any error rather than dying. This runs unattended for months.
+    """
+    st = remote_states[index]
+    port = st["status_port"]
+    sock = None
+    print(f"[remote {index}] listening for a Slave Rx on port {port}")
+    while True:
+        try:
+            if sock is None:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                sock.settimeout(5)
+                sock.bind(('', port))
+
+            data, addr = sock.recvfrom(4096)
+            st["last_seen"] = time.time()
+            # Only on change: this runs on every heartbeat from every
+            # Slave, and rebuilding the relay map two or three times a
+            # second for no reason would take its lock needlessly.
+            if st["addr"] != addr[0]:
+                print(f"[remote {index}] source address {st['addr'] or '(none)'} -> {addr[0]}")
+                st["addr"] = addr[0]
+                relay_refresh_sources()
+
+            for line in data.decode(errors='replace').splitlines():
+                line = line.strip()
+                if line.startswith("SITE"):
+                    # "SITE <locator> <name>" - locator first because a
+                    # name contains spaces and a locator does not, so
+                    # name-first cannot be split reliably. "-" means no
+                    # locator given; the field is always present so the
+                    # parser never has to guess whether the first token
+                    # is a locator or the start of a name.
+                    parts = line.split(None, 2)
+                    if len(parts) >= 2:
+                        loc = parts[1]
+                        st["locator"] = "" if loc == "-" else loc
+                    st["name"] = parts[2].strip() if len(parts) >= 3 else ""
+                    continue
+                if not line.startswith("RX1"):
+                    continue
+                rx1 = line.replace("RX1", "").strip()
+                st["rx1_raw"] = rx1
+                parts = rx1.split()
+                # "search" and "lost" both mean not locked - same set
+                # picotuner_monitor() uses, for the same reason.
+                unlocked_states = {"search", "lost", ""}
+                if len(parts) >= 2 and parts[-1] not in unlocked_states:
+                    st["locked"] = True
+                    st["callsign"] = parts[-1]
+                    st["frequency"] = parts[0].rstrip("TB")
+                else:
+                    st["locked"] = False
+                    st["callsign"] = ""
+                    if parts:
+                        st["frequency"] = parts[0].rstrip("TB")
+        except socket.timeout:
+            pass
+        except Exception as e:
+            print(f"[remote {index}] monitor error: {type(e).__name__}: {e}")
+            if sock:
+                try: sock.close()
+                except Exception: pass
+                sock = None
+            time.sleep(1)
+
 
 # ── Diversity combiner process management ────────────────────
 diversity_enabled: bool = False
@@ -3425,6 +5631,29 @@ class TuneRequest(BaseModel):
                              # path for Rx2 too, rather than maintaining
                              # its own, separate reimplementation of it.
 
+class DvbtTuneRequest(BaseModel):
+    freq: int                 # Hz - the actual frequency. No LNB and no
+                              # transverter arithmetic: this tuner is on
+                              # an aerial, not behind a down-converter.
+                              # Hz rather than kHz because that is what
+                              # the device's own API takes, and a unit
+                              # converted at the edge is a unit somebody
+                              # eventually converts twice.
+    modulation: str = "t8dvbt2"
+                              # tNdvbt2 / tNdvbt / aNqamNNN, where N is the
+                              # nominal channel bandwidth in MHz. Explicit
+                              # rather than "auto": auto was confirmed to
+                              # fail repeatedly on a mux that locks within
+                              # seconds when the modulation is given.
+    program: Optional[str] = None
+                              # Program number within the multiplex. None
+                              # locks the mux without selecting a service,
+                              # which is useful for checking a signal.
+    device_id: Optional[str] = None
+                              # Which HDHomeRun. None uses the default -
+                              # the configured preference if present,
+                              # otherwise the first one found.
+
 class StreamRequest(BaseModel):
     url: str
     name: str = ""  # friendly display name, e.g. "GB3OO" — chosen by
@@ -3444,6 +5673,13 @@ class PresetSaveRequest(BaseModel):
     lnb_lo_khz: int = 0
     # Stream field (type="stream")
     url: Optional[str] = None
+    # DVB-T2 fields (type="dvbt"). freq_hz rather than reusing freq:
+    # that one is kHz by long-standing convention throughout Lynx, and
+    # the device's own API works in Hz. Two units in one field is how a
+    # 437 MHz contact once got logged as 0.437 MHz.
+    freq_hz: Optional[int] = None
+    modulation: Optional[str] = None
+    program: Optional[str] = None
 
 class SiteConfigUpdate(BaseModel):
     name: str
@@ -3458,6 +5694,7 @@ class PicotunerConfigUpdate(BaseModel):
     ts_port: int
     ts_port_b: int
     status_port: int
+    receivers: Optional[str] = None   # "share" or "protect"
 
 class DiversityConfigUpdate(BaseModel):
     mer_switch_dwell_secs: Optional[float] = None
@@ -3556,6 +5793,8 @@ class GpioTxConfigUpdate(BaseModel):
     schedule_weekday_end: str
     schedule_weekend_start: str
     schedule_weekend_end: str
+    on_url: str = ""    # fired once on each Tx on/off transition, same
+    off_url: str = ""   # timings as the pin - e.g. Companion stream start/stop
 
 class QuickLynxConfigUpdate(BaseModel):
     """Off by default. It holds an outbound connection to BATC, and most
@@ -3570,12 +5809,12 @@ class DisplayConfigUpdate(BaseModel):
     # television here is 25 fps, so each frame occupies exactly two
     # refreshes. At 60 Hz a 25 fps source needs 3:2 pulldown - frames
     # held alternately for two refreshes and three - which shows as
-    # judder on any horizontal pan. Only applied when the display has
-    # to be switched at all, i.e. when it exceeds max_height.
+    # judder on any horizontal pan. Applied at start-up, on save and when
+    # a screen comes back - see _reapply_refresh_rate().
     refresh_hz: int = 50
     # Cap on display height in lines. Read by lynx_start.sh at startup,
     # so a change needs a restart to take effect.
-    max_height: int = 1080
+    max_height: int = lynx_platform.DEFAULT_MAX_HEIGHT
     # "hdmi" (resolved to the first HDMI output at launch), "auto" to let
     # mpv choose, or an explicit mpv device name from /api/audio/devices.
     audio_device: str = "hdmi"
@@ -3616,6 +5855,36 @@ class PathfinderConfigUpdate(BaseModel):
     enabled: bool = True
     delay_secs: float = 2.0
     duration_secs: float = 30.0
+    # The test card shown when Pathfinder has no map (a stream, or a
+    # station with no QRZ locator). Off: plain black, no card, no caption
+    # (Justin, 2 Nov 2026). Pathfinder's own maps are not affected.
+    placeholder_card: bool = True
+
+
+class RemoteSourceConfigUpdate(BaseModel):
+    """A Slave Rx - a receiver at another site forwarding its tuner
+    status here over the network. See the Lynx-Slave-Rx repository for
+    the remote end.
+
+    Off by default: a receiver with no Slave should need no
+    configuration at all, and should bind no extra port.
+
+    status_port is NOT the local Picotuner's 9997. picotuner_monitor()
+    binds that on all interfaces, so a Slave sending there would
+    collide with the receiver's own tuner status. 10997 keeps Lynx's
+    own -93/-96 offsets free for the table and $n,m ports when those
+    are added.
+    """
+    enabled: bool = False
+    status_port: int = 10997
+
+
+class HdhomerunConfigUpdate(BaseModel):
+    """The HDHomeRun card on the config page. There was no such section
+    before, so its Save button saved nothing (patch_hdhr_after_atsc3.py)."""
+    address: str = ""
+    names: dict = {}           # device ID -> friendly name; empty = default
+    prefer_device_id: Optional[str] = None   # None = leave as it is
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -3632,6 +5901,8 @@ class ConfigUpdateRequest(BaseModel):
     pathfinder: Optional[PathfinderConfigUpdate] = None
     gnss: Optional[GnssConfigUpdate] = None
     squeak: Optional[SqueakConfigUpdate] = None
+    remote_source: Optional[RemoteSourceConfigUpdate] = None
+    hdhomerun: Optional[HdhomerunConfigUpdate] = None
 
 # ── Helpers ───────────────────────────────────────────────────
 def stop_current():
@@ -4374,6 +6645,7 @@ def _kick_off_qrz_notification_lookup(idx, live_callsign, qrz_cfg, src_cfg):
 
 
 def _tri_watch_display_source(idx, src_cfg):
+    global displayed_receiver_id
     """The arbitrator's display_callback - actually switches to show
     the given source. Reuses the exact same, proven tune()/
     start_stream() paths a manual memory/preset selection would use,
@@ -4465,6 +6737,9 @@ def _tri_watch_display_source(idx, src_cfg):
         if commanded_tune_matches(rcv, src_cfg['freq'], src_cfg['sr'],
                                   _lo, _fplug):
             current_mode = "rf"
+            # A local tuner is being displayed now, whatever was
+            # chosen before.
+            displayed_receiver_id = None
             set_converter_state(rcv, src_cfg['freq'], _lo,
                                 'tri_watch display, already tuned')
             print(f"[tri_watch] now displaying source {idx}: RF Rx{rcv} "
@@ -4739,16 +7014,36 @@ def _pathfinder_current_source():
     if tw.get('enabled') and tri_watch_arbitrator is not None:
         idx = tri_watch_arbitrator.displayed_idx
         if idx is None:
-            return (False, 1)
+            return (False, 1, picotuner_state)
         try:
             src = tri_watch_sources_cfg[idx]
         except (IndexError, TypeError):
-            return (False, 1)
+            return (False, 1, picotuner_state)
         if src.get('type') != 'rf':
-            return (False, 1)          # a stream is showing - no card
+            return (False, 1, picotuner_state)   # a stream - no card
         rcv = src.get('rcv', 1)
         st = picotuner_state_b if rcv == 2 else picotuner_state
-        return (bool(st.get('locked')), rcv)
+        return (bool(st.get('locked')), rcv, st)
+
+    # DVB-T2. Checked before the Picotuner branches because when this
+    # is what is on screen, the Picotuner's own lock state is not
+    # merely irrelevant - on a receiver without one it is permanently
+    # false, which is why Pathfinder never drew a card for a DVB-T2
+    # contact while the OSD showed it perfectly.
+    if current_mode == "dvbt":
+        return (_pathfinder_dvbt_state(), None, _pathfinder_dvbt_state.last)
+
+    # A Slave: a receiver at another site, whose telemetry already
+    # arrives in the same field names a local tuner uses, so nothing
+    # here has to translate anything.
+    if displayed_receiver_id is not None:
+        try:
+            _idx = displayed_receiver_id - REMOTE_RECEIVER_ID_BASE
+            if 0 <= _idx < len(remote_states):
+                _rst = remote_states[_idx]
+                return (bool(_rst.get('locked')), None, _rst)
+        except (TypeError, ValueError):
+            pass
 
     # The RUNTIME flag, not config['diversity']['enabled']. Turning
     # diversity on by tuning sets the global and does not write the
@@ -4764,12 +7059,12 @@ def _pathfinder_current_source():
         a = bool(picotuner_state.get('locked'))
         b = bool(picotuner_state_b.get('locked'))
         if a:
-            return (True, 1)
+            return (True, 1, picotuner_state)
         if b:
-            return (True, 2)
-        return (False, 1)
+            return (True, 2, picotuner_state_b)
+        return (False, 1, picotuner_state)
 
-    return (bool(picotuner_state.get('locked')), 1)
+    return (bool(picotuner_state.get('locked')), 1, picotuner_state)
 
 
 def pathfinder_watcher():
@@ -4786,11 +7081,14 @@ def pathfinder_watcher():
         try:
             if not pathfinder_tracker.enabled:
                 continue
-            receiving, rcv = _pathfinder_current_source()
+            # The state comes back with the answer now: with four kinds
+            # of source and only two of them Picotuner receivers, "which
+            # state does rcv mean" stopped being a question this loop
+            # could answer.
+            receiving, rcv, st = _pathfinder_current_source()
             prev = _pathfinder_prev
 
             if receiving:
-                st = picotuner_state_b if rcv == 2 else picotuner_state
                 cs = st.get('callsign', '')
                 if cs:
                     prev['callsign'] = cs
@@ -4918,6 +7216,54 @@ def _pathfinder_via_qo100(rcv, telemetry):
         return False
 
 
+def _pathfinder_dvbt_state():
+    """Is the DVB-T2 tuner locked, and what is it hearing?
+
+    Returns a bool, and leaves the state dict on .last for the caller -
+    an unusual shape, but it keeps _pathfinder_current_source()'s two
+    lines readable and avoids building the dict twice.
+
+    The dict uses the same field names the watcher caches for a local
+    tuner, so the watcher needs no branch of its own. Fields this tuner
+    genuinely does not report are left EMPTY rather than filled with an
+    approximation: there is no symbol rate, and SNQ is not MER however
+    similar it looks on a meter.
+    """
+    _dev = hdhr_default_device_id()
+    _st = None
+    if _dev:
+        for _d in hdhr_devices():
+            if _d["device_id"] == _dev:
+                _st = _d
+                break
+    if not _st:
+        _pathfinder_dvbt_state.last = {}
+        return False
+
+    _lm = _st.get("lock_mode") or ""
+    _std = "DVB-T2" if _lm.endswith("dvbt2") else ("DVB-T" if "dvbt" in _lm else "")
+    _bw = _lm[1:2]
+    _freq = _st.get("frequency_hz")
+
+    _pathfinder_dvbt_state.last = {
+        "locked": bool(_st.get("locked")),
+        "callsign": _st.get("callsign", ""),
+        # Standard and channel width together, which is what an
+        # operator would say out loud and what Portsdown writes in a
+        # log entry. The card's symbol-rate row appends kS/s, so the
+        # bandwidth cannot go there instead.
+        "modcod": (f"{_std} {_bw} MHz" if _std and _bw else _std),
+        "symbol_rate": "",
+        "frequency": (f"{_freq / 1e6:.3f}" if _freq else ""),
+        "mer": "",
+        "margin": "",
+    }
+    return bool(_st.get("locked"))
+
+
+_pathfinder_dvbt_state.last = {}
+
+
 def _pathfinder_on_air_frequency(rcv, reported_mhz):
     """The card's frequency: the on-air one, not the IF.
 
@@ -4936,6 +7282,14 @@ def _pathfinder_on_air_frequency(rcv, reported_mhz):
     """
     raw = str(reported_mhz or '').strip()
     if not raw:
+        return reported_mhz
+    # rcv None means the source is not a local Picotuner receiver - a
+    # Slave, or the DVB-T2 tuner. Neither goes through a converter at
+    # this end: a Slave's is its own business and reported as such,
+    # and the DVB-T2 tuner is fed from an aerial. Applying Rx1's LNB LO
+    # to either would be wrong by construction, even where the LO is
+    # currently zero and the answer happens to come out right.
+    if rcv is None:
         return reported_mhz
     on_air = on_air_from_if(rcv, raw)
     return reported_mhz if on_air is None else f"{on_air:.3f}"
@@ -5081,6 +7435,97 @@ PICOTUNER_MISMATCH_SECS = 20.0      # sustained disagreement before acting
 PICOTUNER_RETUNE_SETTLE_SECS = 8.0  # let its firmware finish booting first
 PICOTUNER_RETUNE_COOLDOWN_SECS = 90.0   # don't hammer a tuner that won't take
 
+PICOTUNER_TAKEOVER_ASK_SECS = 30.0  # how often to ask a taker if it has finished
+_my_ips_cache = (0.0, set())
+_takeover_seen = {}                 # rcv -> (ip, last asked, answer)
+
+
+def _my_ips():
+    """This Pi's own addresses, refreshed once a minute."""
+    global _my_ips_cache
+    when, ips = _my_ips_cache
+    if time.time() - when > 60:
+        try:
+            out = subprocess.run(["hostname", "-I"], capture_output=True,
+                                 text=True, timeout=5).stdout
+            ips = set(out.split())
+        except Exception:
+            pass
+        _my_ips_cache = (time.time(), ips)
+    return ips
+
+
+def _ask_lynx_presence(ip, rcv):
+    """The question Lynx Apple TV and iPhone answer on UDP 9950:
+    "LYNX? n" -> "LYNX WATCHING n" or "LYNX IDLE". None when nothing
+    answers (not a Lynx, asleep, or a phone with Lynx in the background)."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.settimeout(1.2)
+        q = f"LYNX? {rcv}".encode()
+        sock.sendto(q, (ip, 9950))
+        sock.sendto(q, (ip, 9950))
+        while True:
+            data, addr = sock.recvfrom(256)
+            if addr[0] == ip:
+                return data.decode(errors="replace").strip()
+    except Exception:
+        return None
+    finally:
+        sock.close()
+
+
+PICOTUNER_PROTECT_RECLAIM_SECS = 15.0  # protected: at most one take-back per 15 s
+
+
+def _picotuner_mode():
+    """"share" (the default) or "protect", from the Config page."""
+    m = str((config.get('picotuner', {}) or {}).get('receivers', 'share')).lower()
+    return 'protect' if m == 'protect' else 'share'
+
+
+def _picotuner_target_other(rcv):
+    """The address receiver rcv is sending to, when that is another
+    device; None when it is sending to this Pi, to nowhere, or unknown."""
+    st = picotuner_state_b if rcv == 2 else picotuner_state
+    ip = str(st.get("ts_target", "") or "").split(":")[0]
+    if not ip or ip == "0.0.0.0" or ip in _my_ips():
+        return None
+    return ip
+
+
+def _picotuner_taken_over(rcv):
+    """The address of the device that has taken over receiver rcv (1 or
+    2), or None when it is still ours (or nobody's).
+
+    The Picotuner sends a receiver's $-status only to whoever tuned it, so
+    a receiver someone else has tuned looks, from here, exactly like one
+    that has lost its tuning: no symbol rate. Without this check the
+    watchdogs "restored" it within 30 s, snatching it back from an
+    iPhone watching over a VPN (3 Nov 2026)."""
+    st = picotuner_state_b if rcv == 2 else picotuner_state
+    target = str(st.get("ts_target", "") or "")
+    ip = target.split(":")[0]
+    if not ip or ip == "0.0.0.0" or ip in _my_ips():
+        _takeover_seen.pop(rcv, None)
+        return None
+    if _picotuner_mode() == 'protect':
+        return None          # protected: the tuning watchdog takes it straight back
+    now = time.time()
+    seen = _takeover_seen.get(rcv)
+    if seen is None or seen[0] != ip or now - seen[1] >= PICOTUNER_TAKEOVER_ASK_SECS:
+        answer = _ask_lynx_presence(ip, rcv)
+        if seen is None or seen[0] != ip:
+            print(f"[picotuner] Rx{rcv} taken over by {ip} - leaving it alone "
+                  f"(presence answer: {answer or 'none'})")
+        elif answer != seen[2]:
+            print(f"[picotuner] Rx{rcv} at {ip}: presence answer now {answer or 'none'}")
+        seen = (ip, now, answer)
+        _takeover_seen[rcv] = seen
+    if seen[2] and seen[2].startswith("LYNX") and seen[2] != f"LYNX WATCHING {rcv}":
+        return None          # a Lynx that has finished with it: ours again
+    return ip
+
 
 def _tri_watch_present():
     """True only on builds that actually have tri_watch.
@@ -5217,6 +7662,41 @@ def _picotuner_reported_sr(st):
     return sr if sr > 0 else None
 
 
+def lynx_presence_responder():
+    """Answers the question Lynx Apple TV and iPhone ask before taking a
+    Picotuner receiver: "LYNX? n" on UDP 9950, answered from the same
+    socket straight back to the asker. "LYNX WATCHING n" while this Lynx is
+    using receiver n (tuned for it, and its stream still comes here),
+    otherwise "LYNX IDLE". The exact text existing app builds compare
+    against, so a receiver in use here is reported as in use."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("", 9950))
+    except OSError as e:
+        print(f"[presence] could not listen on UDP 9950: {e}")
+        return
+    print("[presence] answering Lynx devices on UDP 9950")
+    while True:
+        try:
+            data, addr = sock.recvfrom(256)
+            text = data.decode(errors="replace").strip()
+            if not text.startswith("LYNX?"):
+                continue
+            try:
+                n = int(text.split()[1])
+            except (IndexError, ValueError):
+                continue
+            answer = "LYNX IDLE"
+            if n in _picotuner_expected_tuning() and not _picotuner_target_other(n):
+                answer = f"LYNX WATCHING {n}"
+            sock.sendto(answer.encode(), addr)
+            print(f"[presence] {addr[0]} asked about Rx{n}: {answer}")
+        except Exception as e:
+            print(f"[presence] {e}")
+            time.sleep(1)
+
+
 def picotuner_tuning_watchdog():
     """Puts the Picotuner back where it belongs whenever it has lost its
     tuning, whatever the cause."""
@@ -5234,11 +7714,32 @@ def picotuner_tuning_watchdog():
                 bad_since = None
                 continue
 
+            # Protected (a repeater): a receiver Lynx is using that another
+            # device has tuned is taken back at once, not after the 20 s a
+            # lost tuning waits, and with a shorter cooldown than a restore
+            # that isn't taking.
+            if _picotuner_mode() == 'protect':
+                grabbed = [(r, _picotuner_target_other(r)) for r in expected]
+                grabbed = [(r, ip) for r, ip in grabbed if ip]
+                if grabbed:
+                    now = time.time()
+                    if now - last_fix >= PICOTUNER_PROTECT_RECLAIM_SECS:
+                        for r, ip in grabbed:
+                            print(f"[picotuner] Rx{r} taken by {ip} - receivers "
+                                  f"are protected (repeater), taking it back")
+                        last_fix = now
+                        bad_since = None
+                        threading.Thread(target=_picotuner_restore_tuning,
+                                         daemon=True).start()
+                    continue
+
             wrong = []
             for rcv, (want_khz, want_sr) in expected.items():
                 st = picotuner_state_b if rcv == 2 else picotuner_state
                 if rcv == 2 and not st.get("online"):
                     continue          # Rx2 not reporting at all - nothing to compare
+                if _picotuner_taken_over(rcv):
+                    continue          # another device is using it: not a lost tuning
                 got_khz = _picotuner_reported_khz(st)
                 if got_khz is None:
                     wrong.append(f"Rx{rcv} not tuned "
@@ -5679,6 +8180,145 @@ def proxy_quicklynx_chat():
             f"Chat unavailable: {e}</p>", status_code=502)
 
 
+# ── Source registry (Lynx+ step 2) ────────────────────────────
+#
+# Built from the state dicts above rather than replacing them. Nothing
+# consumes it yet: every existing consumer keeps its own logic, so the
+# receiver behaves identically whether this is published or not.
+#
+# The state dicts are passed as callables rather than references
+# because several of these globals are rebound rather than mutated,
+# and a reference captured here would quietly stop updating - which is
+# the kind of fault that shows up as a figure frozen an hour ago.
+source_registry = lynx_sources.SourceRegistry()
+
+
+def build_source_registry():
+    """Populate the registry from whatever this receiver actually has.
+
+    Called after discovery and after the config is loaded, so it sees
+    the real hardware rather than the possible hardware. Rebuilt rather
+    than patched when sources appear or disappear - there are at most a
+    handful, and a rebuild cannot leave a stale entry behind.
+    """
+    reg = lynx_sources.SourceRegistry()
+
+    reg.add(lynx_sources.PicotunerSource(
+        "rf:a", "Tuner Rx 1",
+        get_state=lambda: picotuner_state,
+        rcv=1,
+        get_mpv_running=lambda: mpv_running_for_rf,
+        get_on_air_freq=on_air_from_if))
+
+    # Tuner B only when something actually uses it. A source in the
+    # registry that nothing can select is a lie, and a receiver with
+    # one plug should not list two.
+    _tw = (config.get('tri_watch') or {})
+    _tw_has_b = _tw.get('enabled') and any(
+        s.get('type') == 'rf' and s.get('rcv') == 2 and s.get('enabled')
+        for s in (_tw.get('sources') or []))
+    if diversity_enabled or _tw_has_b:
+        reg.add(lynx_sources.PicotunerSource(
+            "rf:b", "Tuner Rx 2",
+            get_state=lambda: picotuner_state_b,
+            rcv=2,
+            get_mpv_running=lambda: mpv_running_for_rf,
+            get_on_air_freq=on_air_from_if))
+
+    for _i, _rs in enumerate(remote_states):
+        if not _rs.get('enabled', True):
+            continue
+        reg.add(lynx_sources.SlaveSource(
+            f"slave:{_i}", _rs.get('name') or f"Slave Rx {_i + 1}",
+            get_state=(lambda i=_i: remote_states[i])))
+
+    # Tuner 0 only for now - nothing tunes tuner 1 yet. The index is in
+    # the identifier from the start so adding it later changes nothing
+    # else, here or in any config file that has stored one.
+    for _dev in hdhr_devices():
+        _did = _dev["device_id"]
+        reg.add(lynx_sources.HdhrSource(
+            f"dvbt:{_did}:0", "DVB-T2",
+            get_state=(lambda d=_did: next(
+                (x for x in hdhr_devices() if x["device_id"] == d), None)),
+            device_id=_did, tuner=0,
+            get_stream_info=lambda: (get_live_stream_info()
+                                     if current_mode == "dvbt" else {}),
+            is_broadcast=lambda hz: not hdhr_is_amateur_band(hz)))
+
+    reg.add(lynx_sources.StreamSource(
+        "stream", "Stream",
+        get_name=lambda: current_stream_name,
+        get_stream_info=lambda: (get_live_stream_info()
+                                 if current_mode == "stream" else {}),
+        get_active=lambda: current_mode == "stream"))
+
+    return reg
+
+
+def _published_sources():
+    """The registry as plain data, rebuilt on each call.
+
+    Rebuilt rather than cached because sources appear and disappear -
+    a Slave comes online, an HDHomeRun is unplugged - and this runs
+    twice a second at most, against a handful of entries. Cheap enough
+    not to need a cache, and a cache is how a stale entry survives.
+
+    Never allowed to fail: this is diagnostic, and a receiver must not
+    stop reporting its status because an experimental block raised.
+    """
+    try:
+        reg = build_source_registry()
+        reg.set_active(_registry_active_id())
+        return {
+            "active": reg.active_id(),
+            "showing_picture": reg.showing_picture(),
+            "list": reg.describe(),
+        }
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+
+def _registry_active_id():
+    """Which registry id corresponds to the current mode.
+
+    A translation rather than a source of truth: current_mode remains
+    the authority until consumers move across, and this exists so the
+    published registry can say which source is active without anything
+    depending on it.
+    """
+    if current_mode == "stream":
+        return "stream"
+    if current_mode == "dvbt":
+        # The box actually tuned, not the default one: with a DVB-T2 box
+        # and an ATSC 3.0 box both present, the default named the other
+        # box, the registry said "no picture" and the overlay blanked a
+        # perfectly good one.
+        _d = hdhr_active_device or hdhr_default_device_id()
+        return f"dvbt:{_d}:0" if _d else None
+    if current_mode == "rf":
+        if displayed_receiver_id is not None:
+            try:
+                return f"slave:{displayed_receiver_id - REMOTE_RECEIVER_ID_BASE}"
+            except (TypeError, ValueError):
+                return None
+        # Diversity can be carried by either tuner; the one reporting a
+        # lock is the honest answer, A first.
+        if picotuner_state.get('locked'):
+            return "rf:a"
+        if diversity_enabled and picotuner_state_b.get('locked'):
+            return "rf:b"
+        return "rf:a"
+    return None
+
+
+def _in_use_status():
+    nm = globals().get("notification_manager")
+    if nm is None:
+        return {"active": False, "since": None}
+    return {"active": bool(nm.in_use), "since": nm.in_use_since}
+
+
 @app.get("/api/status", tags=["Status"],
          summary="Get current receiver status",
          description="Returns lock state, MER, callsign, frequency and more. "
@@ -5687,9 +8327,51 @@ def get_status():
     status = {
         "lynx": {
             "mode": current_mode,
+            # Lynx+ step 2: the registry's own view, for comparison
+            # against everything else in this payload. Off by default,
+            # and nothing consumes it - it is here to be looked at.
+            **({"sources": _published_sources()}
+               if (config.get('sources') or {}).get('publish') else {}),
+            # The overlay polls this endpoint and only this
+            # endpoint, so a source it has to draw has to be here.
+            # None when no device was found at startup, which the
+            # overlay treats as "not this receiver's problem" rather
+            # than as a fault.
+            # The device on screen (or the DVB box when none is), under
+            # the long-standing key the overlay reads; and one block per
+            # kind for the page's DVB-T2 and ATSC 3.0 panels.
+            "hdhomerun": _hdhr_block(_hdhr_pick("active")),
+            "hdhomerun_dvb": _hdhr_block(_hdhr_pick("dvb")),
+            "hdhomerun_atsc": _hdhr_block(_hdhr_pick("atsc")),
+
             "preset": current_preset,
             "stream_name": current_stream_name,
-            "stream_info": get_live_stream_info() if current_mode == "stream" else None,
+            # True when what is playing is a Slave rather than a real
+            # stream. Derived from the URL rather than stored: the relay
+            # output port is the only thing a Slave is ever played from,
+            # so this cannot disagree with reality the way a separate
+            # flag set in one place and cleared in three eventually
+            # would. The Stream panel uses it to stand down.
+            # Which Slave, not just that it is one. Read from the
+            # relay rather than stored: the relay is what decides
+            # whose packets reach mpv, so it cannot disagree with
+            # what is actually on screen.
+            "remote_selected": slave_relay.selected(),
+            # Which receiver is on screen: 1 or 2 for the local
+            # Picotuner, 11+ for a Slave, null for a stream. The
+            # single answer, derived in one place, for anything
+            # that needs to know — panels, overlay, and whatever
+            # comes next.
+            "active_receiver": active_receiver_id(),
+            "stream_is_remote": (current_mode == "stream"
+                                 and current_stream_url == f"udp://@:{REMOTE_VIDEO_OUT_PORT}"),
+            # Called for dvbt too: it reads the codecs from mpv, which
+            # is the only thing that knows them - the HDHomeRun reports
+            # bitrate and quality but nothing about what is inside the
+            # multiplex. One function, both sources, rather than a
+            # second copy that drifts.
+            "stream_info": (get_live_stream_info()
+                            if current_mode in ("stream", "dvbt") else None),
             "stream_protocol": get_stream_protocol(current_stream_url) if current_mode == "stream" and current_stream_url else None,
             "mpv_transitioning": mpv_transitioning,
             "mpv_running_for_rf": mpv_running_for_rf,
@@ -5701,7 +8383,9 @@ def get_status():
                       "running": gnss_reader.running, **gnss_reader.status()},
             "ppm_style": config.get('display', {}).get('ppm_style', 'full_fat'),
             "refresh_hz": config.get('display', {}).get('refresh_hz', 50),
-            "max_height": config.get('display', {}).get('max_height', 1080),
+            "max_height": display_max_height(),
+            "board": lynx_platform.BOARD,
+            "board_name": lynx_platform.BOARD_NAME,
             "quicklynx_enabled": bool(config.get('quicklynx', {}).get('enabled', False)),
             "site_locator": config.get('site', {}).get('locator', ''),
             # Published so the overlay's PPM can follow mpv to whichever
@@ -5746,7 +8430,18 @@ def get_status():
             # nothing left for it to carry once the card it was covering
             # for would itself have finished.
             "pathfinder_duration_secs": pathfinder_tracker.duration_secs,
+            # Whether the overlay may draw the placeholder card (or the
+            # SWITCHING caption) when Pathfinder has no map to show.
+            "pathfinder_placeholder": bool((config.get('pathfinder') or {}).get('placeholder_card', True)),
             "squeak": _squeak_status(),
+            # Something to show, settled with the Video Switching card's
+            # settle times: what it switches on, whether or not Companion
+            # or its pin is enabled. RF and relayed streams alike.
+            "in_use": _in_use_status(),
+            # Cached by video_badge_monitor(); never waits on mpv or wlr-randr.
+            "video_in": video_in_info,
+            "video_out": video_out_info,
+            "board": board_info,
             "timestamp": utc_now_iso()
         },
         "picotuner": {
@@ -5764,6 +8459,7 @@ def get_status():
             "mer": picotuner_state["mer"],
             "margin": picotuner_state["margin"],
             "programme": picotuner_state["programme"],
+            "service": picotuner_state.get("service", ""),
             "modcod": picotuner_state["modcod"],
             "codec": picotuner_state["codec"],
             "audio_codec": picotuner_state["audio_codec"],
@@ -5779,6 +8475,72 @@ def get_status():
                 "plug_b": current_lnb_psu_b, "plug_b_tone": current_lnb_tone_b,
             },
         },
+        # Remote source (Slave Rx). Always present in the response
+        # rather than appearing only when configured, so a consumer
+        # can read remote.enabled once instead of testing whether the
+        # key exists at all - the same reason the diversity block
+        # below is always present even when idle.
+        "batc": {
+            "online": batc_health["online"],
+            "last_ok": batc_health["last_ok"],
+        },
+        # One entry per configured Slave, in config order. Always
+        # present even when empty, so a consumer can iterate without
+        # first testing whether the key exists.
+        "remotes": [
+            {
+                "index": i,
+                "enabled": st["enabled"],
+                "online": remote_online(i),
+                "locked": st["locked"],
+                "callsign": st["callsign"],
+                "frequency": st["frequency"],
+                "rx1": st["rx1_raw"],
+                "name": remote_display_name(i),
+                "locator": st["locator"],
+                "status_port": st["status_port"],
+                "addr": st["addr"],
+                # Video presence, deliberately separate from "locked":
+                # a Slave can be heartbeating happily while its own
+                # receiver is unlocked and no TS is flowing, and the
+                # two states need telling apart on the panel.
+                "video": _relay_video_for(i),
+                # Same call the local receivers get. Asking is also
+                # what warms the cache, so a station heard on a
+                # Slave gets its name on the first contact rather
+                # than the second — or never, which is what
+                # happened while nothing asked.
+                "callsign_name": qrz_first_name(st["callsign"]),
+                # Only the fields the Slave has actually sent. A
+                # Slave with no quality port simply has none of
+                # these, which reads differently from a Slave
+                # reporting zeros — and it should.
+                **{k: st[k] for k in REMOTE_QUALITY_FIELDS if k in st},
+                "last_seen": st["last_seen"],
+            }
+            for i, st in enumerate(remote_states)
+        ],
+        # The first Slave, for anything still expecting a single one -
+        # the overlay, at the time of writing. Goes when that learns
+        # about source selection; kept for now so both do not have to
+        # change in the same patch.
+        "remote": (
+            {
+                "enabled": remote_states[0]["enabled"],
+                "online": remote_online(0),
+                "locked": remote_states[0]["locked"],
+                "callsign": remote_states[0]["callsign"],
+                "frequency": remote_states[0]["frequency"],
+                "rx1": remote_states[0]["rx1_raw"],
+                "name": remote_display_name(0),
+                "locator": remote_states[0]["locator"],
+                "last_seen": remote_states[0]["last_seen"],
+            }
+            if remote_states else
+            {"enabled": False, "online": False, "locked": False,
+             "callsign": "", "frequency": "", "rx1": "",
+             "name": "Slave Rx", "locator": "", "last_seen": 0}
+        ),
         "diversity": {
             "enabled": diversity_enabled,
             # rcv=2's own native status — only meaningful while
@@ -5810,6 +8572,7 @@ def get_status():
                 "agc1": picotuner_state_b["agc1"],
                 "agc2": picotuner_state_b["agc2"],
                 "programme": picotuner_state_b["programme"],
+                "service": picotuner_state_b.get("service", ""),
             },
             # Combiner's own live rolling-window stats (see
             # diversity_combiner_pcr.py) — None when not running.
@@ -6236,6 +8999,9 @@ const REASON_LABELS = {
     "drift_drop_buffers": "Drift correction: drop-buffers resync",
     "drift_breaker_tripped": "Drift correction: repeated resyncs not helping, backed off",
     "drift_hard_freeze_restart": "Hard freeze detected - immediate mpv restart",
+    "screen_back_restart": "Screen came back with no picture - mpv restarted",
+    "screen_back_stall_restart": "Screen came back with mpv stuck - mpv restarted",
+    "screen_back_ao_reload": "Screen came back with mpv stuck - sound output reopened",
     "drift_hard_freeze_suppressed": "Hard freeze detected - restart breaker active, suppressed",
     "drift_hard_freeze_breaker_tripped": "Hard freeze restarts not helping, backed off",
     "notif_confirmed_lock": "Notifications: own lock confirmation (arms settle timers)",
@@ -6575,6 +9341,19 @@ def config_page():
                             <input class="form-check-input" type="checkbox" id="gpio-weekend-none-input">
                             <label class="form-check-label small" for="gpio-weekend-none">No schedule (24hr auto)</label>
                         </div>
+                        <hr>
+                        <p class="text-muted small mb-2">
+                            Optional: also call a URL when Tx turns on and off - for example to
+                            start and stop a stream in Companion. Same schedule and settle times
+                            as the pin, fired once per change. Use explicit start/stop actions,
+                            never a toggle. Works without a transmitter relay fitted.
+                        </p>
+                        <label for="gpio-on-url">Tx on URL</label>
+                        <input type="text" class="form-control mb-2" id="gpio-on-url-input"
+                               placeholder="http://companion-ip:8000/api/location/1/3/0/press">
+                        <label for="gpio-off-url">Tx off URL</label>
+                        <input type="text" class="form-control" id="gpio-off-url-input"
+                               placeholder="http://companion-ip:8000/api/location/1/3/1/press">
                         <div class="mt-3 d-flex align-items-center gap-2">
                             <button class="btn btn-save" onclick="saveGpioTx()">Save GPIO settings</button>
                             <span class="save-status" id="gpio-save-status"></span>
@@ -6687,12 +9466,13 @@ def config_page():
                     <div class="card-header">&#x1F5A5;&#xFE0F; Screen</div>
                     <div class="card-body">
                         <p class="text-muted small">
-                            Lynx caps the screen at 1080 lines, switching a 4K monitor down when it
-                            starts. A 4K screen is more than a Raspberry Pi can drive while also
+                            On a Raspberry Pi, Lynx caps the screen at 1080 lines, switching a 4K
+                            monitor down when it starts. A 4K screen is more than a Pi can drive while also
                             decoding a live picture &mdash; it causes picture glitches, audio dropouts
                             and a missing overlay. Nothing is lost: DATV video is well below 1080
                             anyway, so a bigger screen buffer only draws more pixels for exactly the
-                            same picture. An ultrawide monitor is unaffected.
+                            same picture. An ultrawide monitor is unaffected. On a ROCK 5T the full 4K
+                            output is kept.
                         </p>
                         <input type="hidden" id="max-height-hidden" value="1080">
                         <label class="small text-muted mb-1" for="refresh-hz-select">Refresh rate</label>
@@ -6701,16 +9481,46 @@ def config_page():
                             <option value="60">60 Hz &mdash; North America, Japan (30 fps)</option>
                         </select>
                         <p class="text-muted small mb-2">
-                            Only used when the screen actually has to be switched. 50 Hz suits 25 fps
+                            Applied when Lynx starts, when you save, and when a screen comes back,
+                            if the screen offers it. 50 Hz suits 25 fps
                             television: each frame then lasts exactly two refreshes. At 60 Hz a 25 fps
                             picture judders on pans, because frames are held alternately for two
-                            refreshes and three. A monitor with no mode at the chosen rate falls back
-                            to the highest it offers.
+                            refreshes and three. A screen with no mode at the chosen rate is left
+                            at its own (a ROCK or Pi 5 asks for a custom mode first).
                         </p>
                         <div class="mt-2 d-flex align-items-center gap-2">
                             <button class="btn btn-save" onclick="saveScreen()">Save screen settings</button>
                             <span class="save-status" id="screen-save-status"></span>
                         </div>
+                    </div>
+                </div>
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F4E1; Slave Rx (remote receiver)</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            Accepts tuner status from a receiver at another site, sent over
+                            the network, so a repeater can have an RF input somewhere it has
+                            no antenna. The remote end is a converted MiniTiouner and a Pi
+                            running the Lynx-Slave-Rx software.
+                        </p>
+                        <div class="form-check form-switch mb-3">
+                            <input class="form-check-input" type="checkbox" id="rs-enabled">
+                            <label class="form-check-label" for="rs-enabled">Enabled</label>
+                        </div>
+                        <div class="row g-2 mb-2">
+                            <div class="col-6">
+                                <label class="form-label small mb-1" for="rs-status-port">Status port</label>
+                                <input type="number" min="1024" max="65535" step="1" class="form-control form-control-sm" id="rs-status-port">
+                                <div class="small text-muted mt-1">Must not be 9997</div>
+                            </div>
+                        </div>
+                        <div id="rs-warning" class="alert alert-warning py-2 px-2 small mb-2" style="display:none;"></div>
+                        <div class="text-muted small mb-2">
+                            9997 is the port this receiver's own Picotuner uses. A Slave
+                            sending there would collide with it, so the Slave gets its own.
+                        </div>
+                        <button class="btn btn-save" onclick="saveRemoteSource()">Save Slave Rx settings</button>
+                        <span id="rs-status" class="save-status ms-2"></span>
                     </div>
                 </div>
                 <div class="card mb-3">
@@ -6749,6 +9559,14 @@ def config_page():
                         <span id="pf-status" class="save-status ms-2"></span>
                         <hr class="my-3">
                         <div class="fw-semibold small mb-1">Switch placeholder card</div>
+                        <div class="form-check form-switch mb-2">
+                            <input class="form-check-input" type="checkbox" id="pf-placeholder"
+                                   onchange="savePathfinder('pf-placeholder-status')">
+                            <label class="form-check-label small" for="pf-placeholder">Show a card when there is no
+                                Pathfinder map (off: plain black, no card and no caption; the maps themselves
+                                are unaffected). Saved as soon as you change it; takes effect after a restart.</label>
+                            <span id="pf-placeholder-status" class="save-status ms-2"></span>
+                        </div>
                         <p class="text-muted small mb-2">
                             Shown full-screen during a Tri-Watch source change when there is
                             no Pathfinder map to show &mdash; a stream, or a station with no
@@ -6966,6 +9784,22 @@ def config_page():
                                 <label for="pt-ts-port-b">TS port (B)</label>
                                 <input type="number" class="form-control" id="pt-ts-port-b-input">
                             </div>
+                            <div class="col-md-6">
+                                <label for="pt-receivers">Receivers</label>
+                                <select class="form-select" id="pt-receivers-input">
+                                    <option value="share">Share with other devices</option>
+                                    <option value="protect">Protect (repeater)</option>
+                                </select>
+                            </div>
+                            <div class="col-12">
+                                <p class="text-muted small mb-0">
+                                    Share: another device (an iPhone or Apple TV, say) may take a
+                                    receiver this Lynx is using; Lynx takes it back when that device has
+                                    finished. Protect: a receiver Lynx is using is always taken straight
+                                    back, about 10 s later. Use Protect on a repeater. Takes effect on Save,
+                                    with no restart.
+                                </p>
+                            </div>
                         </div>
                         <div class="mt-3 d-flex align-items-center gap-2">
                             <button class="btn btn-save" onclick="savePicotuner()">Save Picotuner settings</button>
@@ -6982,6 +9816,41 @@ def config_page():
                             than finding it by hand.</p>
                         <div id="discovered-picotuners-list">
                             <p class="text-muted small">Checking...</p>
+                        </div>
+                    </div>
+                </div>
+                <div class="card mb-3">
+                    <div class="card-header">&#x1F4FA; HDHomeRun Tuners</div>
+                    <div class="card-body">
+                        <p class="text-muted small">
+                            SiliconDust HDHomeRuns on the network: DVB-T/T2/C
+                            boxes, and ATSC boxes. Found automatically on the
+                            same subnet, and each tune goes to a box that can
+                            receive it. Name them here if you like.
+                        </p>
+                        <div class="alert alert-warning py-2 small mb-3">
+                            Auto-discovery is a broadcast, so it does not cross
+                            a router. A tuner on another subnet - at a repeater
+                            site, say - works perfectly once its address is
+                            given here, but will never be found on its own.
+                        </div>
+                        <label class="small">Discovered</label>
+                        <div class="mb-3">
+                            <span class="status-value" id="hdhr-discovered">-</span>
+                        </div>
+                        <label class="small">Address (optional)</label>
+                        <input type="text" class="form-control mb-2"
+                               id="hdhr-address-input"
+                               placeholder="e.g. 10.20.30.40">
+                        <p class="text-muted small">
+                            Leave empty unless the tuner is on another subnet.
+                            An address given here is asked directly rather than
+                            broadcast for, and is used in addition to anything
+                            discovered locally.
+                        </p>
+                        <div class="mt-3 d-flex align-items-center gap-2">
+                            <button class="btn btn-save" onclick="saveHdhr()">Save HDHomeRun settings</button>
+                            <span class="save-status" id="hdhr-status"></span>
                         </div>
                     </div>
                 </div>
@@ -7478,10 +10347,60 @@ async function loadCurrentConfig() {
         document.getElementById('site-location-input').value = cfg.site?.location || '';
         document.getElementById('site-locator-input').value = cfg.site?.locator || '';
 
+        const hdhrCfg = cfg.hdhomerun || {};
+        const hdhrAddr = document.getElementById('hdhr-address-input');
+        if (hdhrAddr) { hdhrAddr.value = hdhrCfg.address || ''; }
+        // What was actually found, from the live endpoint rather than
+        // the config: the whole point of the field is to cover the case
+        // where discovery found nothing, so showing the configured
+        // value back as "discovered" would be worse than useless.
+        try {
+            const hr = await fetch('/api/hdhomerun');
+            const hd = await hr.json();
+            const el = document.getElementById('hdhr-discovered');
+            if (el) {
+                const devs = (hd && hd.devices) || [];
+                if (!devs.length) {
+                    el.textContent = 'none found';
+                } else {
+                    // One row per box: its name, editable, in ordinary
+                    // text, and what it is. Left at the default, a name
+                    // saves as no name given. See patch_hdhr_after_atsc3.py.
+                    const given = (hdhrCfg.names || {});
+                    el.textContent = '';
+                    devs.forEach(function (d) {
+                        const row = document.createElement('div');
+                        row.className = 'mb-2';
+                        const inp = document.createElement('input');
+                        inp.type = 'text';
+                        inp.className = 'form-control form-control-sm';
+                        inp.id = 'hdhr-name-' + d.device_id;
+                        inp.dataset.def = d.default_name || '';
+                        inp.value = given[d.device_id] || d.default_name || d.name || '';
+                        const info = document.createElement('div');
+                        info.className = 'small text-muted';
+                        info.textContent = (d.kind === 'atsc' ? 'ATSC / ATSC 3.0' : 'DVB-T / T2 / C')
+                            + ' - ' + d.device_id + ' at ' + (d.address || '?')
+                            + (d.online ? '' : ' - offline') + (d.active ? ' - in use' : '');
+                        row.appendChild(inp);
+                        row.appendChild(info);
+                        el.appendChild(row);
+                    });
+                }
+            }
+        } catch (e) { /* the card still works without it */ }
+
+        const rs = cfg.remote_source || {};
+        document.getElementById('rs-enabled').checked = rs.enabled === true;
+        document.getElementById('rs-status-port').value = rs.status_port ?? 10997;
+        updateRemoteSourceWarning();
+        document.getElementById('rs-status-port').addEventListener('input', updateRemoteSourceWarning);
+
         const pf = cfg.pathfinder || {};
         document.getElementById('pf-enabled').checked = pf.enabled !== false;
         document.getElementById('pf-delay').value = pf.delay_secs ?? 2;
         document.getElementById('pf-duration').value = pf.duration_secs ?? 30;
+        document.getElementById('pf-placeholder').checked = pf.placeholder_card !== false;
         updatePathfinderWarning();
         // Which placeholder card is in place isn't part of the config
         // (it's a file, not a setting), so it's fetched separately.
@@ -7520,6 +10439,7 @@ async function loadCurrentConfig() {
         document.getElementById('pt-ts-port-input').value = cfg.picotuner?.ts_port || '';
         document.getElementById('pt-cmd-port-b-input').value = cfg.picotuner?.cmd_port_b || '';
         document.getElementById('pt-ts-port-b-input').value = cfg.picotuner?.ts_port_b || '';
+        document.getElementById('pt-receivers-input').value = cfg.picotuner?.receivers === 'protect' ? 'protect' : 'share';
 
         document.getElementById('div-dwell-input').value = cfg.diversity?.mer_switch_dwell_secs ?? 10.0;
         document.getElementById('div-margin-input').value = cfg.diversity?.mer_switch_margin_db ?? 1.0;
@@ -7581,6 +10501,8 @@ async function loadCurrentConfig() {
         document.getElementById('gpio-polarity-input').value = gpio.polarity || 'high';
         document.getElementById('gpio-power-up-input').value = gpio.power_up_settle_secs ?? 5;
         document.getElementById('gpio-power-down-input').value = gpio.power_down_settle_secs ?? 900;
+        document.getElementById('gpio-on-url-input').value = gpio.on_url || '';
+        document.getElementById('gpio-off-url-input').value = gpio.off_url || '';
         setScheduleFields('weekday', gpio.schedule_weekday_start, gpio.schedule_weekday_end);
         setScheduleFields('weekend', gpio.schedule_weekend_start, gpio.schedule_weekend_end);
 
@@ -7945,15 +10867,90 @@ async function removeTestcard() {
     }
 }
 
-async function savePathfinder() {
-    const statusEl = document.getElementById('pf-status');
+function updateRemoteSourceWarning() {
+    // 9997 is the one value that cannot work: picotuner_monitor() binds
+    // it for this receiver's own tuner, so a Slave sending there would
+    // be read as the local Picotuner. Caught here as well as in the
+    // Slave's own sender, because a wrong port produces confusing
+    // symptoms rather than an obvious failure - the local tuner would
+    // appear to report things it never sent.
+    const el = document.getElementById('rs-warning');
+    const port = parseInt(document.getElementById('rs-status-port').value, 10);
+    if (port === 9997) {
+        el.textContent = 'Port 9997 belongs to this receiver and its own ' +
+                          'Picotuner. Choose another - 10997 is the default.';
+        el.style.display = '';
+    } else {
+        el.style.display = 'none';
+    }
+}
+
+async function saveHdhr() {
+    const statusEl = document.getElementById('hdhr-status');
+    statusEl.textContent = 'Saving...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const body = { hdhomerun: {
+            address: document.getElementById('hdhr-address-input').value.trim(),
+            names: (function () {
+                const n = {};
+                document.querySelectorAll('[id^="hdhr-name-"]').forEach(function (i) {
+                    const v = i.value.trim();
+                    n[i.id.slice(10)] = (v === (i.dataset.def || '')) ? '' : v;
+                });
+                return n;
+            })()
+        }};
+        const r = await fetch('/api/config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+        });
+        if (!r.ok) throw new Error(await r.text());
+        // Restart required: the address is read once, during the single
+        // discovery sweep at startup. A device is installed rather than
+        // plugged in and out, so there is no reason to poll for one.
+        statusEl.textContent = 'Saved. Names apply now; a new address needs a restart.';
+        statusEl.className = 'save-status text-success';
+    } catch (e) {
+        statusEl.textContent = 'Save failed - see console.';
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
+async function saveRemoteSource() {
+    const statusEl = document.getElementById('rs-status');
+    statusEl.textContent = 'Saving...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const body = { remote_source: {
+            enabled: document.getElementById('rs-enabled').checked,
+            status_port: parseInt(document.getElementById('rs-status-port').value, 10)
+        }};
+        const r = await fetch('/api/config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+        });
+        if (!r.ok) throw new Error(await r.text());
+        statusEl.textContent = 'Saved - restart required.';
+        statusEl.className = 'save-status text-success';
+    } catch (e) {
+        statusEl.textContent = 'Save failed - see console.';
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
+async function savePathfinder(statusId) {
+    // The placeholder switch saves itself, with its own status beside it
+    // (it sits below the Save button, and flicking it alone saved nothing).
+    const statusEl = document.getElementById(statusId || 'pf-status');
     statusEl.textContent = 'Saving...';
     statusEl.className = 'save-status text-muted';
     try {
         const body = { pathfinder: {
             enabled: document.getElementById('pf-enabled').checked,
             delay_secs: parseFloat(document.getElementById('pf-delay').value),
-            duration_secs: parseFloat(document.getElementById('pf-duration').value)
+            duration_secs: parseFloat(document.getElementById('pf-duration').value),
+            placeholder_card: document.getElementById('pf-placeholder').checked
         }};
         const r = await fetch('/api/config', {
             method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
@@ -8051,10 +11048,11 @@ async function saveScreen() {
         const r = await fetch('/api/config', {method: 'POST',
             headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)});
         if (!r.ok) throw new Error(await r.text());
-        // The screen mode is set once, by lynx_start.sh, before mpv and
-        // the overlay start - changing it underneath them is exactly
-        // what breaks them - so this cannot take effect live.
-        el.textContent = 'Saved - restart Lynx for this to take effect.';
+        // The refresh rate is applied as it is saved (same size, new
+        // rate, as a screen return has always done). The height cap
+        // still waits for a restart: changing the SIZE underneath mpv
+        // and the overlay is what breaks them.
+        el.textContent = 'Saved. Refresh rate applied now; a height change needs a restart.';
         el.className = 'save-status text-success';
     } catch (e) {
         el.textContent = 'Save failed - see console.';
@@ -8105,6 +11103,7 @@ async function savePicotuner() {
                 ts_port: parseInt(document.getElementById('pt-ts-port-input').value),
                 cmd_port_b: parseInt(document.getElementById('pt-cmd-port-b-input').value),
                 ts_port_b: parseInt(document.getElementById('pt-ts-port-b-input').value),
+                receivers: document.getElementById('pt-receivers-input').value,
             }
         };
         const r = await fetch('/api/config', {
@@ -8485,6 +11484,8 @@ async function saveGpioTx() {
                 schedule_weekday_end: weekday.end,
                 schedule_weekend_start: weekend.start,
                 schedule_weekend_end: weekend.end,
+                on_url: document.getElementById('gpio-on-url-input').value.trim(),
+                off_url: document.getElementById('gpio-off-url-input').value.trim(),
             }
         };
         const r = await fetch('/api/config', {
@@ -8876,7 +11877,8 @@ def tune(req: TuneRequest):
     # working fine, since it never touched this lock at all — exactly
     # what was reported after a burst of rapid, overlapping preset/
     # stream switches.
-    global _tune_lock_handed_off
+    global _tune_lock_handed_off, switch_generation
+    switch_generation += 1          # anything still waiting on a picture gives way
     if not tune_lock.acquire(timeout=15):
         raise HTTPException(status_code=503, detail="Another tune operation is already in progress — please try again shortly")
     _tune_lock_handed_off = False
@@ -8891,6 +11893,7 @@ def tune(req: TuneRequest):
     # the actual tune is fully complete, not just accepted.
 
 def _tune_impl(req: TuneRequest):
+    global displayed_receiver_id
     global current_mode, current_preset, diversity_enabled, _tune_lock_handed_off
     cfg = config['picotuner']
     is_diversity = req.plug.lower() == "diversity"
@@ -9058,7 +12061,10 @@ def _tune_impl(req: TuneRequest):
             stop_diversity_combiner()
         diversity_enabled = False
     
+    global rf_tuned_at
+    rf_tuned_at = time.time()
     current_mode = "rf"
+    displayed_receiver_id = None
     if req.lnb_lo_khz:
         current_preset = f"{req.freq/1000:.3f} MHz (LNB LO {req.lnb_lo_khz/1000:.3f} MHz) / {req.sr} kS/s"
     else:
@@ -9130,6 +12136,596 @@ def _tune_impl(req: TuneRequest):
         "plug": req.plug
     }
 
+@app.post("/api/tune_dvbt", tags=["RF Reception"],
+          summary="Tune an HDHomeRun to a DVB-T/T2/C frequency",
+          description="Tunes a network-attached HDHomeRun tuner and starts "
+                      "mpv playing its stream. Stops any current reception "
+                      "first.")
+def tune_dvbt(req: DvbtTuneRequest):
+    # Same thin-wrapper split as tune(), and for the same reason: a
+    # failure inside the implementation before the async thread starts
+    # must not leave tune_lock held, or every future tune returns 503
+    # while streaming carries on working and nothing says why.
+    global _tune_lock_handed_off
+    if not tune_lock.acquire(timeout=15):
+        raise HTTPException(
+            status_code=503,
+            detail="Another tune operation is already in progress - "
+                   "please try again shortly")
+    _tune_lock_handed_off = False
+    try:
+        return _tune_dvbt_impl(req)
+    except Exception:
+        if not _tune_lock_handed_off:
+            tune_lock.release()
+        raise
+
+
+def _tune_dvbt_impl(req: DvbtTuneRequest):
+    global current_mode, current_preset, displayed_receiver_id
+    global diversity_enabled, mpv_running_for_rf, _tune_lock_handed_off
+
+    # The device that can do this modulation, chosen before anything else
+    # so every step below - the cover, the OSD state, the tune, the saved
+    # state - talks about the same box.
+    _dev = hdhr_device_for(req.modulation, req.device_id)
+    hdhr_choose_tuner(_dev)
+    source = hdhr_source(_dev)
+    global hdhr_active_device
+    hdhr_active_device = _dev
+
+    # Lynx is changing source, so whatever was being received is no
+    # longer being listened to - same reason and same placement as in
+    # _tune_impl(), before anything is tuned, so the watcher's next
+    # poll already knows rather than racing.
+    try:
+        pathfinder_source_changed()
+    except Exception:
+        pass
+
+    # Tear down whatever owns the video path now. The HDHomeRun has its
+    # own port, so this is not about port contention - it is so that a
+    # Picotuner still pushing to 9941, or a combiner still running, is
+    # not left burning CPU and confusing the lifecycle monitor while a
+    # different source is on screen.
+    stop_ffmpeg_bg()
+    if diversity_enabled:
+        stop_diversity_combiner()
+        diversity_enabled = False
+    # Any other HDHomeRun still sending to our port goes quiet first.
+    hdhr_release_others(_dev)
+    hdhr_relay.clear()
+
+    # Cover the screen before anything else. Without it mpv carries on
+    # showing whatever was on before - a stream, or the previous
+    # multiplex - for the several seconds a tune takes, which reads as
+    # the tune having done nothing at all. _kick_mpv() lowers it again
+    # when the new picture arrives.
+    start_transition_cover()
+
+    # Mode and frequency BEFORE the attempt, so the OSD can show it
+    # while the tune runs - and keeps showing it if the tune fails.
+    #
+    # Setting them afterwards meant a receiver displayed the PREVIOUS
+    # source for the twenty seconds a lock attempt takes, and went on
+    # displaying it for ever if no lock came. That is arbitration
+    # behaviour, which belongs in tri_watch where sources genuinely
+    # compete; in manual mode the operator asked for a frequency and
+    # is entitled to see what is happening on it. A tune to an empty
+    # channel should look like one.
+    current_mode = "dvbt"
+    displayed_receiver_id = None
+    with hdhr_lock:
+        _live_early = hdhr_states.get(_dev)
+        if _live_early is not None:
+            _live_early["frequency_hz"] = req.freq
+            _live_early["lock_mode"] = req.modulation
+
+    # Tune and wait for lock. Unlike the RF path - which defers mpv
+    # until rf_mpv_lifecycle_monitor() confirms a stable lock - the
+    # device reports its own lock and its own packet rate, so there is
+    # nothing to infer and no reason to wait twice.
+    try:
+        source.tune(
+            modulation=req.modulation,
+            frequency_hz=req.freq,
+            program=req.program,
+        )
+    except lynx_hdhomerun.HDHomeRunLockTimeout as e:
+        # The box is armed for when the signal arrives (see
+        # patch_hdhr_arm_on_timeout.py): remember what it is waiting
+        # for, so the name and callsign are fetched on lock, and so a
+        # restart resumes the same repeater rather than the last one
+        # that happened to be on air.
+        with hdhr_lock:
+            _w = hdhr_states.get(_dev)
+            if _w is not None:
+                _w["service_name"] = ""
+                _w["callsign"] = ""
+                _w["pending_program"] = (str(req.program)
+                                         if req.program is not None else None)
+                _w["pending_freq_hz"] = req.freq
+                _w["last_program"] = _w["pending_program"]
+                _w["logged_callsign"] = ""
+                _w["pending_attempts"] = 10
+        try:
+            save_last_state({
+                "mode": "dvbt",
+                "freq": req.freq,
+                "modulation": req.modulation,
+                "program": req.program,
+                "device_id": req.device_id,
+            })
+        except Exception as _e:
+            print(f"[hdhr] could not save the armed tune: {_e}")
+        print(f"[hdhr] no signal on {req.freq / 1e6:.3f} MHz yet - "
+              f"armed, will play when it arrives", flush=True)
+        # Lower the cover before giving up, or a failed tune leaves the
+        # screen covered until something else happens to raise and
+        # lower it - which on a receiver doing nothing else is never.
+        end_transition_cover()
+        raise HTTPException(status_code=504, detail=str(e))
+    except lynx_hdhomerun.HDHomeRunError as e:
+        end_transition_cover()
+        raise HTTPException(status_code=502, detail=str(e))
+
+    # Ask the poller to fetch the service name on its next pass rather
+    # than fetching it here. An earlier version called streaminfo
+    # inline and deadlocked the whole app - see this patch's own notes.
+    # A tune has no business waiting on a name lookup anyway.
+    #
+    # device_id resolved BEFORE the lock is taken: hdhr_default_device_id()
+    # takes hdhr_lock itself, and threading.Lock is not reentrant. The
+    # device's kind likewise - hdhr_device_kind() can take it too.
+    _atsc = hdhr_device_kind(_dev) == "atsc"
+    with hdhr_lock:
+        live = hdhr_states.get(_dev)
+        if live is not None:
+            # Cleared, not left stale: the previous service's name over
+            # a new one is worse than no name at all.
+            live["service_name"] = ""
+            live["callsign"] = ""
+            # "*" for an ATSC 3.0 tune: no programme is chosen there (the
+            # box carries one TS), but its name is still wanted.
+            live["pending_program"] = (
+                str(req.program) if req.program is not None
+                else ("*" if _atsc else None))
+            live["pending_freq_hz"] = req.freq
+            # Kept so a re-lock can ask again. Without it, a station
+            # keying up after a gap kept the previous contact's name
+            # and was never logged a second time.
+            live["last_program"] = live["pending_program"]
+            live["logged_callsign"] = ""
+            # Attempts remaining. The device reports lock before its
+            # service tables can be read, so the first ask usually
+            # comes back empty - bounded rather than endless, since a
+            # multiplex that genuinely never names its services should
+            # not be interrogated about it every two seconds for ever.
+            live["pending_attempts"] = 10
+
+    current_mode = "dvbt"
+    displayed_receiver_id = None
+    current_preset = f"{req.freq / 1e6:.3f} MHz / {req.modulation}"
+
+    # is_rf=True is correct here and is not a fudge: the device sends
+    # raw MPEG-TS over UDP, which is exactly what that flag set was
+    # written for. The RTMP-specific concerns in restart_mpv()'s own
+    # docstring do not apply to it.
+    def _kick_mpv():
+        global mpv_running_for_rf
+        try:
+            time.sleep(1)
+            # is_rf=False despite this being a raw MPEG-TS over UDP.
+            # is_rf=True forces --demuxer-lavf-format=mpegts, which
+            # skips lavf's own probe - and that probe is what finds
+            # the AAC LATM audio in a broadcast multiplex. With the
+            # flag on, mpv listed video and subtitles only and played
+            # in silence; with it off, the audio track appears. The
+            # Picotuner's own TS carries simpler audio and does not
+            # need the probe, which is why the flag was right there
+            # and wrong here.
+            restart_mpv(f"udp://@:{HDHR_VIDEO_PORT}", is_rf=False)
+            mpv_running_for_rf = True
+            # Lower it here rather than leaving it to the cap. The RF
+            # path lowers it from rf_mpv_lifecycle_monitor() once a
+            # Picotuner lock is confirmed - a confirmation that never
+            # arrives on a receiver with no Picotuner, so the cover
+            # would sit over live video, with its sound, until the
+            # timeout expired.
+            end_transition_cover()
+        finally:
+            tune_lock.release()
+
+    threading.Thread(target=_kick_mpv, daemon=True).start()
+    _tune_lock_handed_off = True
+
+    save_last_state({
+        "mode": "dvbt",
+        "freq": req.freq,
+        "modulation": req.modulation,
+        "program": req.program,
+        "device_id": _dev,
+    })
+
+    return {
+        "success": True,
+        "mode": "dvbt",
+        "freq_hz": req.freq,
+        "modulation": req.modulation,
+        "program": req.program,
+        "device_id": _dev,
+    }
+
+
+@app.get("/api/hdhomerun", tags=["RF Reception"],
+         summary="HDHomeRun tuners found on the network",
+         description="Devices discovered at startup, their current status, "
+                     "and the configured presets.")
+def hdhomerun_status():
+    _active = hdhr_default_device_id()
+    return {
+        "devices": [
+            {
+                "device_id": st["device_id"],
+                "name": st["name"],
+                "default_name": st.get("default_name", st["name"]),
+                "kind": hdhr_device_kind(st["device_id"]),
+                "active": (current_mode == "dvbt" and st["device_id"] == _active),
+                "address": st.get("address"),
+                "online": st["online"],
+                "locked": st["locked"],
+                "streaming": st["streaming"],
+                "lock_mode": st["lock_mode"],
+                "level": st["signal_strength"],      # ss
+                "quality": st["signal_quality"],     # snq - NOT MER
+                "errors": st["symbol_quality"],      # seq
+                "bitrate_bps": st["bitrate_bps"],
+                "frequency_hz": st["frequency_hz"],
+            }
+            for st in hdhr_devices()
+        ],
+        "presets": hdhr_presets_cfg(),
+    }
+
+
+# ── Programmes in a DVB-S2 stream (mpv's own tracks) ──────────────────
+# A transmitter can carry more than one programme in one carrier: Lynx-Tx
+# sends a 4K stills carousel as programme 2 alongside the live picture.
+# mpv already demuxes every programme in the transport stream; choosing one
+# is choosing its video track (and its sound, if it has any). mpv 0.37 has
+# no "program" property any more, so it is done by track (tested 23 Oct
+# 2026 on a two-programme stream from Lynx-Tx's merge).
+def mpv_programmes() -> list:
+    n = _mpv_prop("track-list/count") or 0
+    progs = {}
+    for i in range(int(n)):
+        t = _mpv_prop(f"track-list/{i}") or {}
+        pid = t.get("program-id")
+        if pid is None or t.get("type") not in ("video", "audio"):
+            continue
+        p = progs.setdefault(int(pid), {"program": int(pid), "video": None, "audio": None,
+                                        "width": None, "height": None, "codec": "",
+                                        "selected": False})
+        if t["type"] == "video" and p["video"] is None:
+            p.update(video=t.get("id"), width=t.get("demux-w"), height=t.get("demux-h"),
+                     codec=t.get("codec") or "", selected=bool(t.get("selected")))
+        elif t["type"] == "audio" and p["audio"] is None:
+            p["audio"] = t.get("id")
+    return [p for _, p in sorted(progs.items()) if p["video"] is not None]
+
+
+@app.get("/api/programmes", tags=["RF Reception"],
+         summary="Programmes in the stream now playing",
+         description="Every programme with a picture in the transport stream mpv is "
+                     "playing, from mpv's own tracks. More than one when the "
+                     "transmitter sends a second programme (Lynx-Tx's 4K carousel).")
+def api_programmes():
+    """The programmes on what is tuned: mpv's, or the remembered list.
+
+    Remembered per tune, like a television's channel scan, and kept on disk
+    (config/lynx_programmes.json). mpv only knows the programmes it saw in
+    its first second, and a transmitter coming on air starts its second
+    programme a few seconds after the first (Lynx-Tx's carousel), so when a
+    signal returned Lynx offered only programme 1 until a re-tune (10 Nov
+    2026). Lynx for Enigma2 does the same thing by scanning once and zapping
+    by service. Choosing a remembered programme restarts mpv, which by then
+    finds it on air. A restart's moment without tracks is covered too."""
+    progs = mpv_programmes()
+    key = _programme_key_str()
+    known = _programmes_known().get(key) or []
+    if len(progs) >= 2 and (_programmes_strip(progs) != known or
+                            time.time() - (_programmes_cache or {}).get(key, {}).get("seen", 0) > 3600):
+        _programmes_remember(key, progs)
+        known = _programmes_strip(progs)
+    if len(progs) < len(known):
+        on = {x["program"] for x in progs}
+        sel = next((x["program"] for x in progs if x.get("selected")), None)
+        want = (programme_wanted or {}).get("program")
+        chosen = want or sel or known[0]["program"]
+        progs = [dict(x, selected=(x["program"] == chosen), on_air=(x["program"] in on or None))
+                 for x in known]
+    return {"programmes": progs}
+
+
+# In /tmp: forgotten at every reboot, as Justin wanted (11 Nov 2026), and
+# kept across a restart of Lynx. An entry not seen again for 7 days goes too.
+PROGRAMMES_PATH = Path("/tmp/lynx_programmes.json")
+PROGRAMMES_KEEP_SECS = 7 * 24 * 3600
+_programmes_cache = None
+
+
+def _programme_key_str() -> str:
+    return json.dumps(_programme_key())
+
+
+def _programmes_known() -> dict:
+    global _programmes_cache
+    if _programmes_cache is None:
+        try:
+            _programmes_cache = json.loads(PROGRAMMES_PATH.read_text())
+        except Exception:
+            _programmes_cache = {}
+    now = time.time()
+    for k in [k for k, v in _programmes_cache.items()
+              if not isinstance(v, dict) or now - v.get("seen", 0) > PROGRAMMES_KEEP_SECS]:
+        del _programmes_cache[k]
+    return {k: v["programmes"] for k, v in _programmes_cache.items()}
+
+
+def _programmes_strip(progs: list) -> list:
+    return [{k: x.get(k) for k in ("program", "video", "audio", "width", "height", "codec")}
+            for x in progs]
+
+
+def _programmes_remember(key: str, progs: list):
+    _programmes_known()                       # loads, and drops the expired
+    known = _programmes_cache
+    known[key] = {"programmes": _programmes_strip(progs), "seen": time.time()}
+    try:
+        PROGRAMMES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PROGRAMMES_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(known, indent=1))
+        tmp.replace(PROGRAMMES_PATH)
+        print(f"[programme] remembered {len(progs)} programmes for this tune")
+    except OSError as e:
+        print(f"[programme] could not save the programme list: {e}")
+
+
+class ProgrammeRequest(BaseModel):
+    program: int
+
+
+def _programme_key():
+    """What is tuned, as the saved state says: a programme chosen by hand
+    belongs to this tune and no other."""
+    st = load_last_state() or {}
+    return (st.get("mode"), st.get("freq"), st.get("sr"), st.get("plug"), st.get("url"))
+
+
+def mpv_programmes_known(progs) -> bool:
+    """mpv is up and has found at least one programme with a picture."""
+    return bool(progs)
+
+
+def programme_keeper():
+    """Background thread: puts the chosen programme back after mpv restarts.
+
+    mpv always starts on the first programme, and Lynx restarts it for many
+    reasons (a lock regained, a freeze, the screen coming back), so a choice
+    of programme 2 lasted only until the next one: 10 Nov 2026, the 4K
+    carousel chosen on a ROCK 5C went back to the live picture by itself
+    after two minutes. The choice is kept for as long as the same thing is
+    tuned (a re-tune to the same frequency keeps it), and forgotten when
+    something else is."""
+    global programme_wanted
+    while True:
+        time.sleep(2)
+        try:
+            want = programme_wanted
+            if not want:
+                continue
+            if _programme_key() != want["key"]:
+                programme_wanted = None
+                print("[programme] something else tuned - back to programme 1")
+                continue
+            # Never restarts mpv by itself (Justin, 11 Nov 2026: one restart
+            # per choice, no automatic ones). It only keeps the record true.
+            progs = mpv_programmes()
+            if not progs or time.time() - programme_switched_at < 20:
+                continue
+            p = next((x for x in progs if x["program"] == want["program"]), None)
+            if p is None and not want.get("first"):
+                programme_wanted = None
+                print(f"[programme] programme {want['program']} is not on air: choice "
+                      f"dropped (choose it again once it is)")
+            elif p and not p["selected"] and (want.get("video"), want.get("audio")) != (p["video"], p["audio"]):
+                # mpv numbered its tracks differently this time: remember the
+                # right numbers for the next start (no restart now).
+                want["video"], want["audio"] = p["video"], p["audio"]
+                print(f"[programme] programme {want['program']} has new track numbers "
+                      f"(video {p['video']}): used from the next start")
+        except Exception as e:
+            print(f"[programme] {type(e).__name__}: {e}")
+
+
+@app.post("/api/programme", tags=["RF Reception"],
+          summary="Watch another programme in the same stream",
+          description="Chooses that programme's picture and sound. A programme "
+                      "with no sound (a stills carousel) keeps none. The picture "
+                      "appears at its next keyframe (up to 10 s for Lynx-Tx's carousel).")
+def api_programme(req: ProgrammeRequest):
+    global programme_wanted
+    progs = mpv_programmes()
+    p = next((x for x in progs if x["program"] == req.program), None)
+    if not p:
+        # Remembered from an earlier time on this tune but not (yet) in mpv:
+        # restart mpv on it, with the track numbers it had then.
+        known = _programmes_known().get(_programme_key_str()) or []
+        p = next((dict(x, selected=False) for x in known if x["program"] == req.program), None)
+        progs = known or progs
+    if not p:
+        raise HTTPException(404, f"No programme {req.program} in this stream")
+    first = progs[0]["program"] if progs else req.program
+    # Every choice is remembered with its track numbers, the first
+    # programme's too: mpv's own first pick is whichever video it found
+    # first, which on a two-programme stream can be the other one.
+    programme_wanted = {"program": req.program, "key": _programme_key(),
+                        "video": p["video"], "audio": p["audio"],
+                        "first": req.program == first}
+    if not p["selected"]:
+        threading.Thread(target=_restart_on_programme,
+                         args=(f"chosen: programme {req.program}",), daemon=True).start()
+    return {"success": True, "programme": p}
+
+
+def _restart_on_programme(why: str):
+    """Restart mpv on the programme in programme_wanted (or the first). Up
+    to 15 s for a picture: the carousel's keyframes are 10 s apart."""
+    global programme_switched_at, mpv_last_started_at, mpv_running_for_rf
+    src, is_rf = playing_source, playing_source_is_rf
+    if not src:
+        return
+    # Waits for a restart already under way (up to 15 s for a carousel
+    # picture) rather than giving up: with 5 s, choosing programme 1 while
+    # programme 2 was still starting did nothing at all (10 Nov 2026).
+    if not tune_lock.acquire(timeout=25):
+        print(f"[programme] could not restart mpv ({why}): something else held it for 25 s")
+        return
+    try:
+        if programme_wanted and programme_wanted.get("program") is not None \
+                and f"programme {programme_wanted['program']}" not in why \
+                and why.startswith("chosen"):
+            why = f"chosen: programme {programme_wanted['program']} (latest choice)"
+        print(f"[programme] restarting mpv ({why}) {_programme_track_flags().strip() or 'programme 1'}")
+        programme_switched_at = time.time()
+        if is_rf:
+            # RF: no cover. Marking mpv as not yet running makes the overlay
+            # show what it shows while a receiver acquires: the logo and the
+            # status, frequency, lock and MER, which all still hold on the
+            # same carrier (Justin, 11 Nov 2026: "no orange overlay between
+            # channels"). Back to the picture once mpv has one; if it never
+            # does, rf_mpv_lifecycle_monitor() starts it again as on a lock.
+            mpv_running_for_rf = False
+            restart_mpv(src, is_rf=True)
+            mpv_last_started_at = time.time()
+            if wait_for_mpv_rendering(timeout=15):
+                time.sleep(0.3)
+                mpv_running_for_rf = True
+        else:
+            start_transition_cover()
+            time.sleep(0.3)
+            restart_mpv(src, is_rf=is_rf)
+            wait_for_mpv_rendering(timeout=15)
+            end_transition_cover()
+    finally:
+        tune_lock.release()
+
+
+@app.get("/api/hdhomerun/programs", tags=["RF Reception"],
+         summary="Services in the currently tuned multiplex",
+         description="Read from the device's own streaminfo. Empty when "
+                     "the tuner is not locked, since an unlocked tuner "
+                     "has nothing to list.")
+def hdhomerun_programs(device_id: str = None):
+    # Read live rather than from the polled state: this is wanted when
+    # somebody opens the dropdown, which is rare, and there is no
+    # reason to fetch it every two seconds alongside the status.
+    try:
+        # The DVB box when none is named: the service list is the DVB-T2
+        # card's, and an ATSC box carrying TS has no programmes to list.
+        _dvb = _hdhr_pick("dvb")
+        _did = (device_id or (_dvb or {}).get("device_id")
+                or hdhr_default_device_id() or "")
+        with hdhr_lock:
+            _t = int((hdhr_states.get(_did) or {}).get("tuner", 0) or 0)
+        tuner = lynx_hdhomerun.HDHomeRunTuner(device_id=_did, tuner=_t)
+        return {"programs": tuner.stream_info()}
+    except lynx_hdhomerun.HDHomeRunError as e:
+        return {"programs": [], "error": str(e)}
+
+
+class ScreenOutputRequest(BaseModel):
+    mode: Optional[str] = None          # hdmi | srt
+    format: Optional[str] = None        # 1080p50 | 1080p25 | 2160p25 | 2160p50
+    codec: Optional[str] = None         # hevc | h264
+    audio_delay_ms: Optional[int] = None
+    host: Optional[str] = None
+    port: Optional[int] = None
+    srt_mode: Optional[str] = None      # caller | listener
+    latency_ms: Optional[int] = None
+    bitrate_kbps: Optional[int] = None
+    passphrase: Optional[str] = None    # None keeps it; "" clears it
+    streamid: Optional[str] = None
+
+
+@app.get("/api/screen_output", tags=["Configuration"],
+         summary="Where the finished screen goes: HDMI or SRT")
+def get_screen_output():
+    return screen_output.status()
+
+
+@app.post("/api/screen_output", tags=["Configuration"],
+          summary="Send the finished screen over SRT, or show it on HDMI",
+          description="SRT carries what is on the screen, overlay and "
+                      "chat included, encoded in hardware (ROCK). In SRT "
+                      "mode Lynx draws on a virtual 1920x1080 screen at "
+                      "the Refresh rate setting, so no monitor is needed. "
+                      "Lynx calls the far end by default (caller).")
+def set_screen_output(req: ScreenOutputRequest):
+    cur = dict(config.get('screen_output') or {})
+    new = req.model_dump(exclude_none=True)
+    if 'mode' in new and new['mode'] not in lynx_screen_output.MODES:
+        raise HTTPException(status_code=400, detail="mode must be hdmi or srt")
+    if 'format' in new and new['format'] not in lynx_screen_output.FORMATS:
+        raise HTTPException(status_code=400, detail="format must be one of "
+                            + ", ".join(lynx_screen_output.FORMATS))
+    if 'codec' in new and new['codec'] not in ("hevc", "h264"):
+        raise HTTPException(status_code=400, detail="codec must be hevc or h264")
+    if new.get('bitrate_kbps') == 0:
+        new['bitrate_kbps'] = None      # 0 from the page: back to the default
+        cur.pop('bitrate_kbps', None)
+    if 'srt_mode' in new and new['srt_mode'] not in ("caller", "listener"):
+        raise HTTPException(status_code=400, detail="srt_mode must be caller or listener")
+    if 'passphrase' in new and new['passphrase'] and not 10 <= len(new['passphrase']) <= 79:
+        raise HTTPException(status_code=400,
+                            detail="An SRT passphrase is 10 to 79 characters")
+    if 'latency_ms' in new:
+        new['latency_ms'] = max(20, min(8000, int(new['latency_ms'])))
+    if new.get('bitrate_kbps'):
+        new['bitrate_kbps'] = max(500, min(60000, int(new['bitrate_kbps'])))
+    new = {k: v for k, v in new.items() if v is not None}
+    if 'host' in new:
+        new['host'] = new['host'].strip()
+    cur.update(new)
+    config['screen_output'] = cur
+    try:
+        save_config(config)
+    except Exception as e:
+        print(f"[srt] could not save: {e}")
+    screen_output.apply_now()
+    return screen_output.status()
+
+
+@app.post("/api/hdhomerun/stop", tags=["RF Reception"],
+          summary="Stop HDHomeRun streaming",
+          description="Releases this receiver's tuners. With force=true, "
+                      "every tuner on every box, whoever it is sending to: "
+                      "for a tuner left streaming by a receiver that was "
+                      "switched off, which nothing else will free.")
+def hdhomerun_stop(force: bool = False):
+    if not force:
+        hdhr_stop_all()
+        return {"success": True}
+    for st in hdhr_devices():
+        for n in range(lynx_hdhomerun.tuner_count(st["device_id"])):
+            try:
+                lynx_hdhomerun.HDHomeRunTuner(
+                    device_id=st["device_id"], tuner=n).release()
+            except Exception as e:
+                print(f"[hdhr] forced release {st['device_id']}/{n} failed: {e}")
+    return {"success": True, "forced": True}
+
+
 @app.get("/api/tune", tags=["RF Reception"],
          summary="Tune Picotuner to a frequency (URL/GET version)",
          description="Identical to POST /api/tune, but takes the same "
@@ -9163,6 +12759,23 @@ def tune_preset(req: PresetTuneRequest):
                                                  # existed - always RF back then
             if preset_type == "stream":
                 result = start_stream(StreamRequest(url=p['url'], name=p['name']))
+                current_preset = p['name']
+                return result
+            elif preset_type == "dvbt":
+                # Dispatched on the preset's own type rather than kept
+                # in a separate list. The two were split because a
+                # DVB-T2 memory clicked on the Picotuner's card would
+                # have tuned it to a frequency in kHz that was really
+                # MHz - a number it accepts without complaint. Knowing
+                # what a preset IS fixes that properly, and means the
+                # Knobler can reach every memory rather than two
+                # thirds of them.
+                result = tune_dvbt(DvbtTuneRequest(
+                    freq=p['freq_hz'],
+                    modulation=p.get('modulation', 't8dvbt2'),
+                    program=p.get('program'),
+                    device_id=p.get('device_id'),
+                ))
                 current_preset = p['name']
                 return result
             else:
@@ -9213,7 +12826,7 @@ def list_presets():
                       "is generated from the frequency (e.g. '437.025 MHz') "
                       "- a stream save always requires an explicit name.")
 def add_preset(req: PresetSaveRequest):
-    preset_type = req.type if req.type in ("rf", "stream") else "rf"
+    preset_type = req.type if req.type in ("rf", "stream", "dvbt") else "rf"
     config.setdefault('presets', [])
 
     if preset_type == "stream":
@@ -9222,6 +12835,12 @@ def add_preset(req: PresetSaveRequest):
         if not req.name.strip():
             raise HTTPException(status_code=400, detail="A stream memory needs a name")
         name = req.name.strip()
+    elif preset_type == "dvbt":
+        if req.freq_hz is None or not req.modulation:
+            raise HTTPException(status_code=400,
+                                detail="A DVB-T2 memory needs a frequency and modulation")
+        name = (req.name.strip() if req.name.strip()
+                else f"{req.freq_hz/1e6:.3f} MHz")
     else:
         if req.freq is None or req.sr is None:
             raise HTTPException(status_code=400, detail="An RF memory needs a frequency and symbol rate")
@@ -9241,6 +12860,10 @@ def add_preset(req: PresetSaveRequest):
                         "note": "name already used by a different memory type"}
             if preset_type == "stream":
                 same = (p.get('url') == req.url)
+            elif preset_type == "dvbt":
+                same = (p.get('freq_hz') == req.freq_hz
+                        and p.get('modulation') == req.modulation
+                        and p.get('program') == req.program)
             else:
                 same = (p.get('freq') == req.freq and p.get('sr') == req.sr
                         and p.get('plug', 'a') == req.plug
@@ -9255,6 +12878,15 @@ def add_preset(req: PresetSaveRequest):
             "type": "stream",
             "name": name,
             "url": req.url.strip(),
+            "note": "User saved via web UI"
+        })
+    elif preset_type == "dvbt":
+        config['presets'].append({
+            "type": "dvbt",
+            "name": name,
+            "freq_hz": req.freq_hz,
+            "modulation": req.modulation,
+            "program": req.program,
             "note": "User saved via web UI"
         })
     else:
@@ -9339,7 +12971,8 @@ def start_stream(req: StreamRequest):
     # briefly exposing the desktop underneath. Reported directly: a
     # "flash of desktop" during rapid stream switching, right before RF
     # tuning stopped responding entirely from the related tune_lock bug.
-    global _tune_lock_handed_off
+    global _tune_lock_handed_off, switch_generation
+    switch_generation += 1          # anything still waiting on a picture gives way
     if not tune_lock.acquire(timeout=15):
         raise HTTPException(status_code=503, detail="Another tune/stream operation is already in progress — please try again shortly")
     _tune_lock_handed_off = False
@@ -9354,6 +12987,7 @@ def start_stream(req: StreamRequest):
 
 def _start_stream_impl(req: StreamRequest):
     global current_mode, current_preset, current_stream_name, current_stream_url, _tune_lock_handed_off
+    global diversity_enabled
 
     # Cover the screen well before touching the source — a full second
     # of head start, generous enough to absorb scheduling jitter if the
@@ -9383,6 +13017,22 @@ def _start_stream_impl(req: StreamRequest):
     # accepted trade-off for anyone who's turned this on.
     if not tri_watch_enabled:
         picotuner_cmd(f"[to@wh] rcv={picotuner_rcv('a')} fplug=a offset=0 freq=0 srate=333")
+        # Same reasoning as the detune above, and as _tune_impl()'s own
+        # switching-away-from-diversity branch: a combiner left running
+        # with nothing consuming its output reads both Picotuner TS
+        # sockets and produces a stream nobody watches, for as long as
+        # the stream is up. This path never did it, so diversity ->
+        # stream left the combiner running indefinitely - visible as a
+        # stale Rx 2 panel and a live combining-stats line on the main
+        # page while a stream played, both of which the front end hides
+        # correctly once diversity.enabled actually goes false.
+        #
+        # Inside the tri_watch gate deliberately: that feature exists to
+        # keep sources genuinely live regardless of what is on screen,
+        # so it keeps its combiner too.
+        if diversity_enabled:
+            stop_diversity_combiner()
+            diversity_enabled = False
 
     # Same as the RF tune path: this is Lynx changing source, not a
     # station going off air, so no end-of-contact card is due.
@@ -9405,7 +13055,18 @@ def _start_stream_impl(req: StreamRequest):
     def _kick_mpv():
         try:
             time.sleep(1)
-            restart_mpv(req.url, is_rf=False)
+            # A Slave sends genuine MPEG-TS over UDP, exactly what the
+            # RF flags exist for, and only reaches this path because it
+            # borrows start_stream()'s lock and cover handling. Without
+            # the mpegts hint mpv probes instead of being told, and on a
+            # sparse feed it infers a bogus finite duration and parks
+            # itself paused at position zero.
+            #
+            # Derived from the URL rather than passed in: the relay's
+            # output port is the only source a Slave is ever played
+            # from, so there is nothing to set and nothing to clear.
+            _is_slave = req.url == f"udp://@:{REMOTE_VIDEO_OUT_PORT}"
+            restart_mpv(req.url, is_rf=_is_slave)
             # Confirms real rendering rather than guessing with a fixed
             # delay - a weak/low-bandwidth stream source can genuinely
             # take longer to start producing a real picture than RF
@@ -9424,8 +13085,9 @@ def _start_stream_impl(req: StreamRequest):
             # before giving up; if that also fails, the cover stays up
             # rather than exposing anything - a stuck cover is a far
             # smaller problem than a silently exposed desktop.
+            _my_gen = switch_generation
             rendering_confirmed = wait_for_mpv_rendering(timeout=12.0)
-            if not rendering_confirmed:
+            if not rendering_confirmed and switch_generation == _my_gen:
                 print(f"[stream_start] mpv did not confirm rendering within 12s for "
                       f"'{req.name or req.url}' - giving it one more, longer attempt "
                       f"before uncovering")
@@ -9496,6 +13158,61 @@ def list_live_streams():
         "cache_age_seconds": age,
         "cache_expires_seconds": max(0, BATC_CACHE_TTL - age)
     }
+
+@app.post("/api/remote/{index}/select", tags=["Streaming"],
+          summary="Display a Slave Rx",
+          description="Routes the chosen Slave's video to mpv. The Slave must be "
+                      "enabled and must have been heard from, since its video is "
+                      "identified by the address its status arrives from.")
+def select_remote_source(index: int):
+    if index < 0 or index >= len(remote_states):
+        raise HTTPException(status_code=404, detail=f"No Slave at index {index}")
+    st = remote_states[index]
+    if not st["enabled"]:
+        raise HTTPException(status_code=409, detail="That Slave is configured but not enabled")
+    # Refused rather than attempted: without an address the relay cannot
+    # tell this Slave's packets from any other's, so selecting it would
+    # produce a black screen with nothing to explain it.
+    if not st["addr"]:
+        raise HTTPException(status_code=409,
+                            detail="Nothing heard from that Slave yet — it must send status before its video can be identified")
+    if not slave_relay.stats()["running"]:
+        raise HTTPException(status_code=503,
+                            detail=f"Slave video relay is not running: {slave_relay.bind_error or 'not started'}")
+
+    slave_relay.select(index)
+    # start_stream() below saves the URL, which says where mpv
+    # should listen but not whose video belongs there. Saved after
+    # it returns, so this write is the one that survives.
+    _remote_resume_index = index
+    # Handing off to start_stream() rather than restarting mpv here: it
+    # already holds the lock discipline, the transition cover and the
+    # render confirmation, and a second copy of that sequence would be a
+    # second place for it to go wrong.
+    result = start_stream(StreamRequest(
+        url=f"udp://@:{REMOTE_VIDEO_OUT_PORT}",
+        name=remote_display_name(index),
+    ))
+    save_last_state({
+        "mode": "stream",
+        "url": f"udp://@:{REMOTE_VIDEO_OUT_PORT}",
+        "name": remote_display_name(index),
+        "remote_index": _remote_resume_index,
+    })
+    # start_stream() sets the mode to "stream" because that is
+    # what it does. A Slave is a receiver, so the mode is
+    # corrected here, once the machinery that actually needed
+    # borrowing — the lock hand-off and the transition cover —
+    # has done its work.
+    #
+    # Safe after the call: _start_stream_impl sets the mode
+    # before handing off to its background thread, and nothing
+    # in that thread touches it again.
+    global current_mode, displayed_receiver_id
+    current_mode = "rf"
+    displayed_receiver_id = REMOTE_RECEIVER_ID_BASE + index
+    return result
+
 
 @app.post("/api/streams/refresh", tags=["Streaming"],
           summary="Force refresh of BATC live stream list",
@@ -9906,13 +13623,44 @@ def refresh_dependencies(context):
                                 f"{context}: dependency refresh skipped - "
                                 "no passwordless sudo",
                                 count_as_mpv_restart=False)
+        try:
+            p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "logs", "update.log")
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(f"--- {datetime.now():%Y-%m-%d %H:%M:%S} {context}: "
+                        "dependency refresh SKIPPED, no passwordless sudo. "
+                        "Run ~/lynx/install.sh --deps-only in a terminal.\n")
+        except Exception:
+            pass
         return
 
+    # The output goes to ~/lynx/logs/update.log (the one before kept as
+    # update.prev.log), not to Lynx's log in /tmp: the reboot straight
+    # after wiped /tmp, so a failed refresh left no trace (Gareth's Pi 5,
+    # 12 Nov 2026: Update Now ran, wf-recorder never built, and nothing
+    # said why).
+    here = os.path.dirname(os.path.abspath(__file__))
+    log_path = os.path.join(here, "logs", "update.log")
     try:
-        install_script = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), "install.sh")
-        env = os.environ.copy()
-        env["DEBIAN_FRONTEND"] = "noninteractive"
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        if os.path.exists(log_path):
+            os.replace(log_path, log_path.replace(".log", ".prev.log"))
+        log = open(log_path, "w", buffering=1)
+    except Exception:
+        log = None
+
+    def note(line):
+        print(f"[{context}] {line}")
+        if log:
+            log.write(f"--- {datetime.now():%Y-%m-%d %H:%M:%S} {line}\n")
+
+    env = os.environ.copy()
+    env["DEBIAN_FRONTEND"] = "noninteractive"
+    env["LYNX_DIR"] = here
+    out = log or subprocess.DEVNULL
+
+    def run(cmd, timeout):
         # stdin closed, belt and braces. The blanket check above says
         # this user has sudo, but it does not promise every command
         # install.sh runs is covered by the same rule - and a sudo that
@@ -9920,12 +13668,38 @@ def refresh_dependencies(context):
         # that cannot come. With no stdin it fails immediately instead,
         # which the timeout then does not have to catch twenty minutes
         # later.
-        subprocess.run(["bash", install_script, "--deps-only"],
-                       env=env, timeout=1200,
-                       stdin=subprocess.DEVNULL)
-    except Exception as e:
-        print(f"[{context}] Dependency check failed or timed out ({e}) "
-              "- rebooting anyway with whatever succeeded so far.")
+        try:
+            rc = subprocess.run(cmd, env=env, timeout=timeout,
+                                stdin=subprocess.DEVNULL, stdout=out,
+                                stderr=subprocess.STDOUT).returncode
+        except Exception as e:
+            note(f"{' '.join(cmd)}: did not finish ({e})")
+            return False
+        note(f"{' '.join(cmd)}: exit {rc}")
+        return rc == 0
+
+    note(f"dependency refresh ({context})")
+    installer_ok = run(["bash", os.path.join(here, "install.sh"),
+                        "--deps-only"], 1200)
+
+    # install.sh runs under `set -e`, and the SRT screen output's pieces
+    # come at the very end of its --deps-only path: any earlier step
+    # failing (apt, pip), or the timeout above, stopped it before they
+    # were built. They depend on none of those steps, so when the
+    # installer did not finish they are run here on their own. Each
+    # checks first and returns at once when already done.
+    if not installer_ok:
+        note("installer did not finish: building the SRT screen output on its own")
+        if lynx_platform.IS_ROCK:
+            run(["bash", os.path.join(here, "install", "rock5t.sh")], 1800)
+        else:
+            run(["bash", os.path.join(here, "install",
+                                      "build_wf_recorder.sh")], 900)
+            run(["python3", os.path.join(here, "install",
+                                         "lynx_labwc_srt_keys.py")], 60)
+    note("dependency refresh done")
+    if log:
+        log.close()
 
 @app.post("/api/update/apply", tags=["Configuration"],
           summary="Pull the latest code and reboot",
@@ -10160,10 +13934,20 @@ def restore_wifi():
     return {"result": "ok", "message": "WiFi re-enabled."}
 
 class DefaultBootRequest(BaseModel):
-    freq: int
-    sr: int
+    # type tells the two kinds of fallback apart. Absent means "rf", so
+    # an existing config and every existing caller keep working.
+    type: str = "rf"
+    # Optional now: a DVB-T2 default has neither, and required fields
+    # would have the request rejected before the endpoint ever saw it.
+    freq: Optional[int] = None
+    sr: Optional[int] = None
     plug: str = "a"
     lnb_lo_khz: int = 0
+    # DVB-T2 (type="dvbt"). Hz rather than kHz, matching the device's
+    # own API and the dvbt preset type.
+    freq_hz: Optional[int] = None
+    modulation: Optional[str] = None
+    program: Optional[str] = None
 
 @app.post("/api/boot-default", tags=["Control"],
           summary="Set the default boot-time RF preset",
@@ -10175,6 +13959,19 @@ class DefaultBootRequest(BaseModel):
                       "what it was last doing — this is only the safety "
                       "net for when that isn't possible.")
 def set_boot_default(req: DefaultBootRequest):
+    # A type, because the fallback can now be either kind of tuner and
+    # the resume has to tell them apart. Absent means "rf", so an
+    # existing config file keeps working untouched.
+    if req.type == "dvbt":
+        config['default_boot_preset'] = {
+            "type": "dvbt",
+            "freq_hz": req.freq_hz,
+            "modulation": req.modulation,
+            "program": req.program,
+        }
+        save_config(config)
+        return {"success": True,
+                "default_boot_preset": config['default_boot_preset']}
     config['default_boot_preset'] = {
         "freq": req.freq, "sr": req.sr, "plug": req.plug, "lnb_lo_khz": req.lnb_lo_khz
     }
@@ -10190,7 +13987,12 @@ def get_boot_default():
 @app.get("/api/config", tags=["Configuration"],
          summary="Get current configuration")
 def get_config():
-    return config
+    # The effective max_height is filled in when the file has none:
+    # the config page round-trips it, and falling back to 1080 there
+    # would cap a ROCK 5T at 1080 the first time Screen was saved.
+    display = dict(config.get('display') or {})
+    display.setdefault('max_height', display_max_height())
+    return {**config, 'display': display}
 
 @app.post("/api/config", tags=["Configuration"],
           summary="Save site and/or Picotuner configuration",
@@ -10219,8 +14021,13 @@ def update_config(req: ConfigUpdateRequest):
         if req.site is not None:
             on_disk.setdefault('site', {}).update(req.site.model_dump())
         if req.picotuner is not None:
-            new_pt = req.picotuner.model_dump()
-            picotuner_changed = on_disk.get('picotuner', {}) != {**on_disk.get('picotuner', {}), **new_pt}
+            new_pt = req.picotuner.model_dump(exclude_none=True)
+            if new_pt.get('receivers') not in (None, 'share', 'protect'):
+                new_pt.pop('receivers')
+            # receivers (share/protect) is read live by the tuning watchdog
+            # and the presence responder: changing it needs no restart.
+            restart_part = {k: v for k, v in new_pt.items() if k != 'receivers'}
+            picotuner_changed = on_disk.get('picotuner', {}) != {**on_disk.get('picotuner', {}), **restart_part}
             on_disk.setdefault('picotuner', {}).update(new_pt)
 
         diversity_changed = False
@@ -10344,6 +14151,42 @@ def update_config(req: ConfigUpdateRequest):
         # live and takes effect on the next card.
         if req.squeak is not None:
             on_disk.setdefault('squeak', {}).update(req.squeak.model_dump())
+        # Slave Rx: needs a restart either way, so nothing is applied
+        # live here. The monitor thread is only started at boot if this
+        # is enabled, and it binds its port once at that moment -
+        # rebinding a socket underneath a running thread is real work
+        # for a setting that gets changed once.
+        # Writes the FIRST Slave, and migrates the config to list form
+        # while doing it. The card only edits one; the Slaves page will
+        # edit them all, and building a list editor here that is about
+        # to be replaced would be waste.
+        if req.hdhomerun is not None:
+            h = on_disk.setdefault('hdhomerun', {})
+            h['address'] = (req.hdhomerun.address or "").strip()
+            names = {str(k).upper(): str(v).strip()
+                     for k, v in (req.hdhomerun.names or {}).items()
+                     if v is not None and str(v).strip()}
+            if names:
+                h['names'] = names
+            else:
+                h.pop('names', None)
+            if req.hdhomerun.prefer_device_id is not None:
+                pref = req.hdhomerun.prefer_device_id.strip().upper()
+                if pref:
+                    h['prefer_device_id'] = pref
+                else:
+                    h.pop('prefer_device_id', None)
+            # Names apply now; only a changed address waits for a restart.
+            config.setdefault('hdhomerun', {})['names'] = names
+            _hdhr_apply_names()
+        if req.remote_source is not None:
+            srcs = on_disk.get('remote_sources')
+            if not isinstance(srcs, list) or not srcs:
+                existing = on_disk.get('remote_source')
+                srcs = [dict(existing)] if isinstance(existing, dict) and existing else [{}]
+            srcs[0].update(req.remote_source.model_dump())
+            on_disk['remote_sources'] = srcs
+            on_disk.pop('remote_source', None)
 
         tmp_path = str(CONFIG_PATH) + ".tmp"
         with open(tmp_path, 'w') as f:
@@ -10351,6 +14194,13 @@ def update_config(req: ConfigUpdateRequest):
         os.replace(tmp_path, CONFIG_PATH)
 
         config = on_disk  # reload in-memory immediately - site fields take effect right away
+        # Refresh rate: live, on save (3 Nov 2026). Only the rate changes,
+        # not the size, which a screen return has always done live.
+        if req.display is not None:
+            def _apply_saved_rate():
+                if _reapply_refresh_rate("setting saved"):
+                    _check_mpv_after_mode_change("the refresh change")
+            threading.Thread(target=_apply_saved_rate, daemon=True).start()
         _apply_gnss_mode()
         return {
             "success": True,
@@ -10457,6 +14307,9 @@ def web_ui():
                 <button class="btn btn-sm" id="lnb-psu-b-tone" onclick="onLnbToneClick('b')" title="Hi-Band LO (22kHz tone) - almost never needed for Amateur TV, default is Lo-Band">Tone</button>
             </span>
             <span class="btn btn-sm" id="mode-badge" style="background:#3a4a63; color:#fff; cursor:default;">IDLE</span>
+            <span class="btn btn-sm" id="video-in-badge" style="background:#3a4a63; color:#fff; cursor:default;" title="Received video">NO VIDEO</span>
+            <span class="btn btn-sm" id="video-out-badge" style="background:#3a4a63; color:#fff; cursor:default;" title="HDMI output">OUT ?</span>
+            <span class="btn btn-sm" id="board-badge" style="background:#3a4a63; color:#fff; cursor:default; display:none;" title="Processor temperature and fan">--</span>
             <a href="/config" class="btn btn-sm" id="locator-badge" style="background:#3a4a63; color:#fff;" title="Portable locator">&#x1F4CD; —</a>
             <a href="/diagnostics" class="btn btn-sm btn-outline-light" title="mpv restart/stop diagnostics" id="diagnostics-link">mpv: <span id="mpv-restart-count">0</span></a>
             <span class="btn btn-sm" id="version-badge" style="background:#3a4a63; color:#fff; cursor:default;" title="Current version">v?</span>
@@ -10470,14 +14323,14 @@ def web_ui():
         <!-- Status Panel -->
         <div class="col-md-4">
             <div class="card">
-                <div class="card-header">&#x1F4E1; Tuner Rx 1</div>
+                <div class="card-header" id="status-panel-header">&#x1F4E1; Tuner Rx 1</div>
                 <div class="card-body" id="status-panel">
                     <div class="text-center text-muted py-3">Loading...</div>
                 </div>
             </div>
             <!-- Diversity: second tuner's own native status, shown only when diversity mode is active -->
             <div class="card mt-2" id="diversity-panel-b" style="display:none">
-                <div class="card-header">&#x1F4E1; Tuner Rx 2 (Diversity)</div>
+                <div class="card-header" id="status-panel-b-header">&#x1F4E1; Tuner Rx 2</div>
                 <div class="card-body" id="status-panel-b"></div>
             </div>
             <!-- tri_watch: the active stream's own info, shown independently
@@ -10488,10 +14341,37 @@ def web_ui():
                  panel above used to switch entirely to stream info whenever
                  a stream was on screen, hiding Rx1's own status completely
                  until whichever one "came up first" lost that slot again. -->
+            <!-- DVB-T2 (HDHomeRun): a network tuner, so it may not be
+                 there at all. Hidden rather than shown red when none
+                 was discovered, the same as the Slave panels - a
+                 receiver without one should not carry a permanent
+                 fault indication for hardware it does not have. -->
+            <div class="card mt-2" id="dvbt-panel" style="display:none">
+                <div class="card-header" id="dvbt-header">&#x1F4FA; DVB-T2</div>
+                <div class="card-body" id="dvbt-status"></div>
+            </div>
+            <!-- ATSC 3.0 (HDHomeRun Flex 4K): its own source, beside the
+                 DVB-T2 box rather than instead of it. Hidden when there
+                 is no ATSC model on the network. -->
+            <div class="card mt-2" id="atsc-panel" style="display:none">
+                <div class="card-header" id="atsc-header">&#x1F4FA; ATSC 3.0</div>
+                <div class="card-body" id="atsc-status"></div>
+            </div>
             <div class="card mt-2" id="tri-watch-stream-panel" style="display:none">
-                <div class="card-header">&#x1F4FA; Stream</div>
+                <div class="card-header" id="tri-watch-stream-header">&#x1F4FA; Stream</div>
                 <div class="card-body" id="tri-watch-stream-status"></div>
             </div>
+            <!-- Slave Rx: a receiver at another site forwarding its tuner
+                 status over the network. Shown only when one is configured -
+                 a receiver with no Slave should not carry a permanently red
+                 panel for hardware it does not have. -->
+            <!-- Slave panels are built here at runtime, one per
+                 configured Slave, because how many there are is not
+                 known until the page has asked. -->
+            <!-- Slave panels are built here at runtime, one per
+                 configured Slave, because how many there are is not
+                 known until the page has asked. -->
+            <div id="remote-panels"></div>
         </div>
 
         <!-- RF Tuning -->
@@ -10557,7 +14437,97 @@ def web_ui():
                         <button class="btn btn-outline-warning btn-sm" onclick="saveMemory()" title="Save current frequency/SR as a preset">&#x1F4BE;</button>
                         <button class="btn btn-outline-info btn-sm" onclick="saveBootDefault()" title="Use this as the fallback frequency on startup, if there's nothing to resume">&#x1F3E0;</button>
                     </div>
+                    <div class="mt-2 d-flex gap-2 align-items-center" id="s2-prog-row" style="display:none !important">
+                        <label class="small text-muted mb-0" for="s2-programme">Programme</label>
+                        <select class="form-select form-select-sm bg-dark text-light border-secondary"
+                                id="s2-programme" onchange="switchS2Programme()"></select>
+                    </div>
                     <div id="boot-default-note" class="text-muted small mt-1"></div>
+                </div>
+            </div>
+
+            <!-- DVB-T2 Reception (HDHomeRun) -->
+            <div class="card mt-3" id="dvbt-tune-card" style="display:none">
+                <div class="card-header">&#x1F4FA; DVB-T2 Reception (HDHomeRun)</div>
+                <div class="card-body">
+                    <!-- No preset list here: DVB-T2 memories live in the
+                         one list on the RF card above, alongside DVB-S2
+                         and streams, so the Knobler and the Web UI show
+                         the same thing. -->
+                    <h6 class="text-muted">Manual Tune (kHz)</h6>
+                    <div class="row g-2 mb-2">
+                        <div class="col-7">
+                            <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary"
+                                   id="dvbt-freq" placeholder="Freq (kHz)" value="437000">
+                        </div>
+                        <div class="col-5">
+                            <select class="form-select form-select-sm bg-dark text-light border-secondary" id="dvbt-bw">
+                                <option value="1">1 MHz</option>
+                                <option value="2">2 MHz</option>
+                                <option value="3">3 MHz</option>
+                                <option value="4">4 MHz</option>
+                                <option value="5">5 MHz</option>
+                                <option value="6">6 MHz</option>
+                                <option value="7">7 MHz</option>
+                                <option value="8" selected>8 MHz</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="d-flex gap-2 align-items-center">
+                        <select class="form-select form-select-sm bg-dark text-light border-secondary"
+                                id="dvbt-program" onchange="switchDvbtProgram()">
+                            <option value="">Service...</option>
+                        </select>
+                        <button class="btn btn-danger btn-sm" onclick="tuneDvbtManual()">Tune</button>
+                        <button class="btn btn-outline-warning btn-sm"
+                                onclick="saveDvbtMemory()"
+                                title="Save this frequency and mode as a preset">&#x1F4BE;</button>
+                        <button class="btn btn-outline-info btn-sm"
+                                onclick="saveDvbtBootDefault()"
+                                title="Use this as the fallback on startup, if there's nothing to resume">&#x1F3E0;</button>
+                    </div>
+                    <div id="dvbt-boot-note" class="text-muted small mt-1"></div>
+                    <div class="text-muted small mt-2">
+                        Frequency in kHz, as on the Picotuner card above. Bandwidth is the channel width, not
+                        the bitrate - 1 and 2 MHz are the narrowband amateur
+                        modes, 7 and 8 MHz are broadcast. DVB-T2 is tried
+                        first and DVB-T after it, so there is nothing to
+                        choose.
+                    </div>
+                </div>
+            </div>
+
+            <!-- ATSC 3.0 Reception (HDHomeRun Flex 4K) -->
+            <div class="card mt-3" id="atsc-tune-card" style="display:none">
+                <div class="card-header">&#x1F4FA; ATSC 3.0 Reception (HDHomeRun)</div>
+                <div class="card-body">
+                    <h6 class="text-muted">Manual Tune (kHz)</h6>
+                    <div class="d-flex gap-2 align-items-center">
+                        <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary"
+                               id="atsc-freq" placeholder="Freq (kHz)" value="437000">
+                        <button class="btn btn-danger btn-sm" onclick="tuneAtscManual()">Tune</button>
+                        <button class="btn btn-outline-warning btn-sm"
+                                onclick="saveAtscMemory()"
+                                title="Save this frequency as a preset">&#x1F4BE;</button>
+                        <button class="btn btn-outline-info btn-sm"
+                                onclick="saveAtscBootDefault()"
+                                title="Use this as the fallback on startup, if there's nothing to resume">&#x1F3E0;</button>
+                    </div>
+                    <div class="text-muted small mt-2">
+                        6 MHz ATSC 3.0, as sent by Lynx-Tx. The tuner takes any
+                        frequency it reaches, not just the US channel plan: 70cm
+                        directly, 23cm through a down-converter.
+                    </div>
+                </div>
+            </div>
+
+            <!-- Slave Receivers -->
+            <div class="card mt-3">
+                <div class="card-header">&#x1F4E1; Slave Receivers</div>
+                <div class="card-body p-0">
+                    <div id="slave-list" style="max-height: 300px; overflow-y: auto;">
+                        <div class="text-muted small p-3">Loading Slaves...</div>
+                    </div>
                 </div>
             </div>
 
@@ -10586,6 +14556,94 @@ def web_ui():
 
         <!-- Control & Config -->
         <div class="col-md-4">
+            <!-- Screen output: HDMI or SRT (lynx_screen_output.py). -->
+            <div class="card mb-3">
+                <div class="card-header">&#x1F4E1; Screen output</div>
+                <div class="card-body">
+                    <div class="btn-group btn-group-sm w-100 mb-2" role="group" id="scrout-mode">
+                        <button class="btn btn-outline-light" data-mode="hdmi" onclick="setScreenOutputMode('hdmi')">HDMI</button>
+                        <button class="btn btn-outline-light" data-mode="srt" onclick="setScreenOutputMode('srt')">SRT</button>
+                    </div>
+                    <p class="text-muted small mb-2">
+                        SRT sends the finished screen (picture, overlay and chat)
+                        to another machine. In SRT mode Lynx draws on a virtual
+                        screen in the format chosen below, so nothing need be
+                        plugged in; the HDMI screen is switched off meanwhile.
+                    </p>
+                    <label class="small text-muted mb-1" for="scrout-host">Port, and the far end's address if Lynx calls it</label>
+                    <div class="input-group input-group-sm mb-2">
+                        <input type="text" class="form-control bg-dark text-light border-secondary" id="scrout-host"
+                               placeholder="192.168.1.50" onchange="saveScreenOutput()">
+                        <span class="input-group-text">:</span>
+                        <input type="number" class="form-control bg-dark text-light border-secondary" id="scrout-port"
+                               style="max-width:6em" value="9000" onchange="saveScreenOutput()">
+                    </div>
+                    <label class="small text-muted mb-1" for="scrout-format">Picture</label>
+                    <select class="form-select form-select-sm mb-2 bg-dark text-light border-secondary"
+                            id="scrout-format" onchange="saveScreenOutput()">
+                        <option value="720p50">720p50</option>
+                        <option value="720p25">720p25</option>
+                        <option value="1080p50">1080p50</option>
+                        <option value="1080p25">1080p25</option>
+                        <option value="2160p25">2160p25 (4K)</option>
+                        <option value="2160p50">2160p50 (4K)</option>
+                    </select>
+                    <label class="small text-muted mb-1" for="scrout-codec">Coding</label>
+                    <select class="form-select form-select-sm mb-2 bg-dark text-light border-secondary"
+                            id="scrout-codec" onchange="saveScreenOutput()">
+                        <option value="hevc">H.265 (HEVC)</option>
+                        <option value="h264">H.264</option>
+                    </select>
+                    <div class="row g-2 mb-2">
+                        <div class="col-6">
+                            <label class="small text-muted mb-1" for="scrout-bitrate">Bit rate (kb/s)</label>
+                            <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary"
+                                   id="scrout-bitrate" placeholder="automatic" step="500" onchange="saveScreenOutput()">
+                        </div>
+                        <div class="col-6">
+                            <label class="small text-muted mb-1" for="scrout-latency">Latency (ms)</label>
+                            <input type="number" class="form-control form-control-sm bg-dark text-light border-secondary"
+                                   id="scrout-latency" value="500" step="50" onchange="saveScreenOutput()">
+                        </div>
+                    </div>
+                    <details class="mb-2">
+                        <summary class="small" style="cursor:pointer; color:#cfd8e3;">&#x2699;&#xFE0F; More SRT settings (who connects, passphrase, sound delay)</summary>
+                        <div class="mt-2">
+                            <label class="small text-muted mb-1" for="scrout-delay">Sound delay (ms): plus if the picture is late</label>
+                            <input type="number" class="form-control form-control-sm mb-2 bg-dark text-light border-secondary"
+                                   id="scrout-delay" step="20" onchange="saveScreenOutput()">
+                            <label class="small text-muted mb-1" for="scrout-srtmode">Who connects</label>
+                            <select class="form-select form-select-sm mb-2 bg-dark text-light border-secondary"
+                                    id="scrout-srtmode" onchange="saveScreenOutput()">
+                                <option value="listener">The far end calls Lynx (listener)</option>
+                                <option value="caller">Lynx calls the far end (caller)</option>
+                            </select>
+                            <label class="small text-muted mb-1" for="scrout-pass">Passphrase (10 to 79 characters, blank for none)</label>
+                            <!-- Masked with an eye button, like the other passwords;
+                                 the saved phrase is filled in, so deleting it clears it. -->
+                            <div class="input-group input-group-sm mb-2">
+                                <input type="text" class="form-control mask-field bg-dark text-light border-secondary"
+                                       id="scrout-pass" placeholder="none"
+                                       autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false"
+                                       onchange="saveScreenOutput(true)">
+                                <button class="btn btn-outline-secondary reveal-btn" type="button" tabindex="-1"
+                                        data-reveal-target="scrout-pass" title="Hold to reveal">&#x1F441;&#xFE0F;</button>
+                            </div>
+                            <label class="small text-muted mb-1" for="scrout-streamid">Stream ID (if the far end wants one)</label>
+                            <input type="text" class="form-control form-control-sm bg-dark text-light border-secondary"
+                                   id="scrout-streamid" onchange="saveScreenOutput()">
+                        </div>
+                    </details>
+                    <div class="small text-muted mb-1" id="scrout-note" style="display:none">
+                        This receiver encodes in software: SRT is for sources up to 1080p.
+                        A 4K source plays here, but its SRT sound and picture drift apart;
+                        for 4K over SRT use a ROCK.
+                    </div>
+                    <div class="small" id="scrout-status">&nbsp;</div>
+                </div>
+            </div>
+
+
             <div class="card">
                 <div class="card-header">&#x2699;&#xFE0F; Control</div>
                 <div class="card-body">
@@ -10779,6 +14837,131 @@ async function onLnbToneClick(plug) {
     }
 }
 
+function setPanelState(headerId, bodyId, label, state) {
+    // One place sets the header, its badge and whether the body is shown,
+    // so a header can never disagree with what is underneath it - which
+    // is precisely how the Rx 1 panel came to be headed "Tuner Rx 1"
+    // above an RTMP stream.
+    //
+    // Three states, not two: "present but hearing nothing" (amber) and
+    // "not there at all" (red) are different things, and on an input at
+    // another site that difference is the whole point.
+    const badges = {
+        locked:  ['bg-success', 'LOCKED'],
+        idle:    ['bg-warning text-dark', 'NO LOCK'],
+        offline: ['bg-danger', 'OFFLINE'],
+    };
+    const [cls, text] = badges[state] || badges.offline;
+    const h = document.getElementById(headerId);
+    if (h) {
+        h.innerHTML = label +
+            '<span class="badge ' + cls + '" style="float:right; font-size:0.75em;">' +
+            text + '</span>';
+    }
+    const b = document.getElementById(bodyId);
+    if (b) b.style.display = (state === 'locked') ? '' : 'none';
+}
+
+// Video badges - see patch_video_badges.py.
+function videoLabel(h, rate, interlaced) {
+    const scan = interlaced ? 'i' : 'p';
+    if (!h) return '?';
+    if (!rate) return h + scan;
+    const r = Math.abs(rate - Math.round(rate)) < 0.01 ? Math.round(rate) : rate.toFixed(2);
+    return h + scan + r;
+}
+
+function renderVideoBadges(vin, vout) {
+    const NORMAL = '#3a4a63', WARN = '#b7791f', HDR = '#7c3aed';
+    const inB = document.getElementById('video-in-badge');
+    const outB = document.getElementById('video-out-badge');
+    if (!inB || !outB) return;
+    const outs = Array.isArray(vout) ? vout : [];
+    const warnings = [];
+
+    if (vin && vin.height) {
+        let txt = 'IN ' + videoLabel(vin.height, vin.fps, vin.interlaced);
+        if (vin.codec) txt += ' ' + vin.codec;
+        if (vin.range && vin.range !== 'SDR') txt += ' ' + vin.range;
+        inB.textContent = txt;
+        inB.style.background = (vin.range && vin.range !== 'SDR') ? HDR : NORMAL;
+        inB.title = 'Received: ' + vin.width + ' x ' + vin.height
+            + (vin.display_width && vin.display_width !== vin.width
+               ? ' (shown ' + vin.display_width + ' wide)' : '')
+            + (vin.fps ? ', ' + vin.fps + ' fps' : '')
+            + (vin.interlaced ? ', interlaced' : '')
+            + (vin.interlaced && vin.shown_fps && vin.shown_fps !== vin.fps
+               ? ', deinterlaced to ' + vin.shown_fps + ' fps' : '')
+            + (vin.codec ? ', ' + vin.codec : '')
+            + ', ' + (vin.range || 'SDR')
+            + (vin.primaries ? ' (' + vin.primaries + ')' : '')
+            + '. Decode: ' + (vin.hwdec && vin.hwdec !== 'no' ? 'hardware (' + vin.hwdec + ')' : 'software');
+    } else {
+        inB.textContent = 'NO VIDEO';
+        inB.style.background = NORMAL;
+        inB.title = 'Nothing is being decoded';
+    }
+
+    if (!outs.length) {
+        outB.textContent = 'OUT ?';
+        outB.style.background = NORMAL;
+        outB.title = 'Output mode unknown (wlr-randr gave no answer)';
+        return;
+    }
+    outB.textContent = 'OUT ' + outs.map(o => videoLabel(o.height, o.refresh)).join(' + ');
+    outB.title = outs.map(o => o.name + ': ' + o.width + ' x ' + o.height + ' at ' + o.refresh + ' Hz').join('; ');
+
+    if (vin && vin.height) {
+        const o = outs[0];
+        if (o.height < vin.height) {
+            warnings.push('Output is smaller than the picture: ' + vin.height + ' lines shown on ' + o.height);
+        }
+        // The frames actually shown: a bobbed 25i is 50 a second.
+        const shown = vin.shown_fps || vin.fps;
+        if (shown && o.refresh) {
+            const ratio = o.refresh / shown;
+            if (Math.abs(ratio - Math.round(ratio)) > 0.01) {
+                warnings.push(shown + ' fps on ' + o.refresh + ' Hz is not a whole multiple: motion will judder');
+            }
+        }
+    }
+    outB.style.background = warnings.length ? WARN : NORMAL;
+    if (warnings.length) outB.title += '. ' + warnings.join('. ');
+}
+
+// Board badge - see patch_board_badge.py.
+function renderBoardBadge(b) {
+    const el = document.getElementById('board-badge');
+    if (!el) return;
+    if (!b || b.temp_c === null || b.temp_c === undefined) {
+        el.style.display = 'none';
+        return;
+    }
+    el.style.display = '';
+    const deg = String.fromCharCode(176);
+    let stalled = false;
+    let txt = Math.round(b.temp_c) + deg + 'C';
+    let tip = 'Processor ' + b.temp_c + deg + 'C (' + b.sensor + ')';
+    if (b.fan_pct !== null && b.fan_pct !== undefined) {
+        txt += b.fan_pct > 0 ? ' fan ' + b.fan_pct + '%' : ' fan off';
+        tip += '. Fan ' + (b.fan_pct > 0 ? b.fan_pct + '% (PWM ' + b.fan_pwm + ')' : 'off');
+        if (b.fan_pct > 0 && b.fan_rpm !== null && b.fan_rpm !== undefined) {
+            if (b.fan_rpm === 0) {
+                stalled = true;
+                txt += ' STALLED';
+                tip += ', but not turning (0 rpm)';
+            } else {
+                txt += ' ' + b.fan_rpm + 'rpm';
+                tip += ', ' + b.fan_rpm + ' rpm';
+            }
+        }
+    }
+    el.textContent = txt;
+    el.title = tip;
+    el.style.background = (stalled || b.temp_c >= 80) ? '#c0392b'
+                        : b.temp_c >= 60 ? '#b7791f' : '#3a4a63';
+}
+
 async function updateStatus() {
     try {
         const s = await api('GET', '/api/status');
@@ -10787,7 +14970,17 @@ async function updateStatus() {
         const mode = s.lynx?.mode || 'idle';
         const badge = document.getElementById('mode-badge');
         badge.textContent = mode.toUpperCase();
+        if (mode === 'dvbt') {
+            // The tuner says which: t8dvbt2 and so on. See
+            // patch_badges_interlace.py.
+            const lmode = ((s.lynx && s.lynx.hdhomerun) || s.hdhomerun || {}).lock_mode || '';
+            badge.textContent = lmode.indexOf('dvbt2') >= 0 ? 'DVB-T2'
+                              : lmode.indexOf('dvbt') >= 0 ? 'DVB-T' : 'DVB-T/T2';
+        }
         badge.style.background = mode === 'idle' ? '#3a4a63' : mode === 'rf' ? '#1a9850' : '#3b82c4';
+
+        renderVideoBadges(s.lynx?.video_in, s.lynx?.video_out);
+        renderBoardBadge(s.lynx?.board);
 
         // Locator badge - value AND provenance (GPS vs configured),
         // per the task: the two must always be shown together, since
@@ -10895,31 +15088,26 @@ async function updateStatus() {
         // otherwise: whichever of Rx1/stream "came up first" took this
         // shared slot, hiding the other's status entirely.
         const triWatchUsesRx1 = tw.enabled && (tw.sources || []).some(src => src.type === 'rf' && src.rcv === 1);
-        const showStreamInMainPanel = (lynxMode === 'stream') && !triWatchUsesRx1;
+        // Rx 1's panel always shows Rx 1. It used to be taken over by
+        // stream information whenever a stream played outside Tri-Watch,
+        // which made Rx 1 and Rx 2 vanish from the page entirely rather
+        // than sitting collapsed with their badges - and put an RTMP feed
+        // from another repeater under a heading claiming it was this
+        // receiver's own tuner. The stream has its own panel further
+        // down; it was simply gated to Tri-Watch until now.
+        setPanelState('status-panel-header', 'status-panel',
+                      '&#x1F4E1; Tuner Rx 1',
+                      !pt.online ? 'offline' : (locked ? 'locked' : 'idle'));
 
-        if (showStreamInMainPanel) {
-            const info = s.lynx?.stream_info || {};
-            const bitrate = info.bitrate_kbps;
-            const protocol = s.lynx?.stream_protocol;
-            const rows = [
-                ['Mode',       '<span class="badge bg-info">STREAMING</span>'],
-                ['Stream',     s.lynx?.stream_name || '—'],
-                ['Protocol',   protocol || '—'],
-                ['Bitrate',    bitrate != null ? bitrate.toFixed(0) + ' kbps' : '—'],
-                ['Video',      info.video_codec || '—'],
-                ['Audio',      info.audio_codec || '—'],
-            ];
-            panel.innerHTML = rows.map(r =>
-                '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;"><span>' + r[0] + '</span>' +
-                '<span class="status-value">' + r[1] + '</span></div>'
-            ).join('');
-        } else if (!pt.online) {
+        if (!pt.online) {
             panel.innerHTML = '<div class="text-danger small text-center mt-2">Picotuner offline</div>';
         } else if (locked) {
+            // No "Lock" row: the header badge above says it, and saying
+            // it twice a few pixels apart is noise.
             const rows = [
-                ['Lock',      '<span class="badge bg-success">LOCKED</span>'],
                 ['Callsign',  pt.callsign || '—'],
-                ['Programme', pt.programme || '—'],
+                ['Service',  pt.service || '—'],
+                ['Provider', pt.programme || '—'],
             ];
             if (pt.lnb_lo_khz && pt.downlink_frequency != null) {
                 rows.push(['Downlink', pt.downlink_frequency.toFixed(3) + ' MHz']);
@@ -10960,15 +15148,22 @@ async function updateStatus() {
         // confirmed as a real, reported gap.
         const triWatchUsesRx2 = (s.tri_watch?.sources || []).some(src => src.type === 'rf' && src.rcv === 2);
         const panelB = document.getElementById('diversity-panel-b');
-        if (div.enabled || triWatchUsesRx2) {
+        // Always shown. It used to appear only under diversity or
+        // Tri-Watch, so on an ordinary receiver Rx 2 was absent from the
+        // page entirely - and an input you cannot see is one you have to
+        // remember to miss. Red OFFLINE when nothing is using it, which
+        // is what rcv=2 genuinely is outside those modes: never tuned,
+        // so never locked.
+        panelB.style.display = '';
+        if (true) {
             panelB.style.display = '';
             const b = div.tuner_b || {};
             const bodyB = document.getElementById('status-panel-b');
             if (b.online && b.locked) {
                 const rowsB = [
-                    ['Lock',      '<span class="badge bg-success">LOCKED</span>'],
                     ['Callsign',  b.callsign || '—'],
-                    ['Programme', b.programme || '—'],  // ptwh0v3k+ (2026-07-23): now genuinely available for rcv=2, confirmed in the live $0,2 capture
+                    ['Service',  b.service || '—'],
+                    ['Provider', b.programme || '—'],  // ptwh0v3k+ (2026-07-23): now genuinely available for rcv=2, confirmed in the live $0,2 capture
                     ['Frequency', b.frequency ? b.frequency + ' MHz' : '—'],
                     ['Symbol Rate', b.symbol_rate ? b.symbol_rate + ' kS/s' : '—'],
                     ['MER',       b.mer ? b.mer + ' dB' : '—'],
@@ -10983,11 +15178,13 @@ async function updateStatus() {
                     '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;"><span>' + r[0] + '</span>' +
                     '<span class="status-value">' + r[1] + '</span></div>'
                 ).join('');
-            } else if (b.online) {
-                bodyB.innerHTML = '<div class="text-muted small text-center mt-2">Searching for signal...</div>';
-            } else {
-                bodyB.innerHTML = '<div class="text-danger small text-center mt-2">Offline</div>';
             }
+            // Body collapses when there is no lock - the header's own
+            // badge already says why, and the space belongs to whichever
+            // input is actually working.
+            setPanelState('status-panel-b-header', 'status-panel-b',
+                          '&#x1F4E1; Tuner Rx 2',
+                          (b.online && b.locked) ? 'locked' : (b.online ? 'idle' : 'offline'));
             // Live combining stats - the combiner's own rolling window,
             // not a cumulative-since-start figure. Diversity-only,
             // deliberately not shown for tri_watch - there's no
@@ -11005,10 +15202,21 @@ async function updateStatus() {
                     statsLine.textContent = 'Diversity: combiner starting...';
                 }
             }
-        } else {
-            panelB.style.display = 'none';
+        }
+        if (!(div.enabled || triWatchUsesRx2)) {
+            // The combining-stats line belongs to diversity alone and is
+            // still hidden when it is not running - only the panel itself
+            // became permanent, not the stats.
             document.getElementById('diversity-stats-line').style.display = 'none';
             document.getElementById('site-name').style.display = '';
+            // Amber, not red: Rx 2 is a second receiver on the SAME
+            // Picotuner, so if the Picotuner is online then so is Rx 2 -
+            // it is simply not tuned to anything outside diversity or
+            // Tri-Watch. Red is reserved for genuinely unreachable, which
+            // for Rx 2 means the Picotuner itself being off.
+            setPanelState('status-panel-b-header', 'status-panel-b',
+                          '&#x1F4E1; Tuner Rx 2',
+                          pt.online ? 'idle' : 'offline');
         }
 
         // tri_watch: the stream's own info, shown independently of Rx1's
@@ -11017,7 +15225,18 @@ async function updateStatus() {
         // the stream info is already correctly shown there and showing it
         // twice would just be a duplicate.
         const streamPanel = document.getElementById('tri-watch-stream-panel');
-        if (tw.enabled && lynxMode === 'stream' && triWatchUsesRx1) {
+        // Whenever a stream is playing, in any mode. Previously gated to
+        // Tri-Watch, which is the only reason ordinary stream mode had to
+        // borrow Rx 1's panel at all.
+        // Always shown, for the same reason as Rx 2 above: red OFFLINE
+        // when nothing is playing rather than absent from the page.
+        streamPanel.style.display = '';
+        // A Slave plays through the stream path but is not a stream,
+        // and showing it in both panels leaves no way to tell which
+        // input is actually on screen once there is more than one of
+        // either. Its own panel reports it; this one stays idle.
+        const streamIsRemote = s.lynx?.stream_is_remote === true;
+        if (lynxMode === 'stream' && !streamIsRemote) {
             streamPanel.style.display = '';
             const info = s.lynx?.stream_info || {};
             const bitrate = info.bitrate_kbps;
@@ -11033,9 +15252,99 @@ async function updateStatus() {
                 '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;"><span>' + r[0] + '</span>' +
                 '<span class="status-value">' + r[1] + '</span></div>'
             ).join('');
+            // Green only if data is actually arriving. mpv reports a
+            // bitrate while a stream is flowing and nothing when it is
+            // not, so this is the honest signal - and it was already
+            // being displayed in the body, just not consulted for the
+            // badge. Amber here means the stream is selected but silent,
+            // which is a real and useful distinction from playing.
+            setPanelState('tri-watch-stream-header', 'tri-watch-stream-status',
+                          '&#x1F4FA; Stream',
+                          (bitrate != null && bitrate > 0) ? 'locked' : 'idle');
         } else {
-            streamPanel.style.display = 'none';
+            // Amber when BATC is reachable and nothing is simply playing;
+            // red only when BATC itself cannot be reached. "Nothing on"
+            // and "no internet" look identical otherwise, and only one of
+            // them is a fault.
+            setPanelState('tri-watch-stream-header', 'tri-watch-stream-status',
+                          '&#x1F4FA; Stream',
+                          (s.batc?.online === false) ? 'offline' : 'idle');
         }
+
+        // Slave Rx - a receiver at another site. Only the text status port
+        // exists so far, so there is no MER or margin to show: online,
+        // lock state, frequency and callsign is genuinely all there is,
+        // and the header carries most of it.
+        // One panel per Slave, built on first sight and updated in
+        // place thereafter. Rebuilding the markup on every poll would
+        // throw away and recreate DOM three times a second on a page
+        // somebody may be reading, and would fight any control added to
+        // these panels later by destroying it mid-click.
+        // HDHomeRun panels: DVB-T2 and ATSC 3.0, one per kind of box.
+        // Looked up both ways: the status payload nests some blocks under
+        // "lynx" and exposes others at the top level, and this renderer is
+        // called with both shapes. An older server without the per-kind
+        // blocks is shown in the DVB-T2 panel, as before.
+        const L_ = s.lynx || {};
+        const si = L_.stream_info || s.stream_info || {};
+        const hdvb = L_.hdhomerun_dvb || s.hdhomerun_dvb
+            || ((L_.hdhomerun_atsc || s.hdhomerun_atsc) ? null : (L_.hdhomerun || s.hdhomerun || null));
+        const hatsc = L_.hdhomerun_atsc || s.hdhomerun_atsc || null;
+        renderHdhrPanel(hdvb, si, 'dvbt', '&#x1F4FA; DVB-T2');
+        renderHdhrPanel(hatsc, si, 'atsc', '&#x1F4FA; ATSC 3.0');
+
+        const remotes = s.remotes || [];
+        const remoteHost = document.getElementById('remote-panels');
+        remotes.forEach(function (rem) {
+            const id = 'remote-' + rem.index;
+            let panel = document.getElementById(id);
+            if (!panel) {
+                panel = document.createElement('div');
+                panel.className = 'card mt-2';
+                panel.id = id;
+                panel.innerHTML =
+                    '<div class="card-header" id="' + id + '-header">&#x1F4E1; Slave Rx</div>' +
+                    '<div class="card-body" id="' + id + '-status"></div>';
+                remoteHost.appendChild(panel);
+            }
+            // A configured but disabled Slave is hidden rather than
+            // shown as offline: it is switched off deliberately, which
+            // is not a fault and should not look like one.
+            if (!rem.enabled) { panel.style.display = 'none'; return; }
+            panel.style.display = '';
+            const st = !rem.online ? 'offline' : (rem.locked ? 'locked' : 'idle');
+            // Locator in the header rather than as a row: it is the one
+            // thing a Slave has that a local receiver does not, and putting
+            // it in the rows is what stopped the two panels looking alike.
+            const label = '&#x1F4E1; ' + (rem.name || 'Slave Rx')
+                        + (rem.locator ? ' — ' + rem.locator : '');
+            setPanelState(id + '-header', id + '-status', label, st);
+            // Deliberately the local receiver's row set, in its order and
+            // with its units. A Slave sends the same fields under the same
+            // tags, so anything that reads differently here is a fault
+            // rather than a difference worth preserving.
+            const rows = [
+                ['Callsign',    rem.callsign || '—'],
+                ['Service',  rem.service || '—'],
+                ['Provider',    rem.programme || '—'],
+                ['Frequency',   rem.frequency ? rem.frequency + ' MHz' : '—'],
+                ['Symbol Rate', rem.symbol_rate ? rem.symbol_rate + ' kS/s' : '—'],
+                ['MER',         rem.mer ? rem.mer + ' dB' : '—'],
+                ['Margin',      rem.margin ? rem.margin + ' dB' : '—'],
+                ['Level',       (rem.dbm && rem.dbm !== '0') ? rem.dbm + ' dBm' : '—'],
+                ['Mode',        rem.modcod || '—'],
+                ['Codec',       rem.codec || '—'],
+                ['Audio Codec', rem.audio_codec || '—'],
+                // A Slave runs Longmynd on a Pico adaptor, not Picotuner
+                // firmware. There is no equivalent to report, and a dash
+                // says so more honestly than something invented.
+                ['Firmware',    '—'],
+            ];
+            document.getElementById(id + '-status').innerHTML = rows.map(r =>
+                '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;"><span>' + r[0] + '</span>' +
+                '<span class="status-value">' + r[1] + '</span></div>'
+            ).join('');
+        });
     } catch(e) {
         document.getElementById('status-panel').innerHTML = '<div class="text-danger small">Status unavailable</div>';
     }
@@ -11046,6 +15355,13 @@ async function loadPresets() {
     try {
         const data = await api('GET', '/api/presets');
         const local = (data.local || []).map(p => ({...p, _local: true}));
+        // One list, every kind. /api/preset dispatches on the preset's
+        // own type, so clicking a DVB-T2 memory tunes the HDHomeRun
+        // rather than handing the Picotuner a number in the wrong
+        // unit - which is why these used to be filtered apart.
+        //
+        // One list also because the Knobler turns through one, and a
+        // memory the front panel cannot reach may as well not exist.
         const all = [...local, ...(data.ryde || [])];
         const el = document.getElementById('preset-list');
         if (!all.length) { el.innerHTML = '<div class="text-muted small">No presets</div>'; return; }
@@ -11053,8 +15369,9 @@ async function loadPresets() {
             <div class="d-flex align-items-center gap-1 mb-1">
                 <button class="btn btn-outline-secondary btn-sm flex-grow-1 text-start text-light" 
                         onclick="tunePreset('${p.name}')">
-                    ${(p.type === 'stream') ? '&#x1F4F6; ' : ''}${p.name}
-                    ${p.freq ? '<small class="text-muted float-end">' + (p.freq/1000).toFixed(3) + ' MHz</small>' : ''}
+                    ${(p.type === 'stream') ? '&#x1F4F6; ' : (p.type === 'dvbt') ? '&#x1F4FA; ' : '&#x1F4E1; '}${p.name}
+                    ${p.freq ? '<small class="text-muted float-end">' + (p.freq/1000).toFixed(3) + ' MHz</small>'
+                             : p.freq_hz ? '<small class="text-muted float-end">' + (p.freq_hz/1e6).toFixed(3) + ' MHz</small>' : ''}
                 </button>
                 ${p._local ? `<button class="btn btn-outline-danger btn-sm" title="Delete" onclick="deletePreset('${p.name}')">&times;</button>` : ''}
             </div>
@@ -11218,6 +15535,54 @@ async function loadLiveStreams() {
     }
 }
 
+// ── Slave Receivers ──────────────────────────────────────────
+// Reads the same /api/status the panels read rather than its own
+// endpoint: the list and the panels then cannot disagree about which
+// Slaves exist or what they are called.
+async function loadSlaves() {
+    const el = document.getElementById('slave-list');
+    if (!el) return;
+    try {
+        const s = await api('GET', '/api/status');
+        const remotes = s.remotes || [];
+        if (!remotes.length) {
+            el.innerHTML = '<div class="text-muted small p-3">No Slaves configured</div>';
+            return;
+        }
+        el.innerHTML = remotes.map(function (r) {
+            // Three states, same meanings as the panel badges: video
+            // arriving, heard from but no video, nothing at all.
+            var live = r.video && r.video.live;
+            var badge = !r.online
+                ? '<span class="badge bg-danger" style="font-size:0.65em">OFFLINE</span>'
+                : (live
+                    ? '<span class="badge bg-success" style="font-size:0.65em">VIDEO</span>'
+                    : '<span class="badge bg-warning text-dark" style="font-size:0.65em">NO VIDEO</span>');
+            // Only a Slave that is actually sending video can be chosen —
+            // selecting one that is not would just black the screen.
+            var clickable = r.enabled && r.online && live;
+            var kbps = live ? (r.video.kbps + ' kbps') : '';
+            return '<div class="stream-item p-2 border-bottom border-secondary d-flex justify-content-between align-items-center"'
+                 + (clickable ? ' style="cursor:pointer" onclick="playSlave(' + r.index + ')"'
+                              : ' style="opacity:0.55"')
+                 + '><span class="small text-light">' + (r.name || ('Slave Rx ' + (r.index + 1)))
+                 + (r.callsign ? ' <span class="text-muted">' + r.callsign + '</span>' : '')
+                 + '</span><span class="d-flex align-items-center gap-2">'
+                 + '<span class="text-muted small">' + kbps + '</span>' + badge + '</span></div>';
+        }).join('');
+    } catch (e) {
+        el.innerHTML = '<div class="text-danger small p-3">Slave list unavailable</div>';
+    }
+}
+
+async function playSlave(index) {
+    try {
+        await api('POST', '/api/remote/' + index + '/select');
+    } catch (e) {
+        alert('Could not select that Slave: ' + e);
+    }
+}
+
 async function refreshLiveStreams() {
     try {
         await api('POST', '/api/streams/refresh');
@@ -11272,6 +15637,407 @@ async function tuneTo() {
     await api('POST', '/api/tune', {freq, sr, plug, lnb_lo_khz});
 }
 
+// One HDHomeRun panel and its tuning card: prefix 'dvbt' or 'atsc'.
+// The codec rows come from the player, so they are shown only for the
+// box whose picture is actually on screen.
+function renderHdhrPanel(hh, si, prefix, title) {
+    var panel = document.getElementById(prefix + '-panel');
+    var card = document.getElementById(prefix + '-tune-card');
+    if (!panel) { return; }
+    if (!hh) {
+        panel.style.display = 'none';
+        if (card) { card.style.display = 'none'; }
+        return;
+    }
+    panel.style.display = '';
+    if (card) { card.style.display = ''; }
+    var dstate = 'offline';
+    if (hh.online) { dstate = hh.locked ? 'locked' : 'idle'; }
+    setPanelState(prefix + '-header', prefix + '-status', title, dstate);
+    var dbody = document.getElementById(prefix + '-status');
+    if (!dbody) { return; }
+    if (!hh.online) {
+        dbody.innerHTML = '<div class="text-danger small text-center mt-2">HDHomeRun offline</div>';
+        return;
+    }
+    if (!hh.locked) {
+        dbody.innerHTML = '<div class="text-muted small text-center mt-2">Searching for signal...</div>';
+        return;
+    }
+    // t8dvbt2 gives "8 MHz" and "DVB-T2": the second character is the
+    // nominal bandwidth in MHz. atsc3 and 8vsb are 6 MHz by definition.
+    var lm = hh.lock_mode || '';
+    // Kept so the DVB form does not have to ask which standard this is.
+    if (lm && prefix === 'dvbt') { window._dvbtLockMode = lm; }
+    // Service list: see patch_dvbt_service_list.py. Once per multiplex,
+    // whoever tuned it, so a refresh or a tune from elsewhere still fills
+    // it. The frequency box follows the multiplex actually locked, so
+    // changing service retunes the right one (patch_rock_codecs_dvbt_freq.py),
+    // but never while somebody is typing in it.
+    if (prefix === 'dvbt') {
+        window._dvbtServiceName = hh.service_name || '';
+        var fkey = hh.frequency_hz || 0;
+        var stale = window._dvbtProgramsFor !== fkey;
+        var retry = window._dvbtProgramsEmptyAt &&
+                    (Date.now() - window._dvbtProgramsEmptyAt > 10000);
+        if (fkey && (stale || retry) && !window._dvbtProgramsBusy) {
+            window._dvbtProgramsFor = fkey;
+            if (stale) {
+                var fbox = document.getElementById('dvbt-freq');
+                if (fbox && document.activeElement !== fbox) {
+                    fbox.value = Math.round(fkey / 1000);
+                }
+            }
+            window._dvbtProgramsBusy = true;
+            loadDvbtPrograms(8).finally(function () {
+                window._dvbtProgramsBusy = false;
+            });
+        }
+    }
+    var dbw = '', dstd = '-';
+    if (lm === 'atsc3') { dstd = 'ATSC 3.0'; dbw = '6'; }
+    else if (lm === '8vsb') { dstd = 'ATSC 1.0'; dbw = '6'; }
+    else if (lm.indexOf('dvbt2') >= 0) { dstd = 'DVB-T2'; dbw = lm.charAt(1); }
+    else if (lm.indexOf('dvbt') >= 0) { dstd = 'DVB-T'; dbw = lm.charAt(1); }
+    var onScreen = (hh.active === undefined) ? true : hh.active;
+    var drows = [
+        ['Callsign', hh.callsign || '-'],
+        ['Service', hh.service_name || '-'],
+        ['Frequency', hh.frequency_hz ? (hh.frequency_hz / 1e6).toFixed(3) + ' MHz' : '-'],
+        ['Bandwidth', dbw ? dbw + ' MHz' : '-'],
+        ['Standard', dstd],
+        ['SNQ', (hh.snq !== null && hh.snq !== undefined) ? hh.snq + ' %' : '-'],
+        ['SEQ', (hh.seq !== null && hh.seq !== undefined) ? hh.seq + ' %' : '-'],
+        ['Level', (hh.level !== null && hh.level !== undefined) ? hh.level + ' %' : '-'],
+        ['Bitrate', hh.bitrate_bps ? (hh.bitrate_bps / 1e6).toFixed(2) + ' Mb/s' : '-'],
+        ['Codec', onScreen ? (si.video_codec || '-') : 'not on screen'],
+        ['Audio Codec', onScreen ? (si.audio_codec || '-') : '-']
+    ];
+    var dhtml = '';
+    for (var di = 0; di < drows.length; di++) {
+        dhtml += '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;">';
+        dhtml += '<span>' + drows[di][0] + '</span>';
+        dhtml += '<span class="status-value">' + drows[di][1] + '</span></div>';
+    }
+    dbody.innerHTML = dhtml;
+}
+
+async function tuneDvbt(freqMhz, modulation, program) {
+    // MHz in the form, Hz on the wire: the device's own API works in
+    // Hz and nobody wants to type nine digits. Converted here, in one
+    // place, rather than at each caller.
+    await api('POST', '/api/tune_dvbt', {
+        // kHz in the form, Hz on the wire. kHz rather than MHz so
+        // both tuning cards on this page agree with each other and
+        // with Lynx's own convention everywhere else.
+        freq: Math.round(parseFloat(freqMhz) * 1000),
+        modulation: modulation,
+        program: program ? String(program) : null
+    });
+}
+
+async function loadDvbtPrograms(retries) {
+    // Filled from the multiplex itself rather than typed. A number box
+    // let any number be entered, and the device would accept one that
+    // did not exist - a lock with no picture and nothing to say why.
+    var sel = document.getElementById('dvbt-program');
+    if (!sel) { return; }
+    var wanted = sel.value;
+    try {
+        var r = await api('GET', '/api/hdhomerun/programs');
+        var progs = (r && r.programs) || [];
+        // Nothing yet, and attempts left: the tables lag the lock, so
+        // an empty answer this soon means "not ready" rather than "no
+        // services". Stops as soon as there is something, so a device
+        // that answers immediately waits for nothing at all.
+        if (!progs.length && retries && retries > 0) {
+            await new Promise(function (r2) { setTimeout(r2, 500); });
+            return await loadDvbtPrograms(retries - 1);
+        }
+        // Rebuilt with DOM calls rather than innerHTML: service names
+        // come from the broadcaster and can contain anything at all,
+        // and concatenating them into markup is how a stray quote
+        // takes the whole page down.
+        while (sel.firstChild) { sel.removeChild(sel.firstChild); }
+        window._dvbtProgramsEmptyAt = progs.length ? 0 : Date.now();
+        if (!progs.length) {
+            var none = document.createElement('option');
+            none.value = '';
+            none.textContent = 'No services';
+            sel.appendChild(none);
+            return;
+        }
+        for (var i = 0; i < progs.length; i++) {
+            var o = document.createElement('option');
+            o.value = progs[i].program;
+            o.textContent = progs[i].name || progs[i].program;
+            sel.appendChild(o);
+        }
+        // Keep the current selection if it survived the retune,
+        // otherwise take the first service - which is the right
+        // default for an amateur transmission carrying only one.
+        // The service the tuner says is playing comes first: a
+        // service number kept from the previous multiplex can
+        // name a different service on this one.
+        var playing = -1;
+        for (var k = 0; k < sel.options.length; k++) {
+            if (window._dvbtServiceName &&
+                sel.options[k].textContent === window._dvbtServiceName) {
+                playing = k;
+                break;
+            }
+        }
+        if (playing >= 0) { sel.selectedIndex = playing; }
+        else { sel.value = wanted; }
+        if (!sel.value) { sel.selectedIndex = 0; }
+    } catch (e) {
+        while (sel.firstChild) { sel.removeChild(sel.firstChild); }
+        var err = document.createElement('option');
+        err.value = '';
+        err.textContent = 'Unavailable';
+        sel.appendChild(err);
+    }
+}
+
+async function loadS2Programmes() {
+    // Shown only when the stream carries more than one programme with a
+    // picture (Lynx-Tx's 4K carousel as programme 2). Polled gently: it is
+    // a handful of property reads from mpv.
+    var row = document.getElementById('s2-prog-row');
+    var sel = document.getElementById('s2-programme');
+    if (!row || !sel) { return; }
+    try {
+        var r = await fetch('/api/programmes');
+        var progs = ((await r.json()) || {}).programmes || [];
+        if (progs.length < 2) { row.style.setProperty('display', 'none', 'important'); return; }
+        row.style.setProperty('display', 'flex', 'important');
+        if (document.activeElement === sel) { return; }   // not while it is being chosen
+        while (sel.firstChild) { sel.removeChild(sel.firstChild); }
+        for (var i = 0; i < progs.length; i++) {
+            var p = progs[i], o = document.createElement('option');
+            o.value = p.program;
+            o.textContent = 'Programme ' + p.program +
+                (p.width ? ' \u00b7 ' + p.width + '\u00d7' + p.height : '') +
+                (p.codec ? ' ' + p.codec.toUpperCase() : '') +
+                (p.audio === null ? ' (no sound)' : '');
+            if (p.selected) { o.selected = true; }
+            sel.appendChild(o);
+        }
+    } catch (e) { /* mpv not up yet: try again next time */ }
+}
+
+async function switchS2Programme() {
+    var sel = document.getElementById('s2-programme');
+    await api('POST', '/api/programme', {program: parseInt(sel.value, 10)});
+    sel.blur();
+}
+setInterval(loadS2Programmes, 3000);
+loadS2Programmes();
+
+// The device's modulation string for what the form says. "atsc3" stands
+// alone; the DVB modes are tNdvbt2 / tNdvbt, N the bandwidth in MHz.
+function dvbtModulation(bw, std) {
+    return bw === 'atsc3' ? 'atsc3' : 't' + bw + std;
+}
+function dvbtLockedStd() {
+    var lm = window._dvbtLockMode || '';
+    return lm.indexOf('dvbt2') >= 0 ? 'dvbt2' : (lm.indexOf('dvbt') >= 0 ? 'dvbt' : 'dvbt2');
+}
+
+async function switchDvbtProgram() {
+    // No retune: the tuner is already locked on the multiplex, so this
+    // is a demultiplexer change and takes effect immediately. Sending
+    // a full tune here would drop the lock and reacquire it for no
+    // reason, with several seconds of black screen to show for it.
+    var sel = document.getElementById('dvbt-program');
+    if (!sel || !sel.value) { return; }
+    var f = document.getElementById('dvbt-freq').value;
+    var bw = document.getElementById('dvbt-bw').value;
+    // Whatever is locked now - the tuner reports it, so there is no
+    // need to guess or retry here.
+    var lm = (window._dvbtLockMode || dvbtModulation(bw, 'dvbt2'));
+    await tuneDvbt(f, lm, sel.value);
+}
+
+async function saveDvbtMemory() {
+    var f = document.getElementById('dvbt-freq').value;
+    var bw = document.getElementById('dvbt-bw').value;
+    var std = dvbtLockedStd();
+    var progSel = document.getElementById('dvbt-program');
+    if (!f) { return; }
+    var name = prompt('Name this preset:', (parseFloat(f)/1000).toFixed(3) + ' MHz');
+    if (name === null) { return; }
+    var result = await api('POST', '/api/presets/add', {
+        type: 'dvbt',
+        name: name,
+        freq_hz: Math.round(parseFloat(f) * 1000),
+        modulation: dvbtModulation(bw, std),
+        program: (progSel && progSel.value) ? progSel.value : null
+    });
+    if (result && result.note === 'already saved') {
+        alert('A preset with this exact name and tuning already exists.');
+    } else if (result && result.note === 'name already used') {
+        alert('A preset named "' + name + '" already exists with different tuning.');
+    }
+    await loadDvbtPresets();
+}
+
+async function saveDvbtBootDefault() {
+    var f = document.getElementById('dvbt-freq').value;
+    var bw = document.getElementById('dvbt-bw').value;
+    var progSel = document.getElementById('dvbt-program');
+    if (!f) { return; }
+    if (!confirm('Use ' + (parseFloat(f)/1000).toFixed(3) + ' MHz as the fallback on '
+                 + 'startup, whenever there is nothing previous to resume?')) { return; }
+    var std = dvbtLockedStd();
+    await api('POST', '/api/boot-default', {
+        type: 'dvbt',
+        freq_hz: Math.round(parseFloat(f) * 1000),
+        modulation: dvbtModulation(bw, std),
+        program: (progSel && progSel.value) ? progSel.value : null
+    });
+    await loadDvbtBootDefault();
+}
+
+async function loadDvbtBootDefault() {
+    var note = document.getElementById('dvbt-boot-note');
+    if (!note) { return; }
+    try {
+        var d = await api('GET', '/api/boot-default');
+        if (d && d.type === 'dvbt' && d.freq_hz) {
+            note.textContent = 'Default boot: '
+                + (d.freq_hz / 1e6).toFixed(3) + ' MHz';
+        } else {
+            note.textContent = '';
+        }
+    } catch (e) { note.textContent = ''; }
+}
+
+async function loadDvbtPresets() {
+    var el = document.getElementById('dvbt-preset-list');
+    if (!el) { return; }
+    try {
+        var data = await api('GET', '/api/presets');
+        var all = (data.local || []).filter(function (p) {
+            return p.type === 'dvbt';
+        });
+        // Rebuilt with DOM calls rather than innerHTML. A preset name
+        // is whatever somebody typed, and concatenating it into an
+        // onclick attribute means one apostrophe takes the page down.
+        while (el.firstChild) { el.removeChild(el.firstChild); }
+        if (!all.length) {
+            var none = document.createElement('div');
+            none.className = 'text-muted small';
+            none.textContent = 'No presets';
+            el.appendChild(none);
+            return;
+        }
+        all.forEach(function (p) {
+            var row = document.createElement('div');
+            row.className = 'd-flex align-items-center gap-1 mb-1';
+
+            var b = document.createElement('button');
+            b.className = 'btn btn-outline-secondary btn-sm flex-grow-1 text-start text-light';
+            b.textContent = p.name;
+            var mhz = document.createElement('small');
+            mhz.className = 'text-muted float-end';
+            mhz.textContent = (p.freq_hz / 1e6).toFixed(3) + ' MHz';
+            b.appendChild(mhz);
+            b.addEventListener('click', async function () {
+                // The frequency box follows the preset, so a save or a
+                // service change afterwards works on what is actually
+                // tuned rather than whatever was typed last.
+                var f = document.getElementById('dvbt-freq');
+                if (f) { f.value = Math.round(p.freq_hz / 1000); }
+                await tuneDvbt(p.freq_hz / 1000, p.modulation, p.program);
+                // Same refresh the manual tune does: a preset changes
+                // multiplex, so the old service list is wrong.
+                await loadDvbtPrograms(8);
+            });
+            row.appendChild(b);
+
+            var d = document.createElement('button');
+            d.className = 'btn btn-outline-danger btn-sm';
+            d.title = 'Delete';
+            d.textContent = '\u00d7';
+            d.addEventListener('click', function () {
+                deletePreset(p.name);
+                setTimeout(loadDvbtPresets, 300);
+            });
+            row.appendChild(d);
+
+            el.appendChild(row);
+        });
+    } catch (e) { /* the card still tunes without its presets */ }
+}
+
+async function tuneAtscManual() {
+    var f = document.getElementById('atsc-freq').value;
+    if (!f) { return; }
+    // The server sends an atsc3 tune to the ATSC box and releases the
+    // DVB one, so nothing else needs choosing here.
+    await tuneDvbt(f, 'atsc3', null);
+}
+
+async function saveAtscMemory() {
+    var f = document.getElementById('atsc-freq').value;
+    if (!f) { return; }
+    var name = prompt('Name this preset:', (parseFloat(f)/1000).toFixed(3) + ' MHz ATSC 3.0');
+    if (name === null) { return; }
+    var result = await api('POST', '/api/presets/add', {
+        type: 'dvbt', name: name,
+        freq_hz: Math.round(parseFloat(f) * 1000),
+        modulation: 'atsc3', program: null
+    });
+    if (result && result.note === 'already saved') {
+        alert('A preset with this exact name and tuning already exists.');
+    } else if (result && result.note === 'name already used') {
+        alert('A preset named "' + name + '" already exists with different tuning.');
+    }
+    await loadDvbtPresets();
+}
+
+async function saveAtscBootDefault() {
+    var f = document.getElementById('atsc-freq').value;
+    if (!f) { return; }
+    if (!confirm('Use ' + (parseFloat(f)/1000).toFixed(3) + ' MHz ATSC 3.0 as the fallback on '
+                 + 'startup, whenever there is nothing previous to resume?')) { return; }
+    await api('POST', '/api/boot-default', {
+        type: 'dvbt', freq_hz: Math.round(parseFloat(f) * 1000),
+        modulation: 'atsc3', program: null
+    });
+    await loadDvbtBootDefault();
+}
+
+async function tuneDvbtManual() {
+    var f = document.getElementById('dvbt-freq').value;
+    var bw = document.getElementById('dvbt-bw').value;
+    var prog = document.getElementById('dvbt-program').value;
+    if (!f) { return; }
+    // DVB-T2 first, DVB-T if that does not lock. The device's own
+    // "auto" modulation exists but was confirmed unreliable - it
+    // repeatedly failed to lock a mux that locked within seconds when
+    // the modulation was named - so two explicit attempts it is. The
+    // second only runs when the first genuinely fails, which costs
+    // the lock timeout once and nothing thereafter.
+    try {
+        await tuneDvbt(f, 't' + bw + 'dvbt2', prog);
+    } catch (e) {
+        await tuneDvbt(f, 't' + bw + 'dvbt', prog);
+    }
+    // After the tune, not before: the list comes from the multiplex,
+    // and until the tuner has locked there is no multiplex to ask.
+    //
+    // Retried rather than delayed. The tune returns once the device
+    // reports lock, but streaminfo needs the service tables, which
+    // lag it by an amount nobody can predict - a fixed wait was
+    // either too short sometimes or too long always, and the one it
+    // replaces managed both.
+    await loadDvbtPrograms(8);
+    await loadDvbtPresets();
+    await loadDvbtBootDefault();
+}
+
 async function tunePreset(name) {
     await api('POST', '/api/preset', {name});
 }
@@ -11301,6 +16067,147 @@ async function stopApp() {
         // a sign anything went wrong.
     }
 }
+
+        // ── Short messages at the foot of the page ────────────
+// The network output card called showToast() from the start, but it
+// was never defined, so its messages were lost to the console. Now
+// shared by that card and the Screen output card.
+function showToast(text, isError) {
+    let box = document.getElementById('lynx-toast');
+    if (!box) {
+        box = document.createElement('div');
+        box.id = 'lynx-toast';
+        box.style.cssText = 'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);' +
+            'z-index:2000;padding:10px 18px;border-radius:8px;font-size:0.95em;' +
+            'box-shadow:0 4px 16px rgba(0,0,0,.5);transition:opacity .3s;max-width:90vw';
+        document.body.appendChild(box);
+    }
+    box.textContent = text;
+    box.style.background = isError ? '#8b2d2d' : '#2d5f3a';
+    box.style.color = '#fff';
+    box.style.opacity = '1';
+    clearTimeout(box._hide);
+    box._hide = setTimeout(() => { box.style.opacity = '0'; }, isError ? 6000 : 3000);
+}
+
+        // ── Screen output: HDMI or SRT ────────────────────────
+let screenOutputLoaded = false;
+function showScreenOutput(st) {
+    if (!st) return;
+    document.querySelectorAll('#scrout-mode button').forEach(b => {
+        const on = b.dataset.mode === st.mode;
+        b.classList.toggle('btn-light', on);
+        b.classList.toggle('btn-outline-light', !on);
+    });
+    const set = st.settings || {};
+    if (!screenOutputLoaded) {
+        document.getElementById('scrout-host').value = set.host || '';
+        document.getElementById('scrout-port').value = set.port || 9000;
+        // A Pi has no hardware encoder: H.264, sources up to 1080p.
+        document.getElementById('scrout-note').style.display =
+            st.hardware_encoder ? 'none' : 'block';
+        const fmts = st.formats || [];
+        document.querySelectorAll('#scrout-format option').forEach(o => {
+            o.hidden = fmts.length && !fmts.includes(o.value);
+        });
+        document.querySelectorAll('#scrout-codec option').forEach(o => {
+            o.hidden = !st.hardware_encoder && o.value === 'hevc';
+        });
+        document.getElementById('scrout-format').value = set.format || '1080p50';
+        document.getElementById('scrout-codec').value = set.codec || 'hevc';
+        document.getElementById('scrout-delay').value = set.audio_delay_ms ?? 0;
+        document.getElementById('scrout-bitrate').value =
+            (st.bitrate_set ? set.bitrate_kbps : '');
+        document.getElementById('scrout-bitrate').placeholder =
+            'automatic (' + set.bitrate_kbps + ')';
+        document.getElementById('scrout-latency').value = set.latency_ms || 500;
+        document.getElementById('scrout-srtmode').value = set.srt_mode || 'listener';
+        document.getElementById('scrout-streamid').value = set.streamid || '';
+        document.getElementById('scrout-pass').value = set.passphrase || '';
+        screenOutputLoaded = true;
+    }
+    const el = document.getElementById('scrout-status');
+    let txt, colour = '';
+    if (st.missing && st.missing.length && st.mode !== 'hdmi') {
+        txt = 'Missing on this receiver: ' + st.missing.join(', ') + '. Run the installer again.';
+        colour = '#e8a33d';
+    } else if (st.mode === 'hdmi') {
+        txt = 'Picture on HDMI only.';
+    } else if (st.connected) {
+        txt = (set.srt_mode === 'caller' ? 'Sending to ' + (set.host || '?') :
+               'A caller is connected') + ': ' + st.connected_for_s + ' s.';
+        colour = '#5cb85c';
+    } else if (!st.error && set.srt_mode !== 'caller' && st.sending) {
+        // Listener, waiting: say exactly how to connect, with this
+        // receiver's own address (Thomas DL5BCA worked it out himself).
+        const url = 'srt://' + window.location.hostname + ':' + (set.port || 9000);
+        txt = 'Waiting for a caller: in VLC open ' + url +
+              ' (OBS Media Source: ' + url + '?mode=caller).';
+    } else {
+        txt = st.error ? st.error : 'Connecting...';
+        colour = st.error ? '#e8a33d' : '';
+    }
+    el.textContent = txt;
+    el.style.color = colour;
+}
+
+// api() returns the JSON whatever the status: a refusal comes back
+// as {detail: "..."}, which is shown rather than taken as a status.
+async function screenOutputCall(method, body) {
+    const r = await api(method, '/api/screen_output', body);
+    if (r && r.detail) throw new Error(r.detail);
+    return r;
+}
+
+async function loadScreenOutput() {
+    try { showScreenOutput(await screenOutputCall('GET')); } catch (e) {}
+}
+
+async function setScreenOutputMode(mode) {
+    if (mode === 'srt' && !document.getElementById('scrout-host').value.trim() &&
+        document.getElementById('scrout-srtmode').value === 'caller') {
+        showToast('Enter the address to send to first', true);
+        return;
+    }
+    if (mode === 'srt' && !confirm('SRT mode switches this receiver\\'s HDMI screen off ' +
+                                   'and draws on a virtual screen instead. Carry on?')) {
+        return;
+    }
+    try {
+        showScreenOutput(await screenOutputCall('POST', {mode: mode}));
+        showToast(mode === 'hdmi' ? 'Picture on HDMI' : 'Picture going out over SRT');
+    } catch (e) {
+        showToast('Could not change screen output: ' + e.message, true);
+    }
+}
+
+async function saveScreenOutput(withPass) {
+    const body = {
+        host: document.getElementById('scrout-host').value.trim(),
+        port: parseInt(document.getElementById('scrout-port').value, 10) || 9000,
+        format: document.getElementById('scrout-format').value,
+        codec: document.getElementById('scrout-codec').value,
+        audio_delay_ms: parseInt(document.getElementById('scrout-delay').value, 10) || 0,
+        bitrate_kbps: parseInt(document.getElementById('scrout-bitrate').value, 10) || 0,
+        latency_ms: parseInt(document.getElementById('scrout-latency').value, 10) || 500,
+        srt_mode: document.getElementById('scrout-srtmode').value,
+        streamid: document.getElementById('scrout-streamid').value.trim(),
+    };
+    if (withPass) {
+        body.passphrase = document.getElementById('scrout-pass').value;
+    }
+    try {
+        showScreenOutput(await screenOutputCall('POST', body));
+        if (withPass) {
+            showToast(body.passphrase ? 'Passphrase saved' : 'Passphrase cleared');
+        }
+    } catch (e) {
+        showToast('Could not save: ' + e, true);
+    }
+}
+
+loadScreenOutput();
+setInterval(loadScreenOutput, 3000);
 
 async function shutdownPi() {
     if (!confirm('Shut down the Pi completely? Unlike Reboot, it will NOT come back up on ' +
@@ -11539,7 +16446,14 @@ async function applyUpdate() {
 // ── Init ──────────────────────────────────────────────────────
 loadConfig();
 loadPresets();
+loadDvbtPresets();
+loadDvbtBootDefault();
 loadLiveStreams();
+loadSlaves();
+// Its own interval rather than a call inside updateStatus(): the
+// comment on QuickLynx below applies for the same reason, and a
+// fault in this list must not be able to stop the status poll.
+setInterval(loadSlaves, 5000);
 loadVolume();
 loadBootDefault();
 loadUpdateStatus();
@@ -11626,12 +16540,19 @@ if __name__ == "__main__":
     quality_b.start()
     freshness = threading.Thread(target=rf_mpv_lifecycle_monitor, daemon=True)
     freshness.start()
+    screen_output.start()
+    threading.Thread(target=programme_keeper, daemon=True).start()
     diversity_stuck = threading.Thread(target=diversity_stuck_lock_monitor, daemon=True)
     diversity_stuck.start()
     mer_pub = threading.Thread(target=mer_publisher, daemon=True)
     mer_pub.start()
     decoder_health = threading.Thread(target=mpv_decoder_health_monitor, daemon=True)
     decoder_health.start()
+    video_badges = threading.Thread(target=video_badge_monitor, daemon=True)
+    video_badges.start()
+    screen_return = threading.Thread(target=screen_return_monitor, daemon=True)
+    screen_return.start()
+    threading.Thread(target=refresh_rate_at_start, daemon=True).start()
     connectivity = threading.Thread(target=picotuner_connectivity_monitor, daemon=True)
     connectivity.start()
     modcod_monitor = threading.Thread(target=picotuner_modcod_monitor, daemon=True)
@@ -11646,6 +16567,55 @@ if __name__ == "__main__":
     rss_monitor.start()
     dial_discovery = threading.Thread(target=dial_discovery_responder, daemon=True)
     dial_discovery.start()
+    # One thread per ENABLED Slave. A receiver with none binds no extra
+    # port and runs no extra thread - absent configuration means absent
+    # behaviour, not a default that has to be turned off. A configured
+    # but disabled Slave still has a state record, so it appears in the
+    # UI as switched off rather than vanishing.
+    init_remote_states()
+    for _i, _st in enumerate(remote_states):
+        if not _st["enabled"]:
+            continue
+        threading.Thread(target=remote_source_monitor, args=(_i,),
+                         daemon=True).start()
+        # Per Slave, like the line above. This had been dropped into
+        # the HDHomeRun block below instead, where _i does not exist -
+        # so any receiver that actually found an HDHomeRun died at
+        # startup with "NameError: name '_i' is not defined", while one
+        # without found nothing, never entered that block, and ran
+        # perfectly. It is a Slave's quality feed and has nothing to do
+        # with DVB-T2 at all.
+        #
+        # Separate thread from remote_source_monitor rather than
+        # parsing both formats in one: the two ports update at
+        # different rates and a stall on either must not hold up the
+        # other.
+        threading.Thread(target=remote_quality_monitor, args=(_i,),
+                         daemon=True).start()
+    # One sweep rather than a background discovery thread: an HDHomeRun
+    # is installed once, not plugged in and out, and a receiver with
+    # none should run no thread and send no broadcast - absent hardware
+    # means absent behaviour, the same principle the Slave threads
+    # follow for absent configuration. A device added later is picked
+    # up on the next restart.
+    if hdhr_discover_once():
+        hdhr_monitor = threading.Thread(target=hdhomerun_monitor,
+                                        daemon=True)
+        hdhr_monitor.start()
+    # Started whenever any Slave is configured. A failed bind is not
+    # fatal — status, panels and every local source carry on exactly
+    # as before; only Slave video would be unavailable, and the reason
+    # is on the console and in /api/status rather than silent.
+    if remote_any_enabled():
+        if slave_relay.start():
+            print(f"[relay] Slave video ingress listening on {REMOTE_VIDEO_INGRESS_PORT}")
+        else:
+            print(f"[relay] NOT listening: {slave_relay.bind_error}")
+    # Always started: BATC reachability is not conditional on anything
+    # being configured, and it is what tells "nothing playing" apart
+    # from "no internet" on the Stream panel.
+    batc_monitor = threading.Thread(target=batc_health_monitor, daemon=True)
+    batc_monitor.start()
     # Tri-watch (up to 3 sources, Stage 1) - probes for any enabled
     # stream sources are started here, once, rather than lazily on
     # first use, so their connect/handshake/reconnect cycle is already
@@ -11706,6 +16676,7 @@ if __name__ == "__main__":
     picotuner_watchdog_thread = threading.Thread(
         target=picotuner_tuning_watchdog, daemon=True)
     picotuner_watchdog_thread.start()
+    threading.Thread(target=lynx_presence_responder, daemon=True).start()
     # Repeater-activity notifications (QRZ/Slack/Companion/GPIO Tx) - its
     # own, independent monitor, deliberately not gated on current_mode the
     # way rf_mpv_lifecycle_monitor() is (see lynx_notifications.py's own
@@ -11906,8 +16877,9 @@ if __name__ == "__main__":
                 # risk resuming with mpv still pointed at the raw
                 # single-tuner port instead of the combiner's output.
                 print(f"Already locked on {state['freq']} kHz / {state['sr']} kS/s — skipping resume tune.")
-                global current_mode, current_preset
+                global current_mode, current_preset, displayed_receiver_id
                 current_mode = "rf"
+                displayed_receiver_id = None
                 current_preset = f"{state['freq']/1000:.3f} MHz / {state['sr']} kS/s"
                 # Via set_converter_state() rather than assigning
                 # current_lnb_lo_khz directly, because the LO alone is
@@ -11943,17 +16915,108 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"Could not resume previous RF state: {e}")
         elif state and state.get("mode") == "stream":
-            print(f"Resuming previous stream: {state.get('name')}")
-            try:
-                start_stream(StreamRequest(url=state["url"], name=state.get("name", "")))
-                return
-            except Exception as e:
-                print(f"Could not resume previous stream: {e}")
+            # A Slave is saved as a stream, because that is how it
+            # plays, plus the index of which Slave it was. Without
+            # telling the relay, resuming the URL alone points mpv
+            # at a port nothing is being forwarded to.
+            _rem_idx = state.get("remote_index")
+            if _rem_idx is not None:
+                print(f"Resuming Slave Rx {_rem_idx}: waiting for it to report")
+                for _ in range(REMOTE_RESUME_WAIT_SECS):
+                    if (0 <= _rem_idx < len(remote_states)
+                            and remote_states[_rem_idx]["enabled"]
+                            and remote_states[_rem_idx]["addr"]):
+                        break
+                    time.sleep(1)
+                try:
+                    select_remote_source(_rem_idx)
+                    print(f"Resumed Slave Rx {_rem_idx}")
+                    return
+                except Exception as e:
+                    # Left idle rather than falling through to the
+                    # plain stream resume: that would point mpv at
+                    # the relay output with nothing selected, which
+                    # is a black screen with no explanation.
+                    print(f"Could not resume Slave Rx {_rem_idx}: {e}")
+            else:
+                print(f"Resuming previous stream: {state.get('name')}")
+                try:
+                    start_stream(StreamRequest(url=state["url"], name=state.get("name", "")))
+                    return
+                except Exception as e:
+                    print(f"Could not resume previous stream: {e}")
+
+        if state and state.get("mode") == "dvbt":
+            # Discovery has normally finished by now - it runs at
+            # startup and this is seven seconds later - but a device
+            # slow to answer, or a switch still bringing its port up,
+            # would leave nothing found. Bounded wait rather than an
+            # immediate failure, same principle as REMOTE_RESUME_WAIT_SECS.
+            _waited = 0
+            while not hdhr_devices() and _waited < 20:
+                time.sleep(2)
+                _waited += 2
+                hdhr_discover_once()
+
+            _dev = state.get("device_id") or hdhr_default_device_id()
+            if not _dev:
+                print("Could not resume DVB-T2: no HDHomeRun found")
+            else:
+                try:
+                    # Already tuned? An HDHomeRun keeps its channel and
+                    # its stream target across a Lynx restart - it is a
+                    # separate box on the network and has no idea we
+                    # went away. Confirmed live: after a reboot it was
+                    # still locked and still streaming. So retuning is
+                    # usually unnecessary; mpv is the part that needs
+                    # restarting, and the tune route does both.
+                    _st = None
+                    for _d in hdhr_devices():
+                        if _d["device_id"] == _dev:
+                            _st = _d
+                            break
+                    _same = bool(_st and _st.get("locked")
+                                 and _st.get("frequency_hz") == state["freq"])
+
+                    print(f"Resuming previous DVB-T2: "
+                          f"{state['freq']/1e6:.3f} MHz / "
+                          f"{state.get('modulation')}"
+                          f"{' (already locked)' if _same else ''}")
+
+                    tune_dvbt(DvbtTuneRequest(
+                        freq=state["freq"],
+                        modulation=state.get("modulation", "t8dvbt2"),
+                        program=state.get("program"),
+                        device_id=state.get("device_id"),
+                    ))
+                    return
+                except Exception as e:
+                    # Left idle rather than falling through to the
+                    # default boot preset: that is a Picotuner preset,
+                    # and tuning a tuner this receiver may not even
+                    # have is not a useful recovery.
+                    print(f"Could not resume DVB-T2: {type(e).__name__}: {e}")
+                    return
 
         # No valid previous state — fall back to the explicit default
         # boot preset, if one has been configured.
         default_preset = config.get('default_boot_preset')
-        if default_preset:
+        if default_preset and default_preset.get('type') == 'dvbt':
+            # A DVB-T2 fallback. Handed to _resume_tune() it would ask
+            # a Picotuner - which this receiver may not even have - for
+            # a frequency in the wrong unit.
+            print(f"No previous state - using default boot preset: "
+                  f"{default_preset.get('freq_hz', 0)/1e6:.3f} MHz DVB-T2")
+            try:
+                tune_dvbt(DvbtTuneRequest(
+                    freq=default_preset["freq_hz"],
+                    modulation=default_preset.get("modulation", "t8dvbt2"),
+                    program=default_preset.get("program"),
+                ))
+            except Exception as e:
+                print(f"Could not apply default boot preset: "
+                      f"{type(e).__name__}: {e}")
+        elif default_preset:
             print(f"No previous state — using default boot preset: {default_preset}")
             try:
                 _resume_tune(

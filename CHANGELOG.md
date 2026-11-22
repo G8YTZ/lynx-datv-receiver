@@ -2,6 +2,102 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-11-14
+
+**New**
+- `/api/status` gives `lynx.in_use`: `{"active": true/false, "since": <time>}`, the settled "something to show" that the Video Switching card switches on (RF and relayed streams, with its settle times), whether or not Companion or its pin is enabled. For anything that polls Lynx, such as a quad-split controller.
+
+**Fixed**
+- A Pi could stay at 4K when the monitor woke after Lynx started: the 1080-line cap is now also applied by the running receiver (at start, when a screen comes back, and when the screen settings are saved), not only by the start-up script.
+- ROCK 5C sound very quiet on HDMI: start-up set only the default output to full volume, and on the 5C that is the analogue socket. Every output is now set to full and unmuted.
+- Two receivers sharing an HDHomeRun fought over tuner 0: every Lynx used it, and leaving the HDHomeRun stopped every tuner, the other receiver's included. Lynx now takes a free tuner (keeping its own when it can), refuses with who has them when all are busy, and releases only a tuner sending to itself. `POST /api/hdhomerun/stop?force=true` frees a tuner left streaming by a receiver that was switched off.
+
+## 2026-11-12
+
+**Fixed**
+- Update Now could leave SRT output without wf-recorder: the build came last in the installer, so any earlier step failing stopped it. It now runs on its own when the installer does not finish, and each update's output is kept in `~/lynx/logs/update.log` (it was lost at the reboot).
+- "missing on this receiver" on the Screen output card now says the command that fixes it.
+
+## 2026-11-11 (afternoon)
+
+**New**
+- SRT output: the finished screen (picture, overlay, chat, PPM and sound) over SRT. A Screen output card with HDMI and SRT buttons; in SRT mode Lynx draws on a virtual screen and switches HDMI off, so nothing need be plugged in. ROCK: up to 2160p50, H.265 (default) or H.264, encoded in hardware with no copy through the processor. Pi 5: H.264 in software, 720p or 1080p, for sources up to 1080p. Lynx listens by default (the far end calls); passphrase, stream ID, latency, bit rate and a sound delay are on the card. See `docs/SRT_OUTPUT.md`.
+
+**Removed**
+- "Picture to another screen" (UDP output). SRT replaces it.
+
+**Fixed**
+- The PPM follows the sound to wherever the player sends it.
+- Messages from the web page's network cards were never shown.
+
+## 2026-11-11
+
+**New**
+- Radxa ROCK 5C supported, alongside the 5T and the Pi. One installer for every board: it works out which it is on.
+- Two programmes in one carrier (Lynx-Tx's 4K carousel): both offered on the web page, remembered per tune like a channel scan, and a change of programme starts the player on the new programme's own clock.
+- Picotuner receivers can be shared with another Lynx (Apple TV, iPhone) or protected for a repeater (Config, Picotuner).
+
+**Changed**
+- No black transition cover. While a picture starts, the screen shows the logo and the receiver's status, or the stream starting. `LYNX_COVER=1` brings the cover back.
+- Faster lock to picture on RF: about 3 s quicker.
+- Pi 5 fan comes on at 40 °C and steps up at 45, 55 and 65 °C.
+
+**Fixed**
+- Lynx restarted itself every time a signal went away. It now waits quietly and the picture returns with the signal.
+- Choosing a stream that is not sending no longer locks out tuning for about a minute.
+- Pictures that froze for good after a network buffer overrun.
+- Diversity and lock detection on carriers with two programmes.
+- The saved refresh rate (50 Hz) is applied at start-up and when saved, with no restart.
+
+## 2026-11-03
+
+**Fixed**
+- Pi 5: back on the same video path as the Pi 4 and the stable release (`--vo=gpu --hwdec=drm-copy`, through Xwayland). Five beta testers reported trouble within a day of the zero-copy path reaching beta: a picture for a few seconds and then purple, or a stream that never appeared, all cured by going back to stable. Zero-copy stays available for testing with `systemctl --user set-environment LYNX_PI5_ZERO_COPY=1`.
+- A Pi HEVC decoder that keeps reporting errors after mpv starts counts as wedged again, and mpv is restarted. Since 2 November a moving playback clock had been taken as proof of a picture, and a wedged decoder putting out purple frames still has one. The single error logged as mpv joins a stream between keyframes is still ignored, so the restart-every-second loop does not come back.
+
+## 2026-10-16
+
+**Added**
+- ATSC 3.0 reception, as a source of its own: an ATSC 3.0 panel and tuning card beside the DVB-T2 ones, shown when an ATSC model HDHomeRun (the US Flex 4K, `hdhomerun_dvr_atsc3`) is on the network. Both boxes can be present at once; each card tunes its own. It is the receive end of Lynx-Tx's ATSC 3.0 mode, confirmed on the bench at 437 and 557 MHz with live 4K HEVC and sound, SNQ and SEQ at 100. The box tunes any frequency, not just the US channel plan, and hands back the transport stream carried inside the signal, so Lynx plays it like any other source.
+
+**Fixed**
+- With two HDHomeRuns on one network, a tune went to whichever had the lower device ID, and the other kept streaming to the same port: the right figures on the status panel over the previous picture. Each tune now goes to a box that supports the modulation (from its own /sys/features), and every other box is told to stop first.
+- The status panel and the on-screen overlay showed only the first HDHomeRun by ID. They now show each box in its own panel, and the overlay follows the one actually on screen.
+- The overlay read the bandwidth and standard from the mode name's second character, so ATSC 3.0 came out as "t MHz, DVB-T".
+- No callsign or service name on ATSC 3.0. The Flex passes the stream's SDT through untouched but does not read it - an ATSC 3.0 receiver takes names from the SLT - so its programme list said "1: 0", while VLC showed "G8YTZ UHD" from the same stream. The HDHomeRun now sends to a small relay (UDP 10995) that hands every datagram straight on to mpv and reads the SDT on the way; the existing name lookup asks the box first, as before, and falls back to the stream's own names. Callsign, QRZ logging and Pathfinder follow unchanged.
+
+## 2026-09-25
+
+**Added**
+- DVB-T/T2/C reception, via a SiliconDust HDHomeRun on the network. It appears as a fourth source alongside the two Picotuner receivers and the Slave Rx, with its own OSD panel, Web UI card, presets, QRZ logging and Pathfinder card. The device is found automatically at startup, so a tuner on the same network needs nothing configured at all. It is not a dongle or a HAT: it sits on the LAN and streams a transport stream to whatever address it is told, so the receiver need not be in the same room as the antenna, and one box carries two or four tuners.
+- Narrowband DVB-T2 on the amateur bands. The HDHR5-2DT and 4DT demodulate channel bandwidths from 1 to 8 MHz and tune to arbitrary frequencies rather than a broadcast channel plan. Confirmed on air at 437.000 MHz and at 146.500 MHz, both 1 MHz DVB-T2 from a modified Portsdown 4, with SNQ and SEQ at 100. 2m is the interesting one: amateur television has been effectively a UHF and microwave activity because of the bandwidth involved, and 1 MHz changes that arithmetic. 4m and 6m are too narrow to fit a 1 MHz signal, so 2m is as low as this is useful.
+- A service dropdown, filled from the multiplex itself. The program number was a plain box, so any number could be typed and the device would accept one that did not exist - a lock with no picture and nothing to say why. Services are now listed by name, and switching between them does not retune: the tuner is already locked on the multiplex, so it is a demultiplexer change and takes effect immediately.
+- QRZ logging for DVB-T2 contacts, with the callsign taken from the service name carried in the multiplex - which on an amateur transmission is exactly what it is. Gated on the tuned frequency being in an amateur band, not on the shape of the name: what band a tuner is on is a fact, whereas what a name looks like is a guess, and "BBC" would otherwise have been logged as a callsign. The quality figures go in the comment field, where a percentage cannot be mistaken for a dB value.
+- Pathfinder cards for DVB-T2 and for a Slave. `_pathfinder_current_source()` knew about tri_watch, diversity and the local Picotuner and nothing else, so in either mode it reported the Picotuner's lock - false on a receiver without one - and no card was ever drawn.
+- A manual address field on the Config page, for a tuner on another subnet. Discovery is a UDP broadcast and stops at the first router; everything after it is ordinary unicast, so a device at a repeater site across a link works perfectly once named but can never be found on its own.
+
+**Changed**
+- The QRZ ADIF mode string is no longer hardcoded to DVB-S2. That assumption was sound while the Picotuner was the only source and was flagged as such in its own comment; a source that knows what it is now says so.
+- The DVB-T/DVB-T2 selector was removed from the Web UI. The tuner detects the standard itself, so asking the operator to name it was asking them to know something the device already knew. It is not replaced by the device's own "auto" modulation, which is unreliable - it repeatedly failed to lock a mux that locked within seconds when the modulation was given explicitly. Lynx tries DVB-T2 and falls back to DVB-T.
+- The DVB-T2 card takes kHz, like the Picotuner card. Two cards on one page asking for the same thing in different units is the sort of thing that catches somebody once and annoys them for ever.
+
+**Fixed**
+- Lynx drives an HDHomeRun through `hdhomerun_config`, SiliconDust's own command-line tool, and `install.sh` did not install it. The development machine had it from earlier experiments, so discovery worked there from the first run and the dependency went unnoticed: the beta channel shipped code that could not work out of the box for anyone else. Found by the first user to try it, whose log said exactly what was missing - the error message at least did its job. The package is now installed above the `--deps-only` exit, so Update Now retro-fits an existing receiver rather than only helping fresh installs.
+- The stream target was set to `udp://127.0.0.1:<port>`, which the HDHomeRun accepted and reported back perfectly while sending the stream to its own loopback - it is a separate box on the network, so its idea of localhost is itself. Nothing arrived and nothing said why: the status showed locked and streaming, pps was non-zero, and tcpdump on every interface at this end saw nothing at all. The address is now asked of the kernel on every tune rather than configured, since a remembered one would break on a DHCP change or a move between interfaces, and the failure would look identical.
+- The service-name fetch deadlocked the whole application. It ran inline in the tune route and took `hdhr_lock` while calling a function that takes the same lock - and `threading.Lock` is not reentrant, so the thread blocked waiting for a lock it was already holding. Everything behind that lock stopped, including `/api/status`.
+- mpv was given the RF flag set, which forces `--demuxer-lavf-format=mpegts` and skips lavf's own probe - and that probe is what finds the AAC LATM audio in a broadcast multiplex. mpv listed video and subtitles only and played in silence, while ffprobe found the audio track immediately. The Picotuner's own transport stream carries simpler audio and does not need the probe, which is why the flag was right there and wrong here.
+- mpv held a stale frame when the content changed underneath it: a station stopped, the source was changed at the far end, and the old test card was still on screen when it came back. The poller now restarts mpv when lock returns, so a station keying up after a gap gets a picture without anyone touching anything - the difference between a bench demonstration and something usable at a repeater.
+- The OSD covered live DVB-T2 video with the logo screen, and took the sound with it. `genuinely_locked` was computed from the Picotuner's lock state, correctly false on a receiver that has no Picotuner, so the cover went up over a picture mpv was decoding perfectly underneath. The magic eye and PPM were suppressed by the same test.
+- A restart left a DVB-T2 source idle. The tune route saved the mode correctly but the startup resume had no branch for it, so a receiver watching a DVB-T2 station came back to nothing after a reboot, watchdog restart or power cut.
+- The service list was read once, immediately after the tune. The device reports lock before its service tables can be read, so the first attempt came back empty and the callsign and dropdown only filled after a retune. Both now retry rather than waiting a fixed time, which is also quicker where the device is ready at once.
+
+**Known issues**
+- The narrow bandwidths are available only on the HDHR5-2DT and HDHR5-4DT, and both are now discontinued - second-hand only. They are not a standard feature anywhere: SiliconDust reverse-engineered how the driver sets channel width on that demodulator and added a custom set of bandwidths, which is why no other model has them and why SiliconDust know of no other demodulator supporting anything narrower than 1.7 MHz as standard. They have said they would like to make a new model for this using the same demodulator, and are watching what the amateur community does with it.
+- The tuner's RF filtering cannot go below about 5 or 6 MHz whatever the demodulator is set to, so at 1 or 2 MHz there is demodulator selectivity but not front-end selectivity - a strong signal within a few MHz of the wanted one still reaches the demodulator. At a repeater site, or anywhere with a transmitter nearby, that argues for a filter ahead of the tuner.
+- The tuning range is 44-866 MHz on the DT models and 44-1002 MHz on the ATSC 3.0 ones, so 23cm is out of reach of both. 6m and 4m are within range, though neither has room for a 1 MHz channel in its amateur allocation.
+- `t1dvbt2` is a literal 1 MHz, not 1.7 MHz rounded. The ladder is exact, so a 1.7 MHz transmission has no matching setting and will never lock, however healthy the signal strength looks.
+- The multiplex name is not shown. The device does not parse the NIT, and streaminfo gives only the tsid and onid. Deriving a name from the tsid would need a per-country table, and would be confidently wrong outside the country it was written for.
+
 ## 2026-09-04
 
 **Changed**

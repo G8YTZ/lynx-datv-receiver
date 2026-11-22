@@ -1,0 +1,329 @@
+#!/bin/bash
+# ============================================================
+#  Lynx — Radxa ROCK 5T and ROCK 5C platform setup
+#  Called by install.sh when it finds a ROCK 5T or 5C. Also safe to run
+#  on its own: every step checks before it acts, so a second run
+#  changes nothing that is already right.
+#
+#  Base OS: Armbian Debian 13 (trixie), MINIMAL, vendor kernel 6.1.
+#  The same Debian as Raspberry Pi OS on the Pi 5, so Python, GTK4,
+#  labwc and gtk4-layer-shell are the same versions on both boards.
+#
+#  Everything here was found the hard way on 21 Oct 2026. Each step
+#  says why it exists, so nobody "tidies" one away.
+# ============================================================
+set -e
+
+LYNX_DIR="${LYNX_DIR:-$HOME/lynx}"
+LYNX_USER="$(id -un)"
+SRC_DIR="$HOME/src"
+REBOOT_NEEDED=0
+
+# Versions of the media stack this script builds. Bump here, nowhere
+# else. The stamp file records what is installed, so a re-run skips the
+# (15 minute) build unless a version below has changed.
+MEDIA_STACK_VERSION="1"
+MPV_TAG="v0.41.0"
+STAMP=/usr/local/share/lynx/media-stack.version
+
+say() { echo ""; echo "--- $* ---"; }
+
+# --- Is this really a ROCK 5T or 5C on Armbian trixie? -----------
+# The 5C (10 Nov 2026): the same RK3588 family, vendor kernel, Panthor
+# overlay name, /dev/mpp_service and pwmfan as the 5T; one HDMI output.
+MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)"
+case "$MODEL" in
+  *"ROCK 5T"*|*"Rock 5T"*) BOARD_SLUG=rock-5t ;;
+  *"ROCK 5C"*|*"Rock 5C"*) BOARD_SLUG=rock-5c ;;
+  *) echo "This script is for the Radxa ROCK 5T or 5C (found: '${MODEL:-unknown}')."; exit 1 ;;
+esac
+. /etc/os-release
+if [ "${VERSION_CODENAME:-}" != "trixie" ]; then
+  echo "Lynx on the $MODEL needs Armbian trixie (found: ${PRETTY_NAME:-unknown})."
+  echo "Write the 'Trixie vendor minimal' image from armbian.com/boards/$BOARD_SLUG first."
+  exit 1
+fi
+case "$(uname -r)" in
+  *vendor*) ;;
+  *) echo "Lynx on the $MODEL needs Armbian's vendor kernel, for the hardware video decoder"
+     echo "(found: $(uname -r)). Write the 'Trixie vendor minimal' image instead."
+     exit 1 ;;
+esac
+echo "Platform: $MODEL, $PRETTY_NAME, kernel $(uname -r)"
+
+# --- GPU: Panthor, not Rockchip's Mali driver ---------------------
+# Armbian's vendor kernel boots with Rockchip's own Mali driver
+# (/dev/mali0). Mesa cannot drive that, so labwc, GTK and mpv would all
+# fall back to software rendering - hopeless at 4K. The Panthor overlay
+# switches the GPU to the open driver Mesa uses. Takes effect on reboot.
+say "GPU driver (Panthor)"
+ENVTXT=/boot/armbianEnv.txt
+if grep -qE '^overlays=.*panthor-gpu' "$ENVTXT"; then
+  echo "Panthor overlay already enabled."
+elif grep -q '^overlays=' "$ENVTXT"; then
+  sudo sed -i 's/^overlays=\(.*\)$/overlays=\1 panthor-gpu/' "$ENVTXT"
+  echo "Added panthor-gpu to the existing overlays line."; REBOOT_NEEDED=1
+else
+  echo "overlays=panthor-gpu" | sudo tee -a "$ENVTXT" >/dev/null
+  echo "Enabled the panthor-gpu overlay."; REBOOT_NEEDED=1
+fi
+
+# --- Hardware video access for the video group --------------------
+# MPP (decode/encode), RGA (scaling) and the DMA buffer heaps arrive
+# root-only on Armbian. Without this mpv only works as root.
+say "Video hardware permissions"
+sudo tee /etc/udev/rules.d/99-rockchip-media.rules >/dev/null <<'EOF'
+KERNEL=="mpp_service", MODE="0660", GROUP="video"
+KERNEL=="rga", MODE="0660", GROUP="video"
+SUBSYSTEM=="dma_heap", MODE="0660", GROUP="video"
+EOF
+sudo udevadm control --reload && sudo udevadm trigger
+sudo usermod -aG video,render,audio "$LYNX_USER"
+
+# --- Packages ------------------------------------------------------
+# The ROCK list differs from the Pi's in three ways:
+#  - no Debian mpv or ffmpeg: ours in /usr/local must be the ones used
+#  - Armbian minimal has no desktop, audio server or even ping, so the
+#    pieces Raspberry Pi OS Desktop provides are listed here
+#  - Python modules come from apt, not pip (gpiozero is Pi-only and
+#    Lynx's GPIO code fails soft without it)
+say "System packages"
+sudo apt update
+sudo apt install -y \
+  labwc wlr-randr wtype \
+  libgtk4-layer-shell0 gir1.2-gtk4layershell-1.0 gir1.2-gtk-4.0 gir1.2-gdkpixbuf-2.0 \
+  python3-gi python3-gi-cairo python3-cairo \
+  python3-fastapi python3-uvicorn python3-yaml python3-requests \
+  python3-serial python3-numpy python3-pyshp \
+  pipewire pipewire-pulse pipewire-bin wireplumber \
+  iputils-ping curl socat librsvg2-bin iw chrony git tmux \
+  hdhomerun-config
+
+# --- Media stack: MPP, RGA, ffmpeg-rockchip, mpv -------------------
+# TODO: Replace with prebuilt .debs from the GitHub release, so a user
+# install takes seconds rather than 15 minutes of compiling. Until then
+# this builds from source, exactly as proven on 21 Oct 2026.
+media_stack_ok() {
+  [ "$(cat "$STAMP" 2>/dev/null)" = "$MEDIA_STACK_VERSION $MPV_TAG" ] || return 1
+  command -v ffmpeg >/dev/null && ffmpeg -hide_banner -decoders 2>/dev/null | grep -q hevc_rkmpp || return 1
+  mpv --no-config --no-osc --version >/dev/null 2>&1 || return 1   # --no-osc only exists with Lua
+}
+
+if media_stack_ok; then
+  say "Media stack already installed ($MEDIA_STACK_VERSION, mpv $MPV_TAG)"
+else
+  say "Building the media stack (about 15 minutes)"
+  sudo apt install -y build-essential pkg-config cmake meson ninja-build nasm \
+    libdrm-dev libx264-dev libx265-dev libssl-dev libsrt-openssl-dev \
+    libass-dev libfreetype-dev libfontconfig-dev libplacebo-dev \
+    libwayland-dev wayland-protocols libxkbcommon-dev \
+    libegl-dev libgles-dev libgbm-dev libdisplay-info-dev \
+    libpulse-dev libasound2-dev libpipewire-0.3-dev libjpeg-dev \
+    libuchardet-dev liblcms2-dev zlib1g-dev libluajit-5.1-dev
+  export PKG_CONFIG_PATH=/usr/local/lib/pkgconfig:/usr/local/lib/aarch64-linux-gnu/pkgconfig
+  mkdir -p "$SRC_DIR"; cd "$SRC_DIR"
+
+  # MPP and RGA: The branches ffmpeg-rockchip is developed against.
+  [ -d rkmpp ] || git clone -b jellyfin-mpp --depth 1 https://github.com/nyanmisaka/mpp.git rkmpp
+  cmake -S rkmpp -B rkmpp/build -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DBUILD_TEST=OFF
+  make -C rkmpp/build -j"$(nproc)"
+  sudo make -C rkmpp/build install
+
+  [ -d rkrga ] || git clone -b jellyfin-rga --depth 1 https://github.com/nyanmisaka/rk-mirrors.git rkrga
+  [ -d rkrga/build ] || meson setup rkrga rkrga/build --prefix=/usr/local --libdir=lib \
+    --buildtype=release --default-library=shared -Dcpp_args=-fpermissive \
+    -Dlibdrm=false -Dlibrga_demo=false
+  sudo ninja -C rkrga/build install
+  sudo ldconfig
+
+  # ffmpeg-rockchip (FFmpeg 8 based): rkmpp decoders and encoders, RGA.
+  [ -d ffmpeg-rockchip ] || git clone --depth 1 https://github.com/nyanmisaka/ffmpeg-rockchip.git
+  cd ffmpeg-rockchip
+  ./configure --prefix=/usr/local --enable-gpl --enable-version3 --enable-nonfree \
+    --enable-shared --disable-static \
+    --enable-libdrm --enable-rkmpp --enable-rkrga \
+    --enable-libx264 --enable-libx265 --enable-libsrt --enable-openssl \
+    --enable-libass --enable-libfreetype --enable-libfontconfig
+  make -j"$(nproc)"
+  sudo make install && sudo ldconfig
+  cd "$SRC_DIR"
+
+  # mpv: 0.41 or later (FFmpeg 8 removed names older mpv uses), Wayland
+  # only, Lua REQUIRED (Lynx's drift-correction script and --no-osc both
+  # need it; left on "auto" it silently builds without), plus our
+  # two-part rkmpp patch for zero-copy decode (see the patch header).
+  rm -rf mpv
+  git clone --depth 1 -b "$MPV_TAG" https://github.com/mpv-player/mpv.git
+  cd mpv
+  git apply "$LYNX_DIR/patches/mpv-0.41-rkmpp.patch"
+  meson setup build --prefix=/usr/local -Dwayland=enabled -Dx11=disabled \
+    -Degl=enabled -Ddrm=enabled -Dgbm=enabled -Dlua=luajit
+  ninja -C build
+  sudo ninja -C build install && sudo ldconfig
+  cd "$SRC_DIR"
+
+  sudo mkdir -p "$(dirname "$STAMP")"
+  echo "$MEDIA_STACK_VERSION $MPV_TAG" | sudo tee "$STAMP" >/dev/null
+  media_stack_ok || { echo ">>> Media stack built but failed its self-check."; exit 1; }
+  echo "Media stack installed."
+fi
+
+# --- Screen output over SRT: wf-recorder on our FFmpeg ------------------
+# See install/build_wf_recorder.sh (shared with the Pi).
+LYNX_ROCK=1 LYNX_DIR="$LYNX_DIR" SRC_DIR="$SRC_DIR" bash "$LYNX_DIR/install/build_wf_recorder.sh"
+
+# --- Audio: PipeWire user session -----------------------------------
+# Raspberry Pi OS Desktop runs this already. Armbian minimal does not,
+# and without it mpv has no HDMI audio and Lynx's level meter reports
+# "audio stream ended" on a loop.
+say "Audio (PipeWire)"
+systemctl --user enable --now pipewire pipewire-pulse wireplumber 2>/dev/null || \
+  echo "PipeWire will start with the first desktop login."
+
+# --- Kiosk: log in on the console and start labwc --------------------
+# getty auto-login rather than a display manager: if labwc ever exits,
+# the console logs in again and restarts it, so the box heals itself.
+# (greetd's auto-login did not survive a reboot in testing.)
+say "Kiosk start-up (auto-login, labwc)"
+if systemctl is-enabled greetd >/dev/null 2>&1; then
+  sudo systemctl disable greetd
+  echo "Disabled greetd."
+fi
+sudo mkdir -p /etc/systemd/system/getty@tty1.service.d
+sudo tee /etc/systemd/system/getty@tty1.service.d/autologin.conf >/dev/null <<EOF
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty --autologin $LYNX_USER --noclear %I \$TERM
+EOF
+# labwc runs in a loop rather than by exec: if it ever exits, it is back
+# two seconds later, and the console session (and getty) never notice.
+# With exec, a labwc that kept exiting made getty restart 14 times in
+# quick succession, then systemd gave up and left a dead console (22 Oct
+# 2026). Each start and exit, with its exit code, goes to /tmp/labwc.log.
+python3 - <<'PY'
+import re
+from pathlib import Path
+p = Path.home() / ".bash_profile"
+s = p.read_text() if p.exists() else ""
+s = re.sub(r"\n?# Lynx: start labwc on the console at boot.*?\nfi\n", "\n", s, flags=re.S)
+block = (
+    "# Lynx: start labwc on the console at boot, and restart it if it ever exits\n"
+    'if [ "$(tty)" = "/dev/tty1" ] && [ -z "$WAYLAND_DISPLAY" ]; then\n'
+    "    export GTK_A11Y=none\n"
+    "    while true; do\n"
+    "        echo \"=== $(date '+%F %T') labwc starting\" >> /tmp/labwc.log\n"
+    "        labwc >> /tmp/labwc.log 2>&1\n"
+    "        echo \"=== $(date '+%F %T') labwc exited, code $?\" >> /tmp/labwc.log\n"
+    "        sleep 2\n"
+    "    done\n"
+    "fi\n"
+)
+p.write_text(s.rstrip("\n") + "\n\n" + block)
+PY
+echo "labwc will start at boot on the console, and restart if it exits."
+
+# --- labwc: no visible pointer ------------------------------------------
+# An invisible cursor theme (every cursor one transparent pixel), not the
+# Pi's keybind. labwc 0.8.3 (Debian trixie) has no HideCursor action, and
+# with no screen connected the keybind's WarpCursor made labwc QUIT, so
+# switching the monitor to another input took the whole display down
+# (22 Oct 2026). A blank theme needs no key presses and cannot fail.
+say "Mouse pointer (invisible cursor theme)"
+mkdir -p ~/.config/labwc
+if [ -f ~/.config/labwc/rc.xml ] && grep -q 'HideCursor' ~/.config/labwc/rc.xml; then
+  cp ~/.config/labwc/rc.xml ~/.config/labwc/rc.xml.lynx-keybind.bak
+  printf '<?xml version="1.0"?>\n<openbox_config>\n</openbox_config>\n' > ~/.config/labwc/rc.xml
+  echo "Removed the cursor keybind from rc.xml (backup: rc.xml.lynx-keybind.bak)."
+elif [ ! -f ~/.config/labwc/rc.xml ]; then
+  printf '<?xml version="1.0"?>\n<openbox_config>\n</openbox_config>\n' > ~/.config/labwc/rc.xml
+fi
+python3 "$LYNX_DIR/install/lynx_blank_cursor.py"
+
+# --- labwc: keys for the SRT virtual screen ------------------------------
+say "labwc keys for SRT screen output"
+python3 "$LYNX_DIR/install/lynx_labwc_srt_keys.py"
+
+# labwc's autostart runs every time labwc starts:
+#  - any old wtype cursor-hide line is retired (see above)
+#  - Lynx is restarted if it is running, so after a labwc restart its mpv
+#    and overlay reconnect at once rather than waiting to notice
+touch ~/.config/labwc/autostart
+sed -i 's/^\(sh -c .sleep 3; wtype.*\)$/# retired, see install\/rock5t.sh: \1/' ~/.config/labwc/autostart
+if ! grep -q 'try-restart lynx' ~/.config/labwc/autostart; then
+  cat >> ~/.config/labwc/autostart <<'EOF'
+# Lynx: reconnect to this labwc at once if Lynx is already running
+systemctl --user try-restart lynx.service &
+EOF
+fi
+
+# --- Lynx keeps running with nobody logged in ----------------------------
+# Lynx is a user service. Without linger, systemd stops a user's
+# services when their last session ends - so when labwc exited (a
+# monitor unplugged, 21 Oct 2026), the web UI went with it.
+say "User services survive logout (linger)"
+sudo loginctl enable-linger "$LYNX_USER"
+
+# --- Ping for ordinary users -----------------------------------------------
+# Armbian's ping lacks the capability to run unprivileged, so Lynx's
+# "wait for the network" check failed every time and waited 45 s at each
+# start. Debian's own recommended fix: allow unprivileged ICMP sockets.
+say "Unprivileged ping"
+echo 'net.ipv4.ping_group_range = 0 2147483647' | sudo tee /etc/sysctl.d/99-lynx-ping.conf >/dev/null
+sudo sysctl --system >/dev/null
+
+# --- Fan: hold the SoC at a steady 40 C --------------------------------
+# Armbian only steps the fan up at 60 C, in five coarse speeds. lynx_fan.py
+# holds 40 C instead: on at 35 C at its slowest reliable speed, faster as
+# needed, off below 30 C. The kernel's 60 C fan step and 85 C CPU
+# throttling stay as the safety net. Settings: /etc/default/lynx-fan.
+say "Fan control (steady 40 C)"
+sudo install -m 755 "$LYNX_DIR/install/lynx_fan.py" /usr/local/sbin/lynx-fan
+[ -f /etc/default/lynx-fan ] || sudo tee /etc/default/lynx-fan >/dev/null <<'EOF'
+# Lynx fan control - see install/lynx_fan.py
+LYNX_FAN_SET_C=40
+LYNX_FAN_ON_C=35
+LYNX_FAN_OFF_C=30
+LYNX_FAN_MIN_PWM=128
+EOF
+sudo tee /etc/systemd/system/lynx-fan.service >/dev/null <<'EOF'
+[Unit]
+Description=Lynx fan control (hold the SoC at a steady temperature)
+After=systemd-modules-load.service
+
+[Service]
+EnvironmentFile=-/etc/default/lynx-fan
+ExecStart=/usr/bin/python3 /usr/local/sbin/lynx-fan
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+sudo systemctl daemon-reload
+sudo systemctl enable lynx-fan.service
+sudo systemctl restart lynx-fan.service
+
+# Deliberately NOT done: forcing the HDMI connector on (video=HDMI-A-1:e).
+# At 4K50 HDMI 2.0 needs scrambling re-enabled in the monitor whenever its
+# input wakes, and the hot-plug event is what triggers it. Forced on, an
+# LG 27UK850 came back from another input to a signal it would not show.
+# Monitor-off is handled in lynx_start.sh instead (no screen, no verdict).
+
+# --- Lynx service: the ROCK's extra environment ------------------------
+# install.sh installs the same lynx.service as on the Pi. On the Pi,
+# labwc's session hands the service its Wayland details; here the
+# service is started by the user manager, so it is told directly.
+say "Lynx service environment"
+mkdir -p ~/.config/systemd/user/lynx.service.d
+cat > ~/.config/systemd/user/lynx.service.d/rock.conf <<'EOF'
+[Service]
+Environment=WAYLAND_DISPLAY=wayland-0 GTK_A11Y=none
+EOF
+systemctl --user daemon-reload 2>/dev/null || true
+
+echo ""
+echo "=== $MODEL platform setup complete ==="
+if [ "$REBOOT_NEEDED" = "1" ]; then
+  echo ">>> The GPU driver changed: reboot before using Lynx (sudo reboot)."
+fi

@@ -180,6 +180,23 @@ local function check_drift()
     local now = mp.get_time()
     local playback = mp.get_property_number("playback-time")
 
+    -- No sound playing: stand down. With no audio the playback clock is
+    -- driven by the pictures alone, and a stills carousel (Lynx-Tx's
+    -- programme 2) shows a new one every few seconds, so its clock moves
+    -- in jumps. To the checks below that read as drift and then as a
+    -- hard freeze, and mpv was restarted every half minute (10 Nov 2026,
+    -- ROCK 5C). Lynx's own monitors still see a genuinely dead stream.
+    local aid = mp.get_property("aid")
+    if aid == nil or aid == "no" then
+        last_real_time = nil
+        last_playback_time = nil
+        estimated_drift = 0.0
+        hard_freeze_streak = 0
+        hard_freeze_detected_at = 0.0
+        write_status()
+        return
+    end
+
     if playback == nil then
         -- Not actually playing yet (still buffering/starting, or
         -- between streams) - nothing meaningful to measure right now.

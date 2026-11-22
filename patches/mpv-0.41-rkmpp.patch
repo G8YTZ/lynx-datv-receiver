@@ -1,0 +1,70 @@
+diff --git a/video/decode/vd_lavc.c b/video/decode/vd_lavc.c
+index 399e1d5..b116d2c 100644
+--- a/video/decode/vd_lavc.c
++++ b/video/decode/vd_lavc.c
+@@ -384,7 +384,13 @@ static void add_all_hwdec_methods(struct hwdec_info **infos, int *num_infos)
+                 // Usually we want to prefer using hw_frames_ctx for true
+                 // hwaccels only, but we actually don't have any way to detect
+                 // those, so always use hw_frames_ctx if offered.
+-                if (cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX) {
++                // Lynx: except ffmpeg-rockchip's rkmpp wrapper decoders, where
++                // avcodec_get_hw_frames_parameters() cannot work (no hwaccel)
++                // and the decoder allocates its own frames from the device.
++                bool rkmpp_wrapper = wrapper && strcmp(wrapper, "rkmpp") == 0 &&
++                    (cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX);
++                if ((cfg->methods & AV_CODEC_HW_CONFIG_METHOD_HW_FRAMES_CTX) &&
++                    !rkmpp_wrapper) {
+                     info.use_hw_frames = true;
+                 } else {
+                     info.use_hw_device = true;
+diff --git a/video/out/hwdec/hwdec_drmprime.c b/video/out/hwdec/hwdec_drmprime.c
+index 7869eb1..4942077 100644
+--- a/video/out/hwdec/hwdec_drmprime.c
++++ b/video/out/hwdec/hwdec_drmprime.c
+@@ -39,6 +39,8 @@ extern const struct m_sub_options drm_conf;
+ 
+ struct priv_owner {
+     struct mp_hwdec_ctx hwctx;
++    // Lynx: ffmpeg-rockchip decoders want an "rkmpp" device, not "drm"
++    struct mp_hwdec_ctx hwctx_rkmpp;
+     int *formats;
+ 
+     struct dmabuf_interop dmabuf_interop;
+@@ -50,6 +52,9 @@ static void uninit(struct ra_hwdec *hw)
+     if (p->hwctx.driver_name)
+         hwdec_devices_remove(hw->devs, &p->hwctx);
+     av_buffer_unref(&p->hwctx.av_device_ref);
++    if (p->hwctx_rkmpp.driver_name)
++        hwdec_devices_remove(hw->devs, &p->hwctx_rkmpp);
++    av_buffer_unref(&p->hwctx_rkmpp.av_device_ref);
+ }
+ 
+ static const dmabuf_interop_init interop_inits[] = {
+@@ -151,6 +156,27 @@ static int init(struct ra_hwdec *hw)
+     p->hwctx.driver_name = hw->driver->name;
+     hwdec_devices_add(hw->devs, &p->hwctx);
+ 
++    /*
++     * Lynx: ffmpeg-rockchip's *_rkmpp decoders only accept an
++     * AV_HWDEVICE_TYPE_RKMPP device, but output ordinary DRM PRIME frames
++     * that this driver already maps. Register an rkmpp device as well when
++     * the ffmpeg in use knows the type. Looked up by name, so no build-time
++     * dependency on the fork.
++     */
++    enum AVHWDeviceType rkmpp_type = av_hwdevice_find_type_by_name("rkmpp");
++    if (rkmpp_type != AV_HWDEVICE_TYPE_NONE) {
++        if (av_hwdevice_ctx_create(&p->hwctx_rkmpp.av_device_ref, rkmpp_type,
++                                   NULL, NULL, 0) == 0) {
++            p->hwctx_rkmpp.hw_imgfmt = IMGFMT_DRMPRIME;
++            p->hwctx_rkmpp.supported_formats = p->formats;
++            p->hwctx_rkmpp.driver_name = hw->driver->name;
++            hwdec_devices_add(hw->devs, &p->hwctx_rkmpp);
++            MP_VERBOSE(hw, "Registered rkmpp device for zero-copy decode\n");
++        } else {
++            MP_VERBOSE(hw, "rkmpp device type known but could not be created\n");
++        }
++    }
++
+     return 0;
+ }
+ 

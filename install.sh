@@ -40,6 +40,39 @@ fi
 echo "=== Lynx DATV Receiver — Installer ==="
 echo ""
 
+# Which board. A Radxa ROCK 5T or 5C gets everything below, as a Pi
+# does, and then install/rock5t.sh for its own video stack, kiosk
+# start-up, fan and permissions (10 Nov 2026: one installer for every
+# board). Anything else is treated as a Raspberry Pi, as before.
+LYNX_MODEL="$(tr -d '\0' < /proc/device-tree/model 2>/dev/null || true)"
+case "$LYNX_MODEL" in
+  *"ROCK 5T"*|*"Rock 5T"*|*"ROCK 5C"*|*"Rock 5C"*) LYNX_ROCK=1 ;;
+  *) LYNX_ROCK=0 ;;
+esac
+echo ">>> Board: ${LYNX_MODEL:-unknown}"
+
+# Which branch, said out loud and early.
+#
+# The installer is fetched FROM a branch but installs whatever BRANCH
+# says, and those are not the same thing: the documented one-liner
+# curls install.sh from beta, which then cloned main because that is
+# the default here. The result was a beta installer quietly installing
+# stable code, and the first anyone knew of it was a receiver
+# reporting the wrong version a week later.
+#
+# Piping into bash swallows arguments unless invoked as
+# "bash -s -- --branch beta", which is easy to leave out, so the
+# defence is to print the answer rather than to assume it was asked
+# for correctly.
+if [ "$BRANCH_EXPLICIT" = "1" ]; then
+  echo ">>> Installing branch: $BRANCH (asked for with --branch)"
+else
+  echo ">>> Installing branch: $BRANCH (default - no --branch given)"
+  echo ">>> For the beta channel, re-run as:"
+  echo ">>>   curl -sSL https://raw.githubusercontent.com/G8YTZ/lynx-datv-receiver/beta/install.sh | bash -s -- --branch beta"
+fi
+echo ""
+
 # --- System update -----------------------------------------
 echo "--- Updating system packages (this can take a while on first run) ---"
 sudo apt update && sudo apt full-upgrade -y
@@ -49,6 +82,14 @@ sudo apt update && sudo apt full-upgrade -y
 # (needed to clone the repo below - almost always already
 # present, but listed explicitly rather than assumed, same
 # reasoning the guide itself gives for curl).
+#
+# hdhomerun-config is SiliconDust's own command-line tool, and it
+# is how Lynx talks to an HDHomeRun - discovery, tuning, status,
+# all of it. Without it the DVB-T2 source finds nothing and says
+# so in the log, which is exactly how the first user to try it
+# found out. Listed here rather than made optional: the package is
+# 56 KB, and a receiver that silently cannot use hardware it has
+# is worse than one carrying a tool it does not need.
 echo "--- Installing system dependencies ---"
 sudo apt install -y \
   mpv \
@@ -67,8 +108,10 @@ sudo apt install -y \
   iw \
   chrony \
   pipewire-bin \
+  pipewire-pulse \
   wlr-randr \
-  git
+  git \
+  hdhomerun-config
 
 # --- Python dependencies -------------------------------------
 # NOTE: the install guide's own copy of this line is missing
@@ -377,6 +420,49 @@ else
   echo "GNSS serial port permissions configured."
 fi
 
+# --- Pi 5 fan: on at 40 C, steps at 45, 55 and 65 C ------------
+# The Pi 5's Active Cooler is run by the kernel in four fixed steps set in
+# config.txt: by default on at 50 C (29%), then 60 (49%), 67.5 (69%) and
+# 75 C (98%), each stopping 5 C lower. A receiver idled with the fan off
+# in the mid 40s (3 Nov 2026: off at 47 C). With only the first step moved
+# to 40 C it sat at 46 C on 29%, since nothing faster comes in before
+# 60 C. So all four move down, speeds unchanged: 40, 45, 55 and 65 C.
+# The kernel still runs the fan, and the CPU's own throttling at 85 C is
+# untouched. Steps, not a set temperature: the ROCK 5T's lynx_fan.py holds
+# a steady 40 C, the Pi 5 hovers around 45 C.
+#
+# Above the --deps-only exit, so Update Now brings it to receivers
+# already in service. Written under its own [all], so it applies whatever
+# conditional section the file ends in. Lynx's own earlier lines (marked
+# "# Lynx: Pi 5 fan") are replaced; fan settings somebody else put there
+# are left alone. Takes effect at the next boot.
+LYNX_FAN_MARK="# Lynx: Pi 5 fan v2 (on 40 C, steps 45/55/65 C)"
+if [ -f /boot/firmware/config.txt ] \
+   && tr -d '\0' < /proc/device-tree/model 2>/dev/null | grep -q "Raspberry Pi 5"; then
+  if grep -qF "$LYNX_FAN_MARK" /boot/firmware/config.txt; then
+    echo "Pi 5 fan steps already set in config.txt - leaving them untouched."
+  elif grep -q "^dtparam=fan_temp" /boot/firmware/config.txt \
+       && ! grep -q "^# Lynx: Pi 5 fan" /boot/firmware/config.txt; then
+    echo "config.txt already has fan settings of its own - leaving them untouched."
+  else
+    echo "--- Pi 5 fan: on at 40 C, steps at 45, 55, 65 C (takes effect at next boot) ---"
+    sudo cp /boot/firmware/config.txt /boot/firmware/config.txt.lynx-fan.bak
+    # Lynx's earlier version, if present: its marker and fan lines go.
+    sudo sed -i -e '/^# Lynx: Pi 5 fan/d' -e '/^dtparam=fan_temp[0-3]\(_hyst\)\?=/d' \
+      /boot/firmware/config.txt
+    printf '\n[all]\n%s\n%s\n' "$LYNX_FAN_MARK" "\
+dtparam=fan_temp0=40000
+dtparam=fan_temp0_hyst=5000
+dtparam=fan_temp1=45000
+dtparam=fan_temp1_hyst=5000
+dtparam=fan_temp2=55000
+dtparam=fan_temp2_hyst=5000
+dtparam=fan_temp3=65000
+dtparam=fan_temp3_hyst=5000" | sudo tee -a /boot/firmware/config.txt > /dev/null
+    echo "Fan steps written to config.txt."
+  fi
+fi
+
 # --- Desktop shell ---------------------------------------------
 # labwc is required - the overlay is a GTK4 layer-shell client and
 # needs a wlroots compositor - but the Pi desktop shell running on top
@@ -443,6 +529,18 @@ fi
 # --kiosk implies --deps-only: it is a one-off toggle run against an
 # already-working receiver, not a reason to redo the whole install.
 if [ "$1" = "--deps-only" ] || [ "$1" = "--kiosk" ]; then
+  # A ROCK's own set-up is safe to repeat (every step checks first, and
+  # the 15 minute media build is skipped unless its version changed), so
+  # Update Now brings its changes to ROCK receivers too.
+  if [ "$LYNX_ROCK" = "1" ] && [ -f ~/lynx/install/rock5t.sh ]; then
+    LYNX_DIR=~/lynx bash ~/lynx/install/rock5t.sh
+  fi
+  # The Pi's SRT screen output pieces (a ROCK's come with rock5t.sh):
+  # wf-recorder built from source and labwc's virtual-screen keys.
+  if [ "$LYNX_ROCK" != "1" ] && [ -f ~/lynx/install/build_wf_recorder.sh ]; then
+    LYNX_DIR=~/lynx bash ~/lynx/install/build_wf_recorder.sh
+    python3 ~/lynx/install/lynx_labwc_srt_keys.py || true
+  fi
   echo "--- Dependencies confirmed ($1) ---"
   exit 0
 fi
@@ -612,6 +710,29 @@ else
 </openbox_config>
 RCXML
   echo "Created."
+fi
+
+# --- SRT screen output (Pi) -------------------------------------
+# After the cursor keybind above, which may have just made rc.xml.
+if [ "$LYNX_ROCK" != "1" ] && [ -f ~/lynx/install/build_wf_recorder.sh ]; then
+  LYNX_DIR=~/lynx bash ~/lynx/install/build_wf_recorder.sh
+  python3 ~/lynx/install/lynx_labwc_srt_keys.py || true
+fi
+
+# A ROCK: its own platform set-up now, after everything above, because
+# it replaces two things this script does for the Pi (the cursor
+# keybind, which makes labwc quit on Debian's labwc, and desktop
+# auto-login, done there by console auto-login instead). Then it has
+# its own closing words; the Pi's below do not apply.
+if [ "$LYNX_ROCK" = "1" ]; then
+  LYNX_DIR=~/lynx bash ~/lynx/install/rock5t.sh
+  echo ""
+  echo "=== Install complete ==="
+  echo ""
+  echo "Reboot to start Lynx:  sudo reboot"
+  echo "Then open http://$(hostname -I | awk '{print $1}'):8080 and set your Picotuner"
+  echo "and site details under Configuration."
+  exit 0
 fi
 
 echo ""

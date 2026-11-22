@@ -19,6 +19,7 @@ Usage:  python3 verify.py lynx_app.py [reference.py]
 """
 
 import ast
+import shutil
 import re
 import subprocess
 import sys
@@ -92,6 +93,23 @@ def check_removals(path, reference):
     return removed
 
 
+def _node_usable():
+    """Node.js present, and new enough for the page's optional
+    chaining (?.), which needs Node 14. An old Node reports every
+    script block as broken when nothing is wrong with them - it did,
+    on a Mac, on 21 Oct 2026."""
+    if not shutil.which("node"):
+        return False, "node not installed - JavaScript NOT checked (install nodejs)"
+    try:
+        v = subprocess.run(["node", "--version"], capture_output=True,
+                           text=True).stdout.strip()
+        if int(v.lstrip("v").split(".")[0]) < 14:
+            return False, f"node {v} too old (need 14+) - JavaScript NOT checked"
+    except (ValueError, OSError):
+        pass
+    return True, ""
+
+
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else "lynx_app.py"
     reference = sys.argv[2] if len(sys.argv) > 2 else None
@@ -103,7 +121,10 @@ def main():
     print(f"  python           {'OK' if ok else 'FAIL'}   {msg}")
     failed |= not ok
 
-    for n, size, ok, msg in check_scripts(path):
+    node_ok, node_msg = _node_usable()
+    if not node_ok:
+        print(f"  javascript       SKIP   {node_msg}")
+    for n, size, ok, msg in (check_scripts(path) if node_ok else []):
         print(f"  script block {n}   {'OK' if ok else 'FAIL'}   "
               f"{size:>6} chars{'' if ok else '   ' + msg}")
         failed |= not ok
