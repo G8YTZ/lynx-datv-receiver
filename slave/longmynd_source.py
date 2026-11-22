@@ -2,10 +2,15 @@
 """
 Slave Rx - Longmynd tuner source.
 
-Runs a MiniTiouner converted with the BATC Pico adaptor as a Slave Rx:
-drives it with Longmynd over USB, sends the transport stream to the
-repeater, and translates Longmynd's status into the format Lynx already
-parses.
+Runs a standard, unmodified MiniTiouner as a Remote Rx: drives it with
+Longmynd over USB, sends the transport stream to the repeater, and
+translates Longmynd's status into the format Lynx already parses.
+
+A Picotuner (the non-Ethernet one) is not supported yet. It presents
+differently over USB and has not been tested against this, so whether
+Longmynd can drive it here is an open question rather than an assumed
+yes. This docstring previously claimed a Pico-converted board, which
+was never what the Remote Rx was built and proved against.
 
 WHY THE STATUS READER IS NOT OPTIONAL
 -------------------------------------
