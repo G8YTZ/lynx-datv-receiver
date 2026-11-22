@@ -90,6 +90,12 @@ sudo apt update && sudo apt full-upgrade -y
 # found out. Listed here rather than made optional: the package is
 # 56 KB, and a receiver that silently cannot use hardware it has
 # is worse than one carrying a tool it does not need.
+# srt-tools supplies srt-live-transmit, which lynx_relay.py runs to
+# receive a Remote Rx. Missing it, the Remote Rx panel sits at
+# "waiting on port 10947" for ever and only a small note in the
+# panel says why. It went unnoticed because the machine that
+# developed the Remote Rx had the package installed by hand; the
+# first clean install to receive one found it immediately.
 echo "--- Installing system dependencies ---"
 sudo apt install -y \
   mpv \
@@ -111,7 +117,8 @@ sudo apt install -y \
   pipewire-pulse \
   wlr-randr \
   git \
-  hdhomerun-config
+  hdhomerun-config \
+  srt-tools
 
 # --- Python dependencies -------------------------------------
 # NOTE: the install guide's own copy of this line is missing
