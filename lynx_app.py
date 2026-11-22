@@ -9727,7 +9727,7 @@ def config_page():
                             <div class="col-6">
                                 <label class="form-label small mb-1" for="rs-srt-port">SRT port</label>
                                 <input type="number" min="0" max="65535" step="1" class="form-control form-control-sm" id="rs-srt-port" placeholder="status port − 50">
-                                <div class="small text-muted mt-1">Blank: status port minus 50 (10947). Forward this UDP port for a Remote Rx off-site.</div>
+                                <div class="small text-muted mt-1">Blank: status port minus 50 (<span id="rs-srt-derived">10947</span>). Forward this UDP port for a Remote Rx off-site.</div>
                             </div>
                         </div>
                         <div class="fw-semibold small mt-3 mb-1">Settings sent to the Remote Rx</div>
@@ -11127,6 +11127,15 @@ function updateRemoteSourceWarning() {
     // appear to report things it never sent.
     const el = document.getElementById('rs-warning');
     const port = parseInt(document.getElementById('rs-status-port').value, 10);
+    // The derived SRT port, shown live. It used to be hard-coded at
+    // 10947, so changing the status port left the hint stating a number
+    // that was no longer true - which is how an evening got spent
+    // chasing a port mismatch that the page itself had invented.
+    const derived = document.getElementById('rs-srt-derived');
+    if (derived) {
+        derived.textContent = (Number.isFinite(port) && port > 1074)
+                              ? String(port - 50) : '\u2014';
+    }
     if (port === 9997) {
         el.textContent = 'Port 9997 belongs to this receiver and its own ' +
                           'Picotuner. Choose another - 10997 is the default.';
