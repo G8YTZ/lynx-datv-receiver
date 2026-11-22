@@ -1,0 +1,47 @@
+# Lynx Remote Rx settings.
+#
+# Sourced as shell, so anything with a space in it must be quoted.
+# Only LYNX_HOST must be right before the first start: frequency, symbol
+# rate, name and locator can all be set later from the Lynx at the
+# repeater, which sends them here (see KEY below).
+#
+# After editing:  sudo systemctl restart lynx-slave
+
+# Where the repeater's Lynx receiver is.
+LYNX_HOST="192.168.0.160"
+
+# What to tune. Frequency in kHz, symbol rate in kS/s.
+FREQ="1304000"
+SR="2000"
+
+# How this Remote Rx introduces itself.
+# Shown on the repeater's panel, followed by the locator.
+NAME="Remote Rx"
+LOCATOR="JO01AJ"
+
+# Ports. The quality port is derived as STATUS_PORT minus 96 unless
+# set here, and Lynx derives it the same way — changing one end only
+# is how you get a Remote Rx that reports lock but no MER.
+STATUS_PORT="10997"
+VIDEO_PORT="10998"
+#QUALITY_PORT="10901"
+
+# Heartbeat cadence in seconds.
+INTERVAL="2.0"
+
+# How the video reaches the repeater: "udp" on a LAN, "srt" anywhere
+# else. Status always stays UDP. The repeater listens for this Remote Rx's
+# SRT on its status port minus 50 (10947 here) unless set; set it only
+# if Lynx's Remote Rx settings say otherwise.
+TRANSPORT="srt"
+#SRT_PORT="10947"
+# SRT latency in ms: about four round trips. 300 suits most broadband.
+SRT_LATENCY="300"
+
+# Remote configuration. The repeater signs the settings it sends with
+# this key; enter the same key in Lynx's Config page, Remote Rx section.
+# install.sh makes one if there is none. Settings received are kept in
+# /var/lib/lynx-slave/settings.json and win over FREQ, SR, NAME and
+# LOCATOR above, so after a power cut the Remote Rx comes back as it was
+# last told. Delete that file to go back to the values above.
+#KEY=""

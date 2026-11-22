@@ -119,9 +119,18 @@ local last_action_at = 0.0  -- updated whenever speed actually changes or drop-b
 -- is a hard freeze rather than gradual drift.
 local HARD_FREEZE_ADVANCE_THRESHOLD = 0.2     -- playback must advance at least this much per
                                                 -- real second to not count as "frozen"
-local HARD_FREEZE_CONSECUTIVE_CHECKS = 2       -- this many consecutive near-zero-advance checks
-                                                 -- (~2s of genuinely zero progress) confirms a
-                                                 -- hard freeze, distinct from gradual drift
+local HARD_FREEZE_CONSECUTIVE_CHECKS = 5       -- this many consecutive near-zero-advance checks
+                                                 -- (~5s of genuinely zero progress) confirms a
+                                                 -- hard freeze, distinct from gradual drift.
+                                                 -- Was 2: a source that restarts its stream
+                                                 -- (clip change, HDMI mode change) sends
+                                                 -- nothing for 1-2.5 s, which then read as a
+                                                 -- freeze and cost a full mpv restart, where a
+                                                 -- set-top box just waits. Seen in Rob VK3IE's
+                                                 -- PCR logs, gaps of up to 2.2 s (14 Nov 2026).
+local SOURCE_JUMP_SECS = 1.0                   -- playback-time moving backwards, or this much
+                                                 -- further than real time, is the source
+                                                 -- restarting with new timestamps, not drift
 local HARD_FREEZE_STARTUP_GRACE_SECS = 12.0    -- no hard-freeze evaluation at all for this long
                                                  -- after a fresh start-file - covers mpv's own
                                                  -- normal initial buffering/seek-to-live-edge,
@@ -209,6 +218,21 @@ local function check_drift()
         local real_delta = now - last_real_time
         local playback_delta = playback - last_playback_time
 
+        -- The source restarted its stream (new PCR, timestamps jump).
+        -- Start measuring again from here: a jump is neither drift nor a
+        -- freeze, and counting it as either turned one short source
+        -- glitch into a drop-buffers or a full restart on top (14 Nov 2026).
+        if playback_delta < -SOURCE_JUMP_SECS or playback_delta > real_delta + SOURCE_JUMP_SECS then
+            mp.msg.info(string.format(
+                "lynx_drift_correction: playback-time jumped %+.2fs in %.2fs - source " ..
+                "restarted its stream, re-basing", playback_delta, real_delta))
+            last_real_time = now
+            last_playback_time = playback
+            hard_freeze_streak = 0
+            write_status()
+            return
+        end
+
         -- Hard freeze check first, and separately from the drift
         -- accumulator below - a genuine freeze (essentially zero
         -- playback progress despite real time passing) is a
@@ -241,7 +265,13 @@ local function check_drift()
         -- means we fell further behind live by exactly that shortfall -
         -- true regardless of whether the cause is inside mpv or
         -- somewhere upstream of it.
-        estimated_drift = estimated_drift + (real_delta - playback_delta)
+        -- A stall (nothing arriving) is not falling behind live: no backlog
+        -- builds while the source sends nothing. Only count a shortfall
+        -- while playback is actually moving; a stall that never ends is the
+        -- hard-freeze check's job above.
+        if playback_delta >= HARD_FREEZE_ADVANCE_THRESHOLD then
+            estimated_drift = estimated_drift + (real_delta - playback_delta)
+        end
         if estimated_drift < 0 then
             estimated_drift = 0  -- never meaningfully "ahead" of live - clamp for sanity
         end
