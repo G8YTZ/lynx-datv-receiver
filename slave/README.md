@@ -63,15 +63,21 @@ If the name isn't found, look up the Zero's address in your router's device list
 
 ## Step 3: Install
 
-Copy and paste these, one line at a time:
+Copy and paste the whole block in one go:
 
 ```
-sudo apt update && sudo apt full-upgrade -y
-sudo apt install -y git
-git clone --depth 1 --filter=blob:none --sparse -b beta-wip https://github.com/G8YTZ/lynx-datv-receiver.git ~/lynx-datv-receiver
-cd ~/lynx-datv-receiver && git sparse-checkout set slave
-cd slave && ./install.sh
+sudo apt update &&
+sudo apt full-upgrade -y &&
+sudo apt install -y git &&
+git clone --depth 1 --filter=blob:none --sparse -b beta https://github.com/G8YTZ/lynx-datv-receiver.git ~/lynx-datv-receiver &&
+git -C ~/lynx-datv-receiver sparse-checkout set slave &&
+~/lynx-datv-receiver/slave/install.sh
 ```
+
+Each step runs only if the one before it worked, so a failure stops there
+rather than carrying on against a half-built system. Expect it to take a
+while on a Zero 2 W: the upgrade and the Longmynd build are both slow.
+Watch the end of it, because the installer prints this Remote Rx's key.
 
 This fetches only the Remote Rx part of Lynx, not the whole receiver. The installer then:
 
