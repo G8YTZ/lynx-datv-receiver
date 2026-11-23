@@ -49,19 +49,33 @@ straight to srt-live-transmit and the aligner thread is not started.
 WHAT IT CAN AND CANNOT REPORT
 -----------------------------
 It reports SSI as a percentage, SQI, SNR in dB and PER, plus the
-modulation it found. From those, honestly:
+modulation it found. Those go to the repeater under their own names:
 
-    MER     <- SNR, which is the same measurement by another name
+    SNR     <- SNR in dB, in a row of its own
+    Level   <- SSI, as the percentage it is
+    SNQ     <- SQI, likewise
+    PER     <- PER, which is an error rate and not a quality score
+    Standard<- DVB-T or DVB-T2, as the tuner found it
     Mode    <- constellation and FEC rate, e.g. "QPSK 5/6"
+
+This is the HDHomeRun's field set, because the HDHomeRun is the other
+DVB-T/T2 receiver in Lynx and it already faced the same question. It is
+NOT the Minitiouner's: those are DVB-S2 measurements and a Knucker
+cannot fill them.
+
+The first version of this module reported its SNR as MER, which was
+wrong and is now fixed - see build_quality_lines() for why it matters
+rather than being pedantry.
 
 And deliberately not:
 
-    Level   SSI is a percentage with no published mapping to dBm.
-            Inventing one would put a number on the panel that looks
-            like the Minitiouner's calibrated reading and is not.
     Margin  It would need a required-C/N figure per constellation and
             code rate, and a guessed margin is worse than none - the
             same rule the Minitiouner's DVB-S path already follows.
+    dBm     SSI is a percentage with no published mapping to dBm.
+            Inventing one would put a number on the panel that looked
+            like the Minitiouner's calibrated reading and was not. The
+            percentage itself is fine, and is what Level shows.
     Callsign and codecs
             They come from the SDT and the PMT, which Longmynd parses
             and this binary does not expose. Reading them would mean
@@ -222,8 +236,8 @@ class KnuckerState:
             self.per = None
 
 
-def build_quality_lines(snap: dict) -> str:
-    """The tagged $n,m block for the quality port, or "" if nothing yet.
+def build_quality_lines(snap: dict, bandwidth_khz: int = 0) -> str:
+    """The tagged block for the quality port, or "" if nothing yet.
 
     Tagged rather than a column table, for the reason Lynx's own
     comments record: a column shift once fed one receiver's MER into
@@ -233,19 +247,68 @@ def build_quality_lines(snap: dict) -> str:
     Fields are omitted rather than zeroed when they are not known, so
     the repeater can tell "this Remote Rx has no rich status" from
     "this Remote Rx is reporting nothing", which are different faults.
+
+    The DVB-T/T2 measurements use NAMED tags - $SNR, $SSI, $SQI, $PER,
+    $STD, $BW - rather than numbers. The numbered tags mirror Longmynd's
+    own status IDs, and these measurements have no Longmynd equivalent,
+    so any number here would be invented and could collide with a real
+    one later. A name cannot, and it says what it is in a packet dump.
+
+    WHY NOT $12, THE MER TAG
+    ------------------------
+    Because this tuner does not measure MER, and an earlier version of
+    this function said it did. SNR and MER are close relatives, not the
+    same measurement: MER is computed from the constellation error
+    vectors and so carries every impairment - phase noise, I/Q
+    imbalance, non-linearity - while an SNR estimate is about noise.
+    They read alike in a noise-limited channel and part company
+    everywhere else.
+
+    On its own that would be pedantry. What makes it matter is that the
+    panel shows Remote Rx figures beside a Minitiouner's, so a number
+    in the MER row is an invitation to compare the two tuners directly,
+    and the comparison would be wrong. Lynx already refuses exactly
+    this for the HDHomeRun, in its own words: "Presenting SNQ as MER
+    would make two different things look comparable on one overlay, and
+    somebody would eventually compare them." That applies here, for the
+    same reason, so the SNR goes in a row of its own labelled SNR.
     """
     if not snap["locked"]:
         return ""
     lines = []
     if snap["snr_db"]:
-        # $12 is the MER tag Lynx already reads for a Picotuner. SNR
-        # and MER are the same measurement under two names here.
-        lines.append(f"$12,{snap['snr_db']:.1f}")
+        lines.append(f"$SNR,{snap['snr_db']:.1f}")
+    # SSI and SQI as the percentages the tuner gives. The panel labels
+    # them as percentages too, which is what the earlier refusal to
+    # report a Level was really about: the objection was to inventing a
+    # dBm figure from a percentage, not to showing the percentage. The
+    # HDHomeRun panel has shown a percentage Level for months.
+    if snap["ssi"] is not None:
+        lines.append(f"$SSI,{snap['ssi']}")
+    if snap["sqi"] is not None:
+        lines.append(f"$SQI,{snap['sqi']}")
+    if snap["per"] is not None:
+        # Its own row, NOT the HDHomeRun's SEQ: SEQ is a 0-100 quality
+        # where more is better, and PER is an error rate where more is
+        # worse. Putting one in the other's row would be the same
+        # mistake as MER, upside down.
+        lines.append(f"$PER,{snap['per']}")
+    if snap["mod"]:
+        # DVB-T or DVB-T2, as the tuner found it rather than as we
+        # asked: it will lock either without being told which.
+        lines.append(f"$STD,{snap['mod']}")
     if snap["const"] and snap["fec"]:
-        # $18 is the mode tag, e.g. "QPSK 5/6". No $30 margin to go
-        # with it: that needs a required-C/N figure per mode, and a
+        # $18 is the mode tag, e.g. "QPSK 5/6" - a real Longmynd
+        # equivalent, so it keeps the Longmynd number. No $30 margin to
+        # go with it: that needs a required-C/N figure per mode, and a
         # guessed margin is worse than none.
         lines.append(f"$18,{snap['const']} {snap['fec']}")
+    if bandwidth_khz:
+        # What it is tuned to, not a measurement: there is no bandwidth
+        # estimator in this binary. Reported anyway because it confirms
+        # the setting actually took, which is otherwise invisible from
+        # the repeater.
+        lines.append(f"$BW,{bandwidth_khz}")
     return "\n".join(lines)
 
 
@@ -351,7 +414,10 @@ def main():
     tuner = KnuckerState()
     stop = threading.Event()
 
-    status = remote_common.StatusSender(args, tuner, build_quality_lines)
+    # The bandwidth comes from the arguments, not the tuner: it is the
+    # one reported field this binary does not measure.
+    status = remote_common.StatusSender(
+        args, tuner, lambda snap: build_quality_lines(snap, args.sr))
     status.start()
 
     # Where the tuner sends its transport stream. Already 1316-byte

@@ -4402,6 +4402,13 @@ REMOTE_RESUME_WAIT_SECS = 30
 REMOTE_QUALITY_FIELDS = (
     "mer", "margin", "symbol_rate", "modcod", "programme",
     "dbm", "agc1", "agc2", "codec", "audio_codec",
+    # DVB-T/T2 measurements, from a Knucker Remote Rx. Separate names
+    # from the DVB-S2 ones above for the same reason HDHR_QUALITY_FIELDS
+    # is separate: an SNR is not a MER and an SSI percentage is not a
+    # calibrated dBm, and one name for both would invite a comparison
+    # that does not hold. A Remote Rx fills one group or the other,
+    # never both, so the panel shows whichever arrived.
+    "snr", "ssi", "sqi", "per", "standard", "bandwidth",
 )
 
 
@@ -5580,6 +5587,21 @@ def remote_quality_monitor(index: int):
             # tuner fill these rows by the same route.
             if '$31' in fields: st["codec"]       = fields['$31']
             if '$34' in fields: st["audio_codec"] = fields['$34']
+
+            # DVB-T/T2, from a Knucker. Named tags rather than numbers:
+            # the numbered ones mirror Longmynd's own status IDs, and
+            # these measurements have no Longmynd equivalent, so a
+            # number here would be invented and could collide with a
+            # real one later. Deliberately NOT folded into "mer" and
+            # "dbm" above, however convenient that would be for the
+            # panel: an SNR in the MER row would sit beside a
+            # Minitiouner's MER and be compared with it.
+            if '$SNR' in fields: st["snr"]       = fields['$SNR']
+            if '$SSI' in fields: st["ssi"]       = fields['$SSI']
+            if '$SQI' in fields: st["sqi"]       = fields['$SQI']
+            if '$PER' in fields: st["per"]       = fields['$PER']
+            if '$STD' in fields: st["standard"]  = fields['$STD']
+            if '$BW'  in fields: st["bandwidth"] = fields['$BW']
 
         except socket.timeout:
             # Silence is normal and says nothing on its own: the status
@@ -15851,11 +15873,36 @@ async function updateStatus() {
             }
             const st = !rem.online ? 'offline' : (rem.locked ? 'locked' : 'idle');
             setPanelState(id + '-header', id + '-status', label, st);
-            // Deliberately the local receiver's row set, in its order and
-            // with its units. A Slave sends the same fields under the same
-            // tags, so anything that reads differently here is a fault
-            // rather than a difference worth preserving.
-            const rows = [
+            // A Knucker is a DVB-T/T2 receiver and measures different
+            // things, so it gets the HDHomeRun's row set rather than the
+            // Minitiouner's: the same rows, labels and units as the
+            // HDHomeRun panel already uses, because that is the other
+            // DVB-T/T2 receiver here and two DVB-T/T2 panels that read
+            // differently would be a fault.
+            //
+            // The dash tests are "not null and not empty" rather than
+            // truthy, deliberately: 0 % is a real reading from a tuner
+            // that has lost the signal, and a truthy test would show it
+            // as a dash - which looks like a tuner saying nothing
+            // instead of one saying zero.
+            const val = v => (v !== null && v !== undefined && v !== '') ? v : null;
+            const rows = rem.tuner === 'knucker' ? [
+                ['Callsign',    rem.callsign || '—'],
+                ['Service',     rem.service || '—'],
+                ['Frequency',   rem.frequency ? rem.frequency + ' MHz' : '—'],
+                ['Bandwidth',   val(rem.bandwidth) !== null ? rem.bandwidth + ' kHz' : '—'],
+                ['Standard',    rem.standard || '—'],
+                ['Mode',        rem.modcod || '—'],
+                ['SNR',         val(rem.snr) !== null ? rem.snr + ' dB' : '—'],
+                ['Level',       val(rem.ssi) !== null ? rem.ssi + ' %' : '—'],
+                ['SNQ',         val(rem.sqi) !== null ? rem.sqi + ' %' : '—'],
+                ['PER',         val(rem.per) !== null ? rem.per : '—'],
+            ] : [
+                // A Minitiouner Remote Rx: deliberately the local
+                // receiver's row set, in its order and with its units. It
+                // sends the same fields under the same tags, so anything
+                // that reads differently here is a fault rather than a
+                // difference worth preserving.
                 ['Callsign',    rem.callsign || '—'],
                 ['Service',  rem.service || '—'],
                 ['Provider',    rem.programme || '—'],
