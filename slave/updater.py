@@ -182,6 +182,21 @@ def smoke_test(slave_dir, log=print):
         except (OSError, subprocess.SubprocessError) as e:
             return False, f"could not compile {name}: {e}"
 
+    # The start-up wrapper is in the update path too, now that
+    # /usr/local/bin/lynx-slave is only a launcher that hands over to
+    # it. A bash syntax error in it would take the site off the air with
+    # nothing in Python to catch it, so it gets the same treatment as
+    # the .py files: checked, not run.
+    wrapper = os.path.join(slave_dir, "lynx-slave")
+    if os.path.exists(wrapper):
+        try:
+            subprocess.run(["bash", "-n", wrapper], capture_output=True,
+                           text=True, timeout=60, check=True)
+        except subprocess.CalledProcessError as e:
+            return False, f"lynx-slave does not parse: {(e.stderr or '').strip()[:200]}"
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, f"could not check lynx-slave: {e}"
+
     # Every source module, not just the one this unit happens to run.
     # A Knucker unit that only start-tested the Minitiouner source
     # would pass an update that breaks the code it actually runs, and
