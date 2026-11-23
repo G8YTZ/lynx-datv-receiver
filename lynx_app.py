@@ -15387,6 +15387,13 @@ async function onLnbToneClick(plug) {
     }
 }
 
+// Panels a human has opened or closed by hand, keyed by body id.
+// undefined means "follow the lock", true and false mean somebody
+// decided. Held here rather than read back off the element because the
+// status poll rewrites the panel two or three times a second, and
+// anything inferred from the DOM at that rate is a race.
+const panelManual = {};
+
 function setPanelState(headerId, bodyId, label, state, extra) {
     // One place sets the header, its badge and whether the body is shown,
     // so a header can never disagree with what is underneath it - which
@@ -15410,16 +15417,37 @@ function setPanelState(headerId, bodyId, label, state, extra) {
         h.innerHTML = label +
             '<span class="badge ' + cls + '" style="float:right; font-size:0.75em;">' +
             text + '</span>' + (extra || '');
+        // Click the header to open a panel that is not locked, or shut
+        // one that is. Bound once: innerHTML above replaces the
+        // header's CONTENTS on every poll, but not the header itself,
+        // so a listener on the element survives - and an onclick
+        // written into that innerHTML would be rebuilt two or three
+        // times a second for no reason.
+        if (!h.dataset.toggleBound) {
+            h.dataset.toggleBound = '1';
+            h.style.cursor = 'pointer';
+            h.addEventListener('click', () => {
+                const el = document.getElementById(bodyId);
+                if (!el) return;
+                panelManual[bodyId] = (el.style.display === 'none');
+                el.style.display = panelManual[bodyId] ? '' : 'none';
+            });
+        }
     }
     const b = document.getElementById(bodyId);
-    // Hidden unless locked. The panel list is meant to be scannable at
-    // a glance, and a dozen open panels full of dashes is not.
+    // Closed unless locked, so the panel list stays scannable at a
+    // glance - opening every unlocked panel was tried and left a column
+    // of panels full of dashes.
     //
-    // Opening an unlocked Remote Rx's rows was tried, so that its Level
-    // could be read while searching, and it made every panel stand
-    // open. Anything needed on a panel that is not locked belongs in
-    // the header instead, as "extra" above.
-    if (b) b.style.display = (state === 'locked') ? '' : 'none';
+    // Unless somebody has said otherwise by clicking, which wins and
+    // keeps winning: the poll runs two or three times a second, so a
+    // panel opened by hand that was not also remembered would shut
+    // again before it could be read.
+    if (b) {
+        const manual = panelManual[bodyId];
+        b.style.display = (manual === undefined ? state === 'locked' : manual)
+                          ? '' : 'none';
+    }
 }
 
 // Video badges - see patch_video_badges.py.
