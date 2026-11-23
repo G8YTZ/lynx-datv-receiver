@@ -297,6 +297,17 @@ def build_quality_lines(snap: dict, bandwidth_khz: int = 0) -> str:
     if snap["ssi"] is not None:
         lines.append(f"$SSI,{snap['ssi']}")
 
+    if bandwidth_khz:
+        # Also sent whether or not there is a lock, because it is not a
+        # measurement: there is no bandwidth estimator in this binary,
+        # it is simply what the tuner was told to use. So it is known
+        # at all times, and it is one of the first things worth seeing
+        # when a Remote Rx will not lock - it confirms the setting the
+        # repeater pushed actually took. Sending it only when locked
+        # meant the panel showed a dash for it during the one period
+        # anybody would look.
+        lines.append(f"$BW,{bandwidth_khz}")
+
     # Everything else describes a signal being demodulated, so it is
     # suppressed without a lock rather than sent as a stale or zero
     # reading.
@@ -323,12 +334,6 @@ def build_quality_lines(snap: dict, bandwidth_khz: int = 0) -> str:
         # go with it: that needs a required-C/N figure per mode, and a
         # guessed margin is worse than none.
         lines.append(f"$18,{snap['const']} {snap['fec']}")
-    if bandwidth_khz:
-        # What it is tuned to, not a measurement: there is no bandwidth
-        # estimator in this binary. Reported anyway because it confirms
-        # the setting actually took, which is otherwise invisible from
-        # the repeater.
-        lines.append(f"$BW,{bandwidth_khz}")
     return "\n".join(lines)
 
 
