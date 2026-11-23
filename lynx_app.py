@@ -2018,7 +2018,14 @@ DELAY_RESTART_DIAGNOSTIC_MODE = False  # Diagnostic complete - unlike the HEVC t
 # threshold in place as a backstop for a different, more severe failure mode, but it should not
 # be relied on as the only protection while this flag is False.
 DELAY_DIAGNOSTIC_LOG_PATH = "/tmp/delay_diagnostic.log"
-DELAY_EMERGENCY_THRESHOLD_SECS = 20.0        # a gap this large, sustained, is unambiguously bad
+# A gap this large, sustained AND with playback frozen, is unambiguously
+# bad. The frozen-playback condition is not optional: a gap this size is
+# ordinary at a low bitrate, because --demuxer-max-bytes is a BYTE cap
+# and the time it represents scales inversely with the rate - about 2.7s
+# at 1.5 Mb/s, about 28s at the 0.15 Mb/s a narrowband Knucker Remote Rx
+# delivers. Without the test this fired continuously on a healthy
+# picture (23 Nov 2026).
+DELAY_EMERGENCY_THRESHOLD_SECS = 20.0
 DELAY_EMERGENCY_CONSECUTIVE_CHECKS = 5        # ...for this many consecutive checks (~10s) always restarts
 
 # ── Video badges: what is received (IN), what HDMI sends (OUT) ───
@@ -2478,20 +2485,32 @@ def mpv_decoder_health_monitor():
                               # the freeze length rather than mpv's own recovery time. Halved to
                               # reduce worst-case detection latency, now paired with the raised
                               # 10-error threshold above rather than the original 3.
-    DELAY_THRESHOLD_SECS = 6.0   # gap between playback and buffered position...
-                                 # Was 3.0, which a healthy stream could reach on its own:
-                                 # a Slave in good health measures 2.6-2.7s of cache with
-                                 # no underrun and the clock advancing normally, so routine
-                                 # variation crossed the line and restarted mpv for no
-                                 # reason. Observed as fifteen restarts in a few minutes,
-                                 # each rendering successfully before being restarted again,
-                                 # until the circuit breaker below backed off and let a
-                                 # picture settle. The restart is also counterproductive: it
-                                 # discards the buffer and forces a fresh acquisition, which
-                                 # on a five-second GOP costs more delay than it recovers.
-                                 # 6.0 is about double a healthy working delay and still far
-                                 # below the 20s emergency threshold that catches a gap
-                                 # genuinely running away...
+    DELAY_THRESHOLD_SECS = 3.0   # gap between playback and buffered position...
+                                 # 3.0 -> 6.0 -> 3.0, and the round trip is the point.
+                                 #
+                                 # It went up because a healthy stream could reach 3.0 on
+                                 # its own: a Remote Rx in good health measures 2.6-2.7s of
+                                 # cache with no underrun AND THE CLOCK ADVANCING NORMALLY,
+                                 # so routine variation crossed the line and restarted mpv
+                                 # for no reason. Fifteen restarts in a few minutes, each
+                                 # rendering successfully before being restarted again,
+                                 # until the circuit breaker backed off and let a picture
+                                 # settle. The restart is also counterproductive: it
+                                 # discards the buffer and forces a fresh acquisition,
+                                 # which on a five-second GOP costs more delay than it
+                                 # recovers.
+                                 #
+                                 # Every one of those false positives had playback
+                                 # advancing, which the trigger now requires to be frozen.
+                                 # So the reason for 6.0 no longer applies, and 6.0 had a
+                                 # cost: the wedge this trigger was validated against sat
+                                 # at a gap of 4.0s, so raising the threshold quietly
+                                 # disabled the protection for the exact fault that
+                                 # justified it, for two months.
+                                 #
+                                 # Back at 3.0 with the frozen-playback test: the slow feed
+                                 # that provoked all this produces no restarts, and the 4.0s
+                                 # wedge is caught again.
     DELAY_CONSECUTIVE_CHECKS = 2  # ...persisting for this many consecutive checks triggers a restart.
                                     # Was 3 - reduced given this trigger was already confirmed (via
                                     # direct diagnostic testing) to catch a genuine, non-self-recovering
@@ -2529,6 +2548,14 @@ def mpv_decoder_health_monitor():
     emergency_delay_streak = 0
     recent_restart_times = []
     breaker_tripped_until = 0.0
+    # The playback position at the previous reading, and when that was.
+    # A high gap on its own does not mean a wedged decoder: a slow feed
+    # has a high gap with playback advancing perfectly well. What a
+    # wedge actually looks like is a gap that stays put with playback
+    # frozen, which is exactly what the 11 Nov diagnostic recorded.
+    last_playback = None
+    last_playback_at = 0.0
+    last_slow_feed_note_at = 0.0
 
     while True:
         time.sleep(CHECK_INTERVAL)
@@ -2540,6 +2567,7 @@ def mpv_decoder_health_monitor():
                 recent_error_times = []
                 high_delay_streak = 0
                 emergency_delay_streak = 0
+                last_playback = None
                 continue
             try:
                 size = os.path.getsize(LOG_PATH)
@@ -2553,6 +2581,9 @@ def mpv_decoder_health_monitor():
                 recent_error_times = []
                 high_delay_streak = 0
                 emergency_delay_streak = 0
+                # A new mpv instance starts its playback clock again,
+                # so the previous position says nothing about this one.
+                last_playback = None
             if size == last_size:
                 continue
             # A second programme chosen by hand (Lynx-Tx's stills carousel)
@@ -2629,11 +2660,59 @@ def mpv_decoder_health_monitor():
                                 f.write(f"{utc_now_iso()}  gap={gap:.1f}s\n")
                         except OSError:
                             pass
-                    if gap >= DELAY_THRESHOLD_SECS:
+                    # Is playback actually moving? A wedged decoder
+                    # freezes it; a slow feed does not. Measured against
+                    # wall-clock time rather than a fixed step, because
+                    # these checks are not evenly spaced: the loop only
+                    # evaluates when the log has grown.
+                    #
+                    # This is what let a healthy 0.23 Mb/s narrowband
+                    # DVB-T2 Remote Rx be killed every half minute (23
+                    # Nov 2026). At that rate the end-to-end delay is
+                    # genuinely past a threshold set against a 1.5 Mb/s
+                    # DVB-S2 feed, and restarting the decoder blanked a
+                    # picture that was working. The circuit breaker
+                    # eventually said "likely upstream of mpv", which
+                    # was right, but only after five restarts.
+                    elapsed = now - last_playback_at
+                    if last_playback is None or elapsed < 1.0:
+                        # Nothing to compare against yet, or too soon to
+                        # tell advancing from frozen. Give it the
+                        # benefit of the doubt: the emergency threshold
+                        # is the backstop.
+                        playback_frozen = False
+                    else:
+                        playback_frozen = (playback - last_playback) <= 0.2
+                    last_playback = playback
+                    last_playback_at = now
+
+                    if gap >= DELAY_THRESHOLD_SECS and playback_frozen:
                         high_delay_streak += 1
                     else:
+                        if (gap >= DELAY_THRESHOLD_SECS
+                                and now - last_slow_feed_note_at >= 60.0):
+                            last_slow_feed_note_at = now
+                            print(f"[mpv_decoder_health] playback delay is "
+                                  f"{gap:.1f}s but playback is advancing - a "
+                                  f"slow feed, not a wedged decoder; not "
+                                  f"restarting")
                         high_delay_streak = 0
-                    if gap >= DELAY_EMERGENCY_THRESHOLD_SECS:
+                    # The same test, for the same reason. The emergency
+                    # threshold was built to catch a gap that GROWS
+                    # without bound, and a gap that is merely LARGE is
+                    # not that: at 0.15 Mb/s from a Knucker Remote Rx,
+                    # --demuxer-max-bytes=512KiB holds about 28 seconds
+                    # of stream, so the gap sits past 20s permanently
+                    # while the picture plays perfectly. Restarting
+                    # rebuilt the same 28-second buffer and blanked the
+                    # picture again, every time.
+                    #
+                    # Fixing the ordinary threshold this morning and
+                    # leaving this one was my oversight: it meant the
+                    # frozen-playback test was bypassed by whichever
+                    # threshold the bitrate happened to trip first, and
+                    # a low enough bitrate always trips this one.
+                    if gap >= DELAY_EMERGENCY_THRESHOLD_SECS and playback_frozen:
                         emergency_delay_streak += 1
                     else:
                         emergency_delay_streak = 0
@@ -4326,6 +4405,12 @@ REMOTE_DEFAULT_STATUS_PORT = 10997
 # one would be a third port per Slave to keep in step at both ends.
 REMOTE_QUALITY_PORT_OFFSET = 96
 
+# Tuners a Remote Rx can report in its TUN line. A closed set because
+# this decides which fields the panel draws: an unrecognised name falls
+# back to a Minitiouner rather than inventing a layout for a tuner this
+# receiver knows nothing about.
+REMOTE_TUNER_KINDS = ("minitiouner", "knucker")
+
 # How long a resume waits for a saved Slave to report in before
 # giving up. It cannot be selected until its address is known, and
 # at boot nothing has been heard yet. Bounded rather than endless:
@@ -4339,6 +4424,13 @@ REMOTE_RESUME_WAIT_SECS = 30
 REMOTE_QUALITY_FIELDS = (
     "mer", "margin", "symbol_rate", "modcod", "programme",
     "dbm", "agc1", "agc2", "codec", "audio_codec",
+    # DVB-T/T2 measurements, from a Knucker Remote Rx. Separate names
+    # from the DVB-S2 ones above for the same reason HDHR_QUALITY_FIELDS
+    # is separate: an SNR is not a MER and an SSI percentage is not a
+    # calibrated dBm, and one name for both would invite a comparison
+    # that does not hold. A Remote Rx fills one group or the other,
+    # never both, so the panel shows whichever arrived.
+    "snr", "ssi", "sqi", "per", "standard", "bandwidth",
 )
 
 
@@ -4382,14 +4474,20 @@ def _slave_link_for(i: int) -> dict:
     otherwise "UDP" if video is arriving on the shared port, else None."""
     lst = slave_srt_by_index.get(i)
     if lst is not None:
-        link = lst.link()
-        if link["connected"]:
-            return link
+        # A Remote Rx with an SRT listener is on SRT, and its link is
+        # whatever that listener says - connected, or waiting. Never
+        # "UDP", however the video happens to be reaching the relay.
+        #
+        # The relay cannot tell the difference: SRT video arrives at it
+        # on a loopback port and reads as live exactly like UDP video
+        # does. So testing "is video live" before falling back made any
+        # momentary flicker in the SRT connected flag display
+        # "UDP (LAN)" under a Remote Rx that has never sent a UDP
+        # packet in its life - alarming, and untrue.
+        return lst.link()
     vid = _relay_video_for(i) or {}
     if vid.get("live"):
         return {"transport": "UDP", "connected": True}
-    if lst is not None:
-        return lst.link()
     return None
 
 
@@ -5220,6 +5318,13 @@ def _blank_remote_state(cfg: dict) -> dict:
         # it to tell one Slave's stream from another's. Empty until
         # the first packet arrives.
         "addr": "",
+        # Which tuner is on the end of that Remote Rx, from its own TUN
+        # line: "minitiouner" or "knucker". They measure different
+        # things, so the panel labels different fields. Defaults to a
+        # Minitiouner because a Remote Rx old enough to send no TUN line
+        # is certainly one - and so is any unit whose tuner we failed to
+        # recognise.
+        "tuner": "minitiouner",
         "last_seen": 0,
     }
 
@@ -5511,6 +5616,21 @@ def remote_quality_monitor(index: int):
             if '$31' in fields: st["codec"]       = fields['$31']
             if '$34' in fields: st["audio_codec"] = fields['$34']
 
+            # DVB-T/T2, from a Knucker. Named tags rather than numbers:
+            # the numbered ones mirror Longmynd's own status IDs, and
+            # these measurements have no Longmynd equivalent, so a
+            # number here would be invented and could collide with a
+            # real one later. Deliberately NOT folded into "mer" and
+            # "dbm" above, however convenient that would be for the
+            # panel: an SNR in the MER row would sit beside a
+            # Minitiouner's MER and be compared with it.
+            if '$SNR' in fields: st["snr"]       = fields['$SNR']
+            if '$SSI' in fields: st["ssi"]       = fields['$SSI']
+            if '$SQI' in fields: st["sqi"]       = fields['$SQI']
+            if '$PER' in fields: st["per"]       = fields['$PER']
+            if '$STD' in fields: st["standard"]  = fields['$STD']
+            if '$BW'  in fields: st["bandwidth"] = fields['$BW']
+
         except socket.timeout:
             # Silence is normal and says nothing on its own: the status
             # port decides online/offline, and duplicating that judgement
@@ -5748,6 +5868,22 @@ def remote_source_monitor(index: int):
                         print(f"[remote {index}] now running {st['version']}")
                         st["update_pending"] = None
                         st["update_result"] = f"updated to {st['version']}"
+                    continue
+                if line.startswith("TUN"):
+                    # "TUN <kind>": which tuner the Remote Rx found on
+                    # its USB. The panel shows the fields that tuner
+                    # actually measures: a Knucker reports SNR and
+                    # bandwidth, a Minitiouner MER and symbol rate, and
+                    # showing one tuner's labels over the other's
+                    # numbers would be worse than showing nothing.
+                    #
+                    # An unknown kind is left as it was rather than
+                    # stored: a newer Remote Rx reporting a tuner this
+                    # receiver has never heard of is better served by a
+                    # Minitiouner's panel than by a blank one.
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1] in REMOTE_TUNER_KINDS:
+                        st["tuner"] = parts[1]
                     continue
                 if line.startswith("SITE"):
                     # "SITE <locator> <name>" - locator first because a
@@ -8821,6 +8957,10 @@ def get_status():
                 # How the video is arriving: SRT with its link figures, or
                 # plain UDP on the shared port (21 Nov 2026).
                 "link": _slave_link_for(i),
+                # Which tuner is out there, so the panel can label the
+                # fields that tuner measures rather than the ones a
+                # Minitiouner would.
+                "tuner": st.get("tuner", "minitiouner"),
                 "settings": remote_settings_state(i),
                 # What the Remote Rx is running, and whether that
                 # matches this receiver. "behind" is only ever True when
@@ -10804,6 +10944,19 @@ async function loadCurrentConfig() {
         document.getElementById('rs-name').value = rs0.name || '';
         document.getElementById('rs-locator').value = rs0.locator || '';
         document.getElementById('rs-key').value = rs0.key || '';
+        // The second tuning figure is not the same quantity on both
+        // tuners: a Minitiouner takes a symbol rate in kS/s, a Knucker
+        // a channel bandwidth in kHz. Labelled "Symbol rate (kS/s)"
+        // regardless, the box asks for 333 and means two different
+        // things depending on what is plugged in at the far end.
+        //
+        // Only relabelled once the Remote Rx has actually said what it
+        // is. Before that it keeps the Minitiouner wording, which is
+        // what every Remote Rx built so far is.
+        remoteSrLabel();
+        // Remembered so the save can say whether a restart is really
+        // needed, rather than mentioning one every time.
+        window.__rsPortAtLoad = rs0.status_port ?? 10997;
         updateRemoteSourceWarning();
         document.getElementById('rs-status-port').addEventListener('input', updateRemoteSourceWarning);
 
@@ -11337,6 +11490,27 @@ async function saveHdhr() {
     }
 }
 
+async function remoteSrLabel() {
+    // Relabel the second tuning box for whatever tuner the Remote Rx
+    // has reported. Only ever away from the Minitiouner wording: that
+    // is the HTML default and what every Remote Rx built so far is, so
+    // a failure here leaves the box saying what it always said.
+    try {
+        const r = await fetch('/api/status');
+        if (!r.ok) return;
+        const s = await r.json();
+        const rem = (s.remotes || [])[0];
+        if (!rem || rem.tuner !== 'knucker') return;
+        const lab = document.querySelector('label[for="rs-sr"]');
+        if (lab) lab.textContent = 'Bandwidth (kHz)';
+        const box = document.getElementById('rs-sr');
+        if (box) box.placeholder = '1000';
+    } catch (e) {
+        // Leave the label alone. A wrong label is worse than a
+        // general one.
+    }
+}
+
 async function saveRemoteSource() {
     const statusEl = document.getElementById('rs-status');
     statusEl.textContent = 'Saving...';
@@ -11356,7 +11530,19 @@ async function saveRemoteSource() {
             method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
         });
         if (!r.ok) throw new Error(await r.text());
-        statusEl.textContent = 'Saved. Enabled and the settings take effect within seconds; a changed port needs a restart.';
+        // Only mention a restart when one is genuinely needed. The
+        // frequency, the second tuning figure, the name and the
+        // locator are signed and pushed to the Remote Rx in reply to
+        // its next heartbeat, and it applies them within seconds. Only
+        // the status port needs a restart here, because the monitor
+        // thread binds it once at start-up. Saying "needs a restart"
+        // after every save taught people to restart for changes that
+        // never required it.
+        const portChanged = parseInt(document.getElementById('rs-status-port').value, 10)
+                            !== window.__rsPortAtLoad;
+        statusEl.textContent = portChanged
+            ? 'Saved. The status port changed, so this receiver needs a restart to listen on it.'
+            : 'Saved. Pushed to the Remote Rx - it applies them within seconds.';
         statusEl.className = 'save-status text-success';
     } catch (e) {
         statusEl.textContent = 'Save failed - see console.';
@@ -14577,11 +14763,18 @@ def update_config(req: ConfigUpdateRequest):
         # live and takes effect on the next card.
         if req.squeak is not None:
             on_disk.setdefault('squeak', {}).update(req.squeak.model_dump())
-        # Slave Rx: needs a restart either way, so nothing is applied
-        # live here. The monitor thread is only started at boot if this
-        # is enabled, and it binds its port once at that moment -
+        # Slave Rx. Only the STATUS PORT needs a restart: the monitor
+        # thread is started at boot and binds that port once, and
         # rebinding a socket underneath a running thread is real work
-        # for a setting that gets changed once.
+        # for a setting changed once in a Remote Rx's life.
+        #
+        # Everything else here is applied without one. The frequency,
+        # the second tuning figure, the name and the locator are signed
+        # and sent to the Remote Rx in reply to its next heartbeat, and
+        # it applies them in seconds - which is the whole point of
+        # configuring a Remote Rx from this end. The comment here used
+        # to say a restart was needed "either way", which was true when
+        # it was written and had not been true for some time.
         # Writes the FIRST Slave, and migrates the config to list form
         # while doing it. The card only edits one; the Slaves page will
         # edit them all, and building a list editor here that is about
@@ -15275,7 +15468,14 @@ async function onLnbToneClick(plug) {
     }
 }
 
-function setPanelState(headerId, bodyId, label, state) {
+// Panels a human has opened or closed by hand, keyed by body id.
+// undefined means "follow the lock", true and false mean somebody
+// decided. Held here rather than read back off the element because the
+// status poll rewrites the panel two or three times a second, and
+// anything inferred from the DOM at that rate is a race.
+const panelManual = {};
+
+function setPanelState(headerId, bodyId, label, state, extra) {
     // One place sets the header, its badge and whether the body is shown,
     // so a header can never disagree with what is underneath it - which
     // is precisely how the Rx 1 panel came to be headed "Tuner Rx 1"
@@ -15292,12 +15492,43 @@ function setPanelState(headerId, bodyId, label, state) {
     const [cls, text] = badges[state] || badges.offline;
     const h = document.getElementById(headerId);
     if (h) {
+        // "extra" is anything that must stay reachable while the body
+        // is hidden - the Remote Rx Update button, at the time of
+        // writing. Floated like the badge, so it lands beside it.
         h.innerHTML = label +
             '<span class="badge ' + cls + '" style="float:right; font-size:0.75em;">' +
-            text + '</span>';
+            text + '</span>' + (extra || '');
+        // Click the header to open a panel that is not locked, or shut
+        // one that is. Bound once: innerHTML above replaces the
+        // header's CONTENTS on every poll, but not the header itself,
+        // so a listener on the element survives - and an onclick
+        // written into that innerHTML would be rebuilt two or three
+        // times a second for no reason.
+        if (!h.dataset.toggleBound) {
+            h.dataset.toggleBound = '1';
+            h.style.cursor = 'pointer';
+            h.addEventListener('click', () => {
+                const el = document.getElementById(bodyId);
+                if (!el) return;
+                panelManual[bodyId] = (el.style.display === 'none');
+                el.style.display = panelManual[bodyId] ? '' : 'none';
+            });
+        }
     }
     const b = document.getElementById(bodyId);
-    if (b) b.style.display = (state === 'locked') ? '' : 'none';
+    // Closed unless locked, so the panel list stays scannable at a
+    // glance - opening every unlocked panel was tried and left a column
+    // of panels full of dashes.
+    //
+    // Unless somebody has said otherwise by clicking, which wins and
+    // keeps winning: the poll runs two or three times a second, so a
+    // panel opened by hand that was not also remembered would shut
+    // again before it could be read.
+    if (b) {
+        const manual = panelManual[bodyId];
+        b.style.display = (manual === undefined ? state === 'locked' : manual)
+                          ? '' : 'none';
+    }
 }
 
 // Video badges - see patch_video_badges.py.
@@ -15759,13 +15990,55 @@ async function updateStatus() {
                     '<div class="text-muted small">Switched off in Config (Remote Rx: Enabled).</div>';
                 return;
             }
+            // The Update button goes in the HEADER, not in the rows
+            // below. setPanelState hides the body of a panel that is
+            // not locked, so a button in the rows was invisible on
+            // exactly the Remote Rx that most needed it: the one that
+            // is unlocked, deaf or misbehaving. The protocol had no
+            // such restriction - the heartbeat and the update command
+            // never cared about lock - but the interface did, which
+            // from the operator's side is the same thing.
+            const vr = rem.version;
+            const hdrBtn = (vr && vr.behind)
+                ? '<button class="btn btn-sm btn-danger py-0 px-2" '
+                  + 'style="float:right; margin-right:8px; font-size:0.75em;" '
+                  // stopPropagation so pressing Update can never also
+                  // act on the panel it is sitting on.
+                  + 'onclick="event.stopPropagation(); updateSlave('
+                  + rem.index + ')">Update</button>'
+                : '';
             const st = !rem.online ? 'offline' : (rem.locked ? 'locked' : 'idle');
-            setPanelState(id + '-header', id + '-status', label, st);
-            // Deliberately the local receiver's row set, in its order and
-            // with its units. A Slave sends the same fields under the same
-            // tags, so anything that reads differently here is a fault
-            // rather than a difference worth preserving.
-            const rows = [
+            setPanelState(id + '-header', id + '-status', label, st, hdrBtn);
+            // A Knucker is a DVB-T/T2 receiver and measures different
+            // things, so it gets the HDHomeRun's row set rather than the
+            // Minitiouner's: the same rows, labels and units as the
+            // HDHomeRun panel already uses, because that is the other
+            // DVB-T/T2 receiver here and two DVB-T/T2 panels that read
+            // differently would be a fault.
+            //
+            // The dash tests are "not null and not empty" rather than
+            // truthy, deliberately: 0 % is a real reading from a tuner
+            // that has lost the signal, and a truthy test would show it
+            // as a dash - which looks like a tuner saying nothing
+            // instead of one saying zero.
+            const val = v => (v !== null && v !== undefined && v !== '') ? v : null;
+            const rows = rem.tuner === 'knucker' ? [
+                ['Callsign',    rem.callsign || '—'],
+                ['Service',     rem.service || '—'],
+                ['Frequency',   rem.frequency ? rem.frequency + ' MHz' : '—'],
+                ['Bandwidth',   val(rem.bandwidth) !== null ? rem.bandwidth + ' kHz' : '—'],
+                ['Standard',    rem.standard || '—'],
+                ['Mode',        rem.modcod || '—'],
+                ['SNR',         val(rem.snr) !== null ? rem.snr + ' dB' : '—'],
+                ['Level',       val(rem.ssi) !== null ? rem.ssi + ' %' : '—'],
+                ['SNQ',         val(rem.sqi) !== null ? rem.sqi + ' %' : '—'],
+                ['PER',         val(rem.per) !== null ? rem.per : '—'],
+            ] : [
+                // A Minitiouner Remote Rx: deliberately the local
+                // receiver's row set, in its order and with its units. It
+                // sends the same fields under the same tags, so anything
+                // that reads differently here is a fault rather than a
+                // difference worth preserving.
                 ['Callsign',    rem.callsign || '—'],
                 ['Service',  rem.service || '—'],
                 ['Provider',    rem.programme || '—'],
@@ -15808,19 +16081,17 @@ async function updateStatus() {
             // What the Remote Rx is running. Shown only once it has
             // reported one: a dash here would suggest the feature is
             // broken on a Remote Rx too old to send it.
-            const vr = rem.version;
             if (vr && vr.remote) {
                 let v = vr.remote;
                 if (vr.remote_branch && vr.remote_branch !== '-') {
                     v += ' on ' + vr.remote_branch;
                 }
                 if (vr.modified) { v += ' (edited here)'; }
-                if (vr.behind) {
-                    // Index only: no nested quoting in the attribute,
-                    // which is what broke the first attempt at this.
-                    v += ' <button class="btn btn-sm btn-danger py-0 px-2 ms-2" ' +
-                         'onclick="updateSlave(' + rem.index + ')">Update</button>';
-                }
+                // The row says what it runs; the header button is where
+                // you act. Deliberately not both: two Update buttons on
+                // one panel is a question about whether they do the
+                // same thing.
+                if (vr.behind) { v += ' — update available'; }
                 rows.push(['Version', v]);
             }
             document.getElementById(id + '-status').innerHTML = rows.map(r =>

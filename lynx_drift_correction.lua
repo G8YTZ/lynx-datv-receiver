@@ -60,6 +60,33 @@ local NUDGE_ENABLED = false         -- Disabled - confirmed live under marginal-
 local NUDGE_THRESHOLD = 0.5         -- seconds of estimated drift before nudging (unused
                                       -- while NUDGE_ENABLED is false) - avoids reacting to
                                       -- ordinary measurement noise
+-- NOT watching the demuxer's own cache. Tried on 23 Nov 2026 and
+-- reverted the same evening, because it made things considerably worse.
+--
+-- The reasoning was sound as far as it went. --demuxer-max-bytes caps
+-- the cache in BYTES, so how many SECONDS that is depends entirely on
+-- the stream: 512KiB is about 2.7s of a 1.5 Mb/s Minitiouner feed and
+-- about 28s of a 0.15 Mb/s narrowband DVB-T2 Remote Rx. Once it has
+-- filled, input and playback both run at real time and it never
+-- drains, so playback sits permanently that far behind live, and the
+-- drift measurement here cannot see it: playback IS advancing at real
+-- time, so no shortfall accumulates.
+--
+-- What was wrong was the remedy. Dropping buffers does not stop a deep
+-- cache, it empties one that promptly refills, so with the cache
+-- permanently past any threshold worth setting it fired on EVERY check
+-- - measured at one drop-buffers every 4 seconds. Each drop stops
+-- playback advancing, which this script's own hard-freeze detector
+-- then reads as a freeze and asks lynx_app.py for a full mpv restart.
+-- 20 of 24 restarts in one session came from that loop, and every one
+-- of them blanked a picture that was playing perfectly.
+--
+-- The latency is real and still unsolved, but it is a property of a
+-- byte-capped cache at a low bitrate and the fix belongs where the cap
+-- is set, not in a periodic correction that can only react after the
+-- fact. A picture 26s late is worth considerably more than a picture
+-- that blanks every 39 seconds.
+
 local DROP_BUFFERS_THRESHOLD = 1.5  -- seconds of estimated drift before an immediate,
                                       -- visible resync. Lowered from 3.0 now that nudging
                                       -- is disabled and can no longer catch drift early -

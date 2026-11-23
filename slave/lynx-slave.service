@@ -1,5 +1,7 @@
 [Unit]
-Description=Lynx Slave Rx (Longmynd)
+# Not "(Longmynd)" any more: the wrapper picks the source from whichever
+# tuner it finds, so this one unit runs a Minitiouner or a Knucker.
+Description=Lynx Remote Rx
 # The Slave sends to a host on the network, so starting before there is
 # one only produces a burst of failed sends in the journal.
 After=network-online.target

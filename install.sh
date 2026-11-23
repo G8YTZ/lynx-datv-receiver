@@ -303,6 +303,40 @@ echo "--- Setting up persistent log directory ---"
 sudo mkdir -p /var/log/lynx
 sudo chown "$(id -un)":"$(id -gn)" /var/log/lynx
 
+# Make the systemd journal survive a reboot.
+#
+# Raspberry Pi OS ships journald in its default "auto" storage mode,
+# which with no /var/log/journal directory means the journal lives in
+# RAM and is destroyed on every boot. So the one event we most need to
+# investigate - the receiver restarting on its own - erases its own
+# evidence as it happens, and "sudo journalctl -b -1" answers
+# "no persistent journal was found". Reported by more than one
+# operator, never diagnosed, because there was nothing left to read.
+#
+# Capped deliberately: this is an SD card. 200 MB total and 20 MB per
+# file is a few days of a receiver's logs, which is far more than
+# anybody needs to see why it went down last night, and bounded enough
+# not to wear the card or fill it.
+#
+# Placed ABOVE the --deps-only exit so Update Now gives it to existing
+# receivers, which are the ones with the problem.
+if [ ! -d /var/log/journal ]; then
+    echo "Enabling a persistent journal, so a reboot leaves evidence behind"
+fi
+sudo mkdir -p /etc/systemd/journald.conf.d
+printf '%s\n' \
+  "# Written by Lynx install.sh - a receiver that restarts on its own" \
+  "# must leave something to read afterwards." \
+  "[Journal]" \
+  "Storage=persistent" \
+  "SystemMaxUse=200M" \
+  "SystemMaxFileSize=20M" \
+  "MaxRetentionSec=1month" \
+  | sudo tee /etc/systemd/journald.conf.d/lynx.conf >/dev/null
+sudo mkdir -p /var/log/journal
+sudo systemd-tmpfiles --create --prefix /var/log/journal >/dev/null 2>&1 || true
+sudo systemctl restart systemd-journald >/dev/null 2>&1 || true
+
 # --- Startup mechanism: systemd user service -------------------
 # Lynx starts from a systemd user service, NOT the labwc autostart
 # line this script used to write. lynx.service waits for the
