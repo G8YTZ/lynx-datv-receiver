@@ -5451,6 +5451,19 @@ def active_receiver_id():
     explicit act by somebody at the front panel, where diversity and
     tri_watch are modes the receiver puts itself into.
     """
+    # The mode comes first. A Remote Rx is an RF source, so if this
+    # receiver is not in RF mode then no receiver is on screen,
+    # whatever was selected before.
+    #
+    # This used to be tested after displayed_receiver_id, and the
+    # docstring for that variable says why it looked safe: it is
+    # "cleared when anything tunes to RF". Switching to a STREAM does
+    # not tune to RF and does not clear it, so a Remote Rx chosen
+    # earlier stayed on the OSD while a BATC stream was playing.
+    # Reported from a live receiver, 23 Nov 2026.
+    if current_mode != "rf":
+        return None
+
     # Set when a Slave is chosen, cleared when anything tunes to
     # RF. The relay keeps its own selection across a switch to a
     # local tuner, so what the relay is forwarding and what is on
@@ -5460,9 +5473,6 @@ def active_receiver_id():
             return displayed_receiver_id
         # Configured away underneath us — a Slave that no longer
         # exists is not on screen, whatever was chosen earlier.
-        return None
-
-    if current_mode != "rf":
         return None
     if tri_watch_enabled and tri_watch_target_rcv == 2:
         return 2
