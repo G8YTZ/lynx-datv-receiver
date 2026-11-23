@@ -221,14 +221,19 @@ def perform_update(slave_dir, repo, ref, state_path, log=print):
     if target == prev:
         return True, "already up to date", False
 
-    ok, out = git(repo, "checkout", "--force", "--detach", target)
+    # Stay ON the branch, not on a detached HEAD. Detaching worked
+    # once and then disabled itself: the Remote Rx reported its branch
+    # as "HEAD", the repeater stopped seeing a branch it could compare
+    # against, and the Update button never came back. It also broke the
+    # documented "git pull" that people use by hand.
+    ok, out = git(repo, "checkout", "--force", "-B", ref, target)
     if not ok:
         return False, f"checkout failed: {out}", False
 
     good, why = smoke_test(slave_dir, log=log)
     if not good:
         log(f"[update] rejected: {why}")
-        rb_ok, rb = git(repo, "checkout", "--force", "--detach", prev)
+        rb_ok, rb = git(repo, "checkout", "--force", "-B", ref, prev)
         if not rb_ok:
             # Should not happen: prev is a commit we were just sitting
             # on. Say so loudly rather than pretend it is fine.
@@ -269,7 +274,8 @@ def startup_check(repo, state_path, log=print):
     if attempts > UPDATE_MAX_ATTEMPTS:
         log(f"[update] {str(new)[:7]} failed to stay up over {attempts - 1} "
             f"attempts: restoring {str(prev)[:7]}")
-        ok, out = git(repo, "checkout", "--force", "--detach", prev)
+        ok, out = git(repo, "checkout", "--force", "-B",
+                      st.get("ref") or "beta", prev)
         clear_state(state_path)
         if not ok:
             log(f"[update] COULD NOT RESTORE {str(prev)[:7]}: {out}")
