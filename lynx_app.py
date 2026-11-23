@@ -2529,6 +2529,14 @@ def mpv_decoder_health_monitor():
     emergency_delay_streak = 0
     recent_restart_times = []
     breaker_tripped_until = 0.0
+    # The playback position at the previous reading, and when that was.
+    # A high gap on its own does not mean a wedged decoder: a slow feed
+    # has a high gap with playback advancing perfectly well. What a
+    # wedge actually looks like is a gap that stays put with playback
+    # frozen, which is exactly what the 11 Nov diagnostic recorded.
+    last_playback = None
+    last_playback_at = 0.0
+    last_slow_feed_note_at = 0.0
 
     while True:
         time.sleep(CHECK_INTERVAL)
@@ -2540,6 +2548,7 @@ def mpv_decoder_health_monitor():
                 recent_error_times = []
                 high_delay_streak = 0
                 emergency_delay_streak = 0
+                last_playback = None
                 continue
             try:
                 size = os.path.getsize(LOG_PATH)
@@ -2553,6 +2562,9 @@ def mpv_decoder_health_monitor():
                 recent_error_times = []
                 high_delay_streak = 0
                 emergency_delay_streak = 0
+                # A new mpv instance starts its playback clock again,
+                # so the previous position says nothing about this one.
+                last_playback = None
             if size == last_size:
                 continue
             # A second programme chosen by hand (Lynx-Tx's stills carousel)
@@ -2629,9 +2641,42 @@ def mpv_decoder_health_monitor():
                                 f.write(f"{utc_now_iso()}  gap={gap:.1f}s\n")
                         except OSError:
                             pass
-                    if gap >= DELAY_THRESHOLD_SECS:
+                    # Is playback actually moving? A wedged decoder
+                    # freezes it; a slow feed does not. Measured against
+                    # wall-clock time rather than a fixed step, because
+                    # these checks are not evenly spaced: the loop only
+                    # evaluates when the log has grown.
+                    #
+                    # This is what let a healthy 0.23 Mb/s narrowband
+                    # DVB-T2 Remote Rx be killed every half minute (23
+                    # Nov 2026). At that rate the end-to-end delay is
+                    # genuinely past a threshold set against a 1.5 Mb/s
+                    # DVB-S2 feed, and restarting the decoder blanked a
+                    # picture that was working. The circuit breaker
+                    # eventually said "likely upstream of mpv", which
+                    # was right, but only after five restarts.
+                    elapsed = now - last_playback_at
+                    if last_playback is None or elapsed < 1.0:
+                        # Nothing to compare against yet, or too soon to
+                        # tell advancing from frozen. Give it the
+                        # benefit of the doubt: the emergency threshold
+                        # is the backstop.
+                        playback_frozen = False
+                    else:
+                        playback_frozen = (playback - last_playback) <= 0.2
+                    last_playback = playback
+                    last_playback_at = now
+
+                    if gap >= DELAY_THRESHOLD_SECS and playback_frozen:
                         high_delay_streak += 1
                     else:
+                        if (gap >= DELAY_THRESHOLD_SECS
+                                and now - last_slow_feed_note_at >= 60.0):
+                            last_slow_feed_note_at = now
+                            print(f"[mpv_decoder_health] playback delay is "
+                                  f"{gap:.1f}s but playback is advancing - a "
+                                  f"slow feed, not a wedged decoder; not "
+                                  f"restarting")
                         high_delay_streak = 0
                     if gap >= DELAY_EMERGENCY_THRESHOLD_SECS:
                         emergency_delay_streak += 1
