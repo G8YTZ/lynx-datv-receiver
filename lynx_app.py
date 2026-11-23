@@ -15387,7 +15387,7 @@ async function onLnbToneClick(plug) {
     }
 }
 
-function setPanelState(headerId, bodyId, label, state) {
+function setPanelState(headerId, bodyId, label, state, extra, showIdleBody) {
     // One place sets the header, its badge and whether the body is shown,
     // so a header can never disagree with what is underneath it - which
     // is precisely how the Rx 1 panel came to be headed "Tuner Rx 1"
@@ -15404,12 +15404,26 @@ function setPanelState(headerId, bodyId, label, state) {
     const [cls, text] = badges[state] || badges.offline;
     const h = document.getElementById(headerId);
     if (h) {
+        // "extra" is anything that must stay reachable while the body
+        // is hidden - the Remote Rx Update button, at the time of
+        // writing. Floated like the badge, so it lands beside it.
         h.innerHTML = label +
             '<span class="badge ' + cls + '" style="float:right; font-size:0.75em;">' +
-            text + '</span>';
+            text + '</span>' + (extra || '');
     }
     const b = document.getElementById(bodyId);
-    if (b) b.style.display = (state === 'locked') ? '' : 'none';
+    // Hidden unless locked, because for a local tuner the rows below
+    // describe a signal that is not there.
+    //
+    // showIdleBody is the exception, for a Remote Rx that is online but
+    // not locked. Its rows are not stale readings of a lost signal:
+    // they are what it is tuned to, what RF level it can see, and which
+    // version it runs - which is precisely what you need when it will
+    // not lock and is at the other end of a ladder. Hiding them meant
+    // the only panel worth reading was the one panel that would not
+    // open.
+    if (b) b.style.display = (state === 'locked'
+                              || (showIdleBody && state === 'idle')) ? '' : 'none';
 }
 
 // Video badges - see patch_video_badges.py.
@@ -15871,8 +15885,27 @@ async function updateStatus() {
                     '<div class="text-muted small">Switched off in Config (Remote Rx: Enabled).</div>';
                 return;
             }
+            // The Update button goes in the HEADER, not in the rows
+            // below. setPanelState hides the body of a panel that is
+            // not locked, so a button in the rows was invisible on
+            // exactly the Remote Rx that most needed it: the one that
+            // is unlocked, deaf or misbehaving. The protocol had no
+            // such restriction - the heartbeat and the update command
+            // never cared about lock - but the interface did, which
+            // from the operator's side is the same thing.
+            const vr = rem.version;
+            const hdrBtn = (vr && vr.behind)
+                ? '<button class="btn btn-sm btn-danger py-0 px-2" '
+                  + 'style="float:right; margin-right:8px; font-size:0.75em;" '
+                  // stopPropagation so pressing Update can never also
+                  // act on the panel it is sitting on.
+                  + 'onclick="event.stopPropagation(); updateSlave('
+                  + rem.index + ')">Update</button>'
+                : '';
             const st = !rem.online ? 'offline' : (rem.locked ? 'locked' : 'idle');
-            setPanelState(id + '-header', id + '-status', label, st);
+            // Last argument: show the rows for a Remote Rx that is
+            // online but not locked. See setPanelState.
+            setPanelState(id + '-header', id + '-status', label, st, hdrBtn, true);
             // A Knucker is a DVB-T/T2 receiver and measures different
             // things, so it gets the HDHomeRun's row set rather than the
             // Minitiouner's: the same rows, labels and units as the
@@ -15945,19 +15978,17 @@ async function updateStatus() {
             // What the Remote Rx is running. Shown only once it has
             // reported one: a dash here would suggest the feature is
             // broken on a Remote Rx too old to send it.
-            const vr = rem.version;
             if (vr && vr.remote) {
                 let v = vr.remote;
                 if (vr.remote_branch && vr.remote_branch !== '-') {
                     v += ' on ' + vr.remote_branch;
                 }
                 if (vr.modified) { v += ' (edited here)'; }
-                if (vr.behind) {
-                    // Index only: no nested quoting in the attribute,
-                    // which is what broke the first attempt at this.
-                    v += ' <button class="btn btn-sm btn-danger py-0 px-2 ms-2" ' +
-                         'onclick="updateSlave(' + rem.index + ')">Update</button>';
-                }
+                // The row says what it runs; the header button is where
+                // you act. Deliberately not both: two Update buttons on
+                // one panel is a question about whether they do the
+                // same thing.
+                if (vr.behind) { v += ' — update available'; }
                 rows.push(['Version', v]);
             }
             document.getElementById(id + '-status').innerHTML = rows.map(r =>
