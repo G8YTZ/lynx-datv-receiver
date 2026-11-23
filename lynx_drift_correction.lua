@@ -60,21 +60,32 @@ local NUDGE_ENABLED = false         -- Disabled - confirmed live under marginal-
 local NUDGE_THRESHOLD = 0.5         -- seconds of estimated drift before nudging (unused
                                       -- while NUDGE_ENABLED is false) - avoids reacting to
                                       -- ordinary measurement noise
--- The demuxer's own cache, watched after all - see the note at the top
--- of this file, which is only true at a high bitrate. --demuxer-max-bytes
--- caps the cache in BYTES, so how many SECONDS that is depends entirely
--- on the stream: 512KiB is about 2.7s of a 1.5 Mb/s Minitiouner feed and
--- over 30s of a 0.23 Mb/s narrowband DVB-T2 Remote Rx. Once that cache
--- has filled, input and playback both run at real time and it never
--- drains, so playback sits permanently that far behind live.
+-- NOT watching the demuxer's own cache. Tried on 23 Nov 2026 and
+-- reverted the same evening, because it made things considerably worse.
 --
--- Nothing else sees this. The drift measurement above compares playback
--- against wall clock, and playback IS advancing at real time, so the
--- shortfall is zero and no drift accumulates. Meanwhile the delay-based
--- monitor in lynx_app.py restarts mpv, which blanks the picture and
--- changes nothing, because the cache simply fills again.
--- (23 Nov 2026, found with a Knucker Remote Rx at 436 MHz.)
-local CACHE_LATENCY_THRESHOLD = 3.0 -- seconds held in the demuxer cache before dropping it
+-- The reasoning was sound as far as it went. --demuxer-max-bytes caps
+-- the cache in BYTES, so how many SECONDS that is depends entirely on
+-- the stream: 512KiB is about 2.7s of a 1.5 Mb/s Minitiouner feed and
+-- about 28s of a 0.15 Mb/s narrowband DVB-T2 Remote Rx. Once it has
+-- filled, input and playback both run at real time and it never
+-- drains, so playback sits permanently that far behind live, and the
+-- drift measurement here cannot see it: playback IS advancing at real
+-- time, so no shortfall accumulates.
+--
+-- What was wrong was the remedy. Dropping buffers does not stop a deep
+-- cache, it empties one that promptly refills, so with the cache
+-- permanently past any threshold worth setting it fired on EVERY check
+-- - measured at one drop-buffers every 4 seconds. Each drop stops
+-- playback advancing, which this script's own hard-freeze detector
+-- then reads as a freeze and asks lynx_app.py for a full mpv restart.
+-- 20 of 24 restarts in one session came from that loop, and every one
+-- of them blanked a picture that was playing perfectly.
+--
+-- The latency is real and still unsolved, but it is a property of a
+-- byte-capped cache at a low bitrate and the fix belongs where the cap
+-- is set, not in a periodic correction that can only react after the
+-- fact. A picture 26s late is worth considerably more than a picture
+-- that blanks every 39 seconds.
 
 local DROP_BUFFERS_THRESHOLD = 1.5  -- seconds of estimated drift before an immediate,
                                       -- visible resync. Lowered from 3.0 now that nudging
@@ -296,17 +307,12 @@ local function check_drift()
     last_real_time = now
     last_playback_time = playback
 
-    -- How much the demuxer is holding, which at a low bitrate IS the
-    -- latency even when the drift measurement sees nothing wrong.
-    local cache_secs = mp.get_property_number("demuxer-cache-duration", 0) or 0
-    local cache_too_deep = cache_secs >= CACHE_LATENCY_THRESHOLD
-
     if hard_freeze_detected_at > 0.0 then
         -- Confirmed hard freeze pending an external restart - nudging
         -- or dropping buffers can't help when playback isn't
         -- advancing at all, so don't attempt either; just wait for
         -- lynx_app.py to act on the signal in the status file.
-    elseif estimated_drift >= DROP_BUFFERS_THRESHOLD or cache_too_deep then
+    elseif estimated_drift >= DROP_BUFFERS_THRESHOLD then
         if now < breaker_tripped_until then
             -- Circuit breaker active - repeated drop-buffers calls
             -- clearly aren't resolving whatever's actually wrong.
@@ -321,16 +327,9 @@ local function check_drift()
                 last_action_at = now
             end
         else
-            if cache_too_deep and estimated_drift < DROP_BUFFERS_THRESHOLD then
-                mp.msg.warn(string.format(
-                    "lynx_drift_correction: demuxer holding %.1fs >= %.1fs - a low-bitrate " ..
-                    "stream has filled the byte-capped cache; dropping buffers for an " ..
-                    "immediate resync", cache_secs, CACHE_LATENCY_THRESHOLD))
-            else
-                mp.msg.warn(string.format(
-                    "lynx_drift_correction: estimated drift %.1fs >= %.1fs threshold - " ..
-                    "dropping buffers for an immediate resync", estimated_drift, DROP_BUFFERS_THRESHOLD))
-            end
+            mp.msg.warn(string.format(
+                "lynx_drift_correction: estimated drift %.1fs >= %.1fs threshold - " ..
+                "dropping buffers for an immediate resync", estimated_drift, DROP_BUFFERS_THRESHOLD))
             mp.command("drop-buffers")
             drop_buffers_count = drop_buffers_count + 1
             reset_state()
