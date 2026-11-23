@@ -2018,7 +2018,14 @@ DELAY_RESTART_DIAGNOSTIC_MODE = False  # Diagnostic complete - unlike the HEVC t
 # threshold in place as a backstop for a different, more severe failure mode, but it should not
 # be relied on as the only protection while this flag is False.
 DELAY_DIAGNOSTIC_LOG_PATH = "/tmp/delay_diagnostic.log"
-DELAY_EMERGENCY_THRESHOLD_SECS = 20.0        # a gap this large, sustained, is unambiguously bad
+# A gap this large, sustained AND with playback frozen, is unambiguously
+# bad. The frozen-playback condition is not optional: a gap this size is
+# ordinary at a low bitrate, because --demuxer-max-bytes is a BYTE cap
+# and the time it represents scales inversely with the rate - about 2.7s
+# at 1.5 Mb/s, about 28s at the 0.15 Mb/s a narrowband Knucker Remote Rx
+# delivers. Without the test this fired continuously on a healthy
+# picture (23 Nov 2026).
+DELAY_EMERGENCY_THRESHOLD_SECS = 20.0
 DELAY_EMERGENCY_CONSECUTIVE_CHECKS = 5        # ...for this many consecutive checks (~10s) always restarts
 
 # ── Video badges: what is received (IN), what HDMI sends (OUT) ───
@@ -2690,7 +2697,22 @@ def mpv_decoder_health_monitor():
                                   f"slow feed, not a wedged decoder; not "
                                   f"restarting")
                         high_delay_streak = 0
-                    if gap >= DELAY_EMERGENCY_THRESHOLD_SECS:
+                    # The same test, for the same reason. The emergency
+                    # threshold was built to catch a gap that GROWS
+                    # without bound, and a gap that is merely LARGE is
+                    # not that: at 0.15 Mb/s from a Knucker Remote Rx,
+                    # --demuxer-max-bytes=512KiB holds about 28 seconds
+                    # of stream, so the gap sits past 20s permanently
+                    # while the picture plays perfectly. Restarting
+                    # rebuilt the same 28-second buffer and blanked the
+                    # picture again, every time.
+                    #
+                    # Fixing the ordinary threshold this morning and
+                    # leaving this one was my oversight: it meant the
+                    # frozen-playback test was bypassed by whichever
+                    # threshold the bitrate happened to trip first, and
+                    # a low enough bitrate always trips this one.
+                    if gap >= DELAY_EMERGENCY_THRESHOLD_SECS and playback_frozen:
                         emergency_delay_streak += 1
                     else:
                         emergency_delay_streak = 0
@@ -4452,14 +4474,20 @@ def _slave_link_for(i: int) -> dict:
     otherwise "UDP" if video is arriving on the shared port, else None."""
     lst = slave_srt_by_index.get(i)
     if lst is not None:
-        link = lst.link()
-        if link["connected"]:
-            return link
+        # A Remote Rx with an SRT listener is on SRT, and its link is
+        # whatever that listener says - connected, or waiting. Never
+        # "UDP", however the video happens to be reaching the relay.
+        #
+        # The relay cannot tell the difference: SRT video arrives at it
+        # on a loopback port and reads as live exactly like UDP video
+        # does. So testing "is video live" before falling back made any
+        # momentary flicker in the SRT connected flag display
+        # "UDP (LAN)" under a Remote Rx that has never sent a UDP
+        # packet in its life - alarming, and untrue.
+        return lst.link()
     vid = _relay_video_for(i) or {}
     if vid.get("live"):
         return {"transport": "UDP", "connected": True}
-    if lst is not None:
-        return lst.link()
     return None
 
 
