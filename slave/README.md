@@ -87,7 +87,7 @@ Copy and paste the whole block in one go:
 sudo apt update &&
 sudo apt full-upgrade -y &&
 sudo apt install -y git &&
-git clone --depth 1 --filter=blob:none --sparse -b beta-wip https://github.com/G8YTZ/lynx-datv-receiver.git ~/lynx-datv-receiver &&
+git clone --depth 1 --filter=blob:none --sparse -b beta https://github.com/G8YTZ/lynx-datv-receiver.git ~/lynx-datv-receiver &&
 git -C ~/lynx-datv-receiver sparse-checkout set slave &&
 ~/lynx-datv-receiver/slave/install.sh
 ```
