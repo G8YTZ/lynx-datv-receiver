@@ -15387,7 +15387,7 @@ async function onLnbToneClick(plug) {
     }
 }
 
-function setPanelState(headerId, bodyId, label, state, extra, showIdleBody) {
+function setPanelState(headerId, bodyId, label, state, extra) {
     // One place sets the header, its badge and whether the body is shown,
     // so a header can never disagree with what is underneath it - which
     // is precisely how the Rx 1 panel came to be headed "Tuner Rx 1"
@@ -15412,18 +15412,14 @@ function setPanelState(headerId, bodyId, label, state, extra, showIdleBody) {
             text + '</span>' + (extra || '');
     }
     const b = document.getElementById(bodyId);
-    // Hidden unless locked, because for a local tuner the rows below
-    // describe a signal that is not there.
+    // Hidden unless locked. The panel list is meant to be scannable at
+    // a glance, and a dozen open panels full of dashes is not.
     //
-    // showIdleBody is the exception, for a Remote Rx that is online but
-    // not locked. Its rows are not stale readings of a lost signal:
-    // they are what it is tuned to, what RF level it can see, and which
-    // version it runs - which is precisely what you need when it will
-    // not lock and is at the other end of a ladder. Hiding them meant
-    // the only panel worth reading was the one panel that would not
-    // open.
-    if (b) b.style.display = (state === 'locked'
-                              || (showIdleBody && state === 'idle')) ? '' : 'none';
+    // Opening an unlocked Remote Rx's rows was tried, so that its Level
+    // could be read while searching, and it made every panel stand
+    // open. Anything needed on a panel that is not locked belongs in
+    // the header instead, as "extra" above.
+    if (b) b.style.display = (state === 'locked') ? '' : 'none';
 }
 
 // Video badges - see patch_video_badges.py.
@@ -15903,9 +15899,7 @@ async function updateStatus() {
                   + rem.index + ')">Update</button>'
                 : '';
             const st = !rem.online ? 'offline' : (rem.locked ? 'locked' : 'idle');
-            // Last argument: show the rows for a Remote Rx that is
-            // online but not locked. See setPanelState.
-            setPanelState(id + '-header', id + '-status', label, st, hdrBtn, true);
+            setPanelState(id + '-header', id + '-status', label, st, hdrBtn);
             // A Knucker is a DVB-T/T2 receiver and measures different
             // things, so it gets the HDHomeRun's row set rather than the
             // Minitiouner's: the same rows, labels and units as the
