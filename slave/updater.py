@@ -63,6 +63,12 @@ UPDATE_MAX_ATTEMPTS = 3
 
 GIT_TIMEOUT_SECS = 120
 
+# Start-tested by gate 2. One that is missing is skipped rather than
+# failed: an older commit has no knucker_source.py, and a rollback TO
+# that commit must not be refused for not having a file that did not
+# exist yet.
+SOURCE_MODULES = ("longmynd_source.py", "knucker_source.py")
+
 
 def git(repo, *args, timeout=GIT_TIMEOUT_SECS):
     """(ok, output). Never raises: every caller here is running
@@ -176,14 +182,22 @@ def smoke_test(slave_dir, log=print):
         except (OSError, subprocess.SubprocessError) as e:
             return False, f"could not compile {name}: {e}"
 
-    main = os.path.join(slave_dir, "longmynd_source.py")
-    try:
-        r = subprocess.run(["python3", main, "--help"], capture_output=True,
-                           text=True, timeout=60)
-    except (OSError, subprocess.SubprocessError) as e:
-        return False, f"would not start: {e}"
-    if r.returncode != 0:
-        return False, f"would not start: {(r.stderr or r.stdout).strip()[:200]}"
+    # Every source module, not just the one this unit happens to run.
+    # A Knucker unit that only start-tested the Minitiouner source
+    # would pass an update that breaks the code it actually runs, and
+    # the gate would have looked the other way while it did.
+    for name in SOURCE_MODULES:
+        main = os.path.join(slave_dir, name)
+        if not os.path.exists(main):
+            continue
+        try:
+            r = subprocess.run(["python3", main, "--help"], capture_output=True,
+                               text=True, timeout=60)
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, f"{name} would not start: {e}"
+        if r.returncode != 0:
+            return False, (f"{name} would not start: "
+                           f"{(r.stderr or r.stdout).strip()[:200]}")
     return True, f"{len(pys)} files compile and the program starts"
 
 

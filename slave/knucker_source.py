@@ -331,7 +331,7 @@ def main():
                          "most broadband, a LAN needs far less")
     args = ap.parse_args()
 
-    code = remote_common.prepare(args, "kHz bandwidth")
+    code = remote_common.prepare(args, "kHz bandwidth", "knucker")
     if code is not None:
         return code
     if args.srt_port is None:

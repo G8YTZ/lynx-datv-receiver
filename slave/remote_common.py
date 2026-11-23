@@ -231,11 +231,17 @@ class StatusSender(threading.Thread):
         # so the repeater can say whether it is behind. Fixed two
         # fields, "-" when unknown, so the parser never has to guess.
         ver_line = f"VER {self.args.version_commit} {self.args.version_branch}"
+        # "TUN <kind>": which tuner this is, so the repeater can show the
+        # fields that tuner actually measures rather than a Minitiouner's
+        # labels with gaps in them. One token, no spaces. An older Remote
+        # Rx sends no TUN line at all, which the repeater has to read as
+        # a Minitiouner - every one built so far is one.
+        tun_line = f"TUN {getattr(self.args, 'tuner_kind', 'minitiouner')}"
         while self.running:
             snap = self.tuner.snapshot()
             rx = build_status_line(snap, self.args.freq)
             payload = f"{site}\n{rx}" if site else rx
-            payload += "\n" + cfg_line + "\n" + ver_line
+            payload += "\n" + cfg_line + "\n" + ver_line + "\n" + tun_line
             try:
                 sock.sendto((payload + "\n").encode(),
                             (self.args.host, self.args.status_port))
@@ -347,18 +353,25 @@ def add_common_args(ap, sr_help: str):
     return ap
 
 
-def prepare(args, sr_units: str):
+def prepare(args, sr_units: str, tuner_kind: str):
     """Everything between parsing the arguments and starting the tuner.
 
     Resolves the derived ports, applies any settings the repeater sent
     before, works out what version this is, and runs the update
     rollback check.
 
+    tuner_kind is what this source module drives, reported in the
+    heartbeat so the repeater can label the panel for the right tuner.
+    Each module states its own rather than being asked to detect it:
+    detection decides which module to RUN, and once running a module
+    knows perfectly well what it is.
+
     Returns None to carry on, or an exit code the caller should return
     at once: 0 after a rollback (systemd is about to bring us back on
     the restored version), 2 for a configuration error.
     """
     args.sr_units = sr_units
+    args.tuner_kind = tuner_kind
     if args.quality_port is None:
         args.quality_port = args.status_port - QUALITY_PORT_OFFSET
 

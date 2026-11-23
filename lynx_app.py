@@ -4383,6 +4383,12 @@ REMOTE_DEFAULT_STATUS_PORT = 10997
 # one would be a third port per Slave to keep in step at both ends.
 REMOTE_QUALITY_PORT_OFFSET = 96
 
+# Tuners a Remote Rx can report in its TUN line. A closed set because
+# this decides which fields the panel draws: an unrecognised name falls
+# back to a Minitiouner rather than inventing a layout for a tuner this
+# receiver knows nothing about.
+REMOTE_TUNER_KINDS = ("minitiouner", "knucker")
+
 # How long a resume waits for a saved Slave to report in before
 # giving up. It cannot be selected until its address is known, and
 # at boot nothing has been heard yet. Bounded rather than endless:
@@ -5277,6 +5283,13 @@ def _blank_remote_state(cfg: dict) -> dict:
         # it to tell one Slave's stream from another's. Empty until
         # the first packet arrives.
         "addr": "",
+        # Which tuner is on the end of that Remote Rx, from its own TUN
+        # line: "minitiouner" or "knucker". They measure different
+        # things, so the panel labels different fields. Defaults to a
+        # Minitiouner because a Remote Rx old enough to send no TUN line
+        # is certainly one - and so is any unit whose tuner we failed to
+        # recognise.
+        "tuner": "minitiouner",
         "last_seen": 0,
     }
 
@@ -5805,6 +5818,22 @@ def remote_source_monitor(index: int):
                         print(f"[remote {index}] now running {st['version']}")
                         st["update_pending"] = None
                         st["update_result"] = f"updated to {st['version']}"
+                    continue
+                if line.startswith("TUN"):
+                    # "TUN <kind>": which tuner the Remote Rx found on
+                    # its USB. The panel shows the fields that tuner
+                    # actually measures: a Knucker reports SNR and
+                    # bandwidth, a Minitiouner MER and symbol rate, and
+                    # showing one tuner's labels over the other's
+                    # numbers would be worse than showing nothing.
+                    #
+                    # An unknown kind is left as it was rather than
+                    # stored: a newer Remote Rx reporting a tuner this
+                    # receiver has never heard of is better served by a
+                    # Minitiouner's panel than by a blank one.
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1] in REMOTE_TUNER_KINDS:
+                        st["tuner"] = parts[1]
                     continue
                 if line.startswith("SITE"):
                     # "SITE <locator> <name>" - locator first because a
@@ -8878,6 +8907,10 @@ def get_status():
                 # How the video is arriving: SRT with its link figures, or
                 # plain UDP on the shared port (21 Nov 2026).
                 "link": _slave_link_for(i),
+                # Which tuner is out there, so the panel can label the
+                # fields that tuner measures rather than the ones a
+                # Minitiouner would.
+                "tuner": st.get("tuner", "minitiouner"),
                 "settings": remote_settings_state(i),
                 # What the Remote Rx is running, and whether that
                 # matches this receiver. "behind" is only ever True when

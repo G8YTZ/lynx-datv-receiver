@@ -354,7 +354,7 @@ def main():
                     help="SRT latency in ms; about four round trips. 300 suits "
                          "most broadband, a LAN needs far less")
     args = ap.parse_args()
-    code = remote_common.prepare(args, "kS/s")
+    code = remote_common.prepare(args, "kS/s", "minitiouner")
     if code is not None:
         return code
     if args.srt_port is None:
