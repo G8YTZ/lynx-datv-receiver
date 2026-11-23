@@ -49,6 +49,12 @@ case "$KIND" in
 esac
 echo "Tuner detected: $KIND (running $SOURCE)" >&2
 
+# Tells the source module the choice has already been made here, so it
+# does not make it again. It matters for TUNER= in the conf: that is an
+# operator overriding detection, and longmynd_source.py would otherwise
+# detect for itself and override the override.
+export LYNX_TUNER_CHOSEN=1
+
 # -u so output reaches the journal as it happens rather than when a
 # buffer fills. Without it a crash can lose the lines explaining it.
 exec /usr/bin/python3 -u "$SLAVE_DIR/$SOURCE" "${ARGS[@]}"

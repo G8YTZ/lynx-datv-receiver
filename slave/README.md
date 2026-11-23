@@ -188,9 +188,22 @@ it. Once, on the Remote Rx:
 cd ~/lynx-datv-receiver && git pull && sudo systemctl restart lynx-slave
 ```
 
-After that the button works. Run `./install.sh` again only when the
-wrapper or the systemd unit has changed; the installer is safe to run
-again and keeps your settings and your key.
+After that the button works. The installer is safe to run again and
+keeps your settings and your key.
+
+**Changing tuner needs no reinstall**, even on a Remote Rx built before
+tuner detection existed. Such a card has a wrapper that always starts
+the Minitiouner source, and that wrapper is outside the update path, so
+it cannot be replaced remotely. The Minitiouner source therefore checks
+for itself and hands over to the right one. Press **Update**, plug in
+the other tuner, restart the service, and it follows.
+
+Worth running `./install.sh` once anyway when convenient: it replaces
+that wrapper with a thin launcher that defers to the checkout, so from
+then on changes to how the service starts arrive by the Update button
+like everything else. Nothing depends on it; it is the difference
+between a card that can be fixed remotely in future and one that may
+need another ssh session.
 
 ## Moving it to another site
 

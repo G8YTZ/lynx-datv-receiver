@@ -318,7 +318,60 @@ def read_fifo(path: str, tuner: TunerState, stop: threading.Event):
                 time.sleep(1)
 
 
+def hand_over_if_not_a_minitiouner():
+    """Start the right source even when something else started us.
+
+    A Remote Rx installed before tuner detection existed has a wrapper
+    in /usr/local/bin that always runs THIS module, whatever is
+    plugged in. That wrapper is a copy, outside the git checkout, so a
+    remote update cannot replace it - which would leave every existing
+    Remote Rx needing a visit, or at least an ssh session and a sudo
+    password, before it could ever drive a Knucker.
+
+    So this module checks too, and hands over. An old wrapper then
+    reaches the right source through the update path alone, with
+    nothing to reinstall: the Update button is enough.
+
+    LYNX_TUNER_CHOSEN is set by the current wrapper, which has already
+    decided - including when the operator forced a tuner with TUNER= in
+    the conf. Without this, that explicit choice would be silently
+    overridden here, which is precisely what an override is for.
+    """
+    if os.environ.get("LYNX_TUNER_CHOSEN"):
+        return
+    # --help is how the updater's second gate checks this module
+    # starts. It must answer for itself rather than hand the question
+    # to another module, or the gate stops testing what it thinks it
+    # is testing.
+    if "--help" in sys.argv or "-h" in sys.argv:
+        return
+    try:
+        import detect_tuner
+        kind, product, _found = detect_tuner.detect()
+    except Exception as e:
+        # Never fatal. Carrying on as a Minitiouner is what this
+        # Remote Rx did before any of this existed.
+        print(f"[tuner] could not check which tuner is fitted ({e}) - "
+              f"carrying on as a Minitiouner", file=sys.stderr)
+        return
+    if kind == "minitiouner":
+        return
+    target = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          f"{kind}_source.py")
+    if not os.path.exists(target):
+        print(f"[tuner] {product} found, but there is no {kind}_source.py "
+              f"in this checkout - carrying on as a Minitiouner",
+              file=sys.stderr)
+        return
+    print(f"[tuner] {product} found: handing over to {kind}_source.py")
+    sys.stdout.flush()
+    os.execve(sys.executable,
+              [sys.executable, "-u", target] + sys.argv[1:],
+              dict(os.environ, LYNX_TUNER_CHOSEN="1"))
+
+
 def main():
+    hand_over_if_not_a_minitiouner()
     ap = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
