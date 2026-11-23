@@ -79,6 +79,7 @@ reader never exits while the tuner is running.
 
 import argparse
 import os
+import pty
 import re
 import signal
 import subprocess
@@ -143,12 +144,20 @@ class KnuckerState:
         self.fft = ""
         self.last_line_at = 0.0
 
-    def update(self, line: str):
+    def update(self, line: str) -> bool:
+        """True if the line was one we understand.
+
+        The caller echoes the ones that are not, which is how
+        "Unable to claim interface" reaches the journal instead of
+        being silently dropped: that message is the only clue when
+        something else already has the tuner, and the binary answers
+        it with a segfault rather than a sensible exit.
+        """
         with self._lock:
             self.last_line_at = time.time()
             if RE_LOCKED.match(line):
                 self.locked = True
-                return
+                return True
             if RE_UNLOCKED.match(line):
                 self.locked = False
                 # The figures belong to a signal that is no longer
@@ -157,7 +166,7 @@ class KnuckerState:
                 self.snr_db = 0.0
                 self.sqi = None
                 self.per = None
-                return
+                return True
             for rx, attr, cast in (
                     (RE_SNR, "snr_db", float), (RE_SSI, "ssi", int),
                     (RE_SQI, "sqi", int), (RE_PER, "per", float),
@@ -170,7 +179,8 @@ class KnuckerState:
                         setattr(self, attr, cast(m.group(1)))
                     except ValueError:
                         pass
-                    return
+                    return True
+            return False
 
     def snapshot(self) -> dict:
         with self._lock:
@@ -239,23 +249,61 @@ def build_quality_lines(snap: dict) -> str:
     return "\n".join(lines)
 
 
-def read_stdout(proc, tuner: KnuckerState, stop: threading.Event):
-    """Drain the tuner's stdout and parse it.
+def start_tuner(cmd):
+    """Launch the tuner on a pty, and return (proc, reader).
 
-    Draining matters more than parsing. If this stops, the pipe fills,
-    the tuner blocks writing to it, and the transport stream dies.
+    WHY A PTY AND NOT A PIPE
+    ------------------------
+    CombiTunerExpress uses ordinary C stdio, which line-buffers to a
+    terminal and block-buffers to a pipe. Down a pipe its status sits
+    in a 4 KB buffer that takes minutes to fill at a few short lines
+    every two seconds, so the Remote Rx reported "searching" while the
+    tuner was locked and sending pictures perfectly well. Measured
+    against a stand-in with the same buffering: zero lines in the
+    first 1.5 seconds through a pipe, everything immediately through
+    a pty.
+
+    stdbuf is the usual answer and cannot help here: its helper
+    library is 64-bit and the tuner binary is 32-bit, so the preload
+    is refused.
+    """
+    master, slave = pty.openpty()
+    try:
+        proc = subprocess.Popen(cmd, preexec_fn=os.setsid,
+                                stdout=slave, stderr=slave, close_fds=True)
+    finally:
+        # The parent has no use for its end, and holding it open would
+        # stop the reader ever seeing end-of-file.
+        os.close(slave)
+    return proc, os.fdopen(master, "r", errors="replace")
+
+
+def read_tuner(reader, tuner: KnuckerState, stop: threading.Event):
+    """Drain the tuner's output and parse it.
+
+    Draining matters more than parsing. If this stops, the buffer
+    fills, the tuner blocks writing to it, and the transport stream
+    dies: the same trap as Longmynd's status FIFO by another route.
+
+    Lines we do not recognise are echoed rather than dropped. They are
+    the start-up sequence, the PLP report, and the errors.
     """
     try:
-        for raw in proc.stdout:
+        for raw in reader:
             if stop.is_set():
                 return
-            line = raw.rstrip("\n")
-            if line.strip():
-                tuner.update(line.strip())
-    except (OSError, ValueError):
-        # The pipe closed because the process went: the supervisor
-        # loop notices and restarts it.
+            line = raw.strip()
+            if line and not tuner.update(line):
+                print(f"[tuner] {line}", flush=True)
+    except OSError:
+        # Reading a pty whose child has gone raises EIO on Linux. That
+        # is how this loop ends normally; the supervisor restarts it.
         return
+    finally:
+        try:
+            reader.close()
+        except OSError:
+            pass
 
 
 def main():
@@ -373,11 +421,8 @@ def main():
         started = time.time()
         print("[tuner] starting CombiTunerExpress")
         tuner.clear_signal()
-        proc = subprocess.Popen(cmd, preexec_fn=os.setsid,
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT,
-                                text=True, bufsize=1)
-        threading.Thread(target=read_stdout, args=(proc, tuner, stop),
+        proc, reader = start_tuner(cmd)
+        threading.Thread(target=read_tuner, args=(reader, tuner, stop),
                          daemon=True).start()
 
         last_searching = 0.0
