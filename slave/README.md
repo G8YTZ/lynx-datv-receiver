@@ -205,6 +205,11 @@ like everything else. Nothing depends on it; it is the difference
 between a card that can be fixed remotely in future and one that may
 need another ssh session.
 
+If you are changing the Remote Rx code rather than running it, read
+[UPDATE-DISCIPLINE.md](UPDATE-DISCIPLINE.md) first: the rules that keep
+the Update button working on units nobody can reach, and what each one
+cost to learn.
+
 ## Moving it to another site
 
 Add the new site's Wi-Fi before you take it there:
