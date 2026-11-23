@@ -273,18 +273,38 @@ def build_quality_lines(snap: dict, bandwidth_khz: int = 0) -> str:
     somebody would eventually compare them." That applies here, for the
     same reason, so the SNR goes in a row of its own labelled SNR.
     """
-    if not snap["locked"]:
-        return ""
     lines = []
-    if snap["snr_db"]:
-        lines.append(f"$SNR,{snap['snr_db']:.1f}")
-    # SSI and SQI as the percentages the tuner gives. The panel labels
-    # them as percentages too, which is what the earlier refusal to
-    # report a Level was really about: the objection was to inventing a
-    # dBm figure from a percentage, not to showing the percentage. The
-    # HDHomeRun panel has shown a percentage Level for months.
+
+    # SSI goes out whether or not there is a lock, and it is the only
+    # thing that does. It is RF power at the tuner input, which exists
+    # independently of whether anything can be demodulated - so it is
+    # exactly what separates "the transmitter is off, or the coax is
+    # not on" from "there is plenty of signal and the demodulator will
+    # not have it". Without it an unlocked Remote Rx reports nothing at
+    # all, and those two faults look identical from the repeater. They
+    # need very different trips up a ladder.
+    #
+    # Found the hard way: a Knucker sat tuned correctly to 436 MHz with
+    # its front end locking every cycle and its channel scan failing,
+    # for nine minutes, with no way to tell from here which fault it
+    # was.
+    #
+    # The panel labels it as a percentage, which is what the earlier
+    # refusal to report a Level was really about: the objection was to
+    # inventing a dBm figure from a percentage, not to showing the
+    # percentage. The HDHomeRun panel has shown a percentage Level for
+    # months.
     if snap["ssi"] is not None:
         lines.append(f"$SSI,{snap['ssi']}")
+
+    # Everything else describes a signal being demodulated, so it is
+    # suppressed without a lock rather than sent as a stale or zero
+    # reading.
+    if not snap["locked"]:
+        return "\n".join(lines)
+
+    if snap["snr_db"]:
+        lines.append(f"$SNR,{snap['snr_db']:.1f}")
     if snap["sqi"] is not None:
         lines.append(f"$SQI,{snap['sqi']}")
     if snap["per"] is not None:
