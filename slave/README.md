@@ -147,11 +147,25 @@ At the repeater, the Remote Rx panel shows the link's round-trip time, data rate
 
 ## Updating
 
+Normally there is nothing to do here: On the Lynx at the repeater, the
+Remote Rx panel shows the version it is running, and an **Update**
+button appears when this receiver is on a newer one. Pressing it sends
+a signed command in reply to the Remote Rx's next heartbeat. The Remote
+Rx fetches, refuses the update unless the new code compiles and starts,
+then restarts. If the new version will not stay running it puts the old
+one back by itself.
+
+**The first update must be done by hand.** A Remote Rx built before the
+Update button existed has no code to act on the command, so it ignores
+it. Once, on the Remote Rx:
+
 ```
-cd ~/lynx-datv-receiver && git pull && cd slave && ./install.sh
+cd ~/lynx-datv-receiver && git pull && sudo systemctl restart lynx-slave
 ```
 
-The installer is safe to run again: It keeps your settings and your key.
+After that the button works. Run `./install.sh` again only when the
+wrapper or the systemd unit has changed; the installer is safe to run
+again and keeps your settings and your key.
 
 ## Moving it to another site
 
