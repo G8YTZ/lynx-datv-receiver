@@ -2,6 +2,24 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-11-23
+
+**New**
+- A Remote Rx can be a **Knucker** (BATC CombiTuner) instead of a Minitiouner, for narrowband DVB-T and DVB-T2 that a Minitiouner cannot receive at all. The Remote Rx works out which tuner is plugged in at every start, so swapping one for the other needs a service restart and nothing else. `slave/install.sh --knucker` adds the 32-bit driver and its libraries, automatically if a Knucker is plugged in while it runs; a Minitiouner card gets none of it.
+- The panel, OSD and magic eye show the measurements each tuner actually makes: MER, margin and a calibrated dBm level for a Minitiouner; SNR in dB, level and SNQ as percentages, PER, standard and mode for a Knucker. A Knucker's SNR is deliberately not shown as MER and its percentage level is not shown as dBm - they are different measurements and putting one in the other's row invites a comparison that does not hold. The DVB-T/T2 fields are the same ones the HDHomeRun fills, drawn by the same code.
+- A Knucker Remote Rx reports the callsign, provider and codecs, read out of the transport stream on its way past: its driver, unlike Longmynd, exposes none of them. The QRZ lookup and the path finder work from it with no further change.
+- Panels can be opened and closed by clicking their header, so an unlocked receiver's readings can be read on demand without every panel standing open.
+
+**Fixed**
+- **A Remote Rx could only be updated while somebody was transmitting into it.** The Update button sat inside a panel body that is hidden unless locked, so the one unit certain to need updating - a broken one, which never locks - was the one unit that could not be. The button is now in the panel header, where it is reachable whatever the receiver is doing.
+- **The Remote Rx's start-up wrapper was outside its own update path.** `install.sh` copied it to `/usr/local/bin`, so a remote update could change the Python and never how the service starts. It is now a thin launcher that hands over to the checkout. Existing Remote Rx cards need `./install.sh` run once by hand to pick this up.
+- The picture blanked every half minute on a low-bitrate feed. `--demuxer-max-bytes` caps the demuxer in BYTES, so what it holds in SECONDS scales inversely with the rate: about 2.7s at 1.5 Mb/s but about 28s at 0.15 Mb/s. Two separate restart triggers read that ordinary condition as a wedged decoder. Both now require playback to have actually stopped.
+- The OSD showed a Knucker's frequency beside the LOCAL tuner's symbol rate, because the figure was only replaced when the Remote Rx reported one and a Knucker never does. It now carries its own units and is dropped when there is nothing to show.
+- The link row showed "UDP (LAN)" on a Remote Rx that has never sent a UDP packet, masking a real SRT drop. An SRT Remote Rx now always reports its SRT listener's state.
+- The Config card said "needs a restart" after every save. Only the status port needs one; frequency, bandwidth, name and locator are pushed to the Remote Rx and applied in seconds. The second tuning box also relabels itself to **Bandwidth (kHz)** for a Knucker, which takes a bandwidth and not a symbol rate.
+- The systemd journal is now persistent, capped at 200 MB. It was kept in RAM, so a receiver that restarted on its own destroyed the evidence of why as it did it - which is why that fault has never been diagnosed.
+- The Remote Rx's update check now start-tests every tuner source, not just the Minitiouner's: a Knucker unit was proving that the code it does not run would start.
+
 ## 2026-11-14
 
 **New**

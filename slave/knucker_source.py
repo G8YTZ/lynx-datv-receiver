@@ -469,13 +469,18 @@ def main():
 
     if not os.path.exists(args.binary):
         print(f"No CombiTunerExpress at {args.binary}.\n"
-              f"Fetch it with:\n"
+              f"Install it, and the 32-bit libraries it needs, with:\n"
+              f"  cd ~/lynx-datv-receiver/slave && ./install.sh --knucker\n"
+              f"That is also done automatically when a Knucker is "
+              f"plugged in at install time. By hand:\n"
               f"  mkdir -p {os.path.dirname(args.binary)} && curl -sSL -o "
               f"{args.binary} https://raw.githubusercontent.com/"
               f"BritishAmateurTelevisionClub/ryde-build/master/configs/dvbt/"
               f"CombiTunerExpress && chmod +x {args.binary}\n"
-              f"It is a 32-bit binary, so the armhf libraries must be "
-              f"installed too (install.sh does this).", file=sys.stderr)
+              f"It is a 32-bit armhf binary, so on 64-bit Raspberry Pi "
+              f"OS the armhf architecture and its runtime libraries are "
+              f"needed too - which is what --knucker adds.",
+              file=sys.stderr)
         return 2
 
     # One parser, shared: the tap writes it and the heartbeat reads it.

@@ -34,6 +34,73 @@ if [ ! -f /etc/udev/rules.d/minitiouner.rules ]; then
     echo "Installed the Minitiouner udev rule: unplug and replug it, or reboot"
 fi
 
+# ── Knucker (BATC CombiTuner), only if one is here ──────────────────
+#
+# Done only for a card that needs it. The Knucker's driver,
+# CombiTunerExpress, is a closed 32-bit armhf binary, and running it on
+# 64-bit Raspberry Pi OS needs the armhf architecture and its runtime
+# libraries. That is 30-50 MB and an odd-looking package list forever,
+# which a Minitiouner card should not carry for a tuner it will never
+# have. DVB-S2 is the common case; this is the exception.
+#
+# Triggered by a Knucker actually being plugged in, or by --knucker for
+# building a card before the tuner arrives.
+#
+# The processor runs 32-bit ARM natively - AArch32 is a hardware
+# execution state on these cores, not emulation - so there is no
+# performance cost here, only the multiarch packaging.
+knucker_wanted=false
+for a in "$@"; do [ "$a" = "--knucker" ] && knucker_wanted=true; done
+if [ "$knucker_wanted" = false ] \
+   && [ "$(python3 "$here/detect_tuner.py" 2>/dev/null || true)" = "knucker" ]; then
+    knucker_wanted=true
+    echo "A Knucker is plugged in: installing its driver as well"
+fi
+
+cte=/home/pi/knucker/CombiTunerExpress
+if [ "$knucker_wanted" = true ]; then
+    if ! dpkg --print-foreign-architectures | grep -qx armhf; then
+        echo "Adding the armhf architecture for the Knucker's 32-bit driver"
+        sudo dpkg --add-architecture armhf
+        sudo apt-get update
+    fi
+    # The loader plus the libraries this binary has been seen to want.
+    # Not a guess left to stand: the check below reads what it ACTUALLY
+    # needs and says so, rather than leaving a card that looks
+    # installed and fails at the first tune.
+    sudo apt-get install -y libc6:armhf libusb-1.0-0:armhf libstdc++6:armhf \
+        || echo "Some armhf packages would not install - the check below will say if it matters"
+
+    if [ ! -x "$cte" ]; then
+        echo "Fetching CombiTunerExpress"
+        mkdir -p "$(dirname "$cte")"
+        curl -sSL -o "$cte" \
+          https://raw.githubusercontent.com/BritishAmateurTelevisionClub/ryde-build/master/configs/dvbt/CombiTunerExpress
+        chmod +x "$cte"
+    fi
+
+    # Verify rather than hope. ldd cannot read a 32-bit ARM object from
+    # a 64-bit userland ("not a dynamic executable", which is ldd
+    # failing and not the binary being static), but readelf reads any
+    # architecture. Every NEEDED library is checked against what is
+    # actually installed for armhf.
+    missing=""
+    for lib in $(readelf -d "$cte" 2>/dev/null \
+                 | sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p'); do
+        if ! ls /lib/arm-linux-gnueabihf/"$lib"* \
+               /usr/lib/arm-linux-gnueabihf/"$lib"* >/dev/null 2>&1; then
+            missing="$missing $lib"
+        fi
+    done
+    if [ -n "$missing" ]; then
+        echo "WARNING: CombiTunerExpress still needs:$missing"
+        echo "Find the package with:  apt-file search <library>  (then install it :armhf)"
+        echo "The Knucker will not tune until those are present."
+    else
+        echo "Knucker driver installed, and every library it needs is present"
+    fi
+fi
+
 # /usr/local/bin/lynx-slave is a thin launcher, NOT the wrapper. It
 # hands straight over to slave/lynx-slave in the git checkout, so that
 # a remote update - which can only ever change the checkout - can change
