@@ -315,16 +315,32 @@ state = {
     "codec": "",
     "audio_codec": "",
     "programme": "",
-    # HDHomeRun (DVB-T/T2/C). Deliberately their own keys rather than
-    # reusing mer/margin: those are DVB-S2 measurements, and a 0-100
-    # quality percentage drawn under "MER" would invite exactly the
-    # comparison it is not valid to make.
+    # DVB-T/T2 quality, from whichever tuner is on screen: an
+    # HDHomeRun on the LAN, or a Knucker at a Remote Rx. One set of
+    # fields and one piece of drawing code for both - they are the same
+    # measurements and they should not acquire two implementations that
+    # can drift apart.
+    #
+    # Deliberately their own keys rather than reusing mer/margin: those
+    # are DVB-S2 measurements, and a 0-100 quality percentage drawn
+    # under "MER" would invite exactly the comparison it is not valid
+    # to make.
+    #
+    # dvbt_metrics says these are filled and should be drawn. It is
+    # NOT the same question as mode == "dvbt": a Knucker Remote Rx is
+    # mode "rf" like any other receiver, and still reports these.
+    "dvbt_metrics": False,
     "hdhr_online": False,
-    "hdhr_locked": False,
+    "dvbt_locked": False,
     "hdhr_lock_mode": "",
-    "hdhr_level": "",
-    "hdhr_snq": "",
-    "hdhr_seq": "",
+    "dvbt_level": "",
+    "dvbt_snq": "",
+    # SEQ comes from an HDHomeRun only. A Knucker has no equivalent -
+    # its PER is an error rate, where more is worse, and SEQ is a
+    # quality score, where more is better. One is not the other.
+    "dvbt_seq": "",
+    # dB, from a Knucker only. An HDHomeRun reports no SNR at all.
+    "dvbt_snr": "",
     "hdhr_bitrate_bps": 0,
     "hdhr_frequency_hz": None,
     "hdhr_service_name": "",
@@ -669,11 +685,12 @@ def poll_status():
             hh = ((data.get('lynx') or {}).get('hdhomerun')
                   or data.get('hdhomerun') or {})
             state["hdhr_online"] = bool(hh.get('online', False))
-            state["hdhr_locked"] = bool(hh.get('locked', False))
+            state["dvbt_locked"] = bool(hh.get('locked', False))
             state["hdhr_lock_mode"] = hh.get('lock_mode', "") or ""
-            state["hdhr_level"] = hh.get('level', "")
-            state["hdhr_snq"] = hh.get('snq', "")
-            state["hdhr_seq"] = hh.get('seq', "")
+            state["dvbt_level"] = hh.get('level', "")
+            state["dvbt_snq"] = hh.get('snq', "")
+            state["dvbt_seq"] = hh.get('seq', "")
+            state["dvbt_snr"] = ""      # an HDHomeRun reports none
             state["hdhr_bitrate_bps"] = hh.get('bitrate_bps', 0) or 0
             state["hdhr_frequency_hz"] = hh.get('frequency_hz')
             state["hdhr_service_name"] = hh.get('service_name', "") or ""
@@ -853,13 +870,20 @@ def poll_status():
             if live_sr:
                 state["sr_ks"] = live_sr
             # Local tuners are DVB-S2 and have no SNR of their own.
-            # Both reset explicitly, because the last thing on screen
+            # All reset explicitly, because the last thing on screen
             # may have been a Knucker Remote Rx measuring a bandwidth,
-            # and its units and SNR must not outlive it.
+            # and its units, SNR and percentages must not outlive it.
             state["sr_units"] = "kS/s"
             state["snr"] = ""
             lynx = data.get('lynx', {})
             state["mode"]      = lynx.get('mode', 'idle')
+            # Set HERE, not up in the HDHomeRun block, because mode is
+            # only known at this point in the poll: doing it earlier
+            # read the PREVIOUS poll's mode and left the eye and the
+            # quality line one poll behind every source change.
+            # The Remote Rx block below overrides it for a Knucker,
+            # which reports these same figures while in mode "rf".
+            state["dvbt_metrics"] = (state["mode"] == "dvbt")
             # Matched on index rather than position in the list:
             # a disabled Slave still has a record, so the two are
             # not the same thing.
@@ -999,10 +1023,30 @@ def poll_status():
                 state["sr_ks"] = rem.get('bandwidth', '')
                 state["sr_units"] = "kHz"
                 state["snr"] = rem.get('snr', '')
+                # The same table the HDHomeRun fills, because these are
+                # the same measurements: one set of fields, one piece of
+                # drawing code, no second implementation to drift.
+                #
+                # SSI and SQI are 0-100 from the tuner, exactly as the
+                # HDHomeRun's ss and snq are. No dvbt_seq: a Knucker has
+                # no equivalent, and its PER is not one - PER rises as
+                # things get worse and SEQ falls, so putting one in the
+                # other's field would read backwards.
+                state["dvbt_metrics"] = True
+                state["dvbt_locked"] = bool(rem.get('locked'))
+                state["dvbt_level"] = rem.get('ssi', '')
+                state["dvbt_snq"] = rem.get('sqi', '')
+                state["dvbt_seq"] = ''
+                state["dvbt_snr"] = rem.get('snr', '')
             else:
                 state["sr_ks"] = rem.get('symbol_rate', '')
                 state["sr_units"] = "kS/s"
                 state["snr"] = ""
+                # A Minitiouner Remote Rx is DVB-S2 and fills the
+                # mer/margin fields instead. Cleared so a Knucker
+                # watched a moment ago cannot leave its percentages
+                # under a DVB-S2 receiver's panel.
+                state["dvbt_metrics"] = False
             # Two local tuners' worth of state, describing hardware
             # that is not the source. Left set, it would draw a
             # diversity row or a tri_watch indicator over a Slave.
@@ -1173,7 +1217,7 @@ class LynxOverlay(Gtk.Window):
         else:
             genuinely_locked = ((state["locked"] and state["mpv_running_for_rf"])
                                 or state["mode"] == "stream"
-                                or (state["mode"] == "dvbt" and state["hdhr_locked"]))
+                                or (state["mode"] == "dvbt" and state["dvbt_locked"]))
         showing_picture = genuinely_locked and not mpv_transitioning
 
         # Auto-Squeak is drawn BEFORE the showing_picture branch and
@@ -1652,7 +1696,7 @@ class LynxOverlay(Gtk.Window):
             # are quality readings, so strength needs somewhere to live.
             # The service name goes last, in the callsign's place - on
             # an amateur transmission that is exactly what it is.
-            colour = ((0.0, 1.0, 0.25) if state["hdhr_locked"]
+            colour = ((0.0, 1.0, 0.25) if state["dvbt_locked"]
                       else (0.9, 0.5, 0.1))
             # SNQ/SEQ as a pair, where the DVB-S2 block shows MER/D.
             # SNQ is the closest thing this tuner has to MER: the
@@ -1660,9 +1704,9 @@ class LynxOverlay(Gtk.Window):
             # well the FEC is coping, which behaves like margin - it
             # sits at 100 until the correction starts struggling, and
             # it is the one that warns you a picture is about to break.
-            snq = state.get("hdhr_snq")
-            seq = state.get("hdhr_seq")
-            if state["hdhr_locked"] and snq not in ("", None):
+            snq = state.get("dvbt_snq")
+            seq = state.get("dvbt_seq")
+            if state["dvbt_locked"] and snq not in ("", None):
                 lines.append(f"SNQ/SEQ {float(snq):>4.0f}/{float(seq or 0):>4.0f} %")
             # "Justin - G8YTZ" when QRZ has told us a name, the bare
             # callsign otherwise, and the raw service name when there
@@ -1706,13 +1750,29 @@ class LynxOverlay(Gtk.Window):
             else:
                 if state["locked"] and state["mer"] and state["margin"]:
                     lines.append(f"MER/D {state['mer']:>5}/{state['margin']:>5} dB")
-                elif state["locked"] and state["snr"]:
-                    # A Knucker Remote Rx: an SNR and no margin, so the
-                    # MER/D row cannot be drawn and the OSD would carry
-                    # no quality figure at all. Labelled SNR because
-                    # that is what it is - the whole point of keeping it
-                    # out of the MER field in the first place.
-                    lines.append(f"SNR {state['snr']:>5} dB")
+                elif state["locked"] and state["dvbt_metrics"]:
+                    # A DVB-T/T2 Remote Rx - a Knucker. No MER and no
+                    # margin, so the MER/D row cannot be drawn and the
+                    # OSD would otherwise carry no quality figure at
+                    # all. Drawn from the same fields and with the same
+                    # labels the HDHomeRun block uses above, because it
+                    # is the same measurement: SNQ is the demodulator's
+                    # view, LVL the RF strength. SNR leads, because it
+                    # is the one figure here that is in dB and the one
+                    # an operator will quote.
+                    bits = []
+                    for label, key, fmt in (("SNR", "dvbt_snr", "{:.1f} dB"),
+                                            ("SNQ", "dvbt_snq", "{:.0f}%"),
+                                            ("LVL", "dvbt_level", "{:.0f}%")):
+                        v = state.get(key)
+                        if v in ("", None):
+                            continue
+                        try:
+                            bits.append(f"{label} {fmt.format(float(v))}")
+                        except (TypeError, ValueError):
+                            pass
+                    if bits:
+                        lines.append("  ".join(bits))
 
             # Callsign/searching indicator goes last - it takes up
             # less visual real estate than the MER/margin rows above it.
@@ -1803,7 +1863,7 @@ class LynxOverlay(Gtk.Window):
             margin = LEFT_MARGIN
             size = 30
             line_h = size * 1.3
-            colour = DVBT_LOCKED if state["hdhr_locked"] else DVBT_NOT_LOCKED
+            colour = DVBT_LOCKED if state["dvbt_locked"] else DVBT_NOT_LOCKED
 
             # Two lines, the same shape as the DVB-S2 block above:
             # what it is tuned to, then how it is coded and at what
@@ -1837,10 +1897,10 @@ class LynxOverlay(Gtk.Window):
             line1 = f"{freq_hz / 1e6:.3f} MHz" if freq_hz else "--"
             if bw:
                 line1 += f"  {bw}"
-            if std and state["hdhr_locked"]:
+            if std and state["dvbt_locked"]:
                 line1 += f"  {std}"
 
-            if state["hdhr_locked"]:
+            if state["dvbt_locked"]:
                 bps = state.get("hdhr_bitrate_bps") or 0
                 line2 = f"{bps / 1e6:.2f} Mb/s" if bps else "--"
                 # Codecs from the same fields the stream branch uses,
@@ -2147,7 +2207,13 @@ class LynxOverlay(Gtk.Window):
             text = f"{dbm:.0f} dBm" if (dbm_valid or level_str) else "--"
             return frac, text
 
-        if state["mode"] == "dvbt":
+        if state["dvbt_metrics"]:
+            # Any DVB-T/T2 tuner on screen - an HDHomeRun on the LAN or
+            # a Knucker at a Remote Rx. Tested on the metrics rather
+            # than on mode == "dvbt", because a Knucker Remote Rx is
+            # mode "rf" like any other receiver and still reports
+            # exactly these figures.
+            #
             # The device reports level as 0-100, not dBm. Shown as the
             # percentage it is rather than converted into a dBm figure
             # it never measured - the same choice stream mode makes
@@ -2163,15 +2229,23 @@ class LynxOverlay(Gtk.Window):
             # measured. If a model is ever found that reports dBmV,
             # that converts to dBm properly and the bottom half can
             # become directly comparable with the DVB-S2 side.
-            seq = state.get("hdhr_seq")
-            if seq in ("", None):
+            # SEQ when the tuner reports one, SNQ when it does not. An
+            # HDHomeRun reports both and keeps the SEQ it has always
+            # shown here; a Knucker reports no SEQ at all, and its PER
+            # is not a substitute - PER rises as things get worse and
+            # SEQ falls, so the eye would read backwards. SNQ is the
+            # honest second reading for that tuner.
+            top, top_label = state.get("dvbt_seq"), "SEQ"
+            if top in ("", None):
+                top, top_label = state.get("dvbt_snq"), "SNQ"
+            if top in ("", None):
                 value_text_a = "--"
                 fraction_a = 0.0
             else:
-                value_text_a = f"SEQ {float(seq):.0f}%"
-                fraction_a = min(1.0, float(seq) / 100.0) ** 0.5
+                value_text_a = f"{top_label} {float(top):.0f}%"
+                fraction_a = min(1.0, float(top) / 100.0) ** 0.5
 
-            lvl = state.get("hdhr_level")
+            lvl = state.get("dvbt_level")
             if lvl in ("", None):
                 value_text_b = "--"
                 fraction_b = 0.0
@@ -2180,7 +2254,7 @@ class LynxOverlay(Gtk.Window):
                 fraction_b = min(1.0, float(lvl) / 100.0) ** 0.5
 
             # One tuner, so one lock state - both halves agree.
-            locked_a = locked_b = state.get("hdhr_locked", False)
+            locked_a = locked_b = state.get("dvbt_locked", False)
         elif state["mode"] == "stream":
             # No independent tuners in stream mode - both halves show
             # the same bitrate-derived value, per "otherwise both
