@@ -53,6 +53,34 @@ DEFAULT_INTERVAL = 2.0
 # number to keep in step.
 QUALITY_PORT_OFFSET = 96
 
+# MPEG-2 stream types. Shared because both tuners end up looking at
+# the same numbers by different routes: Longmynd parses the PMT and
+# reports the type on $17, and the Knucker's source reads the PMT
+# itself because its binary reports nothing at all about the content.
+# One table, so a codec added for one tuner is not missing from the
+# other.
+#
+# Split by kind rather than by arrival order: the elementary streams
+# come in whatever order they come in, which is not something to rely
+# on, particularly on a service carrying more than one audio track.
+VIDEO_STREAM_TYPES = {
+    1:  "MPEG1",
+    2:  "MPEG2",
+    27: "H264",
+    36: "H265",
+}
+AUDIO_STREAM_TYPES = {
+    3:   "MPA",
+    4:   "MPA",
+    15:  "AAC",
+    17:  "AAC",
+    129: "AC3",
+}
+
+# Both together, only so an unknown type can be told from a known one
+# without asking twice.
+STREAM_TYPES = {**VIDEO_STREAM_TYPES, **AUDIO_STREAM_TYPES}
+
 # Remote configuration. The repeater answers our heartbeat with our
 # settings when we are running an older version; we check its signature
 # with the key shared at install, save them so a power cut brings us

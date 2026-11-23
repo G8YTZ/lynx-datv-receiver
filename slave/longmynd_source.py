@@ -94,27 +94,13 @@ MODCODS = {
     27: ("32APSK 8/9",  15.69), 28: ("32APSK 9/10", 16.05),
 }
 
-# MPEG-2 stream types, as $17 reports them. Split by kind rather
-# than by arrival order: Longmynd cycles through the elementary
-# streams and the order is not something to rely on, particularly on
-# a service carrying more than one audio track.
-VIDEO_STREAM_TYPES = {
-    1:  "MPEG1",
-    2:  "MPEG2",
-    27: "H264",
-    36: "H265",
-}
-AUDIO_STREAM_TYPES = {
-    3:   "MPA",
-    4:   "MPA",
-    15:  "AAC",
-    17:  "AAC",
-    129: "AC3",
-}
-
-# Both tables together, only so an unknown type can be told from a
-# known one without asking twice.
-STREAM_TYPES = {**VIDEO_STREAM_TYPES, **AUDIO_STREAM_TYPES}
+# MPEG-2 stream types, as $17 reports them. They live in
+# remote_common because the Knucker reads the same numbers out of the
+# PMT itself, and two copies of one table is two chances to add H.266
+# to only one of them.
+VIDEO_STREAM_TYPES = remote_common.VIDEO_STREAM_TYPES
+AUDIO_STREAM_TYPES = remote_common.AUDIO_STREAM_TYPES
+STREAM_TYPES = remote_common.STREAM_TYPES
 
 
 # Longmynd state 4. Only here does $18 carry a modcod at all — in
