@@ -103,6 +103,12 @@ import time
 
 import remote_common
 import srt_link
+import ts_info
+
+# Where CombiTunerExpress is pointed, so the stream passes through the
+# parser on its way out. 15998 and 15999 belong to Longmynd's aligner
+# and srt-live-transmit's input; this is the one before them.
+TS_TAP_PORT = 15997
 
 # How long without a line from the tuner before it is assumed gone. It
 # speaks every second or two whether locked or not, so this is generous.
@@ -144,7 +150,12 @@ class KnuckerState:
     about the other.
     """
 
-    def __init__(self):
+    def __init__(self, stream=None):
+        # What the transport stream says about itself, which is where
+        # the callsign comes from: this tuner's binary reports the
+        # signal but never its content. Optional so the state can be
+        # built and tested without a stream behind it.
+        self.stream = stream if stream is not None else ts_info.TsInfo()
         self._lock = threading.Lock()
         self.locked = False
         self.snr_db = 0.0
@@ -197,6 +208,8 @@ class KnuckerState:
             return False
 
     def snapshot(self) -> dict:
+        # Outside the lock: a different object with its own.
+        content = self.stream.snapshot()
         with self._lock:
             fresh = (self.last_line_at > 0
                      and (time.time() - self.last_line_at) < STATUS_STALE_SECS)
@@ -207,11 +220,21 @@ class KnuckerState:
                 # the heartbeat falls back to what we asked for. Unlike
                 # Longmynd there is no carrier offset to show.
                 "frequency_khz": 0,
-                # No SDT parsing, so never a callsign. The heartbeat
-                # reports LOCKED instead, which is the same thing it
-                # does for a Minitiouner whose transmitter left the SDT
-                # empty.
-                "callsign": "",
+                # From the transport stream's own SDT, read on the way
+                # past, because this binary never exposes it. On an
+                # amateur transmission the service name IS the
+                # callsign, which is why Lynx treats them as one field
+                # - and why the QRZ lookup and the path finder at the
+                # repeater need nothing further to start working.
+                #
+                # Empty until a service description arrives, and empty
+                # again once one stops: the heartbeat then reports
+                # LOCKED without a callsign, exactly as it does for a
+                # Minitiouner whose transmitter left the SDT blank.
+                "callsign": content["service"],
+                "programme": content["provider"],
+                "video_codec": content["video_codec"],
+                "audio_codec": content["audio_codec"],
                 "snr_db": self.snr_db,
                 "ssi": self.ssi,
                 "sqi": self.sqi,
@@ -234,6 +257,10 @@ class KnuckerState:
             self.snr_db = 0.0
             self.sqi = None
             self.per = None
+        # And the programme with it. A callsign left standing over a
+        # transmitter that has gone is worse than no callsign, and the
+        # next thing on this frequency may be somebody else.
+        self.stream.clear()
 
 
 def build_quality_lines(snap: dict, bandwidth_khz: int = 0) -> str:
@@ -334,6 +361,21 @@ def build_quality_lines(snap: dict, bandwidth_khz: int = 0) -> str:
         # go with it: that needs a required-C/N figure per mode, and a
         # guessed margin is worse than none.
         lines.append(f"$18,{snap['const']} {snap['fec']}")
+
+    # From the transport stream, under the same Longmynd tags the
+    # Minitiouner fills, because they are the same fields read from the
+    # same tables - just by us rather than by Longmynd. The repeater
+    # needs no new parsing and the panel no new rows.
+    #
+    # Underscores for spaces in the provider: the repeater splits this
+    # block on whitespace and turns them back, which is what Longmynd
+    # does with $14 too.
+    if snap.get("programme"):
+        lines.append(f"$14,{snap['programme'].replace(' ', '_')}")
+    if snap.get("video_codec"):
+        lines.append(f"$31,{snap['video_codec']}")
+    if snap.get("audio_codec"):
+        lines.append(f"$34,{snap['audio_codec']}")
     return "\n".join(lines)
 
 
@@ -436,7 +478,9 @@ def main():
               f"installed too (install.sh does this).", file=sys.stderr)
         return 2
 
-    tuner = KnuckerState()
+    # One parser, shared: the tap writes it and the heartbeat reads it.
+    stream = ts_info.TsInfo()
+    tuner = KnuckerState(stream)
     stop = threading.Event()
 
     # The bandwidth comes from the arguments, not the tuner: it is the
@@ -456,6 +500,18 @@ def main():
     else:
         ts_host, ts_port = args.host, args.video_port
 
+    # The stream goes through the parser on its way out, because the
+    # callsign exists nowhere else: this binary never exposes the SDT.
+    # The tap forwards first and parses after, so a fault in the parser
+    # can cost the callsign but never the picture.
+    #
+    # In the path rather than beside it because there is no way to see
+    # a copy of a UDP flow without being in it - SO_REUSEPORT would
+    # share the datagrams out between the two readers rather than
+    # duplicate them, which would quietly halve the stream reaching the
+    # repeater.
+    ts_info.TapThread(TS_TAP_PORT, (ts_host, ts_port), stream, stop).start()
+
     if args.key:
         threading.Thread(
             target=remote_common.SettingsReceiver(
@@ -470,12 +526,14 @@ def main():
                      args=(args.update_file,),
                      kwargs={"stop": stop}, daemon=True).start()
 
+    # Pointed at the tap, not at the final destination: the tap passes
+    # it on.
     cmd = [args.binary,
            "-m", "dvbt",
            "-f", str(args.freq),
            "-b", str(args.sr),
-           "-i", ts_host,
-           "-p", str(ts_port)]
+           "-i", "127.0.0.1",
+           "-p", str(TS_TAP_PORT)]
 
     print(f"Remote Rx (Knucker) -> {args.host}")
     print(f"  tuner  : {args.freq} kHz, {args.sr} kHz bandwidth, DVB-T/T2")
