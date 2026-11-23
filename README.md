@@ -31,7 +31,8 @@ Start Lynx, then set your Picotuner's IP address and your site details from the 
 - [`lynx_webui_manual.docx`](./docs/lynx_webui_manual.docx): what every button and field on the Web Control Portal does
 - [`lynx_overlay_annotated.pdf`](./docs/lynx_overlay_annotated.pdf): annotated guide to the on-screen display overlay
 - [`lynx_diversity_overview.docx`](./docs/lynx_diversity_overview.docx): how diversity reception works, and what's next
-- [`slave/README.md`](./slave/README.md): the Remote Rx, a Pi Zero 2 W and Minitiouner at another site sending its picture back over SRT: parts, wiring and installation from a blank SD card
+- [`slave/README.md`](./slave/README.md): the Remote Rx, a Pi Zero 2 W and a Minitiouner or Knucker at another site sending its picture back over SRT: parts, wiring and installation from a blank SD card
+- [`slave/UPDATE-DISCIPLINE.md`](./slave/UPDATE-DISCIPLINE.md): the rules that keep the Update button working on Remote Rx units nobody can reach, and what each one cost to learn
 - [`docs/SRT_OUTPUT.md`](./docs/SRT_OUTPUT.md): the SRT output, the Screen output card, and watching it in VLC
 - [`CHANGELOG.md`](./CHANGELOG.md): what's changed recently, in one place
 - [`docs/ROADMAP.md`](./docs/ROADMAP.md): what's being worked on next
