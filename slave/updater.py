@@ -198,14 +198,11 @@ def perform_update(slave_dir, repo, ref, state_path, log=print):
     if not prev:
         return False, "not a git checkout: nothing to update", False
 
-    # Tracked files only, so a stray file somebody left in the
-    # directory does not read as "they edited this".
-    #
-    # The first version of this comment claimed that __pycache__ made
-    # every Remote Rx refuse every update. That was wrong: the
-    # repository ignores __pycache__, and the refusal came from a test
-    # fixture built without a .gitignore. The check is still right for
-    # the reason above; the reasoning was not.
+    # Tracked files only. Running the Remote Rx leaves __pycache__
+    # beside its source, which is untracked, so counting untracked
+    # files here made every Remote Rx refuse every update as "locally
+    # changed" - found the first time this was run against a real
+    # checkout rather than a clean one.
     dirty_ok, dirty = git(repo, "status", "--porcelain",
                           "--untracked-files=no")
     if dirty_ok and dirty:
