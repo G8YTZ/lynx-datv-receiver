@@ -332,6 +332,14 @@ state = {
     "mode": "idle",
     "freq_khz": 437000,
     "sr_ks": 333,
+    # The units for sr_ks. A symbol rate for a DVB-S2 tuner, a channel
+    # bandwidth for the DVB-T/T2 Knucker, which measures no symbol rate
+    # at all. Carried beside the figure rather than hardcoded at the
+    # point it is drawn, so the two can never disagree.
+    "sr_units": "kS/s",
+    # SNR in dB, from a Knucker Remote Rx. Deliberately not "mer": see
+    # slave/knucker_source.py for why they are not interchangeable.
+    "snr": "",
     "stream_name": "",
     "stream_bitrate_kbps": None,
     "stream_video_codec": "",
@@ -844,6 +852,12 @@ def poll_status():
             live_sr = source.get('symbol_rate', '')
             if live_sr:
                 state["sr_ks"] = live_sr
+            # Local tuners are DVB-S2 and have no SNR of their own.
+            # Both reset explicitly, because the last thing on screen
+            # may have been a Knucker Remote Rx measuring a bandwidth,
+            # and its units and SNR must not outlive it.
+            state["sr_units"] = "kS/s"
+            state["snr"] = ""
             lynx = data.get('lynx', {})
             state["mode"]      = lynx.get('mode', 'idle')
             # Matched on index rather than position in the list:
@@ -967,8 +981,28 @@ def poll_status():
             # portable, with GNSS off and no portable locator set.
             state["portable_locator"] = ""
             state["remote_locator"] = rem.get('locator', '')
-            if rem.get('symbol_rate'):
-                state["sr_ks"] = rem['symbol_rate']
+            # What the second tuning figure IS depends on the tuner at
+            # the far end: a Minitiouner measures a symbol rate, and a
+            # Knucker is tuned to a bandwidth and measures no symbol
+            # rate at all.
+            #
+            # Assigned unconditionally. It used to be assigned only when
+            # the Slave reported a symbol rate, to avoid blanking a good
+            # reading - but for a Knucker, which never reports one, that
+            # left the LOCAL tuner's figure standing: the OSD showed a
+            # Knucker on 436 MHz at "1000 kS/s", a number belonging to a
+            # different receiver in a different box. Exactly the fault
+            # the tagged status format exists to prevent, arriving by
+            # another route. A blank figure is dropped from the line; a
+            # wrong one is read out by whoever is watching.
+            if rem.get('tuner') == 'knucker':
+                state["sr_ks"] = rem.get('bandwidth', '')
+                state["sr_units"] = "kHz"
+                state["snr"] = rem.get('snr', '')
+            else:
+                state["sr_ks"] = rem.get('symbol_rate', '')
+                state["sr_units"] = "kS/s"
+                state["snr"] = ""
             # Two local tuners' worth of state, describing hardware
             # that is not the source. Left set, it would draw a
             # diversity row or a tri_watch indicator over a Slave.
@@ -1672,6 +1706,13 @@ class LynxOverlay(Gtk.Window):
             else:
                 if state["locked"] and state["mer"] and state["margin"]:
                     lines.append(f"MER/D {state['mer']:>5}/{state['margin']:>5} dB")
+                elif state["locked"] and state["snr"]:
+                    # A Knucker Remote Rx: an SNR and no margin, so the
+                    # MER/D row cannot be drawn and the OSD would carry
+                    # no quality figure at all. Labelled SNR because
+                    # that is what it is - the whole point of keeping it
+                    # out of the MER field in the first place.
+                    lines.append(f"SNR {state['snr']:>5} dB")
 
             # Callsign/searching indicator goes last - it takes up
             # less visual real estate than the MER/margin rows above it.
@@ -1838,7 +1879,11 @@ class LynxOverlay(Gtk.Window):
             freq = f"{float(dl):.3f}"
         else:
             freq = state["frequency"] or f"{state['freq_khz']/1000:.3f}"
-        lines = [f"{freq} MHz  {state['sr_ks']} kS/s"]
+        # Dropped entirely when there is no figure, rather than drawn as
+        # a bare unit with nothing in front of it. Same shape as the
+        # Rx2 line below.
+        sr = f"  {state['sr_ks']} {state['sr_units']}" if state['sr_ks'] else ""
+        lines = [f"{freq} MHz{sr}"]
 
         # tri_watch, still "searching" (nothing selected/displayed yet):
         # also show Rx2's own frequency on the line right below Rx1's -
