@@ -5552,6 +5552,54 @@ def remote_settings_packet(body: dict, key: str) -> bytes:
     return (head + "\n" + sig + "\n").encode()
 
 
+# An update command: same signing as the settings, under its own magic
+# so the two can never be mistaken for one another. Versioned with the
+# time the button was pressed, so a captured packet cannot be replayed
+# later to force an update nobody asked for.
+REMOTE_UPD_MAGIC = "LYNXUPD1"
+
+
+def remote_update_packet(version: int, ref: str, key: str) -> bytes:
+    body = {"v": int(version), "cmd": "update", "ref": str(ref)}
+    head = REMOTE_UPD_MAGIC + "\n" + json.dumps(body, separators=(",", ":"))
+    sig = hmac.new(key.encode(), head.encode(), hashlib.sha256).hexdigest()
+    return (head + "\n" + sig + "\n").encode()
+
+
+def remote_send_update_if_due(i: int, sock, addr):
+    """Send a pending update command, in reply to the heartbeat.
+
+    The same path the settings take, and for the same reason: nothing
+    at the Remote Rx's site needs a port open, because this goes back
+    to wherever its heartbeat came from.
+
+    Sent on each heartbeat until the Remote Rx reports a different
+    version, because a single UDP packet is not a delivery guarantee.
+    The Remote Rx ignores a repeat of a command it has already acted
+    on, so repeating costs nothing.
+    """
+    st = remote_states[i]
+    pend = st.get("update_pending")
+    if not pend:
+        return
+    cfgs = remote_sources_cfg()
+    key = str(cfgs[i].get("key") or "").strip() if i < len(cfgs) else ""
+    if not key:
+        st["update_pending"] = None
+        return
+    # Give up after a while rather than ask for ever: a Remote Rx that
+    # has not taken it in two minutes is not going to.
+    if time.time() - pend["at"] > 120:
+        print(f"[remote {i}] update command not taken up, giving up")
+        st["update_pending"] = None
+        st["update_result"] = "no response"
+        return
+    try:
+        sock.sendto(remote_update_packet(pend["v"], pend["ref"], key), addr)
+    except OSError as e:
+        print(f"[remote {i}] could not send update command: {e}")
+
+
 def remote_send_settings_if_due(i: int, sock, addr):
     st = remote_states[i]
     if not st.get("cfg_capable"):
@@ -5567,6 +5615,44 @@ def remote_send_settings_if_due(i: int, sock, addr):
                   f"(Slave has {st.get('cfg_version')})")
     except OSError as e:
         print(f"[remote {i}] could not send settings: {e}")
+
+
+def lynx_local_version():
+    """This receiver's own short commit and branch, or ("-", "-").
+
+    Uses git_cmd rather than its own subprocess call, so it inherits
+    the non-interactive environment that stops git trying to prompt for
+    credentials where there is no terminal to prompt on.
+    """
+    ok_c, commit = git_cmd("rev-parse", "--short", "HEAD")
+    ok_b, branch = git_cmd("rev-parse", "--abbrev-ref", "HEAD")
+    return (commit if ok_c and commit else "-",
+            branch if ok_b and branch else "-")
+
+
+def remote_version_state(i: int) -> dict:
+    """For the panel: what the Remote Rx runs, against what we run.
+
+    Only compares when both ends are on the same branch and both
+    reported a commit. A Remote Rx deliberately held on another branch
+    is not "behind", and neither is one whose version we do not know:
+    saying so would put an Update button in front of somebody with
+    nothing to go on.
+    """
+    st = remote_states[i]
+    theirs, their_branch = st.get("version"), st.get("branch")
+    ours, our_branch = lynx_local_version()
+    comparable = bool(theirs and theirs != "-" and ours != "-"
+                      and their_branch == our_branch)
+    return {
+        "remote": theirs or None,
+        "remote_branch": their_branch or None,
+        "local": ours,
+        "local_branch": our_branch,
+        "comparable": comparable,
+        "behind": comparable and theirs.rstrip("+") != ours,
+        "modified": bool(theirs and theirs.endswith("+")),
+    }
 
 
 def remote_settings_state(i: int) -> dict:
@@ -5635,6 +5721,24 @@ def remote_source_monitor(index: int):
                     st["cfg_version"] = int(v) if v.isdigit() else None
                     st["cfg_capable"] = v != "-"
                     continue
+                if line.startswith("VER"):
+                    # "VER <commit> <branch>": the code the Remote Rx is
+                    # running, so the panel can say whether it is behind
+                    # this receiver. Two fixed fields, "-" when the
+                    # remote has no git metadata to report.
+                    parts = line.split()
+                    was = st.get("version")
+                    st["version"] = parts[1] if len(parts) >= 2 else None
+                    st["branch"] = parts[2] if len(parts) >= 3 else None
+                    # The version changing is how an update reports
+                    # itself finished: there is no acknowledgement to
+                    # wait for, and the Remote Rx restarts to apply it,
+                    # so the next heartbeat is the first word back.
+                    if st.get("update_pending") and st["version"] != was:
+                        print(f"[remote {index}] now running {st['version']}")
+                        st["update_pending"] = None
+                        st["update_result"] = f"updated to {st['version']}"
+                    continue
                 if line.startswith("SITE"):
                     # "SITE <locator> <name>" - locator first because a
                     # name contains spaces and a locator does not, so
@@ -5678,6 +5782,7 @@ def remote_source_monitor(index: int):
             # from: the Slave's router keeps that path open, so this works
             # behind NAT with no port forwarding at the Slave's site.
             remote_send_settings_if_due(index, sock, addr)
+            remote_send_update_if_due(index, sock, addr)
         except socket.timeout:
             pass
         except Exception as e:
@@ -8707,6 +8812,11 @@ def get_status():
                 # plain UDP on the shared port (21 Nov 2026).
                 "link": _slave_link_for(i),
                 "settings": remote_settings_state(i),
+                # What the Remote Rx is running, and whether that
+                # matches this receiver. "behind" is only ever True when
+                # both ends actually reported a commit: an unknown
+                # version is not evidence of being out of date.
+                "version": remote_version_state(i),
                 "name": remote_display_name(i),
                 "locator": st["locator"],
                 "status_port": st["status_port"],
@@ -8986,6 +9096,46 @@ def api_audio_devices():
         "resolved": _first_hdmi_device() if current.lower() == 'hdmi' else current,
         "devices": devices,
     }
+
+
+@app.post("/api/remote/{index}/update", tags=["RF Reception"],
+          summary="Tell a Remote Rx to update itself",
+          description="Queues a signed update command, sent in reply to the "
+                      "Remote Rx's next heartbeat, so nothing needs a port "
+                      "open at its site. The Remote Rx fetches this "
+                      "receiver's branch, refuses the update unless the new "
+                      "code compiles and starts, and restores the previous "
+                      "version if the new one fails to stay running. "
+                      "Progress is reported by the version on its panel.")
+def remote_update(index: int):
+    if index < 0 or index >= len(remote_states):
+        raise HTTPException(status_code=404, detail=f"no Remote Rx {index}")
+    cfgs = remote_sources_cfg()
+    key = str(cfgs[index].get("key") or "").strip() if index < len(cfgs) else ""
+    if not key:
+        raise HTTPException(status_code=400,
+                            detail="no key for this Remote Rx: it cannot be "
+                                   "sent commands")
+    st = remote_states[index]
+    if not remote_online(index):
+        raise HTTPException(status_code=400,
+                            detail="this Remote Rx is not currently heard "
+                                   "from, so nothing can be sent to it")
+    ver = remote_version_state(index)
+    # Only ever to the branch this receiver is on. A Remote Rx is
+    # deliberately not given an arbitrary ref to fetch: it is the one
+    # machine nobody can get to if it goes wrong.
+    ref = ver["local_branch"]
+    if not ref or ref == "-":
+        raise HTTPException(status_code=400,
+                            detail="this receiver is not a git checkout, so "
+                                   "it has no branch to point the Remote Rx at")
+    st["update_pending"] = {"v": int(time.time()), "ref": ref,
+                            "at": time.time()}
+    st["update_result"] = None
+    print(f"[remote {index}] update to {ref} queued, sending on next heartbeat")
+    return {"ok": True, "ref": ref,
+            "detail": "queued; it is sent on the next heartbeat"}
 
 
 @app.post("/api/pathfinder/test", tags=["Status"],
@@ -15645,6 +15795,24 @@ async function updateStatus() {
                               'no key on the Slave': 'No key on the Remote Rx'}[se.state] || se.state;
                 rows.push(['Settings', word]);
             }
+            // What the Remote Rx is running. Shown only once it has
+            // reported one: a dash here would suggest the feature is
+            // broken on a Remote Rx too old to send it.
+            const vr = rem.version;
+            if (vr && vr.remote) {
+                let v = vr.remote;
+                if (vr.remote_branch && vr.remote_branch !== '-') {
+                    v += ' on ' + vr.remote_branch;
+                }
+                if (vr.modified) { v += ' (edited here)'; }
+                if (vr.behind) {
+                    // Index only: no nested quoting in the attribute,
+                    // which is what broke the first attempt at this.
+                    v += ' <button class="btn btn-sm btn-danger py-0 px-2 ms-2" ' +
+                         'onclick="updateSlave(' + rem.index + ')">Update</button>';
+                }
+                rows.push(['Version', v]);
+            }
             document.getElementById(id + '-status').innerHTML = rows.map(r =>
                 '<div class="d-flex justify-content-between mb-1" style="flex-wrap:wrap; gap: 4px 12px;"><span>' + r[0] + '</span>' +
                 '<span class="status-value">' + r[1] + '</span></div>'
@@ -15902,6 +16070,23 @@ async function playSlave(index) {
         alert('Could not select that Remote Rx: ' + e);
     }
     setTimeout(loadSlaves, 1500);
+}
+
+async function updateSlave(index) {
+    if (!confirm('Update this Remote Rx to the version this receiver is running? ' +
+                 'It fetches, checks the new code compiles and starts, then restarts. ' +
+                 'If the new version will not run it puts the old one back by itself. ' +
+                 'It is off the air for a few seconds.')) {
+        return;
+    }
+    try {
+        const r = await api('POST', '/api/remote/' + index + '/update');
+        alert('Update queued for ' + r.ref + '. Watch the Version row: it changes ' +
+              'when the Remote Rx comes back on the new code.');
+    } catch (e) {
+        alert('Could not ask that Remote Rx to update: ' + e);
+    }
+    setTimeout(loadSlaves, 2000);
 }
 
 async function refreshLiveStreams() {

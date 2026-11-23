@@ -1,6 +1,6 @@
 # Lynx Remote Rx
 
-A Remote Rx is a small receiver at another site, built from a Raspberry Pi Zero 2 W and a Minitiouner. It tunes one DATV signal and sends the picture back to a Lynx receiver at the repeater over SRT, along with its lock, MER and callsign. At the repeater it appears as one more receiver, with its own panel and a Watch button.
+A Remote Rx is a small receiver at another site, built from a Raspberry Pi Zero 2 W and a standard Minitiouner, unmodified. It tunes one DATV signal and sends the picture back to a Lynx receiver at the repeater over SRT, along with its lock, MER and callsign. At the repeater it appears as one more receiver, with its own panel and a Watch button.
 
 It needs no ports opening at the remote site: The Remote Rx always calls out to the repeater. Once it is built, everything else (frequency, symbol rate, name and locator) is set from the Lynx at the repeater, and the Remote Rx keeps those settings through a power cut.
 
@@ -17,7 +17,7 @@ It needs no ports opening at the remote site: The Remote Rx always calls out to 
 | Raspberry Pi Zero 2 W | The original Zero is too slow. |
 | microSD card, 8 GB or larger | |
 | 5 V 2.5 A micro-USB power supply | The official Zero supply is ideal. |
-| Minitiouner | Any version Longmynd supports, with its own DC supply. Do not try to power it from the Pi. |
+| Minitiouner | A standard Minitiouner, with its own DC supply. Do not try to power it from the Pi. A Picotuner (the non-Ethernet one) is not supported yet: It presents differently over USB and has not been tested here. |
 | Micro-USB to mini-USB OTG cable | Micro-USB plug for the Zero, mini-USB plug for the Minitiouner, sold as "OTG", [for example this one](https://www.amazon.co.uk/dp/B0D9HMQQY9). Or use the Minitiouner's usual USB cable with an OTG adapter (micro-USB plug to USB-A socket). |
 | Masthead LNA for the band | Mounted at the antenna. |
 | Bias-T and a supply for the LNA | Feeds DC up the coax to the LNA. |

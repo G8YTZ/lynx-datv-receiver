@@ -36,8 +36,24 @@ def check_python(path):
 def check_scripts(path):
     """Every <script> block, checked as JavaScript. This is the one that
     would have caught the loadPresets damage."""
-    s = open(path).read()
-    blocks = re.findall(r'<script[^>]*>(.*?)</script>', s, re.S)
+    # The EVALUATED string literals, not the raw file text. The page
+    # JavaScript lives inside Python strings, so the source spelling and
+    # what the browser receives are not the same thing: source `\\'`
+    # is a Python escape that produces `\'`, a perfectly valid escaped
+    # apostrophe in JavaScript. Reading the raw text saw the doubled
+    # backslash, called a working page broken, and left the harness
+    # crying wolf on every run - which is worse than no harness, because
+    # a real failure then looks like the usual noise.
+    #
+    # Only plain string literals are seen, which is all the page uses
+    # today. Each block found is listed, so one going missing because
+    # it was turned into an f-string shows up as a block that stopped
+    # being checked rather than as a silent pass.
+    tree = ast.parse(open(path).read())
+    blocks = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            blocks += re.findall(r'<script[^>]*>(.*?)</script>', node.value, re.S)
     results = []
     for n, b in enumerate(blocks):
         if len(b.strip()) < 40:
