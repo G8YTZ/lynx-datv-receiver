@@ -37,6 +37,22 @@ It does not follow a stream with more than one service. A Remote Rx
 tunes one signal and relays one programme; if multi-programme support
 ever arrives, the choice of which belongs with whatever makes that
 choice, not here.
+
+NOT YET WIRED IN
+----------------
+Nothing imports this. knucker_source.py still points CombiTunerExpress
+straight at the SRT sender, and the Remote Rx still reports no
+callsign. Wiring it means pointing the tuner at TapThread's port
+instead, passing the dest through, and reading the service name into
+the heartbeat - a small change, deliberately not made while the only
+Knucker on the bench was being swapped back for a Minitiouner and the
+result could not be tested on real hardware.
+
+The parser itself is tested against streams built to the MPEG-2 and
+DVB specifications in test_ts_info.py, including the cases a bench
+test would never reach: a section crossing a packet boundary, a PMT
+arriving before the PAT that points at it, adaptation fields shifting
+the payload, and a corrupt section claiming an absurd length.
 """
 
 import socket
