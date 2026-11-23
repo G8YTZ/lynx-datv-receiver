@@ -10944,6 +10944,19 @@ async function loadCurrentConfig() {
         document.getElementById('rs-name').value = rs0.name || '';
         document.getElementById('rs-locator').value = rs0.locator || '';
         document.getElementById('rs-key').value = rs0.key || '';
+        // The second tuning figure is not the same quantity on both
+        // tuners: a Minitiouner takes a symbol rate in kS/s, a Knucker
+        // a channel bandwidth in kHz. Labelled "Symbol rate (kS/s)"
+        // regardless, the box asks for 333 and means two different
+        // things depending on what is plugged in at the far end.
+        //
+        // Only relabelled once the Remote Rx has actually said what it
+        // is. Before that it keeps the Minitiouner wording, which is
+        // what every Remote Rx built so far is.
+        remoteSrLabel();
+        // Remembered so the save can say whether a restart is really
+        // needed, rather than mentioning one every time.
+        window.__rsPortAtLoad = rs0.status_port ?? 10997;
         updateRemoteSourceWarning();
         document.getElementById('rs-status-port').addEventListener('input', updateRemoteSourceWarning);
 
@@ -11477,6 +11490,27 @@ async function saveHdhr() {
     }
 }
 
+async function remoteSrLabel() {
+    // Relabel the second tuning box for whatever tuner the Remote Rx
+    // has reported. Only ever away from the Minitiouner wording: that
+    // is the HTML default and what every Remote Rx built so far is, so
+    // a failure here leaves the box saying what it always said.
+    try {
+        const r = await fetch('/api/status');
+        if (!r.ok) return;
+        const s = await r.json();
+        const rem = (s.remotes || [])[0];
+        if (!rem || rem.tuner !== 'knucker') return;
+        const lab = document.querySelector('label[for="rs-sr"]');
+        if (lab) lab.textContent = 'Bandwidth (kHz)';
+        const box = document.getElementById('rs-sr');
+        if (box) box.placeholder = '1000';
+    } catch (e) {
+        // Leave the label alone. A wrong label is worse than a
+        // general one.
+    }
+}
+
 async function saveRemoteSource() {
     const statusEl = document.getElementById('rs-status');
     statusEl.textContent = 'Saving...';
@@ -11496,7 +11530,19 @@ async function saveRemoteSource() {
             method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
         });
         if (!r.ok) throw new Error(await r.text());
-        statusEl.textContent = 'Saved. Enabled and the settings take effect within seconds; a changed port needs a restart.';
+        // Only mention a restart when one is genuinely needed. The
+        // frequency, the second tuning figure, the name and the
+        // locator are signed and pushed to the Remote Rx in reply to
+        // its next heartbeat, and it applies them within seconds. Only
+        // the status port needs a restart here, because the monitor
+        // thread binds it once at start-up. Saying "needs a restart"
+        // after every save taught people to restart for changes that
+        // never required it.
+        const portChanged = parseInt(document.getElementById('rs-status-port').value, 10)
+                            !== window.__rsPortAtLoad;
+        statusEl.textContent = portChanged
+            ? 'Saved. The status port changed, so this receiver needs a restart to listen on it.'
+            : 'Saved. Pushed to the Remote Rx - it applies them within seconds.';
         statusEl.className = 'save-status text-success';
     } catch (e) {
         statusEl.textContent = 'Save failed - see console.';
@@ -14717,11 +14763,18 @@ def update_config(req: ConfigUpdateRequest):
         # live and takes effect on the next card.
         if req.squeak is not None:
             on_disk.setdefault('squeak', {}).update(req.squeak.model_dump())
-        # Slave Rx: needs a restart either way, so nothing is applied
-        # live here. The monitor thread is only started at boot if this
-        # is enabled, and it binds its port once at that moment -
+        # Slave Rx. Only the STATUS PORT needs a restart: the monitor
+        # thread is started at boot and binds that port once, and
         # rebinding a socket underneath a running thread is real work
-        # for a setting that gets changed once.
+        # for a setting changed once in a Remote Rx's life.
+        #
+        # Everything else here is applied without one. The frequency,
+        # the second tuning figure, the name and the locator are signed
+        # and sent to the Remote Rx in reply to its next heartbeat, and
+        # it applies them in seconds - which is the whole point of
+        # configuring a Remote Rx from this end. The comment here used
+        # to say a restart was needed "either way", which was true when
+        # it was written and had not been true for some time.
         # Writes the FIRST Slave, and migrates the config to list form
         # while doing it. The card only edits one; the Slaves page will
         # edit them all, and building a list editor here that is about
