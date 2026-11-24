@@ -20,6 +20,35 @@ Two are supported, and the Remote Rx works out for itself which one is plugged i
 
 The two report genuinely different measurements, and the panel shows whichever applies rather than converting one into the other. A Knucker's SNR is not a MER and is not displayed as one; its level is a percentage, not a calibrated dBm. Nothing on either panel is a figure its tuner did not measure.
 
+### Wi-Fi, and why the panel now shows it
+
+A Remote Rx reports how it reaches the network in its heartbeat, and the repeater shows it on the panel next to the SRT loss counters: **`Wi-Fi  −66 dBm — fine`**, or **`Network  wired`**.
+
+This is there because the RF figures can be immaculate while the pictures are broken. On 24 November 2026 a card sat at 25.1 dB MER with 18.7 dB of margin, and still produced grey frames and freezes at the repeater: its Wi-Fi was on a distant AP, SRT could not recover the bursts of loss inside its 300 ms window, and the gaps became H.265 frames referencing pictures that never arrived. Hours went on the decoder, the branch, the SD card and the encoder before anybody looked at the radio. The panel could show every figure about the signal off the air and nothing about the link carrying the result.
+
+Read from `/proc/net/wireless` and sysfs, never by running `iw`: that is not installed on a Lite image, and shelling out to a tool that may not be there, from a machine nobody can reach, to answer a question asked every two seconds, is three bad ideas at once.
+
+Rough reading on 2.4 GHz, which is all a Zero 2 W has:
+
+| Signal | Verdict | What to expect |
+|---|---|---|
+| −60 dBm or better | strong | fine |
+| −60 to −70 | fine | fine, with little to spare |
+| −70 to −80 | marginal | bursts of loss under a continuous stream |
+| worse than −80 | poor | visible breakup |
+
+A Remote Rx carries a transport stream continuously, which is a far harsher load than the web browsing those numbers usually describe, so treat them pessimistically. An older Remote Rx sends no such line, and the panel then shows no row at all rather than guessing.
+
+### SRT latency, from the panel
+
+`SRT latency` on the Remote Rx card sets how long SRT may spend recovering lost packets. Leave it blank and the Remote Rx keeps whatever is in its own `/etc/lynx-slave.conf`; set it and it is pushed like the frequency and name, over the same signed path.
+
+Raise it for a site on Wi-Fi or any poor link. The default 300 ms looks generous when the round trip is 2 ms — over a hundred times the RTT — but that rule of thumb assumes random loss. A weak radio does not lose packets randomly: it stalls for hundreds of milliseconds while it retries, and a burst longer than the latency window is unrecoverable by definition. 1000 ms gives it room, at the cost of a second of delay, which on a repeater feed costs nothing.
+
+It is a workaround, not a cure. The real fix for a marginal site is a closer AP or a USB Ethernet adapter; a Zero 2 W has only its internal antenna, so there is nothing to improve on the radio itself.
+
+Bounded at 20 to 8000 ms at both ends: below 20 ms SRT cannot retransmit at all, and a typo of 300000 would take a repeater's input off the air in a way that looks like a dead receiver.
+
 ### The USB PicoTuner
 
 A USB **BATC PicoTuner** (`2e8a:ba2c`) works, with one extra build step. It receives DVB-S/S2 through the same Serit NIM as a Minitiouner and fills the same panel rows.
