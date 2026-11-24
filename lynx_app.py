@@ -15987,9 +15987,18 @@ function setPanelState(headerId, bodyId, label, state, extra) {
         // "extra" is anything that must stay reachable while the body
         // is hidden - the Remote Rx Update button, at the time of
         // writing. Floated like the badge, so it lands beside it.
-        h.innerHTML = label +
+        const drawn = label +
             '<span class="badge ' + cls + '" style="float:right; font-size:0.75em;">' +
             text + '</span>' + (extra || '');
+        // Only when it changed. Rewriting the header on every poll
+        // replaces any button in it, and a button replaced between
+        // press and release swallows the click - Watch and Update
+        // alike. Compared against what was last WRITTEN, because the
+        // browser normalises innerHTML and it would never match.
+        if (h.dataset.drawn !== drawn) {
+            h.innerHTML = drawn;
+            h.dataset.drawn = drawn;
+        }
         // Click the header to open a panel that is not locked, or shut
         // one that is. Bound once: innerHTML above replaces the
         // header's CONTENTS on every poll, but not the header itself,
@@ -16543,7 +16552,11 @@ async function updateStatus() {
                   + (moveTo ? 'Move to ' + moveTo : 'Update') + '</button>'
                 : '';
             const st = !rem.online ? 'offline' : (rem.locked ? 'locked' : 'idle');
-            setPanelState(id + '-header', id + '-status', label, st, hdrBtn);
+            // Watch sits beside Update: every receiver panel, local or
+            // Remote, now says in its own header whether it is the one
+            // on screen and offers to put it there.
+            setPanelState(id + '-header', id + '-status', label, st,
+                          hdrBtn + remoteWatchHtml(rem, s));
             // A Knucker is a DVB-T/T2 receiver and measures different
             // things, so it gets the HDHomeRun's row set rather than the
             // Minitiouner's: the same rows, labels and units as the
@@ -16956,6 +16969,29 @@ function localWatchHtml(rid, s) {
           // or shut the panel it sits on.
           + ' onclick="event.stopPropagation(); watchLocal(' + rid + ')">'
           + label + '</button>';
+}
+
+// The same button for a Remote Rx panel. Same rules as the Remote
+// Receivers list it mirrors: only a unit actually sending video can be
+// chosen, since choosing one that is not would just black the screen,
+// so the greyed button says why instead.
+function remoteWatchHtml(rem, s) {
+    const L_ = s.lynx || {};
+    const onAir = L_.active_receiver ?? s.active_receiver;
+    const style = 'style="float:right; margin-right:8px; font-size:0.75em;"';
+    if ((L_.mode || '') === 'rf' && onAir === 11 + rem.index) {
+        return '<span class="badge bg-success" ' + style + '>&#x25B6; On screen</span>';
+    }
+    const live = rem.video && rem.video.live;
+    const why = !rem.enabled ? 'Switched off in Config'
+              : (!rem.online ? 'Not heard from'
+                 : (live ? '' : 'No video arriving yet'));
+    return why
+        ? '<button class="btn btn-sm btn-outline-secondary py-0 px-2" ' + style
+          + ' disabled title="' + why + '">&#x25B6; Watch</button>'
+        : '<button class="btn btn-sm btn-outline-success py-0 px-2" ' + style
+          + ' onclick="event.stopPropagation(); playSlave(' + rem.index + ')">'
+          + '&#x25B6; Watch</button>';
 }
 
 async function watchLocal(rid) {
