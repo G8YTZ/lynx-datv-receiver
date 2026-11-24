@@ -4409,16 +4409,21 @@ REMOTE_QUALITY_PORT_OFFSET = 96
 # this decides which fields the panel draws: an unrecognised name falls
 # back to a Minitiouner rather than inventing a layout for a tuner this
 # receiver knows nothing about.
-REMOTE_TUNER_KINDS = ("minitiouner", "knucker", "picotuner")
+REMOTE_TUNER_KINDS = ("minitiouner", "knucker",
+                      "picotuner", "picotuner_nodriver")
 
-# Tuners a Remote Rx can report but not drive. It heartbeats, takes
+# A USB PicoTuner driven by Ryde's longmynd is DVB-S/S2 through the same
+# Serit NIM as a Minitiouner and reports the same measurements, so it
+# deliberately gets the Minitiouner's row set rather than one of its own.
+# Nothing to add here: it falls through to the default.
+
+# Tuners a Remote Rx can report but is NOT driving. It heartbeats, takes
 # settings and takes updates; it simply never locks, so the panel says
-# why instead of drawing a Minitiouner's empty rows. A USB PicoTuner
-# (2e8a:ba2c) is an RP2040 and longmynd talks to an FTDI FT2232H, so
-# until there is a longmynd that speaks to the Pico this is as far as it
-# goes. The card stays updatable, which is how support reaches it.
+# why instead of drawing a row set full of dashes, which reads as a dead
+# aerial. A PicoTuner lands here only when the longmynd that can drive
+# it has not been built on that card (slave/install.sh --picotuner).
 REMOTE_TUNER_UNDRIVEN = {
-    "picotuner": "PicoTuner (USB) — not supported yet",
+    "picotuner_nodriver": "PicoTuner (USB) — no driver built on this card",
 }
 
 # How long a resume waits for a saved Slave to report in before
@@ -16122,8 +16127,9 @@ async function updateStatus() {
             const rows = rem.tuner_note ? [
                 ['Tuner',       rem.tuner_note],
                 ['Frequency',   rem.frequency ? rem.frequency + ' MHz' : '—'],
-                ['Receiving',   'nothing — Lynx cannot drive this tuner'],
-                ['Updatable',   'yes — support can arrive by Update'],
+                ['Receiving',   'nothing — no driver for this tuner here'],
+                ['Fix',         'slave/install.sh --picotuner on that card'],
+                ['Updatable',   'yes — the fix can arrive by Update'],
             ] : rem.tuner === 'knucker' ? [
                 ['Callsign',    rem.callsign || '—'],
                 ['Service',     rem.service || '—'],

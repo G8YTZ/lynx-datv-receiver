@@ -6,7 +6,7 @@ It needs no ports opening at the remote site: The Remote Rx always calls out to 
 
 ## Which tuner
 
-Two are supported, and the Remote Rx works out for itself which one is plugged in at every start. Swapping one for the other needs a service restart and nothing else. A third, the USB Picotuner, is recognised but cannot be driven: See [below](#the-usb-picotuner-recognised-not-driven).
+Two are supported, and the Remote Rx works out for itself which one is plugged in at every start. Swapping one for the other needs a service restart and nothing else. A third, the USB PicoTuner, works with one extra build step: See [below](#the-usb-picotuner).
 
 | | **Minitiouner** | **Knucker** (BATC CombiTuner) |
 |---|---|---|
@@ -20,20 +20,30 @@ Two are supported, and the Remote Rx works out for itself which one is plugged i
 
 The two report genuinely different measurements, and the panel shows whichever applies rather than converting one into the other. A Knucker's SNR is not a MER and is not displayed as one; its level is a percentage, not a calibrated dBm. Nothing on either panel is a figure its tuner did not measure.
 
-### The USB Picotuner: recognised, not driven
+### The USB PicoTuner
 
-A USB **BATC PicoTuner** (`2e8a:ba2c`) is detected and named, but Lynx cannot drive one. Longmynd on this card talks to an FTDI FT2232H, and a Picotuner is an RP2040 presenting a different interface entirely, so longmynd exits within a second of starting.
+A USB **BATC PicoTuner** (`2e8a:ba2c`) works, with one extra build step. It receives DVB-S/S2 through the same Serit NIM as a Minitiouner and fills the same panel rows.
 
-Plug one in and the Remote Rx says so rather than pretending:
+The stock BATC longmynd cannot drive one: it talks only to an FTDI FT2232H, and a PicoTuner is an RP2040 presenting a different interface, so longmynd exits within a second of starting. The support lives in the longmynd vendored inside **Ryde**, so that gets built as a second, separate longmynd:
 
-- The journal names what it found: `USB product 'BATC PicoTuner' -> picotuner, which this Remote Rx cannot drive`.
-- The panel shows **PicoTuner (USB) — not supported yet** instead of a Minitiouner's rows with a dash in every one.
-- The heartbeat, the settings and the **Update button all keep working**, so support can arrive by Update with no visit and no ssh. That is the point of handling it at all.
+```
+~/lynx-datv-receiver/slave/install.sh --picotuner
+```
+
+That happens automatically when a PicoTuner is plugged in while the installer runs. Expect it to be slow on a Zero: it is a second longmynd build.
+
+**Why a second build rather than replacing the first.** Ryde's longmynd is an older fork of the same code, and differs from upstream in ways that have nothing to do with the PicoTuner: no DVB character-set conversion for service names, a different search default (`halfscan_ratio` 0.6 instead of 1.5, plus a search algorithm setting), a symbol-rate offset correction taken from WinterHill, and serial TS out of the demodulator. Several of those are probably improvements, but none is proven under Lynx, and putting them beneath every working Minitiouner to benefit a PicoTuner card would be the wrong trade. The status output format is identical, which is why the same source module drives either tuner.
+
+**Without that build**, the Remote Rx says so instead of pretending:
+
+- The journal names what it found, then what it did about it: `USB product 'BATC PicoTuner' -> picotuner`, followed by `No PicoTuner longmynd in /home/pi/longmynd-pico - running report-only`.
+- The panel shows **PicoTuner (USB) — no driver built on this card** instead of a row set with a dash in every line, which reads as a dead aerial.
+- The heartbeat, the settings and the **Update button all keep working**, so the fix can arrive by Update with no visit and no ssh.
 - longmynd is not started, so there is no restart loop writing to the SD card every five seconds.
 
-Fit a Minitiouner or a Knucker to receive anything in the meantime. A supported tuner always wins, so you can leave the Picotuner plugged in.
+A Minitiouner or Knucker always wins over a PicoTuner when both are fitted, so you can leave one plugged in without risk.
 
-Real support needs a `longmynd` that speaks to the Pico over USB; the rest would largely follow, since longmynd's status output is the same whatever the transport. Lynx's own extensive Picotuner support is for the **network** one (WinterHill style, base IP port 9900) and contains no host-side USB driver to reuse. Note also that a Picotuner board can host two NIMs, so one card could eventually serve two receivers.
+**One known limit:** a PicoTuner board can host two NIMs, but Ryde's longmynd drives only one transport stream, which is all a Remote Rx sends anyway. OpenTuner is the only software reported to drive both. Note also that Lynx's own extensive PicoTuner support elsewhere is for the **network** one (WinterHill style, base IP port 9900) and shares nothing with this.
 
 ![Off-air picture from a Remote Rx](docs/remote-rx-off-air.jpg)
 
@@ -48,7 +58,7 @@ Real support needs a `longmynd` that speaks to the Pico over USB; the rest would
 | Raspberry Pi Zero 2 W | The original Zero is too slow. |
 | microSD card, 8 GB or larger | |
 | 5 V 2.5 A micro-USB power supply | The official Zero supply is ideal. |
-| Minitiouner **or** Knucker | See [Which tuner](#which-tuner). A standard Minitiouner, with its own DC supply: Do not try to power it from the Pi. A USB Picotuner is recognised but **cannot be driven** — see [Which tuner](#which-tuner). |
+| Minitiouner **or** Knucker | See [Which tuner](#which-tuner). A standard Minitiouner, with its own DC supply: Do not try to power it from the Pi. A USB PicoTuner also works, with one extra build step — see [Which tuner](#which-tuner). |
 | Micro-USB to mini-USB OTG cable | Micro-USB plug for the Zero, mini-USB plug for the Minitiouner, sold as "OTG", [for example this one](https://www.amazon.co.uk/dp/B0D9HMQQY9). Or use the Minitiouner's usual USB cable with an OTG adapter (micro-USB plug to USB-A socket). |
 | Masthead LNA for the band | Mounted at the antenna. |
 | Bias-T and a supply for the LNA | Feeds DC up the coax to the LNA. |

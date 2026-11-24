@@ -1,39 +1,44 @@
 #!/usr/bin/env python3
-"""Remote Rx source for a USB BATC PicoTuner: reports, does not drive.
+"""Remote Rx fallback for a USB BATC PicoTuner with no driver for it.
 
-Lynx cannot drive a USB Picotuner yet. Longmynd on this card talks to
-an FTDI FT2232H, and a Picotuner is an RP2040 (2e8a:ba2c) presenting a
-different interface entirely, so longmynd exits within a second of
+A PicoTuner CAN be driven - by Ryde's build of longmynd, which
+install.sh fetches with --picotuner into ~/longmynd-pico. When that is
+present the wrapper runs longmynd_source.py against it and this module
+is not used at all.
+
+This is for the card where it is absent. The stock BATC longmynd talks
+only to an FTDI FT2232H, and a PicoTuner is an RP2040 (2e8a:ba2c)
+presenting a different interface, so longmynd exits within a second of
 starting and keeps doing so for as long as the card is left alone.
 
-This module exists so that failure is HONEST instead of misleading.
-Before it, detection fell back to "minitiouner", the panel showed a
-Minitiouner that was not there, and the only clue was a journal filling
-at one line every five seconds - on an SD card up a ladder.
+This module exists so that THAT failure is honest instead of
+misleading. Before it, detection fell back to "minitiouner", the panel
+showed a Minitiouner that was not there, and the only clue was a
+journal filling at a line every five seconds - on an SD card up a
+ladder.
 
-So this does everything a Remote Rx does EXCEPT drive a tuner:
+So it does everything a Remote Rx does EXCEPT drive a tuner:
 
-  - heartbeats, reporting "TUN picotuner", so the site stays visible
+  - heartbeats, reporting "TUN picotuner_nodriver", so the site stays
+    visible and the panel can say what is actually wrong
   - accepts settings, so frequency and name can still be set
-  - accepts the Red Button, so when support does arrive this card can
-    be updated into having it, with no visit and no ssh
+  - accepts the Red Button, so the card can be updated into a version
+    that drives the tuner, with no visit and no ssh
 
 The last of those is the whole point. A Remote Rx that failed in a way
 that left it unreachable would need somebody with a ladder on the day
-support was ready. This one takes an update like any other.
+the fix was ready. This one takes an update like any other.
 
 It reports unlocked, always, because it is: no tuner is running. The
 status line still carries the configured frequency, because
 build_status_line always sends two fields and the repeater reads the
 first as a number.
 
-Note for whoever picks up real support: a Picotuner board can host TWO
-NIMs, so a Picotuner Remote Rx could serve two receivers from one card
-(Justin has one of the two wired as of 24 Nov 2026). The hard part is
-not here - it is a longmynd that speaks to the Pico over USB. Lynx's
-own 550-odd Picotuner references are for the NETWORK one (WinterHill
-style, base IP port 9900, TS on base+41 and +42) and contain no
-host-side USB driver to reuse. Brian G4EWJ is the authority.
+Two notes for later. A PicoTuner board can host TWO NIMs, but Ryde's
+longmynd drives only one transport stream (Colin G4EML, BATC forum);
+OpenTuner is the only software said to do two. And Lynx's own 550-odd
+PicoTuner references are for the NETWORK one - WinterHill style, base
+IP port 9900, TS on base+41 and +42 - which shares nothing with this.
 """
 
 import argparse
@@ -87,7 +92,11 @@ def main():
                     help="accepted and ignored; there is no binary to run")
     args = ap.parse_args()
 
-    code = remote_common.prepare(args, "kS/s", "picotuner")
+    # "picotuner_nodriver", not "picotuner": a PicoTuner that IS being
+    # driven reports "picotuner" from longmynd_source.py and gets the
+    # ordinary DVB-S2 panel. This kind means the tuner is fitted and
+    # nothing is driving it, which is a different thing to show.
+    code = remote_common.prepare(args, "kS/s", "picotuner_nodriver")
     if code is not None:
         return code
 
@@ -119,13 +128,14 @@ def main():
 
     banner = (
         "Remote Rx (PicoTuner) -> " + args.host + "\n"
-        "  tuner  : NOT DRIVEN. A USB BATC PicoTuner (2e8a:ba2c) is fitted\n"
-        "           and Lynx cannot drive one yet: longmynd talks to an\n"
-        "           FTDI FT2232H, which this is not.\n"
+        "  tuner  : NOT DRIVEN. A USB BATC PicoTuner (2e8a:ba2c) is\n"
+        "           fitted, but the longmynd that can drive one is not\n"
+        "           installed. Build it with:\n"
+        "             ~/lynx-datv-receiver/slave/install.sh --picotuner\n"
         f"  status : UDP port {args.status_port}, every {args.interval}s\n"
         f"  name   : {args.name or '(not set - the repeater will show a generic label)'}\n"
         f"  version: {args.version_commit} on {args.version_branch}\n"
-        "  this card stays visible and UPDATABLE, so support can arrive\n"
+        "  this card stays visible and UPDATABLE, so the fix can arrive\n"
         "  by the Update button with no visit. Fit a Minitiouner or a\n"
         "  Knucker to receive anything in the meantime.")
     print(banner)
@@ -146,7 +156,7 @@ def main():
         now = time.monotonic()
         if now - last >= REMINDER_SECS:
             last = now
-            print("[tuner] still a PicoTuner, still not driveable; "
+            print("[tuner] still a PicoTuner with no driver installed; "
                   "heartbeat and updates are running normally")
             sys.stdout.flush()
     return 0

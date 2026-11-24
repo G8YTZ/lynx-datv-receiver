@@ -101,6 +101,85 @@ if [ "$knucker_wanted" = true ]; then
     fi
 fi
 
+# ── PicoTuner (USB), only if one is here ────────────────────────────
+#
+# The USB PicoTuner (2e8a:ba2c) is an RP2040, not an FTDI FT2232H, and
+# the BATC's own longmynd has no support for it at all - confirmed by
+# reading the source, and by Colin G4EML on the BATC forum, who doubted
+# it was ever backported. The support lives in the longmynd vendored
+# inside Ryde (ryde-build/longmynd), which is the same repository this
+# script already takes CombiTunerExpress from.
+#
+# Built as a SECOND longmynd in ~/longmynd-pico rather than replacing
+# the one in ~/longmynd, deliberately. Ryde's copy is an OLDER fork of
+# the same code, and differs from upstream in ways that have nothing to
+# do with the PicoTuner:
+#
+#   - no DVB character-set conversion for service names (upstream has
+#     iconv and 223 lines of code tables; this has none of it)
+#   - halfscan_ratio 1.5 -> 0.6, plus a search_algorithm default and a
+#     -A option, so it hunts for a signal differently
+#   - a symbol-rate offset correction copied from WinterHill
+#   - serial TS out of the STV0910, selected by which USB device was
+#     found - which is how one binary drives either tuner
+#
+# Several of those are probably improvements. None is proven under
+# Lynx, and putting them beneath every working Minitiouner to benefit a
+# PicoTuner card would be the wrong trade. What matters is that the
+# STATUS OUTPUT FORMAT is identical between the two, which is why
+# longmynd_source.py drives either one with no change beyond being
+# told where the binary is.
+#
+# Triggered by a PicoTuner actually being plugged in, or by --picotuner
+# for building a card before the tuner arrives.
+pico_wanted=false
+for a in "$@"; do [ "$a" = "--picotuner" ] && pico_wanted=true; done
+if [ "$pico_wanted" = false ] \
+   && [ "$(python3 "$here/detect_tuner.py" 2>/dev/null || true)" = "picotuner" ]; then
+    pico_wanted=true
+    echo "A PicoTuner is plugged in: building its longmynd as well"
+fi
+
+pico_dir=/home/pi/longmynd-pico
+if [ "$pico_wanted" = true ] && [ ! -x "$pico_dir/longmynd" ]; then
+    echo "Building Ryde's longmynd (PicoTuner support) in $pico_dir"
+    echo "This is a second longmynd build: expect it to be slow on a Zero."
+    sudo apt-get install -y git make gcc libusb-1.0-0-dev libasound2-dev
+    tmp="$(mktemp -d)"
+    # Sparse and blobless: longmynd is 660 kB of that repository and
+    # the rest of it is of no use here.
+    git clone --depth 1 --filter=blob:none --sparse \
+        https://github.com/BritishAmateurTelevisionClub/ryde-build.git "$tmp/ryde"
+    git -C "$tmp/ryde" sparse-checkout set longmynd
+    if [ ! -f "$tmp/ryde/longmynd/ftdi.c" ]; then
+        echo "ERROR: ryde-build has no longmynd/ directory any more." >&2
+        echo "The PicoTuner build cannot proceed; the card will run" >&2
+        echo "report-only instead. Nothing else is affected." >&2
+        rm -rf "$tmp"
+    else
+        # Prove it is the Pico-capable one before building it, rather
+        # than discovering at the first tune that it is not.
+        if ! grep -q "0x2E8A" "$tmp/ryde/longmynd/ftdi.c"; then
+            echo "WARNING: that longmynd has no PicoTuner USB ID in ftdi.c." >&2
+            echo "Building it anyway, but it may not drive a PicoTuner." >&2
+        fi
+        cp -r "$tmp/ryde/longmynd" "$pico_dir"
+        rm -rf "$tmp"
+        make -C "$pico_dir"
+    fi
+fi
+# Ryde's own udev rule names all three product strings - the
+# Minitiouner, the MiniTiouner-Express variant and the PicoTuner - so it
+# REPLACES the Minitiouner-only rule rather than sitting beside it.
+# Checked by content, not by existence, because the file is already
+# there from the Minitiouner install above.
+if [ "$pico_wanted" = true ] && [ -f "$pico_dir/minitiouner.rules" ] \
+   && ! grep -q "BATC PicoTuner" /etc/udev/rules.d/minitiouner.rules 2>/dev/null; then
+    sudo cp "$pico_dir/minitiouner.rules" /etc/udev/rules.d/minitiouner.rules
+    sudo udevadm control --reload-rules
+    echo "Installed the udev rule covering the PicoTuner: unplug and replug it, or reboot"
+fi
+
 # /usr/local/bin/lynx-slave is a thin launcher, NOT the wrapper. It
 # hands straight over to slave/lynx-slave in the git checkout, so that
 # a remote update - which can only ever change the checkout - can change

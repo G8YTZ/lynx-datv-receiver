@@ -46,9 +46,28 @@ fi
 # An unknown kind falls to longmynd deliberately (rule 7): every Remote
 # Rx built so far is a Minitiouner, and guessing wrong that way keeps a
 # working site on the air.
+#
+# A PicoTuner is driven by RYDE's longmynd, which lives in its own
+# directory because it is a different build from the one a Minitiouner
+# uses - see install.sh for why they are kept apart. With that build
+# present the ordinary Longmynd source drives it, because the status
+# format is the same; without it, the report-only source keeps the card
+# visible and updatable instead of flapping on a longmynd that cannot
+# see the tuner.
+PICO_DIR="${PICOTUNER_DIR:-/home/pi/longmynd-pico}"
+EXTRA=()
 case "$KIND" in
     knucker)   SOURCE=knucker_source.py ;;
-    picotuner) SOURCE=picotuner_source.py ;;
+    picotuner)
+        if [ -x "$PICO_DIR/longmynd" ]; then
+            SOURCE=longmynd_source.py
+            EXTRA+=(--tuner-kind picotuner --longmynd-dir "$PICO_DIR")
+        else
+            SOURCE=picotuner_source.py
+            echo "No PicoTuner longmynd in $PICO_DIR - running report-only." >&2
+            echo "Build it with: $SLAVE_DIR/install.sh --picotuner" >&2
+        fi
+        ;;
     *)         SOURCE=longmynd_source.py ;;
 esac
 
@@ -73,4 +92,4 @@ export LYNX_TUNER_CHOSEN=1
 
 # -u so output reaches the journal as it happens rather than when a
 # buffer fills. Without it a crash can lose the lines explaining it.
-exec /usr/bin/python3 -u "$SLAVE_DIR/$SOURCE" "${ARGS[@]}"
+exec /usr/bin/python3 -u "$SLAVE_DIR/$SOURCE" "${ARGS[@]}" ${EXTRA[@]+"${EXTRA[@]}"}

@@ -128,7 +128,9 @@ class DetectTests(unittest.TestCase):
     def test_a_picotuner(self):
         """The case that prompted this: G8YTZ's own card, where the
         answer used to be "minitiouner" and longmynd then flapped every
-        five seconds for ever."""
+        five seconds for ever. Detection reports what is FITTED; whether
+        this card can drive it is the wrapper's question, covered in
+        test_wrapper_routing.py."""
         self.fs.hub().picotuner()
         self.assertEqual(("picotuner", "BATC PicoTuner", True), self.detect())
 
@@ -235,10 +237,14 @@ class DetectTests(unittest.TestCase):
             with self.subTest(kind):
                 self.assertIn(module, updater.SOURCE_MODULES)
 
-    def test_supported_is_derived_and_excludes_the_picotuner(self):
-        self.assertIn("minitiouner", detect_tuner.SUPPORTED)
-        self.assertIn("knucker", detect_tuner.SUPPORTED)
-        self.assertNotIn("picotuner", detect_tuner.SUPPORTED)
+    def test_preference_excludes_the_picotuner(self):
+        """Not a statement about capability - a PicoTuner can be driven
+        given Ryde's longmynd. It means a Minitiouner or Knucker wins
+        when both are fitted, so adding a PicoTuner to a working card
+        cannot take the site off the air."""
+        self.assertIn("minitiouner", detect_tuner.PREFERRED)
+        self.assertIn("knucker", detect_tuner.PREFERRED)
+        self.assertNotIn("picotuner", detect_tuner.PREFERRED)
 
     def test_the_receiver_accepts_every_kind_detection_can_report(self):
         """A kind the Remote Rx reports in TUN but the receiver does not

@@ -52,11 +52,16 @@ SYSFS_DEVICES = "/sys/bus/usb/devices/*/"
 FTDI_ID = ("0403", "6010")
 
 # Substrings of the USB product string, lower case, first match wins.
-# supported=False means Lynx can see the tuner and name it but cannot
-# drive it: the Remote Rx then says so and stays reachable, rather than
-# pretending to be something else.
+#
+# The flag is PREFERENCE, not capability. This module says only what is
+# plugged in; whether there is a driver for it on this card is the
+# wrapper's business, since the wrapper is what looks for one. A
+# preferred=False tuner is one to fall back to when nothing better is
+# present - so plugging a PicoTuner into a working Minitiouner card
+# cannot take the site off the air, whether or not a PicoTuner longmynd
+# has been built there.
 SIGNATURES = (
-    # (needle, kind, supported)
+    # (needle, kind, preferred)
     ("combituner", "knucker", True),
     # What a real Minitiouner actually calls itself. Confirmed on
     # hardware 24 Nov 2026; before that this relied entirely on the
@@ -72,10 +77,8 @@ SIGNATURES = (
     ("picotuner", "picotuner", False),
 )
 
-# Kinds this Remote Rx can actually drive. The wrapper maps a kind to
-# <kind>_source.py; an unsupported kind gets a source module that
-# reports the fact and keeps the heartbeat going.
-SUPPORTED = tuple(k for _n, k, s in SIGNATURES if s)
+# Kinds that win when more than one tuner is plugged in.
+PREFERRED = tuple(k for _n, k, s in SIGNATURES if s)
 
 
 def _read(path):
@@ -94,23 +97,27 @@ def detect(root=None):
     from "a tuner we could not identify": one means nothing is plugged
     in, the other means something is.
 
+    This says what is FITTED. It does not say whether this card can
+    drive it - a PicoTuner needs Ryde's longmynd, built by
+    install.sh --picotuner, and looking for that is the wrapper's job.
+
     root overrides where sysfs is read from, for the tests.
     """
     pattern = SYSFS_DEVICES if root is None else os.path.join(
         root, "sys", "bus", "usb", "devices", "*/")
-    unsupported = None      # remembered, but only used if nothing better
+    second_best = None      # remembered, but only used if nothing better
     ftdi = None             # an FT2232H with a string we do not know
     for d in sorted(glob.glob(pattern)):
         product = _read(os.path.join(d, "product"))
         low = product.lower()
-        for needle, kind, supported in SIGNATURES:
+        for needle, kind, preferred in SIGNATURES:
             if needle not in low:
                 continue
-            if supported:
-                # A tuner we can drive. Nothing beats it, so stop here.
+            if preferred:
+                # Nothing beats a preferred tuner, so stop here.
                 return kind, product, True
-            if unsupported is None:
-                unsupported = (kind, product, True)
+            if second_best is None:
+                second_best = (kind, product, True)
             break
         else:
             ids = (_read(os.path.join(d, "idVendor")),
@@ -121,8 +128,8 @@ def detect(root=None):
         # An FT2232H that says something else. Every Remote Rx built so
         # far is a Minitiouner, so that is the safe assumption.
         return ftdi
-    if unsupported is not None:
-        return unsupported
+    if second_best is not None:
+        return second_best
     return "minitiouner", "", False
 
 
@@ -132,9 +139,6 @@ def main():
         if not found:
             print("no tuner found on USB; assuming minitiouner",
                   file=sys.stderr)
-        elif kind not in SUPPORTED:
-            print(f"USB product {product!r} -> {kind}, which this Remote Rx "
-                  f"cannot drive", file=sys.stderr)
         else:
             print(f"USB product {product!r} -> {kind}", file=sys.stderr)
     print(kind)
