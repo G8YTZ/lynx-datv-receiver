@@ -762,20 +762,42 @@ function estimateSymbolRateKsps(clickedArrayIndex) {
     if (widthBins < 2 || widthBins > EDGE_WALK_LIMIT * 2) return null; // implausible - don't guess wildly
 
     const occupiedHz = widthBins * BIN_HZ;
-    // CALIBRATION: for a raised-cosine spectrum, the theoretical
-    // half-AMPLITUDE (not half-power) width equals the symbol rate
-    // itself (a raised-cosine filter's response is exactly 0.5 at the
-    // Nyquist frequency, regardless of roll-off) - but that's a
-    // linear-amplitude result, and this feed's displayed values are
-    // on a dB (logarithmic) scale, confirmed directly from BATC's own
-    // server source. The 50% point of a dB-scaled display isn't
-    // exactly the same point as 50% of linear amplitude, so this
-    // factor of 1.0 is a reasoned starting point, not yet an
-    // empirically confirmed one - flagged clearly here so it's easy
-    // to correct once calibrated against a known-correct signal (the
-    // beacon, genuinely fixed at 1500 kS/s) using the diagnostic
-    // overlay's own readout.
-    const WIDTH_TO_SYMBOL_RATE_FACTOR = 1.0;
+    // CALIBRATION (corrected 2026-11-24). This was 1.0, on the
+    // reasoning that a raised-cosine spectrum's half-AMPLITUDE width
+    // equals the symbol rate itself, regardless of roll-off. That
+    // reasoning is sound for linear amplitude, but the same comment
+    // flagged the hole in it: this feed's values are dB, confirmed
+    // from BATC's own server source, so the threshold above is the
+    // midpoint between floor and peak IN dB - a point well below half
+    // amplitude, where the signal is already out at its occupied
+    // bandwidth. Measured widths therefore come out at roughly 1.2x
+    // the symbol rate, not 1.0x, and must be divided back down.
+    //
+    // Strictly, neither constant is right for every signal, because
+    // the threshold sits P/2 dB below the peak for a signal P dB
+    // above the floor, and a 0.20 roll-off spectrum's width grows
+    // from 1.00x SR at -3 dB to about 1.19x at -20 dB. So the true
+    // divisor runs 1.0 (a signal barely out of the noise) to 1.2 (a
+    // strong one). Anything worth clicking on is well clear of the
+    // floor, so 1.2 is the right constant for the normal case. A
+    // level-aware divisor is the proper fix and is cheap, since
+    // peakVal and floor above are already measured - deliberately
+    // left for a session with real signals to check it against.
+    //
+    // That is also the only value that agrees with the reference bars
+    // on the same screen, which are drawn at sr * 1.2: with 1.0, a
+    // signal exactly filling the 333 bar read back as 400 and snapped
+    // to 500 - a failed tune on a common QO-100 narrowband rate.
+    // Confirmed against G8KOE's diagnostic readout: 41 bins =
+    // 400.4 kHz, which is 333.7 with this factor, 0.2% from 333.
+    //
+    // Known limitation, not corrected here: below about 50 kS/s the
+    // signal is only four bins wide, the edge walk cuts inside its
+    // shoulders, and the result under-reads. Such signals now return
+    // an honest unsnapped estimate instead of a lucky snap. Fixing
+    // that properly means a tolerance that follows the +/-1 bin
+    // measurement uncertainty, and wants more than two readings.
+    const WIDTH_TO_SYMBOL_RATE_FACTOR = 1 / 1.2;
     const estimatedKsps = (occupiedHz * WIDTH_TO_SYMBOL_RATE_FACTOR) / 1000;
     lastDiagnostic.estimatedKsps = estimatedKsps;
 
