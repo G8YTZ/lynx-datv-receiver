@@ -16264,30 +16264,34 @@ async function updateStatus() {
                     rows.push(['Link rate', lk.mbps != null ? lk.mbps.toFixed(2) + ' Mb/s' : '—']);
                     rows.push(['SRT latency', lk.latency_ms != null ? lk.latency_ms + ' ms' : '—']);
                     rows.push(['Lost / resent / dropped', lk.lost + ' / ' + lk.resent + ' / ' + lk.dropped]);
-                    // Right here, next to the loss counters, because
-                    // that is the connection: a weak radio is what
-                    // makes those numbers climb, and the two read
-                    // together tell the whole story. A Remote Rx can
-                    // have an immaculate signal off the air and still
-                    // deliver broken pictures, and until this row
-                    // existed the panel gave no hint why.
-                    if (rem.net_kind === 'wifi') {
-                        let s = rem.net_dbm != null
-                            ? rem.net_dbm + ' dBm' + (
-                                rem.net_dbm >= -60 ? ' — strong'
-                                : rem.net_dbm >= -70 ? ' — fine'
-                                : rem.net_dbm >= -80 ? ' — marginal, expect loss'
-                                : ' — poor, expect loss')
-                            : 'signal unknown';
-                        rows.push(['Wi-Fi', s]);
-                    } else if (rem.net_kind === 'wired') {
-                        rows.push(['Network', 'wired']);
-                    }
                 } else {
                     rows.push(['Link', 'SRT, waiting on port ' + lk.port + (lk.error ? ' (' + lk.error + ')' : '')]);
                 }
             } else if (lk && lk.transport === 'UDP') {
                 rows.push(['Link', 'UDP (LAN)']);
+            }
+            // OUTSIDE the link block on purpose. This is a property of
+            // the Remote Rx, not of the SRT session, and it was first
+            // written inside it - so every time the link flickered the
+            // signal reading vanished with it (G8YTZ, 24 Nov 2026).
+            // That is exactly backwards: the moment the link drops is
+            // the moment you most want to know the radio is weak.
+            //
+            // Drawn whenever the Remote Rx has reported one, connected
+            // or not. Older units report nothing and get no row, which
+            // is honest: "unknown" and "wired" are different things and
+            // only one of them is reassuring.
+            if (rem.net_kind === 'wifi') {
+                const s = rem.net_dbm != null
+                    ? rem.net_dbm + ' dBm' + (
+                        rem.net_dbm >= -60 ? ' — strong'
+                        : rem.net_dbm >= -70 ? ' — fine'
+                        : rem.net_dbm >= -80 ? ' — marginal, expect loss'
+                        : ' — poor, expect loss')
+                    : 'signal unknown';
+                rows.push(['Wi-Fi', s]);
+            } else if (rem.net_kind === 'wired') {
+                rows.push(['Network', 'wired']);
             }
             const se = rem.settings;
             if (se && se.state !== 'not reported') {
