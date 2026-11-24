@@ -100,6 +100,22 @@ class DetectTests(unittest.TestCase):
                           product="USB <-> NIM tuner")
         self.assertEqual("minitiouner", self.detect()[0])
 
+    def test_every_string_in_the_batcs_own_udev_rule(self):
+        """Ryde's longmynd ships minitiouner.rules naming three product
+        strings. Whatever the BATC's own driver matches on, detection
+        here must recognise, or a tuner its driver supports would land
+        on a guess."""
+        for product, vid, pid, want in (
+                ("USB <-> NIM tuner",   "0403", "6010", "minitiouner"),
+                ("MiniTiouner-Express", "0403", "6010", "minitiouner"),
+                ("BATC PicoTuner",      "2e8a", "ba2c", "picotuner")):
+            with self.subTest(product):
+                shutil.rmtree(self.fs.base, ignore_errors=True)
+                os.makedirs(self.fs.base)
+                self.fs.add(name="1-1", vendor=vid, product_id=pid,
+                            product=product)
+                self.assertEqual(want, self.detect()[0])
+
     def test_a_board_that_does_say_minitiouner(self):
         self.fs.hub().minitiouner(product="BATC MiniTiouner v2")
         self.assertEqual(("minitiouner", "BATC MiniTiouner v2", True),

@@ -2,18 +2,23 @@
 """Which tuner is plugged into this Remote Rx.
 
 Identified by the USB product STRING, not by the vendor and product
-IDs, because the two supported tuners share a pair of IDs:
+IDs, because the Minitiouner and the Knucker share a pair of IDs:
 
     0403:6010   FTDI FT2232H    Minitiouner AND Knucker
     2e8a:ba2c   BATC PicoTuner  (the USB one, RP2040)
 
-The product string tells all three apart. All three below were read off
-G8YTZ's own cards, 23-24 Nov 2026:
+The product string tells them apart:
 
     USB <-> NIM tuner    the Minitiouner - note that it does NOT say
-                         "Minitiouner" anywhere
-    CombiTuner-Express   the Knucker
-    BATC PicoTuner       the USB Picotuner
+                         "Minitiouner" anywhere          [hardware]
+    MiniTiouner-Express  the Express variant             [BATC]
+    CombiTuner-Express   the Knucker                     [hardware]
+    BATC PicoTuner       the USB Picotuner               [hardware]
+
+[hardware]: read off G8YTZ's own cards, 23-24 Nov 2026.
+[BATC]: from the BATC's own udev rule in Ryde's longmynd
+(ryde-build/longmynd/minitiouner.rules), which also carries the
+Minitiouner and PicoTuner strings above and so corroborates them.
 
 Read straight from sysfs rather than by shelling out to lsusb, which
 is not installed on a Lite image, and without opening the device at
@@ -59,6 +64,10 @@ SIGNATURES = (
     # reason. "minitiouner" is kept in case a board somewhere does say
     # it, and costs nothing.
     ("nim tuner", "minitiouner", True),
+    # The Express variant, named in the BATC's own udev rule alongside
+    # the other two. Reached the right answer through the FTDI fallback
+    # before; positive identification is better.
+    ("minitiouner-express", "minitiouner", True),
     ("minitiouner", "minitiouner", True),
     ("picotuner", "picotuner", False),
 )
