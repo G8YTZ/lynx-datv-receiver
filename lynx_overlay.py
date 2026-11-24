@@ -376,6 +376,12 @@ state = {
     # the API doesn't provide it (an older lynx_app.py).
     "pathfinder_delay_secs": 2.0,
     "pathfinder_placeholder": True,
+    # Lynx Bar: how long it holds before sliding back down (0 keeps it
+    # up), and the receiver page's button. Both arrive from
+    # /api/status - declared here so the first draw, which happens
+    # before the first poll returns, has something sane to read.
+    "lynx_bar_secs": 15,
+    "lynx_bar_cmd": None,
     # The other half of the configured Pathfinder window - see
     # _cover_max_secs(). Defaults to 30 if the API doesn't provide it
     # (an older lynx_app.py).
@@ -928,6 +934,13 @@ def poll_status():
             state["pathfinder_delay_secs"] = lynx.get('pathfinder_delay_secs', 2.0)
             state["pathfinder_duration_secs"] = lynx.get('pathfinder_duration_secs', 30.0)
             state["pathfinder_placeholder"] = lynx.get('pathfinder_placeholder', True)
+            # Lynx Bar. The overlay has no config of its own, so both
+            # the auto-hide setting and a button press from the
+            # receiver page arrive here, the same way the pathfinder
+            # timings do. Defaults cover an older lynx_app.py that
+            # sends neither.
+            state["lynx_bar_secs"] = lynx.get('lynx_bar_secs', 15)
+            state["lynx_bar_cmd"] = lynx.get('lynx_bar_cmd')
             state["squeak"] = lynx.get('squeak')
             # tri_watch's "someone else wants in" notification - the
             # backend already handles its own expiry (get_notification()
@@ -1565,6 +1578,7 @@ class LynxOverlay(Gtk.Window):
         # continuous instruments - watching them is the whole point -
         # so they are never suppressed, and the bar is sized to span
         # the gap between them rather than cover them.
+        self.apply_lynx_bar_command()
         self.update_lynx_bar()
         bar_up = False
         if not showing_map:
@@ -1626,19 +1640,28 @@ class LynxOverlay(Gtk.Window):
         shown = getattr(self, "_bar_shown_at", None)
         if shown is None:
             return 0.0
-        age = time.monotonic() - shown
+        now = time.monotonic()
+        age = now - shown
         if age < 0:
             return 0.0
         rise = min(1.0, age / self.LYNX_BAR_SLIDE_SECS)
+        hide_at = getattr(self, "_bar_hide_at", None)
         hold = self._bar_hold_secs()
-        if hold <= 0:
-            fall = 1.0                      # kept up: never falls
+        if hide_at is not None:
+            # Sent away by hand. Beats the auto-hide, including "keep it
+            # up" - somebody pressing the button has said what they want
+            # more recently than the settings page did.
+            fall = 1.0 - max(0.0, min(1.0,
+                                      (now - hide_at) / self.LYNX_BAR_SLIDE_SECS))
+        elif hold <= 0:
+            fall = 1.0                      # kept up: never falls on its own
         else:
             falling = age - (self.LYNX_BAR_SLIDE_SECS + hold)
             fall = 1.0 - max(0.0, min(1.0, falling / self.LYNX_BAR_SLIDE_SECS))
-            if fall <= 0.0:
-                self._bar_shown_at = None   # finished; stop drawing it
-                return 0.0
+        if fall <= 0.0:
+            self._bar_shown_at = None       # finished; stop drawing it
+            self._bar_hide_at = None
+            return 0.0
         t = min(rise, fall)
         return t * t * (3.0 - 2.0 * t)      # smoothstep
 
@@ -1666,8 +1689,45 @@ class LynxOverlay(Gtk.Window):
                 self._bar_shown_at = time.monotonic()
 
     def show_lynx_bar(self):
-        """Bring it up on demand: a keypress, or a remote button."""
+        """Bring it up on demand: the button on the receiver page."""
         self._bar_shown_at = time.monotonic()
+        self._bar_hide_at = None
+
+    def hide_lynx_bar(self):
+        """Send it away now, sliding rather than vanishing - the same
+        motion in reverse, so it reads as being dismissed rather than
+        as a glitch."""
+        if getattr(self, "_bar_shown_at", None) is not None:
+            self._bar_hide_at = time.monotonic()
+
+    def toggle_lynx_bar(self):
+        """What the button does. Up and staying up means put it away;
+        anything else means bring it up."""
+        up = (self._bar_progress() > 0.001
+              and getattr(self, "_bar_hide_at", None) is None)
+        if up:
+            self.hide_lynx_bar()
+        else:
+            self.show_lynx_bar()
+
+    def apply_lynx_bar_command(self):
+        """The receiver page has no way to reach this process, so a
+        press is left in the status payload as a token and picked up on
+        the next poll. Acting on the TOKEN rather than on a flag means a
+        press is never missed and never repeated."""
+        cmd = state.get("lynx_bar_cmd") or {}
+        token = cmd.get("token")
+        if token is None or token == getattr(self, "_bar_cmd_token", None):
+            return
+        seen_before = hasattr(self, "_bar_cmd_token")
+        self._bar_cmd_token = token
+        # The first poll after the overlay starts carries whatever token
+        # the receiver already had. Acting on that would pop the bar up
+        # every time the overlay restarted, for a button nobody pressed.
+        if not seen_before:
+            return
+        {"show": self.show_lynx_bar, "hide": self.hide_lynx_bar}.get(
+            cmd.get("action"), self.toggle_lynx_bar)()
 
     def draw_lynx_bar(self, cr, width, height):
         """True if it drew, so the caller knows to suppress the text

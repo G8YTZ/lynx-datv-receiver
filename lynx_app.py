@@ -9082,6 +9082,10 @@ def get_status():
             # config by the overlay, which has no config of its own -
             # the same route the pathfinder timings take.
             "lynx_bar_secs": int((config.get('lynx_bar') or {}).get('hold_secs', 15)),
+            # The button on the receiver page. A copy, not the dict
+            # itself, so a press landing mid-serialisation cannot be
+            # seen half-applied.
+            "lynx_bar_cmd": dict(lynx_bar_cmd),
             "squeak": _squeak_status(),
             # Something to show, settled with the Video Switching card's
             # settle times: what it switches on, whether or not Companion
@@ -9532,6 +9536,48 @@ def pathfinder_test(req: PathfinderTestRequest):
         "note": None if home else
                 "site.locator is not set in the config - no card can be drawn",
     }
+
+
+# A Lynx Bar button press, left here for the overlay to collect.
+#
+# The overlay is a separate process with no server of its own, so a
+# press travels the only way anything reaches it: in the /api/status
+# payload. It is a TOKEN rather than a flag because the web app has no
+# way of knowing whether the overlay collected one - with a flag, the
+# server would have to guess when to clear it, and would either lose a
+# press or replay it. A number the overlay compares against the last
+# one it saw cannot do either.
+lynx_bar_cmd = {"token": 0, "action": "toggle"}
+
+
+class LynxBarCommand(BaseModel):
+    action: str = "toggle"
+
+
+@app.post("/api/lynx-bar", tags=["Status"],
+          summary="Show, hide or toggle the Lynx Bar",
+          description="Asks the on-screen overlay to bring the Lynx Bar up "
+                      "or send it away. 'toggle' is what the button on the "
+                      "receiver page sends; 'show' and 'hide' are there for "
+                      "anything driving the receiver from outside, such as a "
+                      "Companion button.\n\n"
+                      "The press is handed to the overlay on its next status "
+                      "poll, so it lands within a fraction of a second. A "
+                      "bar brought up this way still auto-hides on the "
+                      "configured hold; one sent away this way goes now, "
+                      "whatever the hold says - the person pressing the "
+                      "button has spoken more recently than the settings "
+                      "page did. Returns ok even when no overlay is "
+                      "running: the web app cannot see it, and has nothing "
+                      "to report about it.")
+def lynx_bar_press(req: Optional[LynxBarCommand] = None):
+    action = ((req.action if req else None) or "toggle").strip().lower()
+    if action not in ("toggle", "show", "hide"):
+        raise HTTPException(status_code=400,
+                            detail="action must be toggle, show or hide")
+    lynx_bar_cmd["action"] = action
+    lynx_bar_cmd["token"] += 1
+    return {"ok": True, "action": action, "token": lynx_bar_cmd["token"]}
 
 
 class QrzTestRequest(BaseModel):
@@ -15185,6 +15231,15 @@ def web_ui():
                    class="btn btn-sm btn-outline-light disabled"
                    aria-disabled="true"
                    title="QuickLynx is switched off. It shows the QO-100 wideband spectrum and lets you click a signal to tune this receiver to it. Turn it on in Config to use it.">&#x1F4E1; QuickLynx</a>
+                <!-- Last in the row on purpose: the four before it go
+                     somewhere, this one acts on the television. Momentary,
+                     not a drawn toggle - the web app cannot see whether the
+                     bar is up (the overlay owns that, and auto-hides on its
+                     own), and a button drawn as pressed after the bar had
+                     slid away would be worse than no indication at all. -->
+                <button type="button" class="btn btn-sm btn-outline-light"
+                        id="lynxbar-btn" onclick="onLynxBarClick()"
+                        title="Show or hide the Lynx Bar on the screen. It slides up from the bottom with frequency, symbol rate, mode, codec, MER and margin, then hides itself again - how long it stays up is set in Config.">&#x2139;&#xFE0F; Lynx Bar</button>
             </div>
             <small class="text-muted" id="site-name"></small>
             <!-- Diversity: replaces the site-name line above with a highlighted stats box while diversity mode is active -->
@@ -17193,6 +17248,39 @@ async function stopApp() {
 // The network output card called showToast() from the start, but it
 // was never defined, so its messages were lost to the console. Now
 // shared by that card and the Screen output card.
+// -- Lynx Bar button --------------------------------------
+// The press goes to the receiver, which leaves it for the overlay to
+// collect on its next status poll - so there is a fraction of a
+// second between the click and the bar moving. The button is held
+// disabled across that gap: without it, an impatient second click
+// sends a second toggle and puts the bar straight back down.
+let lynxBarBusy = false;
+async function onLynxBarClick() {
+    if (lynxBarBusy) return;
+    lynxBarBusy = true;
+    const btn = document.getElementById('lynxbar-btn');
+    if (btn) btn.classList.add('disabled');
+    const free = () => {
+        lynxBarBusy = false;
+        if (btn) btn.classList.remove('disabled');
+    };
+    try {
+        const r = await fetch('/api/lynx-bar', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({action: 'toggle'})
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        showToast('Lynx Bar toggled on the screen');
+        // Long enough for the slide to finish, so the button is not
+        // offering to reverse something still in motion.
+        setTimeout(free, 700);
+    } catch (e) {
+        showToast('Could not reach the receiver: ' + e.message, true);
+        free();     // nothing is moving, so no reason to make them wait
+    }
+}
+
 function showToast(text, isError) {
     let box = document.getElementById('lynx-toast');
     if (!box) {
