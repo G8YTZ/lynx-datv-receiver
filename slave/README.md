@@ -48,7 +48,10 @@ A Minitiouner or Knucker always wins over a PicoTuner when both are fitted, so y
 ```
 sudo udevadm control --reload-rules
 sudo udevadm trigger --subsystem-match=usb --action=add
+sudo udevadm settle
 ```
+
+`trigger` returns before udev has finished, so check the node with `ls -l /dev/bus/usb/<bus>/<dev>` AFTER the settle, wanting `crw-rw-rw-`. Note that `ls -l` shows mtime and a permission change does not alter it, so an unchanged timestamp means nothing either way. `sudo udevadm test /sys/bus/usb/devices/1-1` reports what udev would set, which separates a rule that does not match from one that has not been applied yet.
 
 Unplugging and replugging the tuner does the same thing. The installer now triggers the rule itself, so this should only affect cards built before 24 Nov 2026.
 

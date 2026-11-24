@@ -38,6 +38,10 @@ if [ ! -f /etc/udev/rules.d/minitiouner.rules ]; then
     # device node, which reads as "tuner not found" and sends people
     # looking for a cable fault. Saves the unplug-and-replug.
     sudo udevadm trigger --subsystem-match=usb --action=add || true
+    # trigger is ASYNCHRONOUS: it queues the events and returns, so
+    # anything checking the device node straight afterwards can still
+    # see the old permissions and conclude the rule did not work.
+    sudo udevadm settle --timeout=10 || true
     echo "Installed the Minitiouner udev rule: unplug and replug it, or reboot"
 fi
 
@@ -191,6 +195,10 @@ if [ "$pico_wanted" = true ] && [ -f "$pico_dir/minitiouner.rules" ] \
     # device node, which reads as "tuner not found" and sends people
     # looking for a cable fault. Saves the unplug-and-replug.
     sudo udevadm trigger --subsystem-match=usb --action=add || true
+    # trigger is ASYNCHRONOUS: it queues the events and returns, so
+    # anything checking the device node straight afterwards can still
+    # see the old permissions and conclude the rule did not work.
+    sudo udevadm settle --timeout=10 || true
     echo "Installed the udev rule covering the PicoTuner: unplug and replug it, or reboot"
 fi
 
