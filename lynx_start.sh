@@ -164,7 +164,37 @@ for i in $(seq 1 45); do
     fi
     sleep 1
     if [ "$i" = "45" ]; then
-        echo -e "${AMBER}no internet/NTP available — proceeding (this is fine)${NC}"
+        # Two very different reasons the clock never synced, and until
+        # now both said "this is fine". Only one of them is.
+        #
+        # A site with no internet is fine, and the paragraph above says
+        # why: If NTP can never reach a server the clock never jumps,
+        # which is the whole thing this wait exists to avoid.
+        #
+        # No time daemon INSTALLED is not fine at all. The clock then
+        # sits wrong until something corrects it later, and that
+        # correction is exactly the backward jump that kills mpv a few
+        # seconds after it starts. Found on a user's receiver (VK3IE,
+        # 24 Nov 2026) which had been running without chrony: Lynx
+        # dropped to the desktop at every boot with an mpv error that
+        # scrolled past too quickly to read, and reinstalling fixed it
+        # because the installer put chrony back. Saying "this is fine"
+        # was the least helpful thing Lynx could have said.
+        if systemctl is-active --quiet chrony \
+           || systemctl is-active --quiet chronyd \
+           || systemctl is-active --quiet systemd-timesyncd \
+           || systemctl is-active --quiet ntpsec \
+           || systemctl is-active --quiet ntp; then
+            echo -e "${AMBER}no internet/NTP available — proceeding (this is fine)${NC}"
+        else
+            echo -e "${RED}NO TIME DAEMON RUNNING${NC}"
+            echo -e "${RED}  Nothing on this receiver is keeping the clock correct.${NC}"
+            echo -e "${RED}  When something later corrects it, the backward jump can${NC}"
+            echo -e "${RED}  kill mpv seconds after it starts, which looks like Lynx${NC}"
+            echo -e "${RED}  failing to load and dropping to the desktop.${NC}"
+            echo -e "${RED}  Fix it with:  sudo apt install -y chrony${NC}"
+            echo -e "${RED}  or re-run the installer, which installs it.${NC}"
+        fi
     fi
 done
 
