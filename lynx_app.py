@@ -3799,6 +3799,31 @@ def _start_osd_name_lookup(callsign):
                      name=f"osd-name-{callsign}").start()
 
 
+def qrz_grid(callsign):
+    """The station's own QRZ locator for the OSD, or "" if not known.
+
+    CACHE ONLY, for the same reason as qrz_first_name() below: this runs
+    while /api/status is being built. The grid arrives in the same cache
+    entry as the name, so it costs nothing extra and never asks QRZ
+    anything; qrz_first_name() is what warms the entry.
+
+    Exists because the Lynx Bar showed the station's name next to the
+    RECEIVER's locator, which read as the station's square and was only
+    right by coincidence when the station happened to be near by.
+    """
+    if not callsign or callsign in ("lost", "search", ""):
+        return ""
+    try:
+        cached = lynx_notifications._qrz_lookup_cache.get(
+            callsign.strip().upper())
+        if not isinstance(cached, (tuple, list)) or len(cached) != 2:
+            return ""
+        grid = lynx_notifications._as_details(cached[0])[1]
+        return grid.strip().upper() if isinstance(grid, str) else ""
+    except Exception:
+        return ""
+
+
 def qrz_first_name(callsign):
     """The operator's first name for the OSD, or "" if not known.
 
@@ -4861,6 +4886,7 @@ def _hdhr_block(d):
         # The name from QRZ when it is cached, so a DVB-T2 or ATSC 3.0
         # station reads "Justin - G8YTZ" like any other contact.
         "callsign_name": qrz_first_name(d.get("callsign", "")),
+        "callsign_locator": qrz_grid(d.get("callsign", "")),
     }
 
 
@@ -9137,6 +9163,7 @@ def get_status():
             "locked": picotuner_state["locked"],
             "callsign": picotuner_state["callsign"],
             "callsign_name": qrz_first_name(picotuner_state["callsign"]),
+            "callsign_locator": qrz_grid(picotuner_state["callsign"]),
             "frequency": picotuner_state["frequency"],
             "downlink_frequency": on_air_frequency(1),
             "lnb_lo_khz": get_converter(1)["lo_khz"],
@@ -9226,6 +9253,7 @@ def get_status():
                 # than the second — or never, which is what
                 # happened while nothing asked.
                 "callsign_name": qrz_first_name(st["callsign"]),
+                "callsign_locator": qrz_grid(st["callsign"]),
                 # Only the fields the Slave has actually sent. A
                 # Slave with no quality port simply has none of
                 # these, which reads differently from a Slave
@@ -9273,6 +9301,7 @@ def get_status():
                 "downlink_frequency": on_air_frequency(2),
                 "lnb_lo_khz": get_converter(2)["lo_khz"],
                 "callsign_name": qrz_first_name(picotuner_state_b["callsign"]),
+                "callsign_locator": qrz_grid(picotuner_state_b["callsign"]),
                 "frequency": picotuner_state_b["frequency"],
                 "mer": picotuner_state_b["mer"],
                 "margin": picotuner_state_b["margin"],

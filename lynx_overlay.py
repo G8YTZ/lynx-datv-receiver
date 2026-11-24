@@ -368,6 +368,11 @@ state = {
     "portable_locator": "",
     # The Remote Rx's locator while one is on screen; "" otherwise.
     "remote_locator": "",
+    # The station's own QRZ square, and the receiver the picture came
+    # from. Both on the Lynx Bar's callsign chip.
+    "callsign_locator": "",
+    "rx_name": "",
+    "rx_locator": "",
     "tri_watch_notification": None,   # the current "someone else wants in" message text, or None
     "pathfinder": None,              # end-of-contact card dict, or None if none is due
     # How long the switch cover waits before drawing anything - the same
@@ -851,6 +856,7 @@ def poll_status():
             # fallback and plain single-receiver operation all populate
             # `source` the same way.
             state["callsign_name"] = source.get('callsign_name', '')
+            state["callsign_locator"] = source.get('callsign_locator', '')
             state["frequency"] = source.get('frequency', '')
             # The real on-air frequency where a converter is in use -
             # what the station is actually transmitting on, rather than
@@ -927,6 +933,12 @@ def poll_status():
             state["audio_device"] = lynx.get('audio_device', 'hdmi')
             state["audio_device_resolved"] = lynx.get('audio_device_resolved', '')
             state["site_location"] = lynx.get('site_location', '')
+            # The receiver the picture is coming from. This site unless
+            # a Remote Rx is on screen, in which case the branch below
+            # replaces both - reset here every poll so a Remote's name
+            # cannot outlive switching back to a local tuner.
+            state["rx_name"] = state["site_location"]
+            state["rx_locator"] = state["site_locator"]
             # End-of-contact map. As with the tri_watch bubble, the
             # backend has already decided whether a card is due - this
             # side only ever checks presence.
@@ -989,6 +1001,9 @@ def poll_status():
             state["mpv_running_for_rf"] = True
             state["callsign"] = rem.get('callsign', '')
             state["callsign_name"] = rem.get('callsign_name', '')
+            state["callsign_locator"] = rem.get('callsign_locator', '')
+            state["rx_name"] = rem.get('name') or ""
+            state["rx_locator"] = rem.get('locator') or ""
             state["frequency"] = rem.get('frequency', '')
             # A Slave reports what it is tuned to. Any converter
             # at its end is its business, and inventing a downlink
@@ -1193,18 +1208,51 @@ def render_lynx_bar(cr, width, height, state, progress, ov):
     cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL,
                         cairo.FONT_WEIGHT_BOLD)
     chip_cx = x + chip_m + chip_w / 2.0
-    ov.draw_text(cr, chip_cx, y + 62, call[:11], size=38, align="center",
+    ov.draw_text(cr, chip_cx, y + 50, call[:11], size=34, align="center",
                  colour=ov.BAR_VALUE if locked else ov.BAR_DIM)
-    # The QRZ first name beside the callsign, with the locator after it
-    # when both are known - which is how anybody actually identifies a
-    # station: a name to greet and a square to point an aerial at.
-    name = (state.get("callsign_name") or "").strip()
-    loc = (state.get("site_locator") or state.get("portable_locator")
-           or "").strip()
-    sub = " \u00b7 ".join(bit for bit in (name, loc) if bit)
-    if sub:
-        ov.draw_text(cr, chip_cx, y + 94, sub[:18], size=19, align="center",
-                     colour=ov.BAR_LABEL)
+
+    def fit(name, loc, size, room):
+        """"Name · LOCATOR", shortened to the chip's width by
+        measurement. The NAME gives way, never the locator: a square is
+        the thing you point an aerial at, and "Paddlesworth Remot..."
+        with no locator after it is a name with the useful half gone.
+        """
+        name, loc = (name or "").strip(), (loc or "").strip()
+        cr.set_font_size(size)
+
+        def join(n):
+            return " \u00b7 ".join(b for b in (n, loc) if b)
+
+        text = join(name)
+        if cr.text_extents(text).width <= room:
+            return text
+        while name:
+            name = name[:-1].rstrip()
+            text = join(name + "\u2026" if name else "")
+            if cr.text_extents(text).width <= room:
+                return text
+        # Only the locator is left, and it still does not fit: trim it
+        # rather than draw past the chip.
+        while text and cr.text_extents(text).width > room:
+            text = text[:-1]
+        return text
+
+    room = chip_w - 18
+    # The station: its QRZ first name and its OWN square. This line
+    # used to take the receiver's locator, which read as the station's
+    # and was only right by coincidence when the station was near by.
+    station = fit(state.get("callsign_name"),
+                  state.get("callsign_locator"), 18, room)
+    if station:
+        ov.draw_text(cr, chip_cx, y + 78, station, size=18,
+                     align="center", colour=ov.BAR_LABEL)
+    # Where it was heard: this site, or the Remote Rx on screen. Amber,
+    # the colour Pathfinder gives a receiving site, so the two cards
+    # agree on which end of the path is which without a word of label.
+    rx = fit(state.get("rx_name"), state.get("rx_locator"), 15, room)
+    if rx:
+        ov.draw_text(cr, chip_cx, y + 103, rx, size=15,
+                     align="center", colour=ov.BAR_RX)
 
     # The rest as label-over-value columns: the pairing the web panels
     # use, turned on its side because a bar is wide and shallow.
@@ -1649,6 +1697,7 @@ class LynxOverlay(Gtk.Window):
     BAR_LABEL = (0.659, 0.710, 0.780)           # #a8b5c7
     BAR_VALUE = (0.0, 1.0, 0.25)                # the overlay's green
     BAR_DIM = (0.45, 0.52, 0.60)                # a tuner with no lock
+    BAR_RX = (1.000, 0.647, 0.157)              # Pathfinder's receiving-site amber
 
     def _bar_hold_secs(self):
         """How long it stays up once risen. 0 means permanently, which

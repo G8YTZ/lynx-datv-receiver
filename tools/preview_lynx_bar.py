@@ -115,12 +115,14 @@ def backdrop(cr):
 
 LOCKED = {
     "mode": "rf", "locked": True, "callsign": "G8YTZ",
-    "callsign_name": "Justin",
-    "site_locator": "JO01IF", "frequency": 438.021, "sr_ks": 333,
+    "callsign_name": "Justin", "callsign_locator": "JO01AJ",
+    "rx_name": "Orpington", "rx_locator": "JO01IF",
+    "frequency": 438.021, "sr_ks": 333,
     "sr_units": "kS/s", "modcod": "QPSK 9/10", "mer": 23.4, "margin": 17.0,
     "codec": "H265", "audio_codec": "AAC", "lynx_bar_secs": 15,
 }
-SEARCHING = dict(LOCKED, locked=False, callsign="", mer=None, margin=None,
+SEARCHING = dict(LOCKED, locked=False, callsign="",
+                 callsign_name="", callsign_locator="", mer=None, margin=None,
                  modcod=None, codec=None)
 # Margins as well as MERs: the diversity columns carry both, and a
 # fixture missing them renders "23.4/-" and makes a working layout look
@@ -128,14 +130,17 @@ SEARCHING = dict(LOCKED, locked=False, callsign="", mer=None, margin=None,
 DIVERSITY = dict(LOCKED, diversity_enabled=True, locked_a=True,
                  locked_b=True, mer_a=23.4, mer_b=19.8,
                  margin_a=17.0, margin_b=13.2)
+# Heard at a Remote Rx: the receiver line is where this changes.
+REMOTE = dict(LOCKED, rx_name="Lenham", rx_locator="JO01KG")
 DIVERSITY_ONE = dict(DIVERSITY, locked_b=False, mer_b=None, margin_b=None)
 # The combination that binds the layout: a broadcast symbol rate, the
 # longest modcod and codec names, and both margins gone negative.
 DIVERSITY_WIDE = dict(DIVERSITY, sr_ks=27500, modcod="32APSK 9/10",
                       audio_codec="OPUS", margin_a=-2.5, margin_b=-4.5)
 STREAM = {"mode": "stream", "locked": True, "stream_name": "Lenham",
-          "callsign_name": "Justin",
-    "site_locator": "JO01IF", "stream_protocol": "srt",
+          "callsign_name": "Justin", "callsign_locator": "JO01AJ",
+          "rx_name": "Lenham Remote Rx", "rx_locator": "JO01KG",
+          "stream_protocol": "srt",
           "stream_bitrate_kbps": 610, "stream_video_codec": "H265",
           "stream_audio_codec": "AAC", "lynx_bar_secs": 15}
 
@@ -172,7 +177,10 @@ def main():
     ov = StubOverlay(load_constants())
     render = ns["render_lynx_bar"]
 
-    shots = [("locked", LOCKED, 1.0), ("searching", SEARCHING, 1.0),
+    shots = [("locked", LOCKED, 1.0), ("remote", REMOTE, 1.0),
+             ("long-names", dict(LOCKED, callsign_name="Christopher",
+                                 rx_name="Paddlesworth Remote Rx"), 1.0),
+             ("searching", SEARCHING, 1.0),
              ("diversity", DIVERSITY, 1.0),
              ("diversity-one-down", DIVERSITY_ONE, 1.0),
              ("diversity-widest", DIVERSITY_WIDE, 1.0),
