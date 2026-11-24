@@ -1215,7 +1215,7 @@ def _fit_name_loc(cr, name, loc, size, room):
     return text
 
 
-def render_callsign_chip(cr, ov, state, cx0, cy0):
+def render_callsign_chip(cr, ov, state, cx0, cy0, panel=True):
     """The navy callsign chip, CHIP_W x CHIP_H, top-left at (cx0, cy0).
 
     ONE function for the bar and the corner box, so the two can never
@@ -1231,9 +1231,13 @@ def render_callsign_chip(cr, ov, state, cx0, cy0):
     call = (state.get("callsign") or state.get("hdhr_callsign")
             or state.get("stream_name")
             or ("SEARCHING" if not locked else "\u2014"))
-    cr.set_source_rgba(*ov.BAR_HEAD)
-    ov._rounded_rect_path(cr, cx0, cy0, CHIP_W, CHIP_H, 13)
-    cr.fill()
+    # The navy panel belongs to the bar, where it marks the chip out
+    # from the columns beside it. A corner box IS the chip, so there it
+    # sits straight on the box's own tint - panel=False.
+    if panel:
+        cr.set_source_rgba(*ov.BAR_HEAD)
+        ov._rounded_rect_path(cr, cx0, cy0, CHIP_W, CHIP_H, 13)
+        cr.fill()
     cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL,
                         cairo.FONT_WEIGHT_BOLD)
     mid = cx0 + CHIP_W / 2.0
@@ -1329,12 +1333,15 @@ def render_corner_boxes(cr, width, height, state, ov):
     """
     cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL,
                         cairo.FONT_WEIGHT_BOLD)
-    pad, m = 10, CORNER_MARGIN
-    box_w = CHIP_W + 2 * pad
+    # No padding and no navy panel: the box is exactly the chip's area,
+    # so it takes no more of the picture than the text needs. The chip's
+    # own text already sits 9px in from its edges.
+    m = CORNER_MARGIN
+    box_w = CHIP_W
 
-    # Left: the chip, exactly as it sits in the bar.
-    _lynx_box(cr, ov, m, m, box_w, CHIP_H + 2 * pad)
-    render_callsign_chip(cr, ov, state, m + pad, m + pad)
+    # Left: the chip's content, as it sits in the bar.
+    _lynx_box(cr, ov, m, m, CHIP_W, CHIP_H, radius=13)
+    render_callsign_chip(cr, ov, state, m, m, panel=False)
 
     # Right: the same size as the left, so the two corners read as a
     # matched pair. The content is centred in it: three lines use the
@@ -1342,11 +1349,8 @@ def render_corner_boxes(cr, width, height, state, ov):
     # callsign; fewer lines move down to the middle.
     freq, lines, dim = _corner_numbers(state)
     x = width - m - box_w
-    _lynx_box(cr, ov, x, m, box_w, CHIP_H + 2 * pad)
-    cx0, cy0 = x + pad, m + pad
-    cr.set_source_rgba(*ov.BAR_HEAD)
-    ov._rounded_rect_path(cr, cx0, cy0, CHIP_W, CHIP_H, 13)
-    cr.fill()
+    _lynx_box(cr, ov, x, m, CHIP_W, CHIP_H, radius=13)
+    cx0, cy0 = x, m
     mid = cx0 + CHIP_W / 2.0
     line_sz = 18
     if len(lines) >= 2:
@@ -1838,12 +1842,12 @@ class LynxOverlay(Gtk.Window):
     LYNX_BAR_RADIUS = 20
 
     # The family palette, taken from the web panels.
-    # 20% opaque (was 93%): a tint rather than a panel, so the bar and
+    # 30% opaque (was 93%): a tint rather than a panel, so the bar and
     # the boxes sit over the picture instead of covering it. Readability
     # comes from the text's own drop shadow, not from the fill. The navy
     # callsign chip stays nearly solid - it carries the text that
     # matters most, and it is what makes the family read as Lynx.
-    BAR_FILL = (0.047, 0.078, 0.145, 0.20)      # panel body navy
+    BAR_FILL = (0.047, 0.078, 0.145, 0.30)      # panel body navy
     BAR_HEAD = (0.059, 0.204, 0.376, 0.96)      # #0f3460
     BAR_EDGE = (0.227, 0.290, 0.388, 0.85)      # #3a4a63
     BAR_LABEL = (0.659, 0.710, 0.780)           # #a8b5c7
