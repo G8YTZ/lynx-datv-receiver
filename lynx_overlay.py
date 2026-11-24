@@ -1892,7 +1892,9 @@ class LynxOverlay(Gtk.Window):
             return False
 
         key = (card.get('callsign'), card.get('locator'),
-               card.get('unlocked_at'), int(width), int(height))
+               card.get('unlocked_at'), int(width), int(height),
+               tuple(sorted((x or {}).get('locator', '')
+                            for x in (card.get('heard_by') or []))))
         if key != getattr(self, '_pf_surface_key', None):
             if getattr(self, '_pf_renderer', None) is None or \
                     self._pf_renderer.home_locator != home.upper():
@@ -1906,7 +1908,8 @@ class LynxOverlay(Gtk.Window):
                     symbol_rate=card.get('symbol_rate'),
                     frequency=card.get('frequency'),
                     site_name=state.get("site_location") or "",
-                    via_qo100=bool(card.get('via_qo100')))
+                    via_qo100=bool(card.get('via_qo100')),
+                    heard_by=card.get('heard_by'))
             except Exception as e:
                 # A map that will not draw must never take the OSD down -
                 # fall back silently to the normal idle screen.

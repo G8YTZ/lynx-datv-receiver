@@ -426,9 +426,13 @@ class MapRenderer:
 
     # -- geometry helpers -------------------------------------------------
 
-    def _window(self, lat_s, lon_s, dist_km, W, H):
-        """Frame centred on the midpoint of the path, spanning enough to
-        hold both stations with margin.
+    def _window(self, pts, W, H):
+        """Frame centred on the points given, spanning enough to hold
+        all of them with margin.
+
+        Takes a list rather than a pair because a diversity contact has
+        a receiving site per leg and all of them have to fit. With two
+        points it reduces exactly to what it did before.
 
         The span is driven by whichever axis is LIMITING, not by the
         contact distance. Distance alone is wrong for any path that
@@ -444,9 +448,10 @@ class MapRenderer:
         longitude is only about 0.63 of a degree of latitude, so without
         it the map comes out visibly stretched east-west.
         """
-        lat_h, lon_h = self.home
-        clat = (lat_h + lat_s) / 2.0
-        clon = (lon_h + lon_s) / 2.0
+        lats = [p[0] for p in pts]
+        lons = [p[1] for p in pts]
+        clat = (min(lats) + max(lats)) / 2.0
+        clon = (min(lons) + max(lons)) / 2.0
 
         km_per_deg_lat = 111.32
         km_per_deg_lon = 111.32 * math.cos(math.radians(clat))
@@ -454,8 +459,8 @@ class MapRenderer:
             km_per_deg_lon = 1e-6
 
         aspect = W / float(H)
-        dx_km = abs(lon_s - lon_h) * km_per_deg_lon
-        dy_km = abs(lat_s - lat_h) * km_per_deg_lat
+        dx_km = (max(lons) - min(lons)) * km_per_deg_lon
+        dy_km = (max(lats) - min(lats)) * km_per_deg_lat
 
         # Only the band between the header and footer is actually
         # visible map, so the vertical fit has to be against that, not
@@ -493,9 +498,45 @@ class MapRenderer:
 
     # -- main -------------------------------------------------------------
 
+    def _resolve_sites(self, heard_by, site_name):
+        """The receiving end of the path, as a list.
+
+        Pathfinder used to plot from the configured home locator, which
+        is wrong the moment a Remote Rx is involved: the air path ended
+        at that site, not in the study, so the distance and bearing
+        described a journey the signal never made.
+
+        Deduplicated by locator, which is what makes diversity behave.
+        Two local tuners are two receivers at ONE site, so they are one
+        leg; a local tuner and a Remote Rx are two sites, so they are
+        two. Nothing has to know which case it is in.
+
+        Falls back to home when the caller names no site, so an older
+        card - or a receiver with no remotes at all - draws exactly what
+        it always did.
+        """
+        out, seen = [], set()
+        for entry in (heard_by or []):
+            if not entry:
+                continue
+            loc = str(entry.get('locator') or '').upper()
+            pos = locator_to_latlon(loc)
+            if not pos or loc in seen:
+                continue
+            seen.add(loc)
+            out.append({'locator': loc, 'name': str(entry.get('name') or ''),
+                        'lat': pos[0], 'lon': pos[1]})
+        if out:
+            return out
+        if self.home:
+            return [{'locator': self.home_locator,
+                     'name': str(site_name or ''),
+                     'lat': self.home[0], 'lon': self.home[1]}]
+        return []
+
     def render(self, W, H, callsign, locator, name=None, mer=None,
                modcod=None, symbol_rate=None, frequency=None,
-               site_name=None, via_qo100=False):
+               site_name=None, via_qo100=False, heard_by=None):
         """Returns a cairo.ImageSurface, or None if the card cannot be
         drawn (no home locator, unparseable station locator, missing
         data files). Callers must handle None — a missing map should
@@ -506,21 +547,35 @@ class MapRenderer:
         oscillator, and the only frequency this module ever sees is the
         one the Picotuner reports - which is the IF, several GHz below
         the actual downlink. lynx_app.py knows the LO; this does not."""
-        if not self.home:
-            return None
         if via_qo100:
+            # Left exactly as it was, deliberately. There is one dish,
+            # so there is never a second leg to draw.
+            if not self.home:
+                return None
             return self._render_globe(W, H, callsign, locator, name, mer,
                                       modcod, symbol_rate, frequency,
                                       site_name)
         pos = locator_to_latlon(locator)
         if not pos:
             return None
+        sites = self._resolve_sites(heard_by, site_name)
+        if not sites:
+            return None
         lat_s, lon_s = pos
-        lat_h, lon_h = self.home
 
-        dist = haversine_km(lat_h, lon_h, lat_s, lon_s)
-        brg = bearing_deg(lat_h, lon_h, lat_s, lon_s)
-        x0, x1, y0, y1, span = self._window(lat_s, lon_s, dist, W, H)
+        for site in sites:
+            site['dist'] = haversine_km(site['lat'], site['lon'], lat_s, lon_s)
+            site['brg'] = bearing_deg(site['lat'], site['lon'], lat_s, lon_s)
+        # The first site is the primary: the one that was carrying the
+        # picture when the contact ended. Its figures are the ones a
+        # single-site card shows, so one site behaves exactly as before.
+        lat_h, lon_h = sites[0]['lat'], sites[0]['lon']
+        dist, brg = sites[0]['dist'], sites[0]['brg']
+        # Every point, so a second site cannot fall off the edge. Still
+        # framed entirely by radio paths - nothing here knows about the
+        # internet leg, which is the point.
+        pts = [(lat_s, lon_s)] + [(x['lat'], x['lon']) for x in sites]
+        x0, x1, y0, y1, span = self._window(pts, W, H)
 
         surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, W, H)
         cr = cairo.Context(surf)
@@ -661,21 +716,28 @@ class MapRenderer:
         # ---- place labels, two tiers ----
         self._draw_places(cr, W, H, x0, x1, y0, y1, span)
 
-        # ---- great-circle path ----
-        gc = great_circle_points(lat_h, lon_h, lat_s, lon_s)
-        cr.new_path()
-        cr.move_to(sx(gc[0][1]), sy(gc[0][0]))
-        for plat, plon in gc[1:]:
-            cr.line_to(sx(plon), sy(plat))
-        cr.set_source_rgba(*PATH, 0.18)
-        cr.set_line_width(9)
-        cr.stroke_preserve()
-        cr.set_source_rgba(*PATH, 0.9)
-        cr.set_line_width(2.6)
-        cr.stroke()
+        # ---- great-circle paths, one per receiving site ----
+        # Every leg is a radio path. The hop that carries a Remote Rx's
+        # picture back here is not drawn: it is not a path the signal
+        # travelled through the air, and drawing it to scale would
+        # imply its length meant something.
+        for site in sites:
+            gc = great_circle_points(site['lat'], site['lon'], lat_s, lon_s)
+            cr.new_path()
+            cr.move_to(sx(gc[0][1]), sy(gc[0][0]))
+            for plat, plon in gc[1:]:
+                cr.line_to(sx(plon), sy(plat))
+            cr.set_source_rgba(*PATH, 0.18)
+            cr.set_line_width(9)
+            cr.stroke_preserve()
+            cr.set_source_rgba(*PATH, 0.9)
+            cr.set_line_width(2.6)
+            cr.stroke()
 
         # ---- station markers ----
-        for lon_m, lat_m, colour in ((lon_h, lat_h, AMBER), (lon_s, lat_s, CYAN)):
+        marks = [(x['lon'], x['lat'], AMBER) for x in sites]
+        marks.append((lon_s, lat_s, CYAN))
+        for lon_m, lat_m, colour in marks:
             mx, my = sx(lon_m), sy(lat_m)
             cr.set_source_rgba(*colour, 0.22)
             cr.arc(mx, my, 17, 0, 2 * math.pi)
@@ -689,8 +751,12 @@ class MapRenderer:
             cr.stroke()
 
         # ---- text ----
+        heard_names = " + ".join(x['name'] for x in sites if x['name'])
         self._draw_text(cr, W, H, callsign, locator, name, dist, brg,
-                        mer, modcod, symbol_rate, frequency, site_name)
+                        mer, modcod, symbol_rate, frequency,
+                        heard_names or site_name,
+                        home_label=sites[0]['locator'],
+                        sites=sites if len(sites) > 1 else None)
 
         surf.flush()
         return surf
@@ -996,7 +1062,7 @@ class MapRenderer:
 
     def _draw_text(self, cr, W, H, callsign, locator, name, dist, brg,
                    mer, modcod, symbol_rate, frequency, site_name,
-                   delay_ms=None):
+                   delay_ms=None, home_label=None, sites=None):
         """Shared between the terrestrial card and the QO-100 globe, so
         the two always agree on layout - same bands, same column slots,
         same attribution. A viewer should never feel they are looking at
@@ -1040,8 +1106,12 @@ class MapRenderer:
         if name:
             text(m, top_h * 0.82, name, H * 0.026, TEXT_DIM, mono=False)
 
-        text(W - m, top_h * 0.34, (self.home_locator or ''), H * 0.030,
-             CYAN, bold=True, right=True)
+        # The receiving site, not the configured home: on a Remote Rx
+        # contact those are different places, and this is the one the
+        # signal actually reached.
+        text(W - m, top_h * 0.34,
+             (home_label if home_label is not None else self.home_locator) or '',
+             H * 0.030, CYAN, bold=True, right=True)
         home_line = site_name or ''
         if home_line:
             text(W - m, top_h * 0.62, home_line.upper(), H * 0.020,
@@ -1050,12 +1120,23 @@ class MapRenderer:
              TEXT_LABEL, right=True)
 
         # bottom data strip
-        cols = [('LOCATOR', (locator or '').upper()),
-                ('DISTANCE', f'{dist:,.0f} km')]
-        if delay_ms is not None:
-            cols.append(('DELAY', f'{delay_ms:.0f} ms'))
-        elif brg is not None:
-            cols.append(('BEARING', f'{brg:.0f}\u00b0 {compass_point(brg)}'))
+        cols = [('LOCATOR', (locator or '').upper())]
+        if sites:
+            # One column per site, labelled with the site's own name.
+            # Two bare distances would be unattributable, and the legs
+            # carry no labels of their own: the column heading is what
+            # says which leg is which, and it says which site heard it
+            # better at the same time.
+            for site in sites:
+                cols.append(((site['name'] or site['locator']).upper()[:14],
+                             f"{site['dist']:,.0f} km"))
+        else:
+            cols.append(('DISTANCE', f'{dist:,.0f} km'))
+            if delay_ms is not None:
+                cols.append(('DELAY', f'{delay_ms:.0f} ms'))
+            elif brg is not None:
+                cols.append(('BEARING',
+                             f'{brg:.0f}\u00b0 {compass_point(brg)}'))
         if mer:
             cols.append(('MER', f'{mer} dB'))
         if modcod:
@@ -1126,7 +1207,7 @@ class PathfinderTracker:
 
     def station_unlocked(self, callsign, locator, name=None, mer=None,
                          modcod=None, symbol_rate=None, frequency=None,
-                         via_qo100=False):
+                         via_qo100=False, heard_by=None):
         """A station has stopped. Arms the card if we have enough to draw
         one; otherwise does nothing at all, which leaves the normal idle
         screen in place."""
@@ -1144,6 +1225,10 @@ class PathfinderTracker:
             'symbol_rate': symbol_rate,
             'frequency': frequency,
             'via_qo100': via_qo100,
+            # Which site or sites actually heard it, each {locator,
+            # name}. None means "wherever home is", which is what every
+            # card meant before Remote Rx existed.
+            'heard_by': heard_by or None,
             'unlocked_at': time.time(),
         }
 

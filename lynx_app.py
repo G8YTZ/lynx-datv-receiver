@@ -48,7 +48,7 @@ import yaml
 
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -7646,6 +7646,28 @@ def _start_squeak():
 
 
 
+def _pathfinder_site_for(st):
+    """Where the signal was actually received, as {locator, name}.
+
+    A Remote Rx carries its own locator and name, learned from its SITE
+    heartbeat rather than configured at this end, so the presence of a
+    locator in the source state is what identifies one. Everything else
+    - both local tuners, DVB-T2, a tri-watch RF source - is here, so it
+    takes the configured site.
+
+    This is the whole point of the change: Pathfinder used to plot from
+    home whatever heard the signal, which on a Remote Rx contact drew a
+    path the signal never travelled and a distance that was simply
+    wrong.
+    """
+    loc = str((st or {}).get('locator') or '')
+    if loc:
+        return {'locator': loc, 'name': str((st or {}).get('name') or '')}
+    site = config.get('site', {}) or {}
+    return {'locator': str(site.get('locator') or ''),
+            'name': str(site.get('location') or '')}
+
+
 def _pathfinder_current_source():
     """Which tuner, if any, is currently supplying the displayed picture.
 
@@ -7737,6 +7759,12 @@ def pathfinder_watcher():
                 if cs:
                     prev['callsign'] = cs
                     prev['rcv'] = rcv
+                    # Refreshed on every poll alongside rcv, so it is
+                    # the site of whichever source was carrying the
+                    # picture when the contact ended. The card is
+                    # armed after the lock has gone, by which time
+                    # asking again would find nothing to ask.
+                    prev['site'] = _pathfinder_site_for(st)
                 if not prev['receiving']:
                     # Something is on air again - cancel any card that
                     # is pending or currently showing, and drop the
@@ -7793,7 +7821,8 @@ def pathfinder_watcher():
                 prev['receiving'] = False
                 if prev['callsign']:
                     _pathfinder_arm(prev['callsign'], prev['rcv'],
-                                     dict(prev['telemetry']))
+                                     dict(prev['telemetry']),
+                                     site=prev.get('site'))
         except Exception as e:
             print(f"[map] watcher: {e}")
 
@@ -7939,7 +7968,7 @@ def _pathfinder_on_air_frequency(rcv, reported_mhz):
     return reported_mhz if on_air is None else f"{on_air:.3f}"
 
 
-def _pathfinder_arm(callsign, rcv, telemetry):
+def _pathfinder_arm(callsign, rcv, telemetry, site=None):
     """Looks the station up and arms the card if it has a usable
     locator. The QRZ lookup runs on its own thread - never inline, for
     the same reason tri_watch's name lookup doesn't: a slow or
@@ -7985,7 +8014,12 @@ def _pathfinder_arm(callsign, rcv, telemetry):
             if not grid:
                 print(f"[map] {callsign}: no locator on QRZ - no card")
                 return
-            home = config.get('site', {}).get('locator', '')
+            # From the RECEIVING site, not home. A remote 200km away
+            # would otherwise be measured against the wrong end, and a
+            # contact well inside max_distance_km of the Remote Rx
+            # could be thrown out for being too far from the study.
+            home = (site or {}).get('locator') \
+                or config.get('site', {}).get('locator', '')
             pos_h = lynx_map.locator_to_latlon(home)
             pos_s = lynx_map.locator_to_latlon(grid)
             via_qo100 = _pathfinder_via_qo100(rcv, telemetry)
@@ -8032,6 +8066,7 @@ def _pathfinder_arm(callsign, rcv, telemetry):
 
             pathfinder_tracker.station_unlocked(
                 callsign, grid, name=name, via_qo100=via_qo100,
+                heard_by=[site] if site and site.get('locator') else None,
                 **snapshot)
         except Exception as e:
             print(f"[map] lookup for {callsign} failed: {e}")
@@ -9430,6 +9465,12 @@ class PathfinderTestRequest(BaseModel):
     mer: str = "9.4"
     modcod: str = "QPSK 2/3"
     symbol_rate: str = "333"
+    # Which site or sites heard it, each {"locator": "...", "name":
+    # "..."}. Left out, the card plots from whichever source is
+    # currently selected, exactly as a real contact would. Given, it
+    # plots from these - which is the only way to see a two-leg
+    # diversity card without owning two receive sites.
+    heard_by: Optional[List[Dict[str, str]]] = None
 
 
 @app.get("/api/audio/monitors", tags=["Control"],
@@ -9518,11 +9559,29 @@ def pathfinder_test(req: PathfinderTestRequest):
     # installation: set the switch, POST a distant locator, watch the
     # card. Without that the globe could only ever be seen by someone
     # who already had the hardware working.
+    # No sites given: use whatever is actually on screen, so a test
+    # card lands where a real one would. That makes this endpoint a
+    # check of the Remote Rx plotting too, not only of the layout.
+    heard = req.heard_by
+    if not heard:
+        _recv, _rcv, _st = _pathfinder_current_source()
+        site = _pathfinder_site_for(_st)
+        heard = [site] if site.get('locator') else None
+    bad = [h.get('locator') for h in (heard or [])
+           if lynx_map.locator_to_latlon(h.get('locator') or '') is None]
+    if bad:
+        raise HTTPException(status_code=400,
+                            detail="unusable receiving locator(s): "
+                                   + ", ".join(repr(b) for b in bad))
     pathfinder_tracker.station_unlocked(
         req.callsign, req.locator, name=req.name or None, mer=req.mer,
-        modcod=req.modcod, symbol_rate=req.symbol_rate,
+        modcod=req.modcod, symbol_rate=req.symbol_rate, heard_by=heard,
         via_qo100=bool(config.get('pathfinder', {}).get('qo100_test', False)))
-    home = config.get('site', {}).get('locator', '')
+    # Measured from the site that heard it, which is what the card now
+    # draws. Reporting the distance from home would disagree with the
+    # picture on the screen.
+    home = ((heard or [{}])[0].get('locator')
+            or config.get('site', {}).get('locator', ''))
     pos_h = lynx_map.locator_to_latlon(home)
     dist = lynx_map.haversine_km(*pos_h, *pos) if pos_h else None
     return {
@@ -9531,6 +9590,7 @@ def pathfinder_test(req: PathfinderTestRequest):
         "locator": req.locator,
         "distance_km": round(dist, 1) if dist is not None else None,
         "home_locator": home,
+        "heard_by": heard,
         "appears_in_secs": pathfinder_tracker.delay_secs,
         "visible_for_secs": pathfinder_tracker.duration_secs,
         "note": None if home else
