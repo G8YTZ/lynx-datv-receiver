@@ -1079,8 +1079,10 @@ def _bar_cells(state):
     every variant without a running receiver.
 
     Diversity keeps its split, as the corner OSD always has: two tuners
-    means two MER columns, not an average. An average of two tuners is
-    a number describing nothing.
+    means two columns, not an average. An average of two tuners is a
+    number describing nothing. Each column carries that tuner's MER and
+    margin as a pair, again following the corner OSD - four separate
+    columns will not fit across the bar.
     """
     locked = bool(state.get("locked"))
     cells = []
@@ -1109,11 +1111,34 @@ def _bar_cells(state):
                       not locked))
 
     if state.get("diversity_enabled"):
-        for suffix, name in (("_a", "MER A"), ("_b", "MER B")):
+        # MER and margin together per tuner, which is how the corner
+        # OSD has always written a diversity pair ("A: MER/D 23.4/17.0
+        # dB"). Four separate columns would not fit, and dropping
+        # margin - which is what this did at first - loses the single
+        # most actionable number on the screen in the one mode where
+        # there are two of it.
+        #
+        # The units live in the label rather than on each value. That
+        # is not cosmetic: with " dB" on both numbers the row runs 11px
+        # past the end of the bar and the gap between columns hits its
+        # floor, so the whole row goes tight to buy nothing. In the
+        # label it costs no width at all.
+        for suffix, name in (("_a", "A   MER/D   dB"),
+                             ("_b", "B   MER/D   dB")):
             mer = state.get("mer" + suffix)
+            mar = state.get("margin" + suffix)
             up = bool(state.get("locked" + suffix))
-            cells.append((name, "%.1f dB" % float(mer) if mer else "\u2014",
-                          not up))
+            # No spaces around the slash: that is how the corner OSD
+            # writes it, and at 29px each space costs 17px of column.
+            # With them, a broadcast symbol rate in diversity leaves
+            # under 2px of slack across the whole row.
+            if mer and mar:
+                value = "%.1f/%.1f" % (float(mer), float(mar))
+            elif mer:
+                value = "%.1f/\u2014" % float(mer)
+            else:
+                value = "\u2014"
+            cells.append((name, value, not up))
     elif state.get("mer"):
         cells.append(("MER", "%.1f dB" % float(state["mer"]), not locked))
         if state.get("margin"):

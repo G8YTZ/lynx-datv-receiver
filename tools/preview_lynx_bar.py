@@ -122,9 +122,17 @@ LOCKED = {
 }
 SEARCHING = dict(LOCKED, locked=False, callsign="", mer=None, margin=None,
                  modcod=None, codec=None)
+# Margins as well as MERs: the diversity columns carry both, and a
+# fixture missing them renders "23.4/-" and makes a working layout look
+# broken. A preview is only worth having if it lies about nothing.
 DIVERSITY = dict(LOCKED, diversity_enabled=True, locked_a=True,
-                 locked_b=True, mer_a=23.4, mer_b=19.8)
-DIVERSITY_ONE = dict(DIVERSITY, locked_b=False, mer_b=None)
+                 locked_b=True, mer_a=23.4, mer_b=19.8,
+                 margin_a=17.0, margin_b=13.2)
+DIVERSITY_ONE = dict(DIVERSITY, locked_b=False, mer_b=None, margin_b=None)
+# The combination that binds the layout: a broadcast symbol rate, the
+# longest modcod and codec names, and both margins gone negative.
+DIVERSITY_WIDE = dict(DIVERSITY, sr_ks=27500, modcod="32APSK 9/10",
+                      audio_codec="OPUS", margin_a=-2.5, margin_b=-4.5)
 STREAM = {"mode": "stream", "locked": True, "stream_name": "Lenham",
           "callsign_name": "Justin",
     "site_locator": "JO01IF", "stream_protocol": "srt",
@@ -167,6 +175,7 @@ def main():
     shots = [("locked", LOCKED, 1.0), ("searching", SEARCHING, 1.0),
              ("diversity", DIVERSITY, 1.0),
              ("diversity-one-down", DIVERSITY_ONE, 1.0),
+             ("diversity-widest", DIVERSITY_WIDE, 1.0),
              ("stream", STREAM, 1.0),
              ("rising-25", LOCKED, 0.25), ("rising-60", LOCKED, 0.60)]
     for name, st, p in shots:

@@ -16,6 +16,7 @@ tests what ships rather than a copy of it.
 
 import ast
 import os
+import re
 import sys
 import unittest
 
@@ -125,25 +126,58 @@ class CellTests(unittest.TestCase):
         self.assertIn("FREQUENCY", [c[0] for c in cells])
         self.assertTrue(all(c[2] for c in cells), "everything should be dim")
 
+    DIVERSITY = {"diversity_enabled": True, "locked_a": True,
+                 "locked_b": True, "mer_a": 23.4, "mer_b": 19.8,
+                 "margin_a": 17.0, "margin_b": 13.2}
+
+    def pair(self, st):
+        """The two diversity columns, keyed A and B, whatever the full
+        label text happens to be."""
+        out = {}
+        for label, value, dim in self.cells(st):
+            if label.startswith(("A ", "B ")):
+                out[label[0]] = (value, dim)
+        return out
+
     def test_diversity_stays_a_pair(self):
         """Two tuners means two columns. An average of two tuners is a
         number describing nothing."""
-        st = dict(self.LOCKED, diversity_enabled=True, locked_a=True,
-                  locked_b=True, mer_a=23.4, mer_b=19.8)
-        got = dict((c[0], c[1]) for c in self.cells(st))
-        self.assertEqual("23.4 dB", got["MER A"])
-        self.assertEqual("19.8 dB", got["MER B"])
-        self.assertNotIn("MER", got, "the single MER must give way to the pair")
+        st = dict(self.LOCKED, **self.DIVERSITY)
+        got = self.pair(st)
+        self.assertEqual({"A", "B"}, set(got))
+        self.assertNotIn("MER", [c[0] for c in self.cells(st)],
+                         "the single MER must give way to the pair")
+
+    def test_diversity_keeps_the_margin(self):
+        """Dropping D in diversity loses the most actionable number on
+        the screen in the one mode where there are two of it - and it
+        is what the corner OSD has always shown per tuner."""
+        got = self.pair(dict(self.LOCKED, **self.DIVERSITY))
+        self.assertEqual("23.4/17.0", got["A"][0])
+        self.assertEqual("19.8/13.2", got["B"][0])
+
+    def test_the_units_are_stated_somewhere(self):
+        """They moved off the values to buy column width. They must not
+        have been dropped on the way - an instrument reading with no
+        units is not an instrument reading."""
+        for label, value, _dim in self.cells(dict(self.LOCKED,
+                                                  **self.DIVERSITY)):
+            if label.startswith(("A ", "B ")):
+                self.assertIn("dB", label, "units lost from " + repr(label))
+
+    def test_a_tuner_locked_without_a_margin_still_shows_its_mer(self):
+        st = dict(self.LOCKED, **dict(self.DIVERSITY, margin_b=None))
+        self.assertEqual("19.8/\u2014", self.pair(st)["B"][0])
 
     def test_a_diversity_tuner_with_no_lock_is_dim_but_present(self):
         """Its absence is the information. Dropping the column would
         make a half-working pair look like a working single."""
-        st = dict(self.LOCKED, diversity_enabled=True, locked_a=True,
-                  locked_b=False, mer_a=23.4, mer_b=None)
-        cells = dict((c[0], (c[1], c[2])) for c in self.cells(st))
-        self.assertIn("MER B", cells)
-        self.assertTrue(cells["MER B"][1], "B should be dim")
-        self.assertFalse(cells["MER A"][1], "A should not be")
+        st = dict(self.LOCKED, **dict(self.DIVERSITY, locked_b=False,
+                                      mer_b=None, margin_b=None))
+        got = self.pair(st)
+        self.assertEqual("\u2014", got["B"][0])
+        self.assertTrue(got["B"][1], "B should be dim")
+        self.assertFalse(got["A"][1], "A should not be")
 
     def test_a_stream_says_stream_things(self):
         st = {"mode": "stream", "locked": True, "stream_name": "Lenham",
@@ -160,6 +194,92 @@ class CellTests(unittest.TestCase):
                    {"mode": "stream", "locked": False}):
             with self.subTest(st):
                 self.cells(st)
+
+
+class WidthTests(unittest.TestCase):
+    """Does the row actually fit across the bar?
+
+    Worth testing because it has already gone wrong once: the first
+    attempt at keeping D in diversity put " dB" on both values, which
+    ran 11px past the end of the bar and pinned the column gap to its
+    floor. Nothing about that is visible in the cell list, only in the
+    measured widths.
+
+    Needs cairo and whatever monospace font is installed, so it skips
+    where there is none. A failure means either the layout grew or the
+    font changed under it.
+    """
+
+    def setUp(self):
+        try:
+            import cairo
+        except ImportError:
+            self.skipTest("no cairo")
+        self.cairo = cairo
+        self.ns, self.cls, _, _ = load()
+        src = open(SRC).read()
+        m = re.search(r"chip_w,\s*chip_m\s*=\s*(\d+),\s*(\d+)", src)
+        if not m:
+            self.skipTest("callsign chip geometry not found")
+        self.chip_w, self.chip_m = int(m.group(1)), int(m.group(2))
+        # The sizes the renderer draws labels and values at.
+        self.label_sz, self.value_sz = 15, 29
+
+    def gap(self, cells, screen_w=1920):
+        """The column gap the renderer would end up with, in px.
+
+        Below the 26px floor means the row is wider than the bar.
+        """
+        cr = self.cairo.Context(
+            self.cairo.ImageSurface(self.cairo.FORMAT_ARGB32, 8, 8))
+        cr.select_font_face("monospace", self.cairo.FONT_SLANT_NORMAL,
+                            self.cairo.FONT_WEIGHT_BOLD)
+        bar_w = max(420, screen_w - 2 * self.cls.LYNX_BAR_SIDE_GAP)
+        x = (screen_w - bar_w) / 2.0
+        first = x + self.chip_m + self.chip_w + 32
+        avail = (x + bar_w - 26) - first
+        total = 0.0
+        for label, value, _dim in cells:
+            cr.set_font_size(self.label_sz)
+            lw = cr.text_extents(label).width
+            cr.set_font_size(self.value_sz)
+            vw = cr.text_extents(str(value)).width
+            total += max(lw, vw)
+        return (avail - total) / max(1, len(cells) - 1)
+
+    FULL = {"mode": "rf", "locked": True, "callsign": "G8YTZ",
+            "frequency": 438.021, "sr_ks": 333, "sr_units": "kS/s",
+            "modcod": "QPSK 9/10", "mer": 23.4, "margin": 17.0,
+            "codec": "H265", "audio_codec": "AAC"}
+
+    def test_a_locked_single_tuner_fits(self):
+        g = self.gap(self.ns["_bar_cells"](self.FULL))
+        self.assertGreater(g, 26.0, "columns pinned to the gap floor")
+
+    def test_a_diversity_pair_fits(self):
+        st = dict(self.FULL, diversity_enabled=True, locked_a=True,
+                  locked_b=True, mer_a=23.4, mer_b=19.8,
+                  margin_a=17.0, margin_b=13.2)
+        g = self.gap(self.ns["_bar_cells"](st))
+        self.assertGreater(g, 26.0,
+                           "the diversity row is wider than the bar")
+
+    def test_it_still_fits_with_the_widest_real_signal(self):
+        """A broadcast symbol rate, the longest modcod and codec names,
+        and margins gone negative, in diversity. Not contrived: that is
+        a commercial bird on a dish with both tuners struggling, and it
+        is the combination that binds the layout.
+
+        Margins go negative; MER does not, because a tuner reporting a
+        negative MER would not be locked and the row would be dim and
+        mostly dashes.
+        """
+        st = dict(self.FULL, sr_ks=27500, sr_units="kS/s",
+                  modcod="32APSK 9/10", codec="H265", audio_codec="OPUS",
+                  diversity_enabled=True, locked_a=True, locked_b=True,
+                  mer_a=23.4, mer_b=19.8, margin_a=-2.5, margin_b=-4.5)
+        g = self.gap(self.ns["_bar_cells"](st))
+        self.assertGreater(g, 26.0, "the widest real signal overflows")
 
 
 class TimingTests(unittest.TestCase):
