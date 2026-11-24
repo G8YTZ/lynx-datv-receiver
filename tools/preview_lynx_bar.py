@@ -72,38 +72,40 @@ def load_constants():
 
 
 class StubOverlay:
-    """Enough of the overlay for the renderer: the constants, and the
-    two drawing helpers it calls. draw_text and _rounded_rect_path are
-    copied from lynx_overlay.py deliberately - they are four lines each
-    and lifting them by AST as well would obscure more than it saved."""
+    """Enough of the overlay for the renderers: the constants, and the
+    drawing helpers they call - draw_text and _rounded_rect_path.
+
+    The helpers are LIFTED from lynx_overlay.py, not copied. They used
+    to be copied, and the copy of _rounded_rect_path differed in one
+    line (the real one starts with new_path()), which hid a bug that
+    darkened every Lynx box on the television while the preview looked
+    right. A preview is only worth having if it draws what ships.
+    """
 
     def __init__(self, consts):
         self.__dict__.update(consts)
 
-    def draw_text(self, cr, x, y, text, size=30, align="left",
-                  colour=(0.0, 1.0, 0.25)):
-        cr.set_font_size(size)
-        ext = cr.text_extents(text)
-        if align == "right":
-            x = x - ext.width
-        elif align == "center":
-            x = x - ext.width / 2
-        cr.set_source_rgba(0, 0, 0, 0.75)
-        cr.move_to(x + 2, y + 2)
-        cr.show_text(text)
-        cr.set_source_rgba(*colour, 0.95)
-        cr.move_to(x, y)
-        cr.show_text(text)
-        cr.new_path()
 
-    def _rounded_rect_path(self, cr, x, y, w, h, r):
-        import math
-        cr.new_sub_path()
-        cr.arc(x + w - r, y + r, r, -math.pi / 2, 0)
-        cr.arc(x + w - r, y + h - r, r, 0, math.pi / 2)
-        cr.arc(x + r, y + h - r, r, math.pi / 2, math.pi)
-        cr.arc(x + r, y + r, r, math.pi, 3 * math.pi / 2)
-        cr.close_path()
+def _lift_helpers():
+    import math
+    src = open(os.path.join(HERE, "lynx_overlay.py")).read()
+    want = {"draw_text", "_rounded_rect_path"}
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.ClassDef) and node.name == "LynxOverlay":
+            found = [f for f in node.body
+                     if isinstance(f, ast.FunctionDef) and f.name in want]
+            ns = {"math": math, "cairo": cairo}
+            exec(compile(ast.Module(found, []), "<helpers>", "exec"), ns)
+            missing = want - set(ns)
+            if missing:
+                raise SystemExit("not found in LynxOverlay: " + ", ".join(missing))
+            for name in want:
+                setattr(StubOverlay, name, ns[name])
+            return
+    raise SystemExit("LynxOverlay not found")
+
+
+_lift_helpers()
 
 
 def backdrop(cr):

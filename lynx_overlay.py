@@ -1265,10 +1265,19 @@ def _lynx_box(cr, ov, x, y, w, h, radius=16):
     fill shows through it as a darker offset patch, and the box reads
     as two-tone rather than as one pane of tinted glass.
     """
+    # Both outlines into ONE path, then fill even-odd so only the strip
+    # between them is painted. The box outline is captured and appended
+    # rather than traced second, because _rounded_rect_path() starts
+    # with new_path(): tracing it twice in a row keeps only the second
+    # outline, and that filled the whole box with 45% black - on the
+    # television, though not in a preview that used its own copy of
+    # the helper.
+    ov._rounded_rect_path(cr, x, y, w, h, radius)
+    box = cr.copy_path()
+    ov._rounded_rect_path(cr, x + 3, y + 5, w, h, radius)
+    cr.append_path(box)
     cr.save()
     cr.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
-    ov._rounded_rect_path(cr, x + 3, y + 5, w, h, radius)
-    ov._rounded_rect_path(cr, x, y, w, h, radius)
     cr.set_source_rgba(0, 0, 0, 0.45)
     cr.fill()
     cr.restore()
