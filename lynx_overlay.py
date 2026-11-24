@@ -1838,11 +1838,12 @@ class LynxOverlay(Gtk.Window):
     LYNX_BAR_RADIUS = 20
 
     # The family palette, taken from the web panels.
-    # 80% opaque (was 93%): less of the picture hidden behind the bar
-    # and the boxes, still enough to hold green text over a pale sky.
-    # The navy callsign chip stays nearly solid - it carries the text
-    # that matters most, and it is what makes the family read as Lynx.
-    BAR_FILL = (0.047, 0.078, 0.145, 0.80)      # panel body navy
+    # 20% opaque (was 93%): a tint rather than a panel, so the bar and
+    # the boxes sit over the picture instead of covering it. Readability
+    # comes from the text's own drop shadow, not from the fill. The navy
+    # callsign chip stays nearly solid - it carries the text that
+    # matters most, and it is what makes the family read as Lynx.
+    BAR_FILL = (0.047, 0.078, 0.145, 0.20)      # panel body navy
     BAR_HEAD = (0.059, 0.204, 0.376, 0.96)      # #0f3460
     BAR_EDGE = (0.227, 0.290, 0.388, 0.85)      # #3a4a63
     BAR_LABEL = (0.659, 0.710, 0.780)           # #a8b5c7
