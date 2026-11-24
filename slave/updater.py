@@ -67,7 +67,8 @@ GIT_TIMEOUT_SECS = 120
 # failed: an older commit has no knucker_source.py, and a rollback TO
 # that commit must not be refused for not having a file that did not
 # exist yet.
-SOURCE_MODULES = ("longmynd_source.py", "knucker_source.py")
+SOURCE_MODULES = ("longmynd_source.py", "knucker_source.py",
+                  "picotuner_source.py")
 
 
 def git(repo, *args, timeout=GIT_TIMEOUT_SECS):

@@ -356,6 +356,20 @@ def hand_over_if_not_a_minitiouner():
         return
     if kind == "minitiouner":
         return
+    if kind == "picotuner":
+        # THIS module drives a PicoTuner too, given Ryde's build of
+        # longmynd. So when that build is present there is nothing to
+        # hand over to: carry on, pointed at it. Handing over to
+        # picotuner_source.py here would put a card that can receive
+        # into report-only.
+        pico = os.path.expanduser(
+            os.environ.get("PICOTUNER_DIR", "~/longmynd-pico"))
+        if os.path.exists(os.path.join(pico, "longmynd")):
+            sys.argv += ["--tuner-kind", "picotuner", "--longmynd-dir", pico]
+            print(f"[tuner] {product} found, with its longmynd in {pico}: "
+                  f"driving it from here")
+            return
+        # No build for it, so the report-only source after all.
     target = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           f"{kind}_source.py")
     if not os.path.exists(target):
@@ -382,6 +396,24 @@ def main():
                     help="where the longmynd binary and its status fifo live")
     ap.add_argument("--tuner-timeout", type=float, default=0.6,
                     help="Longmynd -S scan width, its own default is 0.6")
+    # Longmynd drives a Minitiouner or, with Ryde's build of it, a USB
+    # PicoTuner. Both are DVB-S/S2 through the same Serit NIM and report
+    # the same measurements in the same format, so the only thing that
+    # differs is what the heartbeat should call it - and only the
+    # wrapper knows, since it is what chose the build. Not detected
+    # here: this module is told, so TUNER= in the conf keeps working as
+    # an override rather than being second-guessed.
+    # Which F connector the aerial is on. Longmynd reads the TOP one
+    # unless given -w, and there was no way to ask for the other, so a
+    # feed on the bottom socket simply never locked and said nothing
+    # about why. Both a Minitiouner and a PicoTuner have two.
+    ap.add_argument("--input", choices=("top", "bottom"), default="top",
+                    help="which F connector to receive on (default top; "
+                         "bottom passes Longmynd's -w)")
+    ap.add_argument("--tuner-kind", choices=("minitiouner", "picotuner"),
+                    default="minitiouner",
+                    help="which tuner this Longmynd is driving, for the "
+                         "heartbeat's TUN line (default minitiouner)")
     ap.add_argument("--transport", choices=("udp", "srt"), default="udp",
                     help="how the video reaches the repeater: plain UDP on a LAN, "
                          "SRT anywhere else (status always stays UDP)")
@@ -393,7 +425,7 @@ def main():
                     help="SRT latency in ms; about four round trips. 300 suits "
                          "most broadband, a LAN needs far less")
     args = ap.parse_args()
-    code = remote_common.prepare(args, "kS/s", "minitiouner")
+    code = remote_common.prepare(args, "kS/s", args.tuner_kind)
     if code is not None:
         return code
     if args.srt_port is None:
@@ -456,11 +488,14 @@ def main():
         ts_host, ts_port = args.host, args.video_port
     cmd = [binary,
            "-i", ts_host, str(ts_port),
-           "-S", str(args.tuner_timeout),
-           str(args.freq), str(args.sr)]
+           "-S", str(args.tuner_timeout)]
+    if args.input == "bottom":
+        cmd.append("-w")
+    cmd += [str(args.freq), str(args.sr)]
 
     print(f"Slave Rx (Longmynd) -> {args.host}")
-    print(f"  tuner  : {args.freq} kHz, {args.sr} kS/s")
+    print(f"  tuner  : {args.freq} kHz, {args.sr} kS/s, "
+          f"{args.input} F connector")
     if args.transport == "srt":
         print(f"  video  : SRT to port {args.srt_port}, latency {args.srt_latency} ms")
     else:

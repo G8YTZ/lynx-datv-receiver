@@ -4409,7 +4409,22 @@ REMOTE_QUALITY_PORT_OFFSET = 96
 # this decides which fields the panel draws: an unrecognised name falls
 # back to a Minitiouner rather than inventing a layout for a tuner this
 # receiver knows nothing about.
-REMOTE_TUNER_KINDS = ("minitiouner", "knucker")
+REMOTE_TUNER_KINDS = ("minitiouner", "knucker",
+                      "picotuner", "picotuner_nodriver")
+
+# A USB PicoTuner driven by Ryde's longmynd is DVB-S/S2 through the same
+# Serit NIM as a Minitiouner and reports the same measurements, so it
+# deliberately gets the Minitiouner's row set rather than one of its own.
+# Nothing to add here: it falls through to the default.
+
+# Tuners a Remote Rx can report but is NOT driving. It heartbeats, takes
+# settings and takes updates; it simply never locks, so the panel says
+# why instead of drawing a row set full of dashes, which reads as a dead
+# aerial. A PicoTuner lands here only when the longmynd that can drive
+# it has not been built on that card (slave/install.sh --picotuner).
+REMOTE_TUNER_UNDRIVEN = {
+    "picotuner_nodriver": "PicoTuner (USB) — no driver built on this card",
+}
 
 # How long a resume waits for a saved Slave to report in before
 # giving up. It cannot be selected until its address is known, and
@@ -5290,6 +5305,19 @@ def remote_sources_cfg() -> list:
     return []
 
 
+def _remote_int_or_none(parts, i):
+    """parts[i] as an int, or None for "-", a missing field or rubbish.
+
+    The heartbeat's numeric fields are all optional in practice: a
+    Remote Rx that cannot read one sends "-" rather than inventing a
+    zero, and zero is a real value for several of them.
+    """
+    try:
+        return int(parts[i])
+    except (IndexError, ValueError):
+        return None
+
+
 def _blank_remote_state(cfg: dict) -> dict:
     """A state record for one Slave.
 
@@ -5325,6 +5353,14 @@ def _blank_remote_state(cfg: dict) -> dict:
         # is certainly one - and so is any unit whose tuner we failed to
         # recognise.
         "tuner": "minitiouner",
+        # How that Remote Rx reaches the network, from its NET line.
+        # None rather than a default: a unit old enough to send no NET
+        # line has an UNKNOWN connection, and showing "wired" for it
+        # would be a reassuring guess about the very thing most likely
+        # to be wrong.
+        "net_kind": None,       # "wifi", "wired", or None
+        "net_dbm": None,        # signal in dBm, Wi-Fi only
+        "net_link": None,       # driver's own 0-100 link quality
         "last_seen": 0,
     }
 
@@ -5651,7 +5687,23 @@ def remote_quality_monitor(index: int):
 # shared at build time, so nobody else can retune a Slave; versioned with
 # the time Save was pressed, so a replayed old packet cannot wind it back.
 REMOTE_CFG_MAGIC = "LYNXCFG1"
-REMOTE_CFG_FIELDS = ("freq_khz", "sr", "name", "locator")
+REMOTE_CFG_FIELDS = ("freq_khz", "sr", "name", "locator", "srt_latency")
+
+
+def _remote_cfg_latency(cfg: dict):
+    """The configured SRT latency in ms, or None when unset.
+
+    Bounded at both ends on the way out as well as on the way in. The
+    Remote Rx clamps it too - belt and braces, because the far end is
+    the one that cannot be reached when a typo takes it off the air.
+    """
+    raw = cfg.get("srt_latency")
+    if raw in (None, ""):
+        return None
+    try:
+        return max(20, min(8000, int(raw)))
+    except (TypeError, ValueError):
+        return None
 
 
 def remote_wanted_settings(i: int):
@@ -5670,8 +5722,18 @@ def remote_wanted_settings(i: int):
         return None
     return {
         "key": key,
+        # srt_latency is sent as null when it has never been set, which
+        # the Remote Rx reads as "leave whatever the conf says alone".
+        # Sending 0 or a default instead would quietly overwrite a value
+        # somebody set by hand on the card.
+        #
+        # It belongs here because it is the one setting that matters on
+        # a lossy link, and the sites that need it are the ones nobody
+        # can reach (24 Nov 2026: a card with 18.7 dB of margin dropping
+        # SRT packets on a distant AP, fixable only over ssh).
         "body": {"v": int(cfg.get("settings_version") or 0), "freq_khz": freq, "sr": sr,
-                 "name": str(cfg.get("name") or ""), "locator": str(cfg.get("locator") or "")},
+                 "name": str(cfg.get("name") or ""), "locator": str(cfg.get("locator") or ""),
+                 "srt_latency": _remote_cfg_latency(cfg)},
     }
 
 
@@ -5954,6 +6016,30 @@ def remote_source_monitor(index: int):
                     parts = line.split()
                     if len(parts) >= 2 and parts[1] in REMOTE_TUNER_KINDS:
                         st["tuner"] = parts[1]
+                    continue
+                if line.startswith("NET"):
+                    # "NET <kind> <dbm> <link>": how the Remote Rx is
+                    # attached to the network, with "-" for anything it
+                    # could not read. Three fixed fields.
+                    #
+                    # Here because the RF figures can be immaculate
+                    # while the pictures are broken, and until now the
+                    # panel had no way to say so. 24 Nov 2026: a card at
+                    # 25.1 dB MER and 18.7 dB margin produced grey
+                    # frames and freezes at the repeater, and the cause
+                    # was its Wi-Fi being on a distant AP. Hours went on
+                    # the decoder, the branch, the SD card and the
+                    # encoder before anybody looked at the radio.
+                    #
+                    # An older Remote Rx sends no NET line, which leaves
+                    # these as None and the panel simply omits the row -
+                    # right, because "unknown" and "wired" are different
+                    # things and only one of them is reassuring.
+                    parts = line.split()
+                    if len(parts) >= 2 and parts[1] in ("wifi", "wired", "-"):
+                        st["net_kind"] = None if parts[1] == "-" else parts[1]
+                        st["net_dbm"] = _remote_int_or_none(parts, 2)
+                        st["net_link"] = _remote_int_or_none(parts, 3)
                     continue
                 if line.startswith("SITE"):
                     # "SITE <locator> <name>" - locator first because a
@@ -6404,6 +6490,10 @@ class RemoteSourceConfigUpdate(BaseModel):
     sr: int = 0
     name: str = ""
     locator: str = ""
+    # None means "leave whatever the Remote Rx already has". Not 300:
+    # a default here would push a value at every card the first time
+    # anybody pressed Save on this page.
+    srt_latency: Optional[int] = None
 
 
 class HdhomerunConfigUpdate(BaseModel):
@@ -9031,6 +9121,17 @@ def get_status():
                 # fields that tuner measures rather than the ones a
                 # Minitiouner would.
                 "tuner": st.get("tuner", "minitiouner"),
+                # Set only for a tuner the Remote Rx can see but cannot
+                # drive. The panel shows this instead of a row set full
+                # of dashes, which would read as a broken aerial.
+                "tuner_note": REMOTE_TUNER_UNDRIVEN.get(
+                    st.get("tuner", "minitiouner")),
+                # How it reaches the network. All three are null for a
+                # Remote Rx that sends no NET line, and the panel then
+                # shows no row at all rather than guessing.
+                "net_kind": st.get("net_kind"),
+                "net_dbm": st.get("net_dbm"),
+                "net_link": st.get("net_link"),
                 "settings": remote_settings_state(i),
                 # What the Remote Rx is running, and whether that
                 # matches this receiver. "behind" is only ever True when
@@ -10124,6 +10225,11 @@ def config_page():
                                 <label class="form-label small mb-1" for="rs-locator">Locator</label>
                                 <input type="text" maxlength="10" class="form-control form-control-sm" id="rs-locator" placeholder="JO01AJ">
                             </div>
+                            <div class="col-6">
+                                <label class="form-label small mb-1" for="rs-latency">SRT latency (ms)</label>
+                                <input type="number" min="20" max="8000" step="10" class="form-control form-control-sm" id="rs-latency" placeholder="300">
+                                <div class="small text-muted mt-1">How long SRT may spend recovering lost packets. Blank leaves the Remote Rx's own setting alone. Raise it (1000) for a site on Wi-Fi or a poor link: the cost is that much extra delay.</div>
+                            </div>
                             <div class="col-12">
                                 <label class="form-label small mb-1" for="rs-key">Key</label>
                                 <input type="password" autocomplete="off" class="form-control form-control-sm" id="rs-key" placeholder="from the Remote Rx's install">
@@ -11015,6 +11121,10 @@ async function loadCurrentConfig() {
         document.getElementById('rs-sr').value = rs0.sr || '';
         document.getElementById('rs-name').value = rs0.name || '';
         document.getElementById('rs-locator').value = rs0.locator || '';
+        // Blank, not 300, when unset: blank MEANS "leave the card's own
+        // value alone", and showing a default here would turn opening
+        // the page and pressing Save into a silent change.
+        document.getElementById('rs-latency').value = rs0.srt_latency || '';
         document.getElementById('rs-key').value = rs0.key || '';
         // The second tuning figure is not the same quantity on both
         // tuners: a Minitiouner takes a symbol rate in kS/s, a Knucker
@@ -11596,6 +11706,7 @@ async function saveRemoteSource() {
             sr: parseInt(document.getElementById('rs-sr').value, 10) || 0,
             name: document.getElementById('rs-name').value.trim(),
             locator: document.getElementById('rs-locator').value.trim().toUpperCase(),
+            srt_latency: parseInt(document.getElementById('rs-latency').value, 10) || null,
             key: document.getElementById('rs-key').value.trim()
         }};
         const r = await fetch('/api/config', {
@@ -16100,7 +16211,17 @@ async function updateStatus() {
             // as a dash - which looks like a tuner saying nothing
             // instead of one saying zero.
             const val = v => (v !== null && v !== undefined && v !== '') ? v : null;
-            const rows = rem.tuner === 'knucker' ? [
+            // A tuner the Remote Rx can name but not drive. Say so,
+            // rather than drawing a Minitiouner's rows with a dash in
+            // every one: that reads as a signal problem and sends
+            // somebody up a ladder to check an aerial that is fine.
+            const rows = rem.tuner_note ? [
+                ['Tuner',       rem.tuner_note],
+                ['Frequency',   rem.frequency ? rem.frequency + ' MHz' : '—'],
+                ['Receiving',   'nothing — no driver for this tuner here'],
+                ['Fix',         'slave/install.sh --picotuner on that card'],
+                ['Updatable',   'yes — the fix can arrive by Update'],
+            ] : rem.tuner === 'knucker' ? [
                 ['Callsign',    rem.callsign || '—'],
                 ['Service',     rem.service || '—'],
                 ['Frequency',   rem.frequency ? rem.frequency + ' MHz' : '—'],
@@ -16148,6 +16269,29 @@ async function updateStatus() {
                 }
             } else if (lk && lk.transport === 'UDP') {
                 rows.push(['Link', 'UDP (LAN)']);
+            }
+            // OUTSIDE the link block on purpose. This is a property of
+            // the Remote Rx, not of the SRT session, and it was first
+            // written inside it - so every time the link flickered the
+            // signal reading vanished with it (G8YTZ, 24 Nov 2026).
+            // That is exactly backwards: the moment the link drops is
+            // the moment you most want to know the radio is weak.
+            //
+            // Drawn whenever the Remote Rx has reported one, connected
+            // or not. Older units report nothing and get no row, which
+            // is honest: "unknown" and "wired" are different things and
+            // only one of them is reassuring.
+            if (rem.net_kind === 'wifi') {
+                const s = rem.net_dbm != null
+                    ? rem.net_dbm + ' dBm' + (
+                        rem.net_dbm >= -60 ? ' — strong'
+                        : rem.net_dbm >= -70 ? ' — fine'
+                        : rem.net_dbm >= -80 ? ' — marginal, expect loss'
+                        : ' — poor, expect loss')
+                    : 'signal unknown';
+                rows.push(['Wi-Fi', s]);
+            } else if (rem.net_kind === 'wired') {
+                rows.push(['Network', 'wired']);
             }
             const se = rem.settings;
             if (se && se.state !== 'not reported') {

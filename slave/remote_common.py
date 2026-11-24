@@ -35,6 +35,7 @@ import sys
 import threading
 import time
 
+import net_info
 import updater
 
 # Lynx binds 9997 on all interfaces for its own local Picotuner, so a
@@ -180,6 +181,30 @@ def parse_settings_packet(data: bytes, key: str):
         return None
     st["name"] = str(st.get("name", ""))[:40]
     st["locator"] = str(st.get("locator", ""))[:10]
+    # SRT latency, optional. Absent in a packet from an older repeater,
+    # which must mean "leave it alone" rather than "set it to zero" -
+    # hence None here and a presence test where it is applied.
+    #
+    # It earns a place among the settings because it is the one knob
+    # that matters on a lossy link, and the sites that need it are the
+    # ones nobody can reach: 24 Nov 2026, a Remote Rx with 18.7 dB of
+    # margin off the air made grey frames and freezes at the repeater
+    # because its Wi-Fi was on a distant AP and 300 ms was not enough
+    # for SRT to recover the bursts. Changing that meant an ssh.
+    #
+    # Bounded rather than trusted. Below about 20 ms SRT cannot
+    # retransmit anything at all and the link becomes worse than plain
+    # UDP; above a few seconds the delay is its own fault, and a typo
+    # that put 300000 in the box would take a repeater's input off the
+    # air in a way that looked like a dead receiver.
+    if st.get("srt_latency") is None:
+        st["srt_latency"] = None
+    else:
+        try:
+            lat = int(st["srt_latency"])
+        except (ValueError, TypeError):
+            return None
+        st["srt_latency"] = max(20, min(8000, lat))
     return st
 
 
@@ -265,11 +290,20 @@ class StatusSender(threading.Thread):
         # Rx sends no TUN line at all, which the repeater has to read as
         # a Minitiouner - every one built so far is one.
         tun_line = f"TUN {getattr(self.args, 'tuner_kind', 'minitiouner')}"
+        # "NET <kind> <dbm> <link>": how this Remote Rx is attached to
+        # the network. Rebuilt every poll rather than once, because the
+        # whole point is to watch it change - a card that drifts from
+        # -66 to -78 over an afternoon is the story, and a figure read
+        # at boot would never tell it.
+        #
+        # Cheap: two small reads from /proc and sysfs, no subprocess.
+        # See net_info.py for why it is not `iw`.
         while self.running:
             snap = self.tuner.snapshot()
             rx = build_status_line(snap, self.args.freq)
             payload = f"{site}\n{rx}" if site else rx
-            payload += "\n" + cfg_line + "\n" + ver_line + "\n" + tun_line
+            payload += ("\n" + cfg_line + "\n" + ver_line + "\n" + tun_line
+                        + "\n" + net_info.heartbeat_line())
             try:
                 sock.sendto((payload + "\n").encode(),
                             (self.args.host, self.args.status_port))
@@ -434,6 +468,17 @@ def prepare(args, sr_units: str, tuner_kind: str):
         # that cannot be told to forget where it was is a nuisance.
         if "locator" in saved:
             args.locator = saved["locator"]
+        # Presence AND not-None: the field exists in every settings file
+        # written since 24 Nov 2026, but is null in one saved by a
+        # repeater that did not send a latency. Null means "whatever the
+        # conf says", not "zero".
+        #
+        # Only the SRT sources have this argument at all; a Remote Rx
+        # sending plain UDP has no latency to set, and getattr keeps it
+        # from being a special case in three source modules.
+        if saved.get("srt_latency") is not None and \
+                hasattr(args, "srt_latency"):
+            args.srt_latency = int(saved["srt_latency"])
 
     if args.status_port == 9997:
         print("Refusing port 9997: Lynx binds that for its own local Picotuner.",

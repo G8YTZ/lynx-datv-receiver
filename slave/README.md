@@ -6,7 +6,7 @@ It needs no ports opening at the remote site: The Remote Rx always calls out to 
 
 ## Which tuner
 
-Two are supported, and the Remote Rx works out for itself which one is plugged in at every start. Swapping one for the other needs a service restart and nothing else.
+Two are supported, and the Remote Rx works out for itself which one is plugged in at every start. Swapping one for the other needs a service restart and nothing else. A third, the USB PicoTuner, works with one extra build step: See [below](#the-usb-picotuner).
 
 | | **Minitiouner** | **Knucker** (BATC CombiTuner) |
 |---|---|---|
@@ -19,6 +19,72 @@ Two are supported, and the Remote Rx works out for itself which one is plugged i
 **The Minitiouner is the usual choice.** DVB-S2 is what most amateur DATV uses, and a Minitiouner card carries nothing unusual. The Knucker is there for narrowband DVB-T2, which the Minitiouner cannot receive at all.
 
 The two report genuinely different measurements, and the panel shows whichever applies rather than converting one into the other. A Knucker's SNR is not a MER and is not displayed as one; its level is a percentage, not a calibrated dBm. Nothing on either panel is a figure its tuner did not measure.
+
+### Wi-Fi, and why the panel now shows it
+
+A Remote Rx reports how it reaches the network in its heartbeat, and the repeater shows it on the panel next to the SRT loss counters: **`Wi-Fi  −66 dBm — fine`**, or **`Network  wired`**.
+
+This is there because the RF figures can be immaculate while the pictures are broken. On 24 November 2026 a card sat at 25.1 dB MER with 18.7 dB of margin, and still produced grey frames and freezes at the repeater: its Wi-Fi was on a distant AP, SRT could not recover the bursts of loss inside its 300 ms window, and the gaps became H.265 frames referencing pictures that never arrived. Hours went on the decoder, the branch, the SD card and the encoder before anybody looked at the radio. The panel could show every figure about the signal off the air and nothing about the link carrying the result.
+
+Read from `/proc/net/wireless` and sysfs, never by running `iw`: that is not installed on a Lite image, and shelling out to a tool that may not be there, from a machine nobody can reach, to answer a question asked every two seconds, is three bad ideas at once.
+
+Rough reading on 2.4 GHz, which is all a Zero 2 W has:
+
+| Signal | Verdict | What to expect |
+|---|---|---|
+| −60 dBm or better | strong | fine |
+| −60 to −70 | fine | fine, with little to spare |
+| −70 to −80 | marginal | bursts of loss under a continuous stream |
+| worse than −80 | poor | visible breakup |
+
+A Remote Rx carries a transport stream continuously, which is a far harsher load than the web browsing those numbers usually describe, so treat them pessimistically. An older Remote Rx sends no such line, and the panel then shows no row at all rather than guessing.
+
+### SRT latency, from the panel
+
+`SRT latency` on the Remote Rx card sets how long SRT may spend recovering lost packets. Leave it blank and the Remote Rx keeps whatever is in its own `/etc/lynx-slave.conf`; set it and it is pushed like the frequency and name, over the same signed path.
+
+Raise it for a site on Wi-Fi or any poor link. The default 300 ms looks generous when the round trip is 2 ms — over a hundred times the RTT — but that rule of thumb assumes random loss. A weak radio does not lose packets randomly: it stalls for hundreds of milliseconds while it retries, and a burst longer than the latency window is unrecoverable by definition. 1000 ms gives it room, at the cost of a second of delay, which on a repeater feed costs nothing.
+
+It is a workaround, not a cure. The real fix for a marginal site is a closer AP or a USB Ethernet adapter; a Zero 2 W has only its internal antenna, so there is nothing to improve on the radio itself.
+
+Bounded at 20 to 8000 ms at both ends: below 20 ms SRT cannot retransmit at all, and a typo of 300000 would take a repeater's input off the air in a way that looks like a dead receiver.
+
+### The USB PicoTuner
+
+A USB **BATC PicoTuner** (`2e8a:ba2c`) works, with one extra build step. It receives DVB-S/S2 through the same Serit NIM as a Minitiouner and fills the same panel rows.
+
+The stock BATC longmynd cannot drive one: it talks only to an FTDI FT2232H, and a PicoTuner is an RP2040 presenting a different interface, so longmynd exits within a second of starting. The support lives in the longmynd vendored inside **Ryde**, so that gets built as a second, separate longmynd:
+
+```
+~/lynx-datv-receiver/slave/install.sh --picotuner
+```
+
+That happens automatically when a PicoTuner is plugged in while the installer runs. Expect it to be slow on a Zero: it is a second longmynd build.
+
+**Why a second build rather than replacing the first.** Ryde's longmynd is an older fork of the same code, and differs from upstream in ways that have nothing to do with the PicoTuner: no DVB character-set conversion for service names, a different search default (`halfscan_ratio` 0.6 instead of 1.5, plus a search algorithm setting), a symbol-rate offset correction taken from WinterHill, and serial TS out of the demodulator. Several of those are probably improvements, but none is proven under Lynx, and putting them beneath every working Minitiouner to benefit a PicoTuner card would be the wrong trade. The status output format is identical, which is why the same source module drives either tuner.
+
+**Without that build**, the Remote Rx says so instead of pretending:
+
+- The journal names what it found, then what it did about it: `USB product 'BATC PicoTuner' -> picotuner`, followed by `No PicoTuner longmynd in /home/pi/longmynd-pico - running report-only`.
+- The panel shows **PicoTuner (USB) — no driver built on this card** instead of a row set with a dash in every line, which reads as a dead aerial.
+- The heartbeat, the settings and the **Update button all keep working**, so the fix can arrive by Update with no visit and no ssh.
+- longmynd is not started, so there is no restart loop writing to the SD card every five seconds.
+
+A Minitiouner or Knucker always wins over a PicoTuner when both are fitted, so you can leave one plugged in without risk.
+
+**If longmynd keeps exiting with `rc=102`**, and running it by hand shows `libusb requires write access to USB device nodes` with `errno=13`, the udev rule has not been applied to a tuner that was already plugged in when the installer ran. It reads like a cable fault and is not one:
+
+```
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=usb --action=add
+sudo udevadm settle
+```
+
+`trigger` returns before udev has finished, so check the node with `ls -l /dev/bus/usb/<bus>/<dev>` AFTER the settle, wanting `crw-rw-rw-`. Note that `ls -l` shows mtime and a permission change does not alter it, so an unchanged timestamp means nothing either way. `sudo udevadm test /sys/bus/usb/devices/1-1` reports what udev would set, which separates a rule that does not match from one that has not been applied yet.
+
+Unplugging and replugging the tuner does the same thing. The installer now triggers the rule itself, so this should only affect cards built before 24 Nov 2026.
+
+**One known limit:** a PicoTuner board can host two NIMs, but Ryde's longmynd drives only one transport stream, which is all a Remote Rx sends anyway. OpenTuner is the only software reported to drive both. Note also that Lynx's own extensive PicoTuner support elsewhere is for the **network** one (WinterHill style, base IP port 9900) and shares nothing with this.
 
 ![Off-air picture from a Remote Rx](docs/remote-rx-off-air.jpg)
 
@@ -33,7 +99,7 @@ The two report genuinely different measurements, and the panel shows whichever a
 | Raspberry Pi Zero 2 W | The original Zero is too slow. |
 | microSD card, 8 GB or larger | |
 | 5 V 2.5 A micro-USB power supply | The official Zero supply is ideal. |
-| Minitiouner **or** Knucker | See [Which tuner](#which-tuner). A standard Minitiouner, with its own DC supply: Do not try to power it from the Pi. A Picotuner (the non-Ethernet one) is not supported yet: It presents differently over USB and has not been tested here. |
+| Minitiouner **or** Knucker | See [Which tuner](#which-tuner). A standard Minitiouner, with its own DC supply: Do not try to power it from the Pi. A USB PicoTuner also works, with one extra build step — see [Which tuner](#which-tuner). |
 | Micro-USB to mini-USB OTG cable | Micro-USB plug for the Zero, mini-USB plug for the Minitiouner, sold as "OTG", [for example this one](https://www.amazon.co.uk/dp/B0D9HMQQY9). Or use the Minitiouner's usual USB cable with an OTG adapter (micro-USB plug to USB-A socket). |
 | Masthead LNA for the band | Mounted at the antenna. |
 | Bias-T and a supply for the LNA | Feeds DC up the coax to the LNA. |
