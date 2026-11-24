@@ -2,6 +2,11 @@
 
 All notable changes to Lynx are documented here, in reverse chronological order. Kept as short, scannable headlines - see the git history for full detail on any entry.
 
+## 2026-11-24
+
+**Fixed**
+- **QuickLynx's automatic symbol rate was 1.2x too high, so clicking a 333 kS/s carrier offered 500 and the tune failed.** The spectrum values are dB, and the edge walk takes the midpoint between noise floor and peak in dB - a point well below half amplitude, out where the signal occupies its full bandwidth of about 1.2x the symbol rate. The estimate was not divided back down, so it disagreed with the reference bars drawn on the same screen, which have always used 1.2x. Confirmed against G8KOE's own diagnostic readout: 41 bins measured 400.4 kHz, which is 333.7 kS/s, 0.2% from 333. Signals below about 50 kS/s are only four bins wide, where the edge walk under-reads; those now give an honest unsnapped estimate rather than a lucky snap to 33.
+
 ## 2026-11-14
 
 **New**
