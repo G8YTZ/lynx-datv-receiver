@@ -137,6 +137,49 @@ Where that is impossible - a tuner is off the bench, a case cannot be
 reproduced - say so in the commit message rather than letting silence
 imply it was proven.
 
+## 11. The button must mean something
+
+An update is not free. It fetches, checks out, restarts the service and
+sits on probation for two minutes, and every bit of that is a write
+cycle on an SD card in a loft, plus an interruption to whatever the
+receiver was showing.
+
+A Remote Rx holds a checkout of this whole repository, so its commit
+stops matching the repeater's after **any** change at all: a QuickLynx
+fix, a line in this file. For a while the Update button appeared for
+all of them, so pressing it was usually a restart in exchange for
+nothing - and a button that is usually noise is a button that gets
+ignored on the day it matters.
+
+`remote_version_state()` now separates two questions. `behind` is the
+plain fact that the commits differ, and is still reported. `stale` is
+`behind` **and** a change to something under `slave/` that the unit
+actually runs, and that is what the button switches on. Documentation
+under `slave/` does not count. (24 Nov 2026)
+
+Two rules follow:
+
+- **When git cannot answer, offer the update.** An unknown commit or a
+  shallow clone gives `None`, which counts as stale. Never withhold a
+  real fix because it could not be proved to be one.
+- **Do not narrow it further by guessing.** `install.sh`, the unit file
+  and the conf example all count, even though pressing Update re-runs
+  none of them. Deciding for ourselves which files really matter is how
+  a genuine fix ends up never prompting anybody, and the cost of being
+  wrong the generous way is one restart.
+
+**The trap: this comparison looks only under `slave/`.** Every module a
+Remote Rx runs lives there today, and every import in `slave/*.py` is
+either the standard library or another file in `slave/`. The day
+anything a Remote Rx executes is added outside that directory, this
+comparison goes quietly blind to changes in it and the button stops
+appearing for real fixes. Keep the unit self-contained, or teach
+`slave_code_changed()` about the new path in the same commit.
+
+Tested in `test_slave_staleness.py`, against a git repository the test
+builds commit by commit, because neither failure here is visible from
+the panel.
+
 ---
 
 ## The question to ask before pressing push
