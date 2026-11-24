@@ -218,7 +218,47 @@ If the Remote Rx comes in over the internet rather than an SD-WAN, the repeater'
 | 10997 | Status (lock, callsign) and the settings sent back |
 | 10901 | Quality (MER and level, or SNR and SNQ) |
 
-Nothing needs opening at the remote site.
+Nothing needs opening at the remote site. The Remote Rx only ever dials out: It sends its heartbeat and its video to the repeater, and the repeater replies to whatever address those arrived from. So the person hosting the Remote Rx needs no router changes at all, which matters when that person is not you.
+
+#### Doing it on an ordinary ISP box
+
+All three ports are **UDP**. Forwarding them as TCP is the commonest mistake and produces a Remote Rx that never appears at all.
+
+**1. Find the Lynx receiver's address on your own network.** On the receiver:
+
+```
+hostname -I
+```
+
+Take the first address, typically something like `192.168.1.42`.
+
+**2. Fix that address so it cannot move.** In the router, find **DHCP reservation**, **static lease** or **address reservation**, and tie that address to the Lynx receiver. Skip this and the forwarding will work until the day something reboots in the wrong order, after which the ports point at somebody's phone and nothing works for reasons that look like radio.
+
+**3. Add the three rules.** Look for **Port forwarding**, **Virtual server**, **Applications and gaming**, or **NAT** — ISPs all name it differently. Add one rule per line:
+
+| Name | External port | Internal port | Protocol | To |
+|---|---|---|---|---|
+| Lynx video | 10947 | 10947 | UDP | the receiver's address |
+| Lynx status | 10997 | 10997 | UDP | the receiver's address |
+| Lynx quality | 10901 | 10901 | UDP | the receiver's address |
+
+Where a router asks for a range, put the same number in both boxes.
+
+**4. Tell the Remote Rx where to find you.** It needs your public address, not your internal one: Visit [whatismyip.com](https://www.whatismyip.com) from any machine on the repeater's network, and use that where the installer asks for the Lynx receiver's address. If your ISP changes it from time to time, use a dynamic DNS name instead.
+
+#### When it will not work, and how to tell
+
+**Carrier-grade NAT.** Many broadband and nearly all mobile connections share one public address between many customers, and no amount of forwarding will get a packet in. To check: Compare the WAN or internet address shown on the router's own status page with what whatismyip.com reports. If they differ, you are behind CGNAT.
+
+That is not a fault to debug, it is a dead end. The ways out are to ask the ISP for a public IP address (some give one free, some charge, some refuse), or to skip the problem entirely with a VPN or SD-WAN between the two sites, which also saves opening anything.
+
+**Double NAT.** A separate router behind the ISP's own box means forwarding has to be done twice, once on each. Easier to put the ISP box in modem or bridge mode, or to connect the Lynx receiver to the ISP box directly.
+
+**A non-default status port.** All three ports derive from it: The SRT port is the status port minus 50 and the quality port is the status port minus 96. Change the status port and all three move together, so the forwarding must move with them.
+
+#### Checking the forwarding works
+
+The honest test is the Remote Rx itself: Its panel should appear at the repeater within a few seconds of it starting. If it does not, the status port is the one to suspect first, because nothing else happens until that heartbeat arrives.
 
 ## Checking it
 
