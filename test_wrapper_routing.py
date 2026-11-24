@@ -169,6 +169,36 @@ class RoutingTests(unittest.TestCase):
                 self.assertIn("--name Crystal Palace", args)
                 self.assertIn("--locator JO01IF", args)
 
+    # ── INPUT=, which only one source understands ────────────────
+
+    def test_input_reaches_a_longmynd_source(self):
+        with open(self.conf, "a") as f:
+            f.write("INPUT=bottom\n")
+        _, args, _ = self.run_wrapper(detected="minitiouner")
+        self.assertIn("--input bottom", args)
+
+    def test_input_reaches_a_driven_picotuner(self):
+        """Both Minitiouner and PicoTuner boards have two F connectors."""
+        self.build_pico_longmynd()
+        with open(self.conf, "a") as f:
+            f.write("INPUT=bottom\n")
+        module, args, _ = self.run_wrapper(detected="picotuner")
+        self.assertEqual("longmynd_source.py", module)
+        self.assertIn("--input bottom", args)
+
+    def test_input_is_not_passed_to_a_source_that_has_no_such_option(self):
+        """A Knucker takes its input differently and its source has no
+        --input. Passing it would stop that card starting AT ALL, which
+        is a far worse fault than the one INPUT= was added to fix."""
+        with open(self.conf, "a") as f:
+            f.write("INPUT=bottom\n")
+        for detected, want in (("knucker", "knucker_source.py"),
+                               ("picotuner", "picotuner_source.py")):
+            with self.subTest(detected):
+                module, args, _ = self.run_wrapper(detected=detected)
+                self.assertEqual(want, module)
+                self.assertNotIn("--input", args)
+
     def test_detection_is_logged_with_what_it_saw(self):
         """The -v run, added because a card with an unrecognised tuner
         logged the same cheerful line as a working one."""

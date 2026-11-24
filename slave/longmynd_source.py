@@ -403,6 +403,13 @@ def main():
     # wrapper knows, since it is what chose the build. Not detected
     # here: this module is told, so TUNER= in the conf keeps working as
     # an override rather than being second-guessed.
+    # Which F connector the aerial is on. Longmynd reads the TOP one
+    # unless given -w, and there was no way to ask for the other, so a
+    # feed on the bottom socket simply never locked and said nothing
+    # about why. Both a Minitiouner and a PicoTuner have two.
+    ap.add_argument("--input", choices=("top", "bottom"), default="top",
+                    help="which F connector to receive on (default top; "
+                         "bottom passes Longmynd's -w)")
     ap.add_argument("--tuner-kind", choices=("minitiouner", "picotuner"),
                     default="minitiouner",
                     help="which tuner this Longmynd is driving, for the "
@@ -481,11 +488,14 @@ def main():
         ts_host, ts_port = args.host, args.video_port
     cmd = [binary,
            "-i", ts_host, str(ts_port),
-           "-S", str(args.tuner_timeout),
-           str(args.freq), str(args.sr)]
+           "-S", str(args.tuner_timeout)]
+    if args.input == "bottom":
+        cmd.append("-w")
+    cmd += [str(args.freq), str(args.sr)]
 
     print(f"Slave Rx (Longmynd) -> {args.host}")
-    print(f"  tuner  : {args.freq} kHz, {args.sr} kS/s")
+    print(f"  tuner  : {args.freq} kHz, {args.sr} kS/s, "
+          f"{args.input} F connector")
     if args.transport == "srt":
         print(f"  video  : SRT to port {args.srt_port}, latency {args.srt_latency} ms")
     else:

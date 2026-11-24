@@ -71,6 +71,13 @@ case "$KIND" in
     *)         SOURCE=longmynd_source.py ;;
 esac
 
+# Which F connector, for a tuner that has two. Scoped to the Longmynd
+# sources on purpose: it is their -w, and passing it to a source that
+# has no such option would stop that card starting at all.
+if [ "$SOURCE" = longmynd_source.py ] && [ -n "${INPUT:-}" ]; then
+    EXTRA+=(--input "$INPUT")
+fi
+
 # -v so the journal says WHAT was seen, not just what was concluded, and
 # stderr is no longer swallowed. Without this the one case that most
 # needs explaining - a tuner plugged in that nothing here recognises -

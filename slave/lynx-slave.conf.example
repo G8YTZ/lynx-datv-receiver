@@ -45,3 +45,10 @@ SRT_LATENCY="300"
 # LOCATOR above, so after a power cut the Remote Rx comes back as it was
 # last told. Delete that file to go back to the values above.
 #KEY=""
+
+# Which F connector the aerial is on: top (the default) or bottom.
+# Both a Minitiouner and a PicoTuner have two. Longmynd reads the top
+# one unless told otherwise, so a feed on the bottom socket simply
+# never locks. Not used by a Knucker, which takes its input on LOWER F
+# regardless.
+#INPUT=bottom
