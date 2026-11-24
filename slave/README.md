@@ -6,7 +6,7 @@ It needs no ports opening at the remote site: The Remote Rx always calls out to 
 
 ## Which tuner
 
-Two are supported, and the Remote Rx works out for itself which one is plugged in at every start. Swapping one for the other needs a service restart and nothing else.
+Two are supported, and the Remote Rx works out for itself which one is plugged in at every start. Swapping one for the other needs a service restart and nothing else. A third, the USB Picotuner, is recognised but cannot be driven: See [below](#the-usb-picotuner-recognised-not-driven).
 
 | | **Minitiouner** | **Knucker** (BATC CombiTuner) |
 |---|---|---|
@@ -19,6 +19,21 @@ Two are supported, and the Remote Rx works out for itself which one is plugged i
 **The Minitiouner is the usual choice.** DVB-S2 is what most amateur DATV uses, and a Minitiouner card carries nothing unusual. The Knucker is there for narrowband DVB-T2, which the Minitiouner cannot receive at all.
 
 The two report genuinely different measurements, and the panel shows whichever applies rather than converting one into the other. A Knucker's SNR is not a MER and is not displayed as one; its level is a percentage, not a calibrated dBm. Nothing on either panel is a figure its tuner did not measure.
+
+### The USB Picotuner: recognised, not driven
+
+A USB **BATC PicoTuner** (`2e8a:ba2c`) is detected and named, but Lynx cannot drive one. Longmynd on this card talks to an FTDI FT2232H, and a Picotuner is an RP2040 presenting a different interface entirely, so longmynd exits within a second of starting.
+
+Plug one in and the Remote Rx says so rather than pretending:
+
+- The journal names what it found: `USB product 'BATC PicoTuner' -> picotuner, which this Remote Rx cannot drive`.
+- The panel shows **PicoTuner (USB) — not supported yet** instead of a Minitiouner's rows with a dash in every one.
+- The heartbeat, the settings and the **Update button all keep working**, so support can arrive by Update with no visit and no ssh. That is the point of handling it at all.
+- longmynd is not started, so there is no restart loop writing to the SD card every five seconds.
+
+Fit a Minitiouner or a Knucker to receive anything in the meantime. A supported tuner always wins, so you can leave the Picotuner plugged in.
+
+Real support needs a `longmynd` that speaks to the Pico over USB; the rest would largely follow, since longmynd's status output is the same whatever the transport. Lynx's own extensive Picotuner support is for the **network** one (WinterHill style, base IP port 9900) and contains no host-side USB driver to reuse. Note also that a Picotuner board can host two NIMs, so one card could eventually serve two receivers.
 
 ![Off-air picture from a Remote Rx](docs/remote-rx-off-air.jpg)
 
@@ -33,7 +48,7 @@ The two report genuinely different measurements, and the panel shows whichever a
 | Raspberry Pi Zero 2 W | The original Zero is too slow. |
 | microSD card, 8 GB or larger | |
 | 5 V 2.5 A micro-USB power supply | The official Zero supply is ideal. |
-| Minitiouner **or** Knucker | See [Which tuner](#which-tuner). A standard Minitiouner, with its own DC supply: Do not try to power it from the Pi. A Picotuner (the non-Ethernet one) is not supported yet: It presents differently over USB and has not been tested here. |
+| Minitiouner **or** Knucker | See [Which tuner](#which-tuner). A standard Minitiouner, with its own DC supply: Do not try to power it from the Pi. A USB Picotuner is recognised but **cannot be driven** — see [Which tuner](#which-tuner). |
 | Micro-USB to mini-USB OTG cable | Micro-USB plug for the Zero, mini-USB plug for the Minitiouner, sold as "OTG", [for example this one](https://www.amazon.co.uk/dp/B0D9HMQQY9). Or use the Minitiouner's usual USB cable with an OTG adapter (micro-USB plug to USB-A socket). |
 | Masthead LNA for the band | Mounted at the antenna. |
 | Bias-T and a supply for the LNA | Feeds DC up the coax to the LNA. |

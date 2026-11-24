@@ -4409,7 +4409,17 @@ REMOTE_QUALITY_PORT_OFFSET = 96
 # this decides which fields the panel draws: an unrecognised name falls
 # back to a Minitiouner rather than inventing a layout for a tuner this
 # receiver knows nothing about.
-REMOTE_TUNER_KINDS = ("minitiouner", "knucker")
+REMOTE_TUNER_KINDS = ("minitiouner", "knucker", "picotuner")
+
+# Tuners a Remote Rx can report but not drive. It heartbeats, takes
+# settings and takes updates; it simply never locks, so the panel says
+# why instead of drawing a Minitiouner's empty rows. A USB PicoTuner
+# (2e8a:ba2c) is an RP2040 and longmynd talks to an FTDI FT2232H, so
+# until there is a longmynd that speaks to the Pico this is as far as it
+# goes. The card stays updatable, which is how support reaches it.
+REMOTE_TUNER_UNDRIVEN = {
+    "picotuner": "PicoTuner (USB) — not supported yet",
+}
 
 # How long a resume waits for a saved Slave to report in before
 # giving up. It cannot be selected until its address is known, and
@@ -9031,6 +9041,11 @@ def get_status():
                 # fields that tuner measures rather than the ones a
                 # Minitiouner would.
                 "tuner": st.get("tuner", "minitiouner"),
+                # Set only for a tuner the Remote Rx can see but cannot
+                # drive. The panel shows this instead of a row set full
+                # of dashes, which would read as a broken aerial.
+                "tuner_note": REMOTE_TUNER_UNDRIVEN.get(
+                    st.get("tuner", "minitiouner")),
                 "settings": remote_settings_state(i),
                 # What the Remote Rx is running, and whether that
                 # matches this receiver. "behind" is only ever True when
@@ -16100,7 +16115,16 @@ async function updateStatus() {
             // as a dash - which looks like a tuner saying nothing
             // instead of one saying zero.
             const val = v => (v !== null && v !== undefined && v !== '') ? v : null;
-            const rows = rem.tuner === 'knucker' ? [
+            // A tuner the Remote Rx can name but not drive. Say so,
+            // rather than drawing a Minitiouner's rows with a dash in
+            // every one: that reads as a signal problem and sends
+            // somebody up a ladder to check an aerial that is fine.
+            const rows = rem.tuner_note ? [
+                ['Tuner',       rem.tuner_note],
+                ['Frequency',   rem.frequency ? rem.frequency + ' MHz' : '—'],
+                ['Receiving',   'nothing — Lynx cannot drive this tuner'],
+                ['Updatable',   'yes — support can arrive by Update'],
+            ] : rem.tuner === 'knucker' ? [
                 ['Callsign',    rem.callsign || '—'],
                 ['Service',     rem.service || '—'],
                 ['Frequency',   rem.frequency ? rem.frequency + ' MHz' : '—'],

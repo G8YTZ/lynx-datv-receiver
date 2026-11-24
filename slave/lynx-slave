@@ -43,10 +43,26 @@ if [ -z "$KIND" ]; then
     [ -n "$KIND" ] || KIND=minitiouner
 fi
 
+# An unknown kind falls to longmynd deliberately (rule 7): every Remote
+# Rx built so far is a Minitiouner, and guessing wrong that way keeps a
+# working site on the air.
 case "$KIND" in
-    knucker) SOURCE=knucker_source.py ;;
-    *)       SOURCE=longmynd_source.py ;;
+    knucker)   SOURCE=knucker_source.py ;;
+    picotuner) SOURCE=picotuner_source.py ;;
+    *)         SOURCE=longmynd_source.py ;;
 esac
+
+# -v so the journal says WHAT was seen, not just what was concluded, and
+# stderr is no longer swallowed. Without this the one case that most
+# needs explaining - a tuner plugged in that nothing here recognises -
+# logged the same cheerful line as a working Minitiouner. Run a second
+# time rather than reusing the first: the first had to yield a clean
+# value on stdout, and this costs one sysfs scan at start-up.
+if [ -z "${TUNER:-}" ]; then
+    /usr/bin/python3 "$SLAVE_DIR/detect_tuner.py" -v >/dev/null || true
+else
+    echo "Tuner forced to '$KIND' by TUNER= in $CONF" >&2
+fi
 echo "Tuner detected: $KIND (running $SOURCE)" >&2
 
 # Tells the source module the choice has already been made here, so it
