@@ -189,6 +189,32 @@ else
   echo "chrony's own config file by hand, then 'sudo systemctl restart chrony')."
 fi
 
+# Verify, because the step above DISABLED systemd-timesyncd. If chrony
+# is not actually running, this receiver now has no time daemon at all
+# and Lynx is the reason: It turned off the one the OS shipped with.
+#
+# That is not theoretical. A user's receiver (VK3IE, 24 Nov 2026) was
+# found running without chrony, and the symptom was not a wrong clock,
+# it was Lynx failing to start: The clock sat wrong, something
+# corrected it later, and that backward jump killed mpv seconds after
+# it started. Reinstalling fixed it, and the only package the
+# installer added was chrony. Nobody could have guessed that from the
+# symptom.
+if ! systemctl is-active --quiet chrony && ! systemctl is-active --quiet chronyd; then
+  echo "chrony is not running - starting it"
+  sudo systemctl enable --now chrony >/dev/null 2>&1 \
+    || sudo systemctl enable --now chronyd >/dev/null 2>&1 || true
+fi
+if ! systemctl is-active --quiet chrony && ! systemctl is-active --quiet chronyd; then
+  echo "*** WARNING: No time daemon is running on this receiver. ***"
+  echo "    systemd-timesyncd has been disabled in favour of chrony, so"
+  echo "    nothing is keeping the clock correct. When something later"
+  echo "    corrects it, the backward jump can kill mpv seconds after it"
+  echo "    starts, which looks like Lynx failing to load."
+  echo "    Fix with:  sudo apt install -y chrony && sudo systemctl enable --now chrony"
+  echo "    Or re-enable the OS default:  sudo systemctl enable --now systemd-timesyncd"
+fi
+
 # Socket permissions. chrony creates the SOCK refclock owned by
 # root:root, mode 0755 - readable by everyone but writable only by
 # root. Lynx runs as the desktop user and has to WRITE samples into
