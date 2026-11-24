@@ -5899,6 +5899,21 @@ def remote_version_state(i: int) -> dict:
     comparable = bool(theirs and theirs != "-" and ours != "-"
                       and their_branch == our_branch)
     behind = bool(comparable and theirs.rstrip("+") != ours)
+    # Both ends know their branch and the branches differ. Separate
+    # from "behind", which only has meaning within one branch: a Remote
+    # Rx on beta-wip is not an older beta, it is somewhere else.
+    #
+    # Reported because the panel has to offer a way back. Merging
+    # beta-wip into beta and moving the receiver across leaves every
+    # Remote Rx still on beta-wip, and "not behind" meant no button
+    # ever appeared again - a card strandable by an ordinary merge,
+    # recoverable only over ssh (G8YTZ, 24 Nov 2026). The Remote Rx is
+    # the one machine nobody can get to, so it must not be possible to
+    # strand it from here.
+    branch_differs = bool(theirs and theirs != "-" and ours != "-"
+                          and their_branch and their_branch != "-"
+                          and our_branch and our_branch != "-"
+                          and their_branch != our_branch)
     slave_changed = slave_code_changed(theirs.rstrip("+"), ours) if behind \
         else False
     return {
@@ -5908,6 +5923,7 @@ def remote_version_state(i: int) -> dict:
         "local_branch": our_branch,
         "comparable": comparable,
         "behind": behind,
+        "branch_differs": branch_differs,
         # True, False, or None when git could not tell us.
         "slave_changed": slave_changed,
         # Unknown counts as yes: never withhold a real fix because we
@@ -16188,13 +16204,27 @@ async function updateStatus() {
             // Update restarts the service and writes to the card's SD,
             // so the button appears only when something the Remote Rx
             // actually runs has changed.
-            const hdrBtn = (vr && vr.stale)
+            //
+            // It ALSO appears when the two are on different branches,
+            // with a different word on it. The update command only
+            // ever points a Remote Rx at this receiver's own branch,
+            // so the same button does the job - but calling it Update
+            // would be wrong, because it may well be going backwards.
+            //
+            // Without this, merging beta-wip into beta and moving the
+            // receiver across strands every Remote Rx on beta-wip with
+            // no button, for ever, recoverable only over ssh. The one
+            // machine nobody can reach must not be strandable from
+            // here (G8YTZ, 24 Nov 2026).
+            const moveTo = vr && vr.branch_differs ? vr.local_branch : null;
+            const hdrBtn = (vr && (vr.stale || moveTo))
                 ? '<button class="btn btn-sm btn-danger py-0 px-2" '
                   + 'style="float:right; margin-right:8px; font-size:0.75em;" '
-                  // stopPropagation so pressing Update can never also
+                  // stopPropagation so pressing it can never also
                   // act on the panel it is sitting on.
                   + 'onclick="event.stopPropagation(); updateSlave('
-                  + rem.index + ')">Update</button>'
+                  + rem.index + ')">'
+                  + (moveTo ? 'Move to ' + moveTo : 'Update') + '</button>'
                 : '';
             const st = !rem.online ? 'offline' : (rem.locked ? 'locked' : 'idle');
             setPanelState(id + '-header', id + '-status', label, st, hdrBtn);
@@ -16313,7 +16343,12 @@ async function updateStatus() {
                 // you act. Deliberately not both: two Update buttons on
                 // one panel is a question about whether they do the
                 // same thing.
-                if (vr.stale) {
+                if (vr.branch_differs) {
+                    // Named explicitly. "on beta-wip" alone leaves the
+                    // reader to remember what this receiver is on, and
+                    // the whole point of the row is the mismatch.
+                    v += ' — this receiver is on ' + vr.local_branch;
+                } else if (vr.stale) {
                     v += ' — update available';
                 } else if (vr.behind) {
                     // Said plainly rather than hidden: the operator can

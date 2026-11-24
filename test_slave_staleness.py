@@ -317,6 +317,57 @@ class StalenessTests(unittest.TestCase):
         self.assertTrue(v["behind"])
         self.assertFalse(v["stale"])
 
+    # ── a Remote Rx on another branch ────────────────────────────
+
+    def test_a_different_branch_is_reported_as_such(self):
+        """Not "behind": a Remote Rx on beta-wip is not an older beta,
+        it is somewhere else. The panel needs to know the difference
+        because the two want different words on the button."""
+        ns = self.ns(local=(self.slave_code, "beta"))
+        ns["remote_states"] = [{"version": self.base, "branch": "beta-wip"}]
+        v = ns["remote_version_state"](0)
+        self.assertTrue(v["branch_differs"])
+        self.assertFalse(v["behind"], "another branch is not 'behind'")
+        self.assertFalse(v["stale"])
+
+    def test_the_same_branch_never_reports_a_difference(self):
+        ns = self.ns(local=(self.slave_code, "beta"))
+        for theirs in (self.base, self.slave_code, self.slave_code + "+"):
+            with self.subTest(theirs):
+                ns["remote_states"] = [{"version": theirs, "branch": "beta"}]
+                self.assertFalse(
+                    ns["remote_version_state"](0)["branch_differs"])
+
+    def test_an_unknown_branch_at_either_end_is_not_a_difference(self):
+        """A Remote Rx that has not reported yet, or a receiver that is
+        not a git checkout. Offering to move a card somewhere on the
+        strength of a "-" would be worse than offering nothing."""
+        ns = self.ns(local=(self.slave_code, "beta"))
+        for theirs, branch in ((self.base, "-"), ("-", "-"), (self.base, "")):
+            with self.subTest(f"{theirs} on {branch!r}"):
+                ns["remote_states"] = [{"version": theirs, "branch": branch}]
+                self.assertFalse(
+                    ns["remote_version_state"](0)["branch_differs"])
+        ns2 = self.ns(local=("-", "-"))
+        ns2["remote_states"] = [{"version": self.base, "branch": "beta-wip"}]
+        self.assertFalse(ns2["remote_version_state"](0)["branch_differs"])
+
+    def test_a_merge_cannot_strand_a_remote_rx(self):
+        """The case that prompted this. beta-wip is merged into beta and
+        the receiver moves across; every Remote Rx is still on beta-wip.
+        Under the old rule that was "not behind", so no button appeared
+        ever again and the only way back was ssh to a machine in a loft.
+
+        Something must be offered. Which word is on it is the panel's
+        business; that there IS one is this."""
+        ns = self.ns(local=(self.slave_installer, "beta"))
+        ns["remote_states"] = [{"version": self.slave_code,
+                                "branch": "beta-wip"}]
+        v = ns["remote_version_state"](0)
+        self.assertTrue(v["branch_differs"] or v["stale"],
+                        "a Remote Rx on another branch must be recoverable "
+                        "from the panel, or it is strandable by a merge")
+
     def test_stale_is_never_true_without_behind(self):
         """Belt and braces: the button must not appear on a Remote Rx
         that is on our exact commit, whatever git says."""
