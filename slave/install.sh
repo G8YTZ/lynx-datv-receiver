@@ -31,6 +31,13 @@ fi
 if [ ! -f /etc/udev/rules.d/minitiouner.rules ]; then
     sudo cp "$lm_dir/minitiouner.rules" /etc/udev/rules.d/
     sudo udevadm control --reload-rules
+    # And APPLY it to what is already plugged in. A udev rule only
+    # acts on a device when the device appears, so reloading alone
+    # leaves a tuner that was connected before this ran with its old
+    # permissions - and longmynd then fails with errno=13 on the
+    # device node, which reads as "tuner not found" and sends people
+    # looking for a cable fault. Saves the unplug-and-replug.
+    sudo udevadm trigger --subsystem-match=usb --action=add || true
     echo "Installed the Minitiouner udev rule: unplug and replug it, or reboot"
 fi
 
@@ -177,6 +184,13 @@ if [ "$pico_wanted" = true ] && [ -f "$pico_dir/minitiouner.rules" ] \
    && ! grep -q "BATC PicoTuner" /etc/udev/rules.d/minitiouner.rules 2>/dev/null; then
     sudo cp "$pico_dir/minitiouner.rules" /etc/udev/rules.d/minitiouner.rules
     sudo udevadm control --reload-rules
+    # And APPLY it to what is already plugged in. A udev rule only
+    # acts on a device when the device appears, so reloading alone
+    # leaves a tuner that was connected before this ran with its old
+    # permissions - and longmynd then fails with errno=13 on the
+    # device node, which reads as "tuner not found" and sends people
+    # looking for a cable fault. Saves the unplug-and-replug.
+    sudo udevadm trigger --subsystem-match=usb --action=add || true
     echo "Installed the udev rule covering the PicoTuner: unplug and replug it, or reboot"
 fi
 

@@ -43,6 +43,15 @@ That happens automatically when a PicoTuner is plugged in while the installer ru
 
 A Minitiouner or Knucker always wins over a PicoTuner when both are fitted, so you can leave one plugged in without risk.
 
+**If longmynd keeps exiting with `rc=102`**, and running it by hand shows `libusb requires write access to USB device nodes` with `errno=13`, the udev rule has not been applied to a tuner that was already plugged in when the installer ran. It reads like a cable fault and is not one:
+
+```
+sudo udevadm control --reload-rules
+sudo udevadm trigger --subsystem-match=usb --action=add
+```
+
+Unplugging and replugging the tuner does the same thing. The installer now triggers the rule itself, so this should only affect cards built before 24 Nov 2026.
+
 **One known limit:** a PicoTuner board can host two NIMs, but Ryde's longmynd drives only one transport stream, which is all a Remote Rx sends anyway. OpenTuner is the only software reported to drive both. Note also that Lynx's own extensive PicoTuner support elsewhere is for the **network** one (WinterHill style, base IP port 9900) and shares nothing with this.
 
 ![Off-air picture from a Remote Rx](docs/remote-rx-off-air.jpg)
