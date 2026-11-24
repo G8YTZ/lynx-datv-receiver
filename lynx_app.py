@@ -5760,6 +5760,62 @@ def lynx_local_version():
             branch if ok_b and branch else "-")
 
 
+# Paths under slave/ that a Remote Rx carries but never executes.
+SLAVE_DOC_SUFFIXES = (".md",)
+SLAVE_DOC_PREFIXES = ("slave/docs/",)
+
+# (theirs, ours) -> True/False. Keyed on a pair of commits, so the
+# answer cannot change once known. "Cannot tell" is deliberately NOT
+# cached: it usually means we do not have their commit yet, and a later
+# fetch can turn it into a real answer. Written from request threads
+# without a lock, which is safe because the value for a given key is
+# always the same - the worst a race can do is run git twice.
+_slave_diff_cache: dict = {}
+SLAVE_DIFF_CACHE_MAX = 256
+
+
+def slave_code_changed(theirs: str, ours: str):
+    """Does anything the Remote Rx actually RUNS differ between these
+    two commits? True, False, or None for "cannot tell".
+
+    A Remote Rx holds a full checkout of this same repository, so its
+    commit stops matching ours after any change at all: a QuickLynx
+    fix, a line in the CHANGELOG. Offering an update for those is not
+    free. It fetches, checks out, restarts the service and then sits on
+    probation for two minutes, which costs a picture interruption and a
+    write cycle on an SD card in a loft nobody can reach.
+
+    Everything under slave/ counts except documentation, which the card
+    carries but never runs. install.sh, the unit file and the conf
+    example DO count, even though pressing Update re-runs none of them:
+    deciding for ourselves which files matter is exactly the cleverness
+    that ends with a real fix never reaching anybody.
+
+    None rather than False when git cannot answer - a commit we do not
+    have, a shallow clone, no repo at all. The caller then falls back to
+    comparing the commits, so this can only ever be more precise than
+    that and never blinder.
+    """
+    key = (theirs, ours)
+    if key in _slave_diff_cache:
+        return _slave_diff_cache[key]
+    ok, out = git_cmd("diff", "--name-only", theirs, ours, "--", "slave/")
+    if not ok:
+        return None
+    changed = False
+    for path in out.splitlines():
+        path = path.strip()
+        if not path or path.endswith(SLAVE_DOC_SUFFIXES) \
+                or path.startswith(SLAVE_DOC_PREFIXES):
+            continue
+        changed = True
+        break
+    if len(_slave_diff_cache) >= SLAVE_DIFF_CACHE_MAX:
+        _slave_diff_cache.clear()
+    _slave_diff_cache[key] = changed
+    return changed
+
+
 def remote_version_state(i: int) -> dict:
     """For the panel: what the Remote Rx runs, against what we run.
 
@@ -5768,19 +5824,33 @@ def remote_version_state(i: int) -> dict:
     is not "behind", and neither is one whose version we do not know:
     saying so would put an Update button in front of somebody with
     nothing to go on.
+
+    "behind" is the plain fact that the commits differ. "stale" is the
+    one the Update button switches on: behind AND carrying a change to
+    something the Remote Rx runs. The two are separate because a
+    receiver that is behind by a documentation commit should say so
+    honestly without asking anybody to restart it over it.
     """
     st = remote_states[i]
     theirs, their_branch = st.get("version"), st.get("branch")
     ours, our_branch = lynx_local_version()
     comparable = bool(theirs and theirs != "-" and ours != "-"
                       and their_branch == our_branch)
+    behind = bool(comparable and theirs.rstrip("+") != ours)
+    slave_changed = slave_code_changed(theirs.rstrip("+"), ours) if behind \
+        else False
     return {
         "remote": theirs or None,
         "remote_branch": their_branch or None,
         "local": ours,
         "local_branch": our_branch,
         "comparable": comparable,
-        "behind": comparable and theirs.rstrip("+") != ours,
+        "behind": behind,
+        # True, False, or None when git could not tell us.
+        "slave_changed": slave_changed,
+        # Unknown counts as yes: never withhold a real fix because we
+        # could not prove it was one.
+        "stale": bool(behind and slave_changed is not False),
         "modified": bool(theirs and theirs.endswith("+")),
     }
 
@@ -8965,7 +9035,9 @@ def get_status():
                 # What the Remote Rx is running, and whether that
                 # matches this receiver. "behind" is only ever True when
                 # both ends actually reported a commit: an unknown
-                # version is not evidence of being out of date.
+                # version is not evidence of being out of date. "stale"
+                # narrows that to a change in code the Remote Rx runs,
+                # and is what the Update button switches on.
                 "version": remote_version_state(i),
                 "name": remote_display_name(i),
                 "locator": st["locator"],
@@ -15999,7 +16071,13 @@ async function updateStatus() {
             // never cared about lock - but the interface did, which
             // from the operator's side is the same thing.
             const vr = rem.version;
-            const hdrBtn = (vr && vr.behind)
+            // "stale", not "behind": the Remote Rx holds a checkout of
+            // this whole repository, so its commit stops matching ours
+            // after any change at all, documentation included. Pressing
+            // Update restarts the service and writes to the card's SD,
+            // so the button appears only when something the Remote Rx
+            // actually runs has changed.
+            const hdrBtn = (vr && vr.stale)
                 ? '<button class="btn btn-sm btn-danger py-0 px-2" '
                   + 'style="float:right; margin-right:8px; font-size:0.75em;" '
                   // stopPropagation so pressing Update can never also
@@ -16091,7 +16169,14 @@ async function updateStatus() {
                 // you act. Deliberately not both: two Update buttons on
                 // one panel is a question about whether they do the
                 // same thing.
-                if (vr.behind) { v += ' — update available'; }
+                if (vr.stale) {
+                    v += ' — update available';
+                } else if (vr.behind) {
+                    // Said plainly rather than hidden: the operator can
+                    // see it is not on our commit, and also that there
+                    // is no reason to do anything about it.
+                    v += ' — behind, nothing it runs';
+                }
                 rows.push(['Version', v]);
             }
             document.getElementById(id + '-status').innerHTML = rows.map(r =>
