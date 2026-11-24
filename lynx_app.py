@@ -15500,7 +15500,7 @@ def web_ui():
         <!-- RF Tuning -->
         <div class="col-md-4">
             <div class="card">
-                <div class="card-header">&#x1F4FB; RF Reception (Picotuner)</div>
+                <div class="card-header" id="rf-reception-header">&#x1F4FB; RF Reception (Picotuner)</div>
                 <div class="card-body">
                     <!-- Presets -->
                     <h6 class="text-muted">Presets</h6>
@@ -16256,6 +16256,22 @@ async function updateStatus() {
         // from another repeater under a heading claiming it was this
         // receiver's own tuner. The stream has its own panel further
         // down; it was simply gated to Tri-Watch until now.
+        // The same button on the Picotuner's own card, which is the
+        // twin of the Remote Receivers card and so where a Watch button
+        // is looked for first. Rx 1, or the pair in diversity.
+        const rfHdr = document.getElementById('rf-reception-header');
+        if (rfHdr) {
+            const html = '&#x1F4FB; RF Reception (Picotuner)'
+                       + (pt.online ? localWatchHtml(1, s) : '');
+            // Only when it changed, so a click is never lost to a redraw.
+            // Compared against what was last WRITTEN, not innerHTML: the
+            // browser normalises innerHTML (entities become characters),
+            // so that comparison never matches and redraws every poll.
+            if (rfHdr.dataset.drawn !== html) {
+                rfHdr.innerHTML = html;
+                rfHdr.dataset.drawn = html;
+            }
+        }
         setPanelState('status-panel-header', 'status-panel',
                       '&#x1F4E1; Tuner Rx 1',
                       !pt.online ? 'offline' : (locked ? 'locked' : 'idle'),
