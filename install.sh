@@ -182,6 +182,32 @@ else
   echo "chrony's own config file by hand, then 'sudo systemctl restart chrony')."
 fi
 
+# Verify, because the step above DISABLED systemd-timesyncd. If chrony
+# is not actually running, this receiver now has no time daemon at all
+# and Lynx is the reason: It turned off the one the OS shipped with.
+#
+# That is not theoretical. A user's receiver (VK3IE, 24 Nov 2026) was
+# found running without chrony, and the symptom was not a wrong clock,
+# it was Lynx failing to start: The clock sat wrong, something
+# corrected it later, and that backward jump killed mpv seconds after
+# it started. Reinstalling fixed it, and the only package the
+# installer added was chrony. Nobody could have guessed that from the
+# symptom.
+if ! systemctl is-active --quiet chrony && ! systemctl is-active --quiet chronyd; then
+  echo "chrony is not running - starting it"
+  sudo systemctl enable --now chrony >/dev/null 2>&1 \
+    || sudo systemctl enable --now chronyd >/dev/null 2>&1 || true
+fi
+if ! systemctl is-active --quiet chrony && ! systemctl is-active --quiet chronyd; then
+  echo "*** WARNING: No time daemon is running on this receiver. ***"
+  echo "    systemd-timesyncd has been disabled in favour of chrony, so"
+  echo "    nothing is keeping the clock correct. When something later"
+  echo "    corrects it, the backward jump can kill mpv seconds after it"
+  echo "    starts, which looks like Lynx failing to load."
+  echo "    Fix with:  sudo apt install -y chrony && sudo systemctl enable --now chrony"
+  echo "    Or re-enable the OS default:  sudo systemctl enable --now systemd-timesyncd"
+fi
+
 # Socket permissions. chrony creates the SOCK refclock owned by
 # root:root, mode 0755 - readable by everyone but writable only by
 # root. Lynx runs as the desktop user and has to WRITE samples into
@@ -295,6 +321,40 @@ rm -f "$LYNX_SUDO_TMP"
 echo "--- Setting up persistent log directory ---"
 sudo mkdir -p /var/log/lynx
 sudo chown "$(id -un)":"$(id -gn)" /var/log/lynx
+
+# Make the systemd journal survive a reboot.
+#
+# Raspberry Pi OS ships journald in its default "auto" storage mode,
+# which with no /var/log/journal directory means the journal lives in
+# RAM and is destroyed on every boot. So the one event we most need to
+# investigate - the receiver restarting on its own - erases its own
+# evidence as it happens, and "sudo journalctl -b -1" answers
+# "no persistent journal was found". Reported by more than one
+# operator, never diagnosed, because there was nothing left to read.
+#
+# Capped deliberately: this is an SD card. 200 MB total and 20 MB per
+# file is a few days of a receiver's logs, which is far more than
+# anybody needs to see why it went down last night, and bounded enough
+# not to wear the card or fill it.
+#
+# Placed ABOVE the --deps-only exit so Update Now gives it to existing
+# receivers, which are the ones with the problem.
+if [ ! -d /var/log/journal ]; then
+    echo "Enabling a persistent journal, so a reboot leaves evidence behind"
+fi
+sudo mkdir -p /etc/systemd/journald.conf.d
+printf '%s\n' \
+  "# Written by Lynx install.sh - a receiver that restarts on its own" \
+  "# must leave something to read afterwards." \
+  "[Journal]" \
+  "Storage=persistent" \
+  "SystemMaxUse=200M" \
+  "SystemMaxFileSize=20M" \
+  "MaxRetentionSec=1month" \
+  | sudo tee /etc/systemd/journald.conf.d/lynx.conf >/dev/null
+sudo mkdir -p /var/log/journal
+sudo systemd-tmpfiles --create --prefix /var/log/journal >/dev/null 2>&1 || true
+sudo systemctl restart systemd-journald >/dev/null 2>&1 || true
 
 # --- Startup mechanism: systemd user service -------------------
 # Lynx starts from a systemd user service, NOT the labwc autostart
