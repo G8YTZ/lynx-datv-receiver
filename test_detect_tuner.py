@@ -53,8 +53,9 @@ class Sysfs:
                     f.write(value + "\n")
         return self
 
-    # The three tuners, as they actually present.
-    def minitiouner(self, product="Minitiouner"):
+    # The three tuners, as they actually present. The strings are the
+    # ones read off G8YTZ's own cards, not invented.
+    def minitiouner(self, product="USB <-> NIM tuner"):
         return self.add(vendor="0403", product_id="6010", product=product)
 
     def knucker(self):
@@ -84,8 +85,25 @@ class DetectTests(unittest.TestCase):
     # ── one tuner at a time ──────────────────────────────────────
 
     def test_a_minitiouner(self):
+        """The real string is "USB <-> NIM tuner" - it does not contain
+        the word Minitiouner at all, which is why this was matching via
+        the FTDI fallback rather than by name until 24 Nov 2026."""
         self.fs.hub().minitiouner()
-        self.assertEqual(("minitiouner", "Minitiouner", True), self.detect())
+        self.assertEqual(("minitiouner", "USB <-> NIM tuner", True),
+                         self.detect())
+
+    def test_a_minitiouner_is_matched_by_name_not_by_the_fallback(self):
+        """Prove it is the signature doing the work now. With the FTDI
+        IDs absent, only the product string can identify it - so this
+        fails if "nim tuner" is ever dropped from SIGNATURES."""
+        self.fs.hub().add(vendor="1234", product_id="5678",
+                          product="USB <-> NIM tuner")
+        self.assertEqual("minitiouner", self.detect()[0])
+
+    def test_a_board_that_does_say_minitiouner(self):
+        self.fs.hub().minitiouner(product="BATC MiniTiouner v2")
+        self.assertEqual(("minitiouner", "BATC MiniTiouner v2", True),
+                         self.detect())
 
     def test_a_knucker(self):
         self.fs.hub().knucker()

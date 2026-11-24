@@ -7,9 +7,11 @@ IDs, because the two supported tuners share a pair of IDs:
     0403:6010   FTDI FT2232H    Minitiouner AND Knucker
     2e8a:ba2c   BATC PicoTuner  (the USB one, RP2040)
 
-The product string tells all three apart:
+The product string tells all three apart. All three below were read off
+G8YTZ's own cards, 23-24 Nov 2026:
 
-    Minitiouner          BATC's own string, or a generic FTDI one
+    USB <-> NIM tuner    the Minitiouner - note that it does NOT say
+                         "Minitiouner" anywhere
     CombiTuner-Express   the Knucker
     BATC PicoTuner       the USB Picotuner
 
@@ -51,6 +53,12 @@ FTDI_ID = ("0403", "6010")
 SIGNATURES = (
     # (needle, kind, supported)
     ("combituner", "knucker", True),
+    # What a real Minitiouner actually calls itself. Confirmed on
+    # hardware 24 Nov 2026; before that this relied entirely on the
+    # FTDI fallback below, which gave the right answer for the wrong
+    # reason. "minitiouner" is kept in case a board somewhere does say
+    # it, and costs nothing.
+    ("nim tuner", "minitiouner", True),
     ("minitiouner", "minitiouner", True),
     ("picotuner", "picotuner", False),
 )
