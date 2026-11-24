@@ -827,6 +827,12 @@ def current_rf_target_port():
         return HDHR_VIDEO_PORT
     if receiver_is_remote(active_receiver_id() or 0):
         return REMOTE_VIDEO_OUT_PORT
+    # Rx 2 chosen with its Watch button. Asked through the one
+    # derivation point so a freeze recovery lands on Rx 2's port,
+    # not Rx 1's - the exact bug this function exists to prevent.
+    if active_receiver_id() == 2 and not tri_watch_enabled \
+            and not diversity_enabled:
+        return picotuner_ts_port('b', cfg)
     if tri_watch_enabled and tri_watch_target_rcv == 2:
         return picotuner_ts_port('b', cfg)
     elif diversity_enabled:
@@ -5500,6 +5506,11 @@ MAX_REMOTE_RECEIVERS = 5
 # None means a local tuner, and which local tuner is then a
 # question tri_watch and diversity already answer.
 #
+# 2 is the one local value it can hold: Rx 2 chosen with its Watch
+# button outside diversity and Tri-Watch. Rx 1 is never stored,
+# because None already means Rx 1 there. Anything reading this must
+# not assume a non-None value is a Remote - use receiver_is_remote().
+#
 # Real state, deliberately. This was originally inferred from
 # current_stream_url still holding the relay's port, which is
 # true when a Slave is displayed and stays true afterwards,
@@ -7728,6 +7739,11 @@ def _pathfinder_current_source():
     # A Slave: a receiver at another site, whose telemetry already
     # arrives in the same field names a local tuner uses, so nothing
     # here has to translate anything.
+    # Rx 2 chosen with its Watch button. Checked before the Remote
+    # branch below, which would read 2 as a Remote index of -9, find
+    # nothing, and fall through to describe Rx 1's station instead.
+    if displayed_receiver_id == 2:
+        return (bool(picotuner_state_b.get('locked')), 2, picotuner_state_b)
     if displayed_receiver_id is not None:
         try:
             _idx = displayed_receiver_id - REMOTE_RECEIVER_ID_BASE
@@ -9002,6 +9018,8 @@ def _registry_active_id():
         _d = hdhr_active_device or hdhr_default_device_id()
         return f"dvbt:{_d}:0" if _d else None
     if current_mode == "rf":
+        if displayed_receiver_id == 2:
+            return "rf:b"
         if displayed_receiver_id is not None:
             try:
                 return f"slave:{displayed_receiver_id - REMOTE_RECEIVER_ID_BASE}"
@@ -13077,7 +13095,13 @@ def _tune_impl(req: TuneRequest):
     global rf_tuned_at
     rf_tuned_at = time.time()
     current_mode = "rf"
-    displayed_receiver_id = None
+    # Tuning clears a Remote, and tuning Rx 1 returns the picture to
+    # Rx 1 - you tuned it, so you want to see it. But retuning Rx 2
+    # while watching Rx 2 must not snatch the picture back to Rx 1.
+    displayed_receiver_id = 2 if (
+        displayed_receiver_id == 2
+        and int(getattr(req, 'rcv', 1) or 1) == 2
+        and not diversity_enabled) else None
     if req.lnb_lo_khz:
         current_preset = f"{req.freq/1000:.3f} MHz (LNB LO {req.lnb_lo_khz/1000:.3f} MHz) / {req.sr} kS/s"
     else:
@@ -14225,6 +14249,61 @@ def select_remote_source(index: int):
     current_mode = "rf"
     displayed_receiver_id = REMOTE_RECEIVER_ID_BASE + index
     return result
+
+
+@app.post("/api/receiver/{rid}/watch", tags=["RF Reception"],
+          summary="Put a local receiver on screen",
+          description="The local-tuner twin of a Remote Rx's Watch button. "
+                      "Switches the picture without retuning anything: the "
+                      "tuner keeps doing exactly what it was doing, and mpv "
+                      "is pointed at it once its lock is confirmed.\n\n"
+                      "In diversity, Rx 1 and Rx 2 are one receiver as far "
+                      "as the picture goes, so either id brings back the "
+                      "combined pair. Refused under Tri-Watch, which chooses "
+                      "what is on screen itself, and outside RF mode, where "
+                      "returning to a tuner means tuning it.")
+def watch_local_receiver(rid: int):
+    global displayed_receiver_id, mpv_running_for_rf, rf_tuned_at
+    if rid not in (1, 2):
+        raise HTTPException(status_code=404,
+                            detail="Local receivers are 1 and 2; a Remote Rx "
+                                   "uses /api/remote/{index}/select")
+    if tri_watch_enabled:
+        raise HTTPException(status_code=409,
+                            detail="Tri-Watch is choosing what is on screen")
+    if current_mode != "rf":
+        raise HTTPException(status_code=409,
+                            detail="Not in RF mode - tune or choose a preset "
+                                   "to return to a receiver")
+    if rid == 2 and not diversity_enabled \
+            and not picotuner_state_b.get("locked"):
+        # Outside diversity and Tri-Watch nothing tunes Rx 2, so
+        # watching it would be a cover with nothing behind it.
+        raise HTTPException(status_code=409,
+                            detail="Rx 2 is not locked on anything")
+    target = 2 if (rid == 2 and not diversity_enabled) else None
+    if not tune_lock.acquire(timeout=5):
+        raise HTTPException(status_code=503,
+                            detail="Busy with a tune - try again")
+    try:
+        if displayed_receiver_id == target and mpv_running_for_rf:
+            return {"ok": True, "receiver": rid, "changed": False}
+        # The same hand-off a tune does, without the tune: raise the
+        # cover, drop the old picture, and let rf_mpv_lifecycle_monitor
+        # start mpv on the new receiver once its lock is confirmed. It
+        # asks active_receiver() and current_rf_target_port(), which
+        # both follow displayed_receiver_id, so nothing here has to
+        # choose a port. rf_tuned_at makes it ignore the first 1.5 s,
+        # so it cannot start mpv on the OLD receiver's lock state.
+        start_transition_cover()
+        displayed_receiver_id = target
+        rf_tuned_at = time.time()
+        kill_mpv()
+        mpv_running_for_rf = False
+    finally:
+        tune_lock.release()
+    return {"ok": True, "receiver": rid, "changed": True,
+            "on_screen": active_receiver_id()}
 
 
 @app.post("/api/streams/refresh", tags=["Streaming"],
@@ -16179,7 +16258,8 @@ async function updateStatus() {
         // down; it was simply gated to Tri-Watch until now.
         setPanelState('status-panel-header', 'status-panel',
                       '&#x1F4E1; Tuner Rx 1',
-                      !pt.online ? 'offline' : (locked ? 'locked' : 'idle'));
+                      !pt.online ? 'offline' : (locked ? 'locked' : 'idle'),
+                      pt.online ? localWatchHtml(1, s) : '');
 
         if (!pt.online) {
             panel.innerHTML = '<div class="text-danger small text-center mt-2">Picotuner offline</div>';
@@ -16266,7 +16346,8 @@ async function updateStatus() {
             // input is actually working.
             setPanelState('status-panel-b-header', 'status-panel-b',
                           '&#x1F4E1; Tuner Rx 2',
-                          (b.online && b.locked) ? 'locked' : (b.online ? 'idle' : 'offline'));
+                          (b.online && b.locked) ? 'locked' : (b.online ? 'idle' : 'offline'),
+                          b.online ? localWatchHtml(2, s) : '');
             // Live combining stats - the combiner's own rolling window,
             // not a cumulative-since-start figure. Diversity-only,
             // deliberately not shown for tri_watch - there's no
@@ -16296,9 +16377,14 @@ async function updateStatus() {
             // it is simply not tuned to anything outside diversity or
             // Tri-Watch. Red is reserved for genuinely unreachable, which
             // for Rx 2 means the Picotuner itself being off.
+            // Locked is still possible here: something can tune rcv 2
+            // through the API, and its Watch button exists for exactly
+            // that case. Reported as it is rather than assumed idle.
+            const bPlain = div.tuner_b || {};
             setPanelState('status-panel-b-header', 'status-panel-b',
                           '&#x1F4E1; Tuner Rx 2',
-                          pt.online ? 'idle' : 'offline');
+                          !pt.online ? 'offline' : (bPlain.locked ? 'locked' : 'idle'),
+                          pt.online ? localWatchHtml(2, s) : '');
         }
 
         // tri_watch: the stream's own info, shown independently of Rx1's
@@ -16819,6 +16905,48 @@ async function loadSlaves() {
         if (el.innerHTML !== html) el.innerHTML = html;
     } catch (e) {
         el.innerHTML = '<div class="text-danger small p-3">Remote Rx list unavailable</div>';
+    }
+}
+
+// The local twin of a Remote Rx's Watch button, sitting in the
+// panel header where the Remote panels keep their Update button. The
+// badge for the receiver on screen is real state - the server owns
+// it - unlike the Lynx Bar's toggle, which has to stay momentary.
+//
+// Diversity makes Rx 1 and Rx 2 one picture, so both panels show the
+// same pair button and the same On screen badge. Tri-Watch is choosing
+// for itself, so it gets the badge but no button.
+function localWatchHtml(rid, s) {
+    const L_ = s.lynx || {};
+    const onAir = L_.active_receiver ?? s.active_receiver;
+    const pair = !!(s.diversity || {}).enabled;
+    const triWatch = !!(s.tri_watch || {}).enabled;
+    const rf = (L_.mode || '') === 'rf';
+    const onScreen = rf && (pair ? onAir === 1 : onAir === rid);
+    const style = 'style="float:right; margin-right:8px; font-size:0.75em;"';
+    if (onScreen) {
+        return '<span class="badge bg-success" ' + style + '>&#x25B6; On screen</span>';
+    }
+    if (triWatch) return '';
+    const bLocked = !!((s.diversity || {}).tuner_b || {}).locked;
+    const why = !rf ? 'Not in RF mode - tune or choose a preset to return to a receiver'
+              : (rid === 2 && !pair && !bLocked ? 'Rx 2 is not tuned to anything' : '');
+    const label = pair ? '&#x25B6; Watch A+B' : '&#x25B6; Watch';
+    return why
+        ? '<button class="btn btn-sm btn-outline-secondary py-0 px-2" ' + style
+          + ' disabled title="' + why + '">' + label + '</button>'
+        : '<button class="btn btn-sm btn-outline-success py-0 px-2" ' + style
+          // stopPropagation: a click on the button must not also open
+          // or shut the panel it sits on.
+          + ' onclick="event.stopPropagation(); watchLocal(' + rid + ')">'
+          + label + '</button>';
+}
+
+async function watchLocal(rid) {
+    try {
+        await api('POST', '/api/receiver/' + rid + '/watch');
+    } catch (e) {
+        alert('Could not put that receiver on screen: ' + e);
     }
 }
 

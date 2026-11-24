@@ -828,7 +828,13 @@ def poll_status():
             # isn't locked but B is. tri_watch and diversity are
             # mutually exclusive modes, so these two conditions never
             # genuinely compete in practice.
-            use_b = tri_watch_use_b or (diversity_enabled and not a_locked and b_locked)
+            # Or Rx 2 put on screen with its Watch button, which the
+            # backend reports as active_receiver 2. Without this the
+            # OSD and the Lynx Bar would describe Rx 1 over Rx 2's
+            # picture.
+            watched_b = (data.get('lynx', {}) or {}).get('active_receiver') == 2
+            use_b = (tri_watch_use_b or watched_b
+                     or (diversity_enabled and not a_locked and b_locked))
             source = tuner_b if use_b else pt
             state["locked_via"] = "b" if use_b else "a"
             state["tuner_b_pct_nul"] = tuner_b.get("pct_nul", "")
