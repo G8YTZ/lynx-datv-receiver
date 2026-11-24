@@ -1058,6 +1058,162 @@ def poll_status():
         time.sleep(POLL_SECS)
 
 
+def _bar_cells(state):
+    """What goes in the bar, as (label, value, dim) tuples.
+
+    Built from state rather than inline in the drawing code, so the
+    layout code stays about layout and the preview harness can render
+    every variant without a running receiver.
+
+    Diversity keeps its split, as the corner OSD always has: two tuners
+    means two MER columns, not an average. An average of two tuners is
+    a number describing nothing.
+    """
+    locked = bool(state.get("locked"))
+    cells = []
+    if state.get("mode") == "stream":
+        cells.append(("SOURCE", state.get("stream_name") or "stream", False))
+        if state.get("stream_protocol"):
+            cells.append(("LINK", str(state["stream_protocol"]).upper(), False))
+        rate = state.get("stream_bitrate_kbps")
+        if rate:
+            cells.append(("RATE", "%.2f Mb/s" % (float(rate) / 1000.0), False))
+    else:
+        if state.get("frequency"):
+            cells.append(("FREQUENCY", "%.3f MHz" % float(state["frequency"]),
+                          not locked))
+        sr = state.get("sr_ks")
+        if sr:
+            cells.append(("SYMBOL RATE",
+                          "%s %s" % (sr, state.get("sr_units") or "kS/s"),
+                          not locked))
+        if state.get("modcod"):
+            cells.append(("MODE", str(state["modcod"]), not locked))
+    codec = state.get("codec") or state.get("stream_video_codec")
+    if codec:
+        audio = state.get("audio_codec") or state.get("stream_audio_codec")
+        cells.append(("CODEC", "%s/%s" % (codec, audio) if audio else str(codec),
+                      not locked))
+
+    if state.get("diversity_enabled"):
+        for suffix, name in (("_a", "MER A"), ("_b", "MER B")):
+            mer = state.get("mer" + suffix)
+            up = bool(state.get("locked" + suffix))
+            cells.append((name, "%.1f dB" % float(mer) if mer else "\u2014",
+                          not up))
+    elif state.get("mer"):
+        cells.append(("MER", "%.1f dB" % float(state["mer"]), not locked))
+        if state.get("margin"):
+            cells.append(("MARGIN", "%.1f dB" % float(state["margin"]),
+                          not locked))
+    return cells
+
+
+def render_lynx_bar(cr, width, height, state, progress, ov):
+    """Draw the Lynx Bar at `progress` (0 hidden, 1 fully up).
+
+    Outside the overlay class on purpose: it takes everything it needs
+    as arguments, so it can be rendered to a PNG off-screen and LOOKED
+    AT. A bar only ever seen on a television in another room, after a
+    deploy, is a bar designed by guesswork.
+    """
+    bar_w = max(420, width - 2 * ov.LYNX_BAR_SIDE_GAP)
+    bar_h = ov.LYNX_BAR_HEIGHT
+    x = (width - bar_w) / 2.0
+    # Below the bottom edge at 0, in place at 1. The Apple TV's pops up
+    # from off-screen rather than fading in on the spot, and the travel
+    # is what makes it read as arriving.
+    y_up = height - ov.LYNX_BAR_BOTTOM_GAP - bar_h
+    y = y_up + (1.0 - progress) * (bar_h + ov.LYNX_BAR_BOTTOM_GAP)
+
+    cr.push_group()
+
+    cr.set_source_rgba(0, 0, 0, 0.45)
+    ov._rounded_rect_path(cr, x + 3, y + 5, bar_w, bar_h, ov.LYNX_BAR_RADIUS)
+    cr.fill()
+    cr.set_source_rgba(*ov.BAR_FILL)
+    ov._rounded_rect_path(cr, x, y, bar_w, bar_h, ov.LYNX_BAR_RADIUS)
+    cr.fill()
+    cr.set_source_rgba(*ov.BAR_EDGE)
+    cr.set_line_width(1.5)
+    ov._rounded_rect_path(cr, x, y, bar_w, bar_h, ov.LYNX_BAR_RADIUS)
+    cr.stroke()
+
+    # The callsign in a navy chip at the left, echoing the panel
+    # headers on the web pages: the one element that makes this read as
+    # Lynx rather than as a generic infobar.
+    locked = bool(state.get("locked"))
+    call = (state.get("callsign") or state.get("hdhr_callsign")
+            or state.get("stream_name")
+            or ("SEARCHING" if not locked else "\u2014"))
+    chip_w, chip_m = 236, 14
+    cr.set_source_rgba(*ov.BAR_HEAD)
+    ov._rounded_rect_path(cr, x + chip_m, y + chip_m, chip_w,
+                          bar_h - 2 * chip_m, 13)
+    cr.fill()
+
+    cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL,
+                        cairo.FONT_WEIGHT_BOLD)
+    chip_cx = x + chip_m + chip_w / 2.0
+    ov.draw_text(cr, chip_cx, y + 62, call[:11], size=38, align="center",
+                 colour=ov.BAR_VALUE if locked else ov.BAR_DIM)
+    # The QRZ first name beside the callsign, with the locator after it
+    # when both are known - which is how anybody actually identifies a
+    # station: a name to greet and a square to point an aerial at.
+    name = (state.get("callsign_name") or "").strip()
+    loc = (state.get("site_locator") or state.get("portable_locator")
+           or "").strip()
+    sub = " \u00b7 ".join(bit for bit in (name, loc) if bit)
+    if sub:
+        ov.draw_text(cr, chip_cx, y + 94, sub[:18], size=19, align="center",
+                     colour=ov.BAR_LABEL)
+
+    # The rest as label-over-value columns: the pairing the web panels
+    # use, turned on its side because a bar is wide and shallow.
+    cells = _bar_cells(state)
+    if cells:
+        first = x + chip_m + chip_w + 32
+        avail = (x + bar_w - 26) - first
+        # MEASURED, not evenly stepped. Even steps put every column the
+        # same distance apart regardless of how wide its contents are,
+        # so "438.021 MHz" ran straight into the symbol rate beside it
+        # while the right-hand end of the bar sat empty. Each column
+        # gets the width of its widest line, and the slack is shared
+        # out between them as equal gaps.
+        natural = []
+        for label, value, _dim in cells:
+            cr.set_font_size(15)
+            lw = cr.text_extents(label).width
+            cr.set_font_size(29)
+            vw = cr.text_extents(str(value)).width
+            natural.append(max(lw, vw))
+        total = sum(natural)
+        gaps = max(1, len(cells) - 1)
+        # A floor on the gap so columns never actually touch, even when
+        # the contents are too wide for the bar; they are allowed to run
+        # narrow rather than overlap, which at least stays readable.
+        # Capped as well as floored. Without a cap, a searching tuner
+        # with only two things to say put FREQUENCY against the left
+        # edge and SYMBOL RATE against the right, with a yard of
+        # nothing between them - which reads as a broken layout rather
+        # than a quiet moment. Capped, sparse states group tidily to
+        # the left and the bar simply has room to spare.
+        gap = min(96.0, max(26.0, (avail - total) / gaps)) \
+            if len(cells) > 1 else 0.0
+        cx = first
+        for (label, value, dim), w in zip(cells, natural):
+            ov.draw_text(cr, cx, y + 52, label, size=15, colour=ov.BAR_LABEL)
+            ov.draw_text(cr, cx, y + 92, str(value), size=29,
+                         colour=ov.BAR_DIM if dim else ov.BAR_VALUE)
+            cx += w + gap
+
+    cr.pop_group_to_source()
+    # Fades as it travels, so the first frames do not flash at full
+    # strength while still half off-screen.
+    cr.paint_with_alpha(0.25 + 0.75 * progress)
+
+
+
 class LynxOverlay(Gtk.Window):
     def __init__(self):
         super().__init__()
@@ -1404,15 +1560,123 @@ class LynxOverlay(Gtk.Window):
                   "osd_hidden=%s" % _why + (f" cover_age={transition_age:.1f}s" if mpv_transitioning else ""),
                   flush=True)
 
+        # The Lynx Bar stands in for the TEXT zones while it is up, and
+        # only for those. The PPM meter and the magic eye are
+        # continuous instruments - watching them is the whole point -
+        # so they are never suppressed, and the bar is sized to span
+        # the gap between them rather than cover them.
+        self.update_lynx_bar()
+        bar_up = False
         if not showing_map:
-            self.draw_top_right(cr, width, height)
-            self.draw_top_left(cr, width, height)
+            bar_up = self.draw_lynx_bar(cr, width, height)
+            if not bar_up:
+                self.draw_top_right(cr, width, height)
+                self.draw_top_left(cr, width, height)
             self.draw_bottom_left(cr, width, height)
             self.draw_bottom_right(cr, width, height)
         # The tri_watch bubble is NOT suppressed - someone waiting to
         # get in matters more than finishing the card, and it is drawn
         # over the middle-right where the card has no text of its own.
         self.draw_waiting_bubble(cr, width, height)
+
+    # ── The Lynx Bar ────────────────────────────────────────────
+    #
+    # A bar along the bottom, after Enigma2's infobar and the Apple
+    # TV's: it pops up from below the bottom edge when a new
+    # transmission starts, holds for a configurable while, and slides
+    # back down.
+    #
+    # It takes the place of the TEXT zones, not of the meters. The PPM
+    # meter and the magic eye stay exactly where they are in the bottom
+    # corners, and the bar spans the gap between them. They are
+    # continuous instruments and watching them is the point; the text
+    # is reference information that has only ever been on screen
+    # permanently for want of anywhere better to put it.
+    #
+    # Drawn to the family look rather than invented: the deep navy and
+    # slate of the web panels, muted blue-grey labels over green
+    # monospace values, which is what every other Lynx surface does.
+
+    LYNX_BAR_SLIDE_SECS = 0.42      # the Apple TV's is quick; slower reads as sluggish
+    LYNX_BAR_HEIGHT = 128
+    LYNX_BAR_BOTTOM_GAP = 38        # clear of the screen edge when up
+    LYNX_BAR_SIDE_GAP = 208         # clear of the PPM meter and the magic eye
+    LYNX_BAR_RADIUS = 20
+
+    # The family palette, taken from the web panels.
+    BAR_FILL = (0.047, 0.078, 0.145, 0.93)      # panel body navy
+    BAR_HEAD = (0.059, 0.204, 0.376, 0.96)      # #0f3460
+    BAR_EDGE = (0.227, 0.290, 0.388, 0.85)      # #3a4a63
+    BAR_LABEL = (0.659, 0.710, 0.780)           # #a8b5c7
+    BAR_VALUE = (0.0, 1.0, 0.25)                # the overlay's green
+    BAR_DIM = (0.45, 0.52, 0.60)                # a tuner with no lock
+
+    def _bar_hold_secs(self):
+        """How long it stays up once risen. 0 means permanently, which
+        is a fair choice for somebody watching a repeater's input
+        rather than a programme."""
+        try:
+            return max(0.0, float(state.get("lynx_bar_secs", 15)))
+        except (TypeError, ValueError):
+            return 15.0
+
+    def _bar_progress(self):
+        """0 hidden, 1 fully up. Eased, so it does not arrive with a
+        jolt, which is what makes a slide look cheap."""
+        shown = getattr(self, "_bar_shown_at", None)
+        if shown is None:
+            return 0.0
+        age = time.monotonic() - shown
+        if age < 0:
+            return 0.0
+        rise = min(1.0, age / self.LYNX_BAR_SLIDE_SECS)
+        hold = self._bar_hold_secs()
+        if hold <= 0:
+            fall = 1.0                      # kept up: never falls
+        else:
+            falling = age - (self.LYNX_BAR_SLIDE_SECS + hold)
+            fall = 1.0 - max(0.0, min(1.0, falling / self.LYNX_BAR_SLIDE_SECS))
+            if fall <= 0.0:
+                self._bar_shown_at = None   # finished; stop drawing it
+                return 0.0
+        t = min(rise, fall)
+        return t * t * (3.0 - 2.0 * t)      # smoothstep
+
+    def _bar_trigger_signature(self):
+        """What counts as "a new transmission".
+
+        A lock arriving, or the callsign changing under an existing
+        lock. Deliberately NOT the frequency or the symbol rate: those
+        change while somebody tunes around, and a bar that popped up on
+        every twitch of the tuning control would be an irritation
+        rather than information.
+        """
+        if not state.get("locked"):
+            return None
+        return (state.get("callsign") or state.get("hdhr_callsign")
+                or state.get("stream_name") or "?")
+
+    def update_lynx_bar(self):
+        """Once per tick, before drawing. Raises the bar when a new
+        transmission appears."""
+        sig = self._bar_trigger_signature()
+        if sig != getattr(self, "_bar_last_sig", None):
+            self._bar_last_sig = sig
+            if sig is not None:
+                self._bar_shown_at = time.monotonic()
+
+    def show_lynx_bar(self):
+        """Bring it up on demand: a keypress, or a remote button."""
+        self._bar_shown_at = time.monotonic()
+
+    def draw_lynx_bar(self, cr, width, height):
+        """True if it drew, so the caller knows to suppress the text
+        zones it stands in for."""
+        p = self._bar_progress()
+        if p <= 0.001:
+            return False
+        render_lynx_bar(cr, width, height, state, p, self)
+        return True
 
     def draw_text(self, cr, x, y, text, size=30, align="left", colour=(0.0, 1.0, 0.25)):
         cr.set_font_size(size)

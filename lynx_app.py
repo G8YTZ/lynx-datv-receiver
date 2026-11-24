@@ -6466,6 +6466,16 @@ class TriWatchSourcesUpdate(BaseModel):
     rx2: TriWatchRfSourceUpdate
     stream: TriWatchStreamSourceUpdate
 
+class LynxBarConfigUpdate(BaseModel):
+    """How long the Lynx Bar stays up after a new transmission.
+
+    0 means permanently, which is a fair choice for somebody watching a
+    repeater's input rather than a programme: the bar is then a
+    standing readout instead of a notification.
+    """
+    hold_secs: int = 15
+
+
 class PathfinderConfigUpdate(BaseModel):
     """Only the three settings worth changing from the UI. The span and
     distance limits stay in config.yaml deliberately - they are tuned
@@ -6532,6 +6542,7 @@ class ConfigUpdateRequest(BaseModel):
     display: Optional[DisplayConfigUpdate] = None
     tri_watch: Optional[TriWatchSourcesUpdate] = None
     pathfinder: Optional[PathfinderConfigUpdate] = None
+    lynx_bar: Optional[LynxBarConfigUpdate] = None
     gnss: Optional[GnssConfigUpdate] = None
     squeak: Optional[SqueakConfigUpdate] = None
     remote_source: Optional[RemoteSourceConfigUpdate] = None
@@ -9066,6 +9077,11 @@ def get_status():
             # Whether the overlay may draw the placeholder card (or the
             # SWITCHING caption) when Pathfinder has no map to show.
             "pathfinder_placeholder": bool((config.get('pathfinder') or {}).get('placeholder_card', True)),
+            # How long the Lynx Bar holds before sliding back down; 0
+            # keeps it up. Delivered here rather than read from the
+            # config by the overlay, which has no config of its own -
+            # the same route the pathfinder timings take.
+            "lynx_bar_secs": int((config.get('lynx_bar') or {}).get('hold_secs', 15)),
             "squeak": _squeak_status(),
             # Something to show, settled with the Video Switching card's
             # settle times: what it switches on, whether or not Companion
@@ -10291,6 +10307,29 @@ def config_page():
                         <button class="btn btn-save" onclick="savePathfinder()">Save Pathfinder settings</button>
                         <span id="pf-status" class="save-status ms-2"></span>
                         <hr class="my-3">
+                        <div class="fw-semibold small mb-1">Lynx Bar</div>
+                        <div class="row g-2 mb-2">
+                            <div class="col-6">
+                                <label class="form-label small mb-1" for="lb-hold">Auto-hide</label>
+                                <select class="form-select form-select-sm" id="lb-hold"
+                                        onchange="saveLynxBar('lb-status')">
+                                    <option value="8">After 8 seconds</option>
+                                    <option value="15">After 15 seconds</option>
+                                    <option value="30">After 30 seconds</option>
+                                    <option value="60">After 60 seconds</option>
+                                    <option value="0">Keep it up</option>
+                                </select>
+                                <span id="lb-status" class="save-status ms-2"></span>
+                            </div>
+                        </div>
+                        <p class="text-muted small mb-2">
+                            The bar pops up from the bottom of the screen when a new
+                            transmission starts, then slides away again. It stands in for the
+                            callsign and frequency text while it is up; the PPM meter and the
+                            magic eye are untouched, and it is sized to sit between them.
+                            Saved as soon as you change it.
+                        </p>
+                        <hr class="my-3">
                         <div class="fw-semibold small mb-1">Switch placeholder card</div>
                         <div class="form-check form-switch mb-2">
                             <input class="form-check-input" type="checkbox" id="pf-placeholder"
@@ -11163,6 +11202,10 @@ async function loadCurrentConfig() {
         document.getElementById('pf-delay').value = pf.delay_secs ?? 2;
         document.getElementById('pf-duration').value = pf.duration_secs ?? 30;
         document.getElementById('pf-placeholder').checked = pf.placeholder_card !== false;
+        // ?? not ||, so a stored 0 ("keep it up") survives being read
+        // back: 0 is falsy and || would quietly turn it into 15.
+        document.getElementById('lb-hold').value =
+            String((cfg.lynx_bar || {}).hold_secs ?? 15);
         updatePathfinderWarning();
         // Which placeholder card is in place isn't part of the config
         // (it's a file, not a setting), so it's fetched separately.
@@ -11770,6 +11813,30 @@ async function savePathfinder(statusId) {
         statusEl.textContent = 'Saved - restart required.';
         statusEl.className = 'save-status text-success';
         updatePathfinderWarning();
+    } catch (e) {
+        statusEl.textContent = 'Save failed - see console.';
+        statusEl.className = 'save-status text-danger';
+        console.error(e);
+    }
+}
+
+async function saveLynxBar(statusId) {
+    const statusEl = document.getElementById(statusId || 'lb-status');
+    statusEl.textContent = 'Saving...';
+    statusEl.className = 'save-status text-muted';
+    try {
+        const body = { lynx_bar: {
+            hold_secs: parseInt(document.getElementById('lb-hold').value, 10)
+        }};
+        const r = await fetch('/api/config', {
+            method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+        });
+        if (!r.ok) throw new Error(await r.text());
+        // No restart needed, unlike the Pathfinder settings: the overlay
+        // reads this from /api/status on its next poll, so the change
+        // takes effect on the next transmission.
+        statusEl.textContent = 'Saved.';
+        statusEl.className = 'save-status text-success';
     } catch (e) {
         statusEl.textContent = 'Save failed - see console.';
         statusEl.className = 'save-status text-danger';
@@ -14899,6 +14966,9 @@ def update_config(req: ConfigUpdateRequest):
         # sees them, and a blind update() would wipe them.
         if req.pathfinder is not None:
             on_disk.setdefault('pathfinder', {}).update(req.pathfinder.model_dump())
+
+        if req.lynx_bar is not None:
+            on_disk.setdefault('lynx_bar', {}).update(req.lynx_bar.model_dump())
 
         # tri_watch: rebuilds just the `sources` list and top-level
         # `enabled` flag from whichever of Rx1/Rx2/stream are actually
