@@ -1252,18 +1252,28 @@ def render_callsign_chip(cr, ov, state, cx0, cy0):
                      colour=ov.BAR_RX)
 
 
-def _lynx_box(cr, ov, x, y, w, h):
-    """The bar's own backing - shadow, dark fill, edge - at any size, so
-    a corner box over a pale sky reads exactly as the bar does."""
+def _lynx_box(cr, ov, x, y, w, h, radius=16):
+    """The backing every Lynx box shares - the bar and both corner
+    boxes - so they always agree: shadow, dark fill, edge.
+
+    The fill is see-through (BAR_FILL), so the shadow is drawn only
+    where it falls OUTSIDE the box. A whole shadow under a translucent
+    fill shows through it as a darker offset patch, and the box reads
+    as two-tone rather than as one pane of tinted glass.
+    """
+    cr.save()
+    cr.set_fill_rule(cairo.FILL_RULE_EVEN_ODD)
+    ov._rounded_rect_path(cr, x + 3, y + 5, w, h, radius)
+    ov._rounded_rect_path(cr, x, y, w, h, radius)
     cr.set_source_rgba(0, 0, 0, 0.45)
-    ov._rounded_rect_path(cr, x + 3, y + 5, w, h, 16)
     cr.fill()
+    cr.restore()
     cr.set_source_rgba(*ov.BAR_FILL)
-    ov._rounded_rect_path(cr, x, y, w, h, 16)
+    ov._rounded_rect_path(cr, x, y, w, h, radius)
     cr.fill()
     cr.set_source_rgba(*ov.BAR_EDGE)
     cr.set_line_width(1.5)
-    ov._rounded_rect_path(cr, x, y, w, h, 16)
+    ov._rounded_rect_path(cr, x, y, w, h, radius)
     cr.stroke()
 
 
@@ -1326,34 +1336,40 @@ def render_corner_boxes(cr, width, height, state, ov):
     _lynx_box(cr, ov, m, m, box_w, CHIP_H + 2 * pad)
     render_callsign_chip(cr, ov, state, m + pad, m + pad)
 
-    # Right: only as tall as its lines need.
+    # Right: the same size as the left, so the two corners read as a
+    # matched pair. The content is centred in it: three lines use the
+    # chip's own three baselines, so frequency sits level with the
+    # callsign; fewer lines move down to the middle.
     freq, lines, dim = _corner_numbers(state)
-    freq_sz, line_sz, line_h = 26, 18, 23
-    inner_h = 14 + freq_sz + 6 + line_h * len(lines) + 4
     x = width - m - box_w
-    _lynx_box(cr, ov, x, m, box_w, inner_h + 2 * pad)
+    _lynx_box(cr, ov, x, m, box_w, CHIP_H + 2 * pad)
+    cx0, cy0 = x + pad, m + pad
     cr.set_source_rgba(*ov.BAR_HEAD)
-    ov._rounded_rect_path(cr, x + pad, m + pad, CHIP_W, inner_h, 13)
+    ov._rounded_rect_path(cr, cx0, cy0, CHIP_W, CHIP_H, 13)
     cr.fill()
-    mid = x + box_w / 2.0
-    base = m + pad + 14 + freq_sz - 4
-    ov.draw_text(cr, mid, base, freq, size=freq_sz, align="center",
+    mid = cx0 + CHIP_W / 2.0
+    line_sz = 18
+    if len(lines) >= 2:
+        freq_y, line_ys = 36, (64, 89)
+    elif lines:
+        freq_y, line_ys = 44, (78,)
+    else:
+        freq_y, line_ys = 58, ()
+    ov.draw_text(cr, mid, cy0 + freq_y, freq, size=26, align="center",
                  colour=ov.BAR_DIM if dim else ov.BAR_VALUE)
+    lines = lines[:len(line_ys)]
     if not lines:
         return
-    base += 6
     # One left edge for every line, set by the widest, so A and B read
     # as a column even when one of them is only a dash.
     cr.set_font_size(line_sz)
     label_w = max(cr.text_extents(l + "  ").x_advance for l, _v, _d in lines)
     value_w = max(cr.text_extents(v).width for _l, v, _d in lines)
     x0 = mid - (label_w + value_w) / 2.0
-    for label, value, ldim in lines:
-        base += line_h
-        ov.draw_text(cr, x0, base, label, size=line_sz, colour=ov.BAR_LABEL)
-        ov.draw_text(cr, x0 + label_w, base, value, size=line_sz,
+    for (label, value, ldim), ly in zip(lines, line_ys):
+        ov.draw_text(cr, x0, cy0 + ly, label, size=line_sz, colour=ov.BAR_LABEL)
+        ov.draw_text(cr, x0 + label_w, cy0 + ly, value, size=line_sz,
                      colour=ov.BAR_DIM if (dim or ldim) else ov.BAR_VALUE)
-
 
 def render_lynx_bar(cr, width, height, state, progress, ov):
     """Draw the Lynx Bar at `progress` (0 hidden, 1 fully up).
@@ -1374,16 +1390,7 @@ def render_lynx_bar(cr, width, height, state, progress, ov):
 
     cr.push_group()
 
-    cr.set_source_rgba(0, 0, 0, 0.45)
-    ov._rounded_rect_path(cr, x + 3, y + 5, bar_w, bar_h, ov.LYNX_BAR_RADIUS)
-    cr.fill()
-    cr.set_source_rgba(*ov.BAR_FILL)
-    ov._rounded_rect_path(cr, x, y, bar_w, bar_h, ov.LYNX_BAR_RADIUS)
-    cr.fill()
-    cr.set_source_rgba(*ov.BAR_EDGE)
-    cr.set_line_width(1.5)
-    ov._rounded_rect_path(cr, x, y, bar_w, bar_h, ov.LYNX_BAR_RADIUS)
-    cr.stroke()
+    _lynx_box(cr, ov, x, y, bar_w, bar_h, ov.LYNX_BAR_RADIUS)
 
     # The callsign in a navy chip at the left, echoing the panel
     # headers on the web pages: the one element that makes this read as
@@ -1831,7 +1838,11 @@ class LynxOverlay(Gtk.Window):
     LYNX_BAR_RADIUS = 20
 
     # The family palette, taken from the web panels.
-    BAR_FILL = (0.047, 0.078, 0.145, 0.93)      # panel body navy
+    # 80% opaque (was 93%): less of the picture hidden behind the bar
+    # and the boxes, still enough to hold green text over a pale sky.
+    # The navy callsign chip stays nearly solid - it carries the text
+    # that matters most, and it is what makes the family read as Lynx.
+    BAR_FILL = (0.047, 0.078, 0.145, 0.80)      # panel body navy
     BAR_HEAD = (0.059, 0.204, 0.376, 0.96)      # #0f3460
     BAR_EDGE = (0.227, 0.290, 0.388, 0.85)      # #3a4a63
     BAR_LABEL = (0.659, 0.710, 0.780)           # #a8b5c7
