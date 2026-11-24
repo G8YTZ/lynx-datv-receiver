@@ -33,10 +33,19 @@ def load_renderer():
     """
     src = open(os.path.join(HERE, "lynx_overlay.py")).read()
     tree = ast.parse(src)
-    want = {"_bar_cells", "render_lynx_bar"}
+    want = {"_bar_cells", "render_lynx_bar", "_on_air_mhz", "_fit_name_loc",
+            "render_callsign_chip", "_lynx_box", "_corner_numbers",
+            "render_corner_boxes"}
+    consts = {"CHIP_W", "CHIP_H", "CORNER_MARGIN"}
     ns = {"cairo": cairo}
     for node in tree.body:
         if isinstance(node, ast.FunctionDef) and node.name in want:
+            exec(compile(ast.Module([node], []), "<bar>", "exec"), ns)
+        elif isinstance(node, ast.Assign) and any(
+                isinstance(t, (ast.Name, ast.Tuple)) and
+                {getattr(e, "id", None) for e in
+                 (t.elts if isinstance(t, ast.Tuple) else [t])} & consts
+                for t in node.targets):
             exec(compile(ast.Module([node], []), "<bar>", "exec"), ns)
     missing = want - set(ns)
     if missing:
@@ -195,6 +204,23 @@ def main():
         meters(cr, ov)
         render(cr, W, H, st, p, ov)
         path = os.path.join(out, "bar-%s.png" % name)
+        surf.write_to_png(path)
+        print("wrote", path)
+
+    # The corner boxes: what is on screen while the bar is DOWN.
+    corners = ns["render_corner_boxes"]
+    for name, st in (("locked", LOCKED), ("remote", REMOTE),
+                     ("diversity", DIVERSITY),
+                     ("diversity-one-down", DIVERSITY_ONE),
+                     ("searching", SEARCHING),
+                     ("qo100", dict(LOCKED, downlink_frequency=10491.500,
+                                    frequency=741.5))):
+        surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, W, H)
+        cr = cairo.Context(surf)
+        backdrop(cr)
+        meters(cr, ov)
+        corners(cr, W, H, st, ov)
+        path = os.path.join(out, "corners-%s.png" % name)
         surf.write_to_png(path)
         print("wrote", path)
 

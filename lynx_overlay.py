@@ -944,7 +944,11 @@ def poll_status():
             # replaces both - reset here every poll so a Remote's name
             # cannot outlive switching back to a local tuner.
             state["rx_name"] = state["site_location"]
-            state["rx_locator"] = state["site_locator"]
+            # Portable operation moves the receiver, so the portable
+            # square is where the signal was actually heard. The old
+            # corner said "PORTABLE: <square>"; this keeps that.
+            state["rx_locator"] = (state["portable_locator"]
+                                   or state["site_locator"])
             # End-of-contact map. As with the tri_watch bubble, the
             # backend has already decided whether a card is due - this
             # side only ever checks presence.
@@ -1115,9 +1119,9 @@ def _bar_cells(state):
         if rate:
             cells.append(("RATE", "%.2f Mb/s" % (float(rate) / 1000.0), False))
     else:
-        if state.get("frequency"):
-            cells.append(("FREQUENCY", "%.3f MHz" % float(state["frequency"]),
-                          not locked))
+        freq = _on_air_mhz(state)
+        if freq:
+            cells.append(("FREQUENCY", freq, not locked))
         sr = state.get("sr_ks")
         if sr:
             cells.append(("SYMBOL RATE",
@@ -1168,6 +1172,189 @@ def _bar_cells(state):
     return cells
 
 
+CHIP_W, CHIP_H = 236, 100      # the callsign chip, bar and corner alike
+CORNER_MARGIN = 40              # from the screen edge; clear of overscan
+
+
+def _on_air_mhz(state):
+    """"438.021 MHz", or "" if unknown.
+
+    The on-air frequency where a converter is in use, the tuner's own
+    otherwise. The bar used to show the IF unconditionally, so a QO-100
+    or up-converter setup put the wrong number on the screen; the old
+    top-left corner already preferred the downlink and was right.
+    """
+    f = state.get("downlink_frequency") or state.get("frequency")
+    try:
+        return "%.3f MHz" % float(f) if f not in ("", None) else ""
+    except (TypeError, ValueError):
+        return ""
+
+
+def _fit_name_loc(cr, name, loc, size, room):
+    """"Name · LOCATOR", shortened to `room` by measurement. The NAME
+    gives way, never the locator: a square is the thing you point an
+    aerial at, and "Paddlesworth Remot..." with no locator after it is
+    a name with the useful half gone."""
+    name, loc = (name or "").strip(), (loc or "").strip()
+    cr.set_font_size(size)
+
+    def join(n):
+        return " \u00b7 ".join(b for b in (n, loc) if b)
+
+    text = join(name)
+    if cr.text_extents(text).width <= room:
+        return text
+    while name:
+        name = name[:-1].rstrip()
+        text = join(name + "\u2026" if name else "")
+        if cr.text_extents(text).width <= room:
+            return text
+    while text and cr.text_extents(text).width > room:
+        text = text[:-1]
+    return text
+
+
+def render_callsign_chip(cr, ov, state, cx0, cy0):
+    """The navy callsign chip, CHIP_W x CHIP_H, top-left at (cx0, cy0).
+
+    ONE function for the bar and the corner box, so the two can never
+    drift apart - the corner box is meant to read as the bar's chip
+    having been lifted off it, and a copy would stop meaning that the
+    first time one of them was touched.
+
+        G8YTZ
+        Justin · JO01AJ      the station: QRZ name and its own square
+        Lenham · JO01KG      where it was heard, in Pathfinder amber
+    """
+    locked = bool(state.get("locked"))
+    call = (state.get("callsign") or state.get("hdhr_callsign")
+            or state.get("stream_name")
+            or ("SEARCHING" if not locked else "\u2014"))
+    cr.set_source_rgba(*ov.BAR_HEAD)
+    ov._rounded_rect_path(cr, cx0, cy0, CHIP_W, CHIP_H, 13)
+    cr.fill()
+    cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL,
+                        cairo.FONT_WEIGHT_BOLD)
+    mid = cx0 + CHIP_W / 2.0
+    ov.draw_text(cr, mid, cy0 + 36, call[:11], size=34, align="center",
+                 colour=ov.BAR_VALUE if locked else ov.BAR_DIM)
+    room = CHIP_W - 18
+    station = _fit_name_loc(cr, state.get("callsign_name"),
+                            state.get("callsign_locator"), 18, room)
+    if station:
+        ov.draw_text(cr, mid, cy0 + 64, station, size=18, align="center",
+                     colour=ov.BAR_LABEL)
+    rx = _fit_name_loc(cr, state.get("rx_name"), state.get("rx_locator"),
+                       15, room)
+    if rx:
+        ov.draw_text(cr, mid, cy0 + 89, rx, size=15, align="center",
+                     colour=ov.BAR_RX)
+
+
+def _lynx_box(cr, ov, x, y, w, h):
+    """The bar's own backing - shadow, dark fill, edge - at any size, so
+    a corner box over a pale sky reads exactly as the bar does."""
+    cr.set_source_rgba(0, 0, 0, 0.45)
+    ov._rounded_rect_path(cr, x + 3, y + 5, w, h, 16)
+    cr.fill()
+    cr.set_source_rgba(*ov.BAR_FILL)
+    ov._rounded_rect_path(cr, x, y, w, h, 16)
+    cr.fill()
+    cr.set_source_rgba(*ov.BAR_EDGE)
+    cr.set_line_width(1.5)
+    ov._rounded_rect_path(cr, x, y, w, h, 16)
+    cr.stroke()
+
+
+def _corner_numbers(state):
+    """What the right-hand corner box says: (frequency, lines, dim).
+
+    lines are (label, value, dim). One MER/D line for a single tuner;
+    one per antenna, A and B, in diversity - a dead antenna keeps its
+    line as a dimmed dash, because its absence is the information. A
+    Knucker Remote has no MER or margin, so it gets the DVB-T figures
+    the old corner showed for it instead.
+    """
+    locked = bool(state.get("locked"))
+
+    def num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    lines = []
+    if state.get("diversity_enabled"):
+        for sfx, label in (("_a", "A"), ("_b", "B")):
+            up = bool(state.get("locked" + sfx))
+            mer, mar = num(state.get("mer" + sfx)), num(state.get("margin" + sfx))
+            if up and mer is not None and mar is not None:
+                lines.append((label, "%.1f/%.1f dB" % (mer, mar), False))
+            elif up and mer is not None:
+                lines.append((label, "%.1f dB" % mer, False))
+            else:
+                lines.append((label, "\u2014", True))
+    else:
+        mer, mar = num(state.get("mer")), num(state.get("margin"))
+        if mer is not None and mar is not None:
+            lines.append(("MER/D", "%.1f/%.1f dB" % (mer, mar), not locked))
+        elif locked and state.get("dvbt_metrics"):
+            for label, key, fmt in (("SNR", "dvbt_snr", "%.1f dB"),
+                                    ("SNQ", "dvbt_snq", "%.0f%%")):
+                v = num(state.get(key))
+                if v is not None:
+                    lines.append((label, fmt % v, False))
+    return (_on_air_mhz(state) or "--", lines, not locked)
+
+
+def render_corner_boxes(cr, width, height, state, ov):
+    """The two top corners while the Lynx Bar is down: the bar's
+    callsign chip top left, and a compact box top right with the
+    frequency and MER/D, one line per antenna in diversity.
+
+    Outside the overlay class for the same reason render_lynx_bar is:
+    it can be rendered to a PNG and looked at before anyone walks next
+    door to a television.
+    """
+    cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL,
+                        cairo.FONT_WEIGHT_BOLD)
+    pad, m = 10, CORNER_MARGIN
+    box_w = CHIP_W + 2 * pad
+
+    # Left: the chip, exactly as it sits in the bar.
+    _lynx_box(cr, ov, m, m, box_w, CHIP_H + 2 * pad)
+    render_callsign_chip(cr, ov, state, m + pad, m + pad)
+
+    # Right: only as tall as its lines need.
+    freq, lines, dim = _corner_numbers(state)
+    freq_sz, line_sz, line_h = 26, 18, 23
+    inner_h = 14 + freq_sz + 6 + line_h * len(lines) + 4
+    x = width - m - box_w
+    _lynx_box(cr, ov, x, m, box_w, inner_h + 2 * pad)
+    cr.set_source_rgba(*ov.BAR_HEAD)
+    ov._rounded_rect_path(cr, x + pad, m + pad, CHIP_W, inner_h, 13)
+    cr.fill()
+    mid = x + box_w / 2.0
+    base = m + pad + 14 + freq_sz - 4
+    ov.draw_text(cr, mid, base, freq, size=freq_sz, align="center",
+                 colour=ov.BAR_DIM if dim else ov.BAR_VALUE)
+    if not lines:
+        return
+    base += 6
+    # One left edge for every line, set by the widest, so A and B read
+    # as a column even when one of them is only a dash.
+    cr.set_font_size(line_sz)
+    label_w = max(cr.text_extents(l + "  ").x_advance for l, _v, _d in lines)
+    value_w = max(cr.text_extents(v).width for _l, v, _d in lines)
+    x0 = mid - (label_w + value_w) / 2.0
+    for label, value, ldim in lines:
+        base += line_h
+        ov.draw_text(cr, x0, base, label, size=line_sz, colour=ov.BAR_LABEL)
+        ov.draw_text(cr, x0 + label_w, base, value, size=line_sz,
+                     colour=ov.BAR_DIM if (dim or ldim) else ov.BAR_VALUE)
+
+
 def render_lynx_bar(cr, width, height, state, progress, ov):
     """Draw the Lynx Bar at `progress` (0 hidden, 1 fully up).
 
@@ -1201,64 +1388,8 @@ def render_lynx_bar(cr, width, height, state, progress, ov):
     # The callsign in a navy chip at the left, echoing the panel
     # headers on the web pages: the one element that makes this read as
     # Lynx rather than as a generic infobar.
-    locked = bool(state.get("locked"))
-    call = (state.get("callsign") or state.get("hdhr_callsign")
-            or state.get("stream_name")
-            or ("SEARCHING" if not locked else "\u2014"))
     chip_w, chip_m = 236, 14
-    cr.set_source_rgba(*ov.BAR_HEAD)
-    ov._rounded_rect_path(cr, x + chip_m, y + chip_m, chip_w,
-                          bar_h - 2 * chip_m, 13)
-    cr.fill()
-
-    cr.select_font_face("monospace", cairo.FONT_SLANT_NORMAL,
-                        cairo.FONT_WEIGHT_BOLD)
-    chip_cx = x + chip_m + chip_w / 2.0
-    ov.draw_text(cr, chip_cx, y + 50, call[:11], size=34, align="center",
-                 colour=ov.BAR_VALUE if locked else ov.BAR_DIM)
-
-    def fit(name, loc, size, room):
-        """"Name · LOCATOR", shortened to the chip's width by
-        measurement. The NAME gives way, never the locator: a square is
-        the thing you point an aerial at, and "Paddlesworth Remot..."
-        with no locator after it is a name with the useful half gone.
-        """
-        name, loc = (name or "").strip(), (loc or "").strip()
-        cr.set_font_size(size)
-
-        def join(n):
-            return " \u00b7 ".join(b for b in (n, loc) if b)
-
-        text = join(name)
-        if cr.text_extents(text).width <= room:
-            return text
-        while name:
-            name = name[:-1].rstrip()
-            text = join(name + "\u2026" if name else "")
-            if cr.text_extents(text).width <= room:
-                return text
-        # Only the locator is left, and it still does not fit: trim it
-        # rather than draw past the chip.
-        while text and cr.text_extents(text).width > room:
-            text = text[:-1]
-        return text
-
-    room = chip_w - 18
-    # The station: its QRZ first name and its OWN square. This line
-    # used to take the receiver's locator, which read as the station's
-    # and was only right by coincidence when the station was near by.
-    station = fit(state.get("callsign_name"),
-                  state.get("callsign_locator"), 18, room)
-    if station:
-        ov.draw_text(cr, chip_cx, y + 78, station, size=18,
-                     align="center", colour=ov.BAR_LABEL)
-    # Where it was heard: this site, or the Remote Rx on screen. Amber,
-    # the colour Pathfinder gives a receiving site, so the two cards
-    # agree on which end of the path is which without a word of label.
-    rx = fit(state.get("rx_name"), state.get("rx_locator"), 15, room)
-    if rx:
-        ov.draw_text(cr, chip_cx, y + 103, rx, size=15,
-                     align="center", colour=ov.BAR_RX)
+    render_callsign_chip(cr, ov, state, x + chip_m, y + chip_m)
 
     # The rest as label-over-value columns: the pairing the web panels
     # use, turned on its side because a bar is wide and shallow.
@@ -1663,8 +1794,11 @@ class LynxOverlay(Gtk.Window):
         if not showing_map:
             bar_up = self.draw_lynx_bar(cr, width, height)
             if not bar_up:
-                self.draw_top_right(cr, width, height)
-                self.draw_top_left(cr, width, height)
+                if self._corner_boxes_apply():
+                    render_corner_boxes(cr, width, height, state, self)
+                else:
+                    self.draw_top_right(cr, width, height)
+                    self.draw_top_left(cr, width, height)
             self.draw_bottom_left(cr, width, height)
             self.draw_bottom_right(cr, width, height)
         # The tri_watch bubble is NOT suppressed - someone waiting to
@@ -1767,6 +1901,20 @@ class LynxOverlay(Gtk.Window):
             self._bar_last_sig = sig
             if sig is not None:
                 self._bar_shown_at = time.monotonic()
+
+    def _corner_boxes_apply(self):
+        """Whether the top corners are the Lynx boxes or the old text.
+
+        The boxes for an RF receiver - local, diversity or Remote -
+        which is what they were designed for. The old text everywhere
+        else, deliberately: DVB-T2, a stream, an offline Picotuner and
+        Tri-Watch's two-receiver searching state each have their own
+        layout there that the boxes were never designed to carry, and
+        replacing a working display with one that drops half of it
+        would be a step backwards.
+        """
+        return (state.get("mode") == "rf" and bool(state.get("online"))
+                and not state.get("tri_watch_show_searching_rx2"))
 
     def show_lynx_bar(self):
         """Bring it up on demand: the button on the receiver page."""

@@ -23,7 +23,7 @@ import unittest
 HERE = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(HERE, "lynx_overlay.py")
 
-WANT_FUNCS = ("_bar_cells",)
+WANT_FUNCS = ("_bar_cells", "_on_air_mhz", "_corner_numbers")
 WANT_METHODS = ("_bar_hold_secs", "_bar_progress", "_bar_trigger_signature",
                 "update_lynx_bar", "show_lynx_bar", "hide_lynx_bar",
                 "toggle_lynx_bar", "apply_lynx_bar_command")
@@ -194,6 +194,69 @@ class CellTests(unittest.TestCase):
                    {"mode": "stream", "locked": False}):
             with self.subTest(st):
                 self.cells(st)
+
+
+class CornerTests(unittest.TestCase):
+    """The right-hand corner box, shown while the bar is down."""
+
+    def setUp(self):
+        self.ns, _, _, _ = load()
+        self.nums = self.ns["_corner_numbers"]
+
+    BASE = {"locked": True, "frequency": 438.021, "mer": 23.4, "margin": 17.0}
+
+    def test_single_tuner_is_one_mer_d_line(self):
+        freq, lines, dim = self.nums(self.BASE)
+        self.assertEqual("438.021 MHz", freq)
+        self.assertEqual([("MER/D", "23.4/17.0 dB", False)], lines)
+        self.assertFalse(dim)
+
+    def test_diversity_is_one_line_per_antenna(self):
+        st = dict(self.BASE, diversity_enabled=True, locked_a=True,
+                  locked_b=True, mer_a=23.4, mer_b=19.8,
+                  margin_a=17.0, margin_b=13.2)
+        _f, lines, _d = self.nums(st)
+        self.assertEqual(["A", "B"], [l[0] for l in lines])
+        self.assertEqual("19.8/13.2 dB", lines[1][1])
+
+    def test_a_dead_antenna_keeps_its_line_as_a_dim_dash(self):
+        """Dropping the line would make a half-working pair look like a
+        working single."""
+        st = dict(self.BASE, diversity_enabled=True, locked_a=True,
+                  locked_b=False, mer_a=23.4, margin_a=17.0)
+        _f, lines, _d = self.nums(st)
+        self.assertEqual(("B", "\u2014", True), lines[1])
+
+    def test_the_on_air_frequency_wins_over_the_if(self):
+        """The bar used to show the IF, so a QO-100 setup put the
+        tuner's 741 MHz on screen instead of the 10 GHz downlink."""
+        freq, _l, _d = self.nums(dict(self.BASE, frequency=741.5,
+                                      downlink_frequency=10491.5))
+        self.assertEqual("10491.500 MHz", freq)
+
+    def test_the_bar_agrees_about_the_frequency(self):
+        cells = dict((c[0], c[1]) for c in self.ns["_bar_cells"](
+            dict(self.BASE, mode="rf", frequency=741.5,
+                 downlink_frequency=10491.5)))
+        self.assertEqual("10491.500 MHz", cells["FREQUENCY"])
+
+    def test_a_knucker_remote_gets_its_dvbt_figures(self):
+        st = {"locked": True, "frequency": 498.0, "dvbt_metrics": True,
+              "dvbt_snr": 18.2, "dvbt_snq": 87}
+        _f, lines, _d = self.nums(st)
+        self.assertEqual([("SNR", "18.2 dB", False), ("SNQ", "87%", False)],
+                         lines)
+
+    def test_searching_dims_everything(self):
+        freq, lines, dim = self.nums({"locked": False, "frequency": 438.0})
+        self.assertTrue(dim)
+        self.assertEqual([], lines)
+
+    def test_nothing_known_is_not_a_crash(self):
+        for st in ({}, {"frequency": "rubbish"}, {"mer": "x", "margin": "y"},
+                   {"diversity_enabled": True}):
+            with self.subTest(st):
+                self.nums(st)
 
 
 class WidthTests(unittest.TestCase):
