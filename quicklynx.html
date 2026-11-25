@@ -625,9 +625,15 @@ function render() {
         // Readable summary, top-right - includes raw values so they
         // can be read off and reported directly.
         const lines = [
-            `peak=${d.peakVal} floor=${d.floor} thr=${Math.round(d.threshold)}`,
-            `left: bin ${d.leftIdx} (${d.leftReason})  right: bin ${d.rightIdx} (${d.rightReason})`,
-            `width=${d.widthBins} bins  raw est=${d.estimatedKsps ? d.estimatedKsps.toFixed(1) : '?'} kS/s`,
+            // Counts are 3000 to the dB, so the dB figures are what to
+            // read off; the raw counts stay for exact reports.
+            `peak=${d.peakVal} floor=${d.floor} thr=${Math.round(d.threshold)}  `
+                + `(+${((d.peakVal - d.floor) / COUNTS_PER_DB).toFixed(1)} dB, `
+                + `measured ${((d.peakVal - d.threshold) / COUNTS_PER_DB).toFixed(1)} dB down)`
+                + (d.clipped ? '  CLIPPED - true peak hidden, may read high' : ''),
+            `left: bin ${typeof d.leftIdx === 'number' ? d.leftIdx.toFixed(2) : d.leftIdx}  `
+                + `right: bin ${typeof d.rightIdx === 'number' ? d.rightIdx.toFixed(2) : d.rightIdx}`,
+            `width=${d.widthBins ? d.widthBins.toFixed(2) : '?'} bins  raw est=${d.estimatedKsps ? d.estimatedKsps.toFixed(1) : '?'} kS/s`,
         ];
         ctx.font = '11px ' + getComputedStyle(document.body).fontFamily;
         ctx.textAlign = 'right';
@@ -690,22 +696,51 @@ canvas.addEventListener('mouseleave', () => {
 // transponder with adjacent signals won't always be clean.
 let lastDiagnostic = null; // set by estimateSymbolRateKsps() each click - drawn as an overlay by render()
 
+// The feed's scale, from BATC's own server source (eshail-ghy-wb-fft-
+// airspy/main.c): 10*log10 power times FFT_SCALE 9e3, divided by
+// FFT_PRESCALE 3, so 3000 counts per dB. The server shifts the whole
+// spectrum so its quietest bin sits at 9000 counts, and anything about
+// 16 dB above that clips at 65535 - so the full display is only ~22 dB.
+const COUNTS_PER_DB = 3000;
+const CLIP_COUNTS = 65535;
+const countsToLin = (c) => Math.pow(10, c / COUNTS_PER_DB / 10);
+const linToCounts = (p) => 10 * Math.log10(p) * COUNTS_PER_DB;
+
+// Rewritten 2026-11-25 after G8KOE reported misreads on a busy QO-100
+// (a 500 kS/s station read as 333). Two faults, which stacked:
+//
+//  1. The floor was the median of +/-3.9 MHz around the click, which
+//     on a busy transponder is mostly OTHER stations. The "floor" was
+//     then a signal level, the threshold rode up near the top of the
+//     signal, and only its narrow crest was measured - 400 kHz of a
+//     500 kS/s station, which /1.2 is exactly 333.
+//  2. The threshold was halfway between floor and peak IN dB: 8 dB or
+//     more down on a strong signal, and deeper still on a clipped one,
+//     where the true peak is hidden above 65535. That deep, the walk
+//     bridges into the next station.
+//
+// Now: the floor is a low percentile of the WHOLE spectrum (the server
+// already pins it, so this is only "is there a signal here?"), and the
+// threshold is halfway between floor and peak in LINEAR power. For a
+// root-raised-cosine signal the power spectrum is exactly half its peak
+// at +/-SR/2, so the width there IS the symbol rate - for any roll-off,
+// at any level, with the noise underneath properly accounted for. On a
+// strong signal that is 3 dB down; on a weak one it is correctly a
+// little less. No more 1.2 fudge factor, and gaps between carriers are
+// far deeper than 3 dB, so neighbours no longer merge.
+//
+// Edges are interpolated between bins: at ~9.8 kHz a bin, a 33 kS/s
+// signal is barely three bins wide, and whole-bin edges cannot measure
+// it at all.
 function estimateSymbolRateKsps(clickedArrayIndex) {
     if (!latestData) return null;
     lastDiagnostic = null;
 
-    // Find the true local peak near the click - the user may not
-    // have clicked exactly on it, but this should stay TIGHT. It was
-    // previously the same, much wider value used below for the edge
-    // walk (needed to be wide, to measure a full 1500+ kS/s signal's
-    // width) - conflating the two was a real bug: a +/-160 bin
-    // (~1.5MHz) peak search window meant that on a busy transponder,
-    // ANY stronger signal anywhere in that whole span would get
-    // snapped to instead of the one actually clicked, showing up
-    // exactly as reported: the detected signal sitting well to the
-    // right of the intended one.
-    const PEAK_SEARCH_RADIUS = 10; // ~98kHz - just enough for imprecise clicking, not enough to jump to a different signal
-    const EDGE_WALK_LIMIT = 160;   // ~1.5MHz - wide enough to measure a 1500+ kS/s signal's full width once the correct peak is found
+    // Find the true local peak near the click. Kept TIGHT: a wide
+    // search snaps to any stronger signal nearby rather than the one
+    // clicked, which was a real bug once.
+    const PEAK_SEARCH_RADIUS = 10; // ~98kHz
+    const EDGE_WALK_LIMIT = 160;   // ~1.5MHz - room for a 1500 kS/s signal's half-width
 
     let peakIdx = clickedArrayIndex;
     let peakVal = latestData[clickedArrayIndex];
@@ -718,87 +753,45 @@ function estimateSymbolRateKsps(clickedArrayIndex) {
         }
     }
 
-    // Estimate local noise floor as the median of a wider window,
-    // excluding a margin around the peak itself - EDGE_WALK_LIMIT
-    // here deliberately, since the signal being measured could
-    // legitimately be that wide.
-    const FLOOR_WINDOW = 400;
-    const samples = [];
-    for (let d = -FLOOR_WINDOW; d <= FLOOR_WINDOW; d++) {
-        const idx = peakIdx + d;
-        if (idx < 0 || idx >= N_BINS) continue;
-        if (Math.abs(d) < EDGE_WALK_LIMIT) continue; // exclude the signal itself
-        samples.push(latestData[idx]);
-    }
-    if (samples.length < 10) return null;
-    samples.sort((a, b) => a - b);
-    const floor = samples[Math.floor(samples.length / 2)];
+    // Floor: the 10th percentile of the whole spectrum. A busy band
+    // still has gaps and the bins either side of the transponder, and
+    // the server has already shifted the noise to a fixed level.
+    const sorted = Array.from(latestData).sort((a, b) => a - b);
+    const floor = sorted[Math.floor(sorted.length * 0.10)];
 
-    if (peakVal <= floor) return null; // no real peak found - flat/noise-only region
+    // Needs to stand clear of the noise to be worth measuring at all.
+    if (peakVal - floor < 1.0 * COUNTS_PER_DB) return null;
+    const clipped = peakVal >= CLIP_COUNTS;
 
-    // Simplified (2026-07-30) to a straightforward 50%-of-peak-
-    // amplitude threshold, on Justin's own suggestion: below that
-    // level a real receiver won't lock anyway, so there's no
-    // practical value in trying to trace a signal's full, gradual
-    // taper all the way down to the noise floor - and the simpler,
-    // higher threshold is naturally far less likely to walk into a
-    // neighbouring signal on a busy transponder than the previous,
-    // much lower one was, which needed extra valley-detection logic
-    // specifically to compensate for that.
-    const threshold = floor + (peakVal - floor) * 0.5;
+    const threshold = linToCounts((countsToLin(peakVal) + countsToLin(floor)) / 2);
 
-    let leftIdx = peakIdx;
-    while (leftIdx > 0 && latestData[leftIdx] > threshold) leftIdx--;
-    let rightIdx = peakIdx;
-    while (rightIdx < N_BINS - 1 && latestData[rightIdx] > threshold) rightIdx++;
-
-    const widthBins = rightIdx - leftIdx;
+    let l = peakIdx;
+    while (l > 0 && peakIdx - l < EDGE_WALK_LIMIT && latestData[l] > threshold) l--;
+    let r = peakIdx;
+    while (r < N_BINS - 1 && r - peakIdx < EDGE_WALK_LIMIT && latestData[r] > threshold) r++;
 
     lastDiagnostic = {
-        clickedArrayIndex, peakIdx, peakVal, floor, threshold,
-        leftIdx, rightIdx, leftReason: 'threshold', rightReason: 'threshold', widthBins,
+        clickedArrayIndex, peakIdx, peakVal, floor, threshold, clipped,
+        leftIdx: l, rightIdx: r, leftReason: 'threshold', rightReason: 'threshold',
     };
+    // Ran out of room without finding an edge: not a signal we can measure.
+    if (latestData[l] > threshold || latestData[r] > threshold) return null;
 
-    if (widthBins < 2 || widthBins > EDGE_WALK_LIMIT * 2) return null; // implausible - don't guess wildly
+    // Where, between two bins, the spectrum crosses the threshold.
+    const cross = (below, above) =>
+        (threshold - latestData[below]) / (latestData[above] - latestData[below]);
+    const leftEdge = l + cross(l, l + 1);
+    const rightEdge = r - cross(r, r - 1);
+    const widthBins = rightEdge - leftEdge;
+    Object.assign(lastDiagnostic, { leftIdx: leftEdge, rightIdx: rightEdge, widthBins });
 
-    const occupiedHz = widthBins * BIN_HZ;
-    // CALIBRATION (corrected 2026-11-24). This was 1.0, on the
-    // reasoning that a raised-cosine spectrum's half-AMPLITUDE width
-    // equals the symbol rate itself, regardless of roll-off. That
-    // reasoning is sound for linear amplitude, but the same comment
-    // flagged the hole in it: this feed's values are dB, confirmed
-    // from BATC's own server source, so the threshold above is the
-    // midpoint between floor and peak IN dB - a point well below half
-    // amplitude, where the signal is already out at its occupied
-    // bandwidth. Measured widths therefore come out at roughly 1.2x
-    // the symbol rate, not 1.0x, and must be divided back down.
-    //
-    // Strictly, neither constant is right for every signal, because
-    // the threshold sits P/2 dB below the peak for a signal P dB
-    // above the floor, and a 0.20 roll-off spectrum's width grows
-    // from 1.00x SR at -3 dB to about 1.19x at -20 dB. So the true
-    // divisor runs 1.0 (a signal barely out of the noise) to 1.2 (a
-    // strong one). Anything worth clicking on is well clear of the
-    // floor, so 1.2 is the right constant for the normal case. A
-    // level-aware divisor is the proper fix and is cheap, since
-    // peakVal and floor above are already measured - deliberately
-    // left for a session with real signals to check it against.
-    //
-    // That is also the only value that agrees with the reference bars
-    // on the same screen, which are drawn at sr * 1.2: with 1.0, a
-    // signal exactly filling the 333 bar read back as 400 and snapped
-    // to 500 - a failed tune on a common QO-100 narrowband rate.
-    // Confirmed against G8KOE's diagnostic readout: 41 bins =
-    // 400.4 kHz, which is 333.7 with this factor, 0.2% from 333.
-    //
-    // Known limitation, not corrected here: below about 50 kS/s the
-    // signal is only four bins wide, the edge walk cuts inside its
-    // shoulders, and the result under-reads. Such signals now return
-    // an honest unsnapped estimate instead of a lucky snap. Fixing
-    // that properly means a tolerance that follows the +/-1 bin
-    // measurement uncertainty, and wants more than two readings.
-    const WIDTH_TO_SYMBOL_RATE_FACTOR = 1 / 1.2;
-    const estimatedKsps = (occupiedHz * WIDTH_TO_SYMBOL_RATE_FACTOR) / 1000;
+    if (widthBins < 1) return null;
+
+    // The half-power width IS the symbol rate - see above. A clipped
+    // signal's true peak is hidden, so it is measured somewhat further
+    // down than half power and reads a little high; the snap below
+    // absorbs that, and the diagnostic says so.
+    const estimatedKsps = (widthBins * BIN_HZ) / 1000;
     lastDiagnostic.estimatedKsps = estimatedKsps;
 
     // Snap to the nearest standard rate if reasonably close (within
