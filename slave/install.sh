@@ -10,6 +10,21 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")" && pwd)"
 
+# The Remote Rx runs as pi, from /home/pi. Raspberry Pi Imager asks for a
+# username and offers no default, so a card is easily built with another
+# one - and then this script used to get as far as installing packages
+# before failing on "could not create leading directories of
+# '/home/pi/longmynd'". Stop before touching anything instead.
+if [ "$(id -un)" != "pi" ]; then
+    echo "The Lynx Remote Rx must be installed as the user 'pi'." >&2
+    echo "This card's user is '$(id -un)'." >&2
+    echo >&2
+    echo "Re-flash the card with Raspberry Pi Imager, and in its settings" >&2
+    echo "set the username to: pi" >&2
+    echo "Then follow the README again. Nothing has been changed on this card." >&2
+    exit 1
+fi
+
 if ! command -v srt-live-transmit >/dev/null; then
     echo "Installing srt-tools for the SRT transport"
     sudo apt-get install -y srt-tools
